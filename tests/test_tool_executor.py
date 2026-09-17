@@ -48,7 +48,11 @@ def _schema(name: str) -> dict:
         "function": {
             "name": name,
             "description": name,
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": True,
+            },
         },
     }
 
@@ -118,6 +122,60 @@ class ToolExecutorTests(unittest.TestCase):
         from harness_code_agent.agent.tool_executor import ToolExecutor
 
         self.assertNotIn("_executor", ToolExecutor.__dict__)
+
+    def test_model_tool_call_schema_validation_precedes_permission_and_execution(self):
+        registry = tools.ToolRegistry()
+        executed = []
+
+        def probe(value):
+            executed.append(value)
+            return ToolResult(tool="probe", status="success", output="executed")
+
+        registry.register(
+            {
+                "type": "function",
+                "function": {
+                    "name": "probe",
+                    "description": "probe",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["value"],
+                        "properties": {"value": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            probe,
+            permission="edit",
+        )
+
+        class SpyPermissionPolicy(PermissionPolicy):
+            def __init__(self):
+                super().__init__(mode="danger-full-access")
+                self.calls = 0
+
+            def decide_tool_call(self, *args, **kwargs):
+                self.calls += 1
+                return super().decide_tool_call(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation, context = _conversation_with_registry(
+                Path(tmp),
+                registry,
+                [_tool_call("tc_probe", "probe", {"value": 1})],
+            )
+            policy = SpyPermissionPolicy()
+            context.permission_policy = policy
+            with patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2):
+                conversation.run_until_idle()
+
+        self.assertEqual(executed, [])
+        self.assertEqual(policy.calls, 0)
+        tool_result = next(event for event in context.event_bus.events if event.type == "tool_result")
+        self.assertEqual(tool_result.payload["metadata"]["error_kind"], "invalid_arguments")
+        self.assertTrue(tool_result.payload["metadata"]["retryable"])
+        self.assertEqual(tool_result.payload["metadata"]["validation_phase"], "structural")
+        self.assertIn("failure", [event.type for event in context.event_bus.events])
 
     def test_shell_effect_classification_distinguishes_inspect_verify_and_mutation(self):
         cases = {

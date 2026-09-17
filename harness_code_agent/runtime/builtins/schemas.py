@@ -371,13 +371,18 @@ CORE_TOOL_SCHEMAS = [
                             "3-4 options is ideal; maximum 9 (only the first 9 get number-key shortcuts)."
                         ),
                         "items": {
-                            "type": "object",
-                            "required": ["label"],
-                            "properties": {
-                                "label": {"type": "string", "description": "Short visible option label."},
-                                "value": {"type": "string", "description": "Value returned to the model if selected."},
-                                "description": {"type": "string", "description": "Optional one-line explanation."},
-                            },
+                            "oneOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "required": ["label"],
+                                    "properties": {
+                                        "label": {"type": "string", "description": "Short visible option label."},
+                                        "value": {"type": "string", "description": "Value returned to the model if selected."},
+                                        "description": {"type": "string", "description": "Optional one-line explanation."},
+                                    },
+                                },
+                            ],
                         },
                     },
                     "other_label": {

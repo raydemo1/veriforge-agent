@@ -71,3 +71,6 @@ SPEC.md
 
 # Vendored dependency wheels can be rebuilt/downloaded from requirements.txt
 vendor_wheels/
+
+# TRAE local planning documents
+.trae/

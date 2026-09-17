@@ -225,6 +225,11 @@ def _run_hca_case(
         "token_budget_exceeded",
         "tool_call_budget_exceeded",
         "repeated_tool_failure",
+        "repeated_policy_failure",
+        "retry_budget_exhausted",
+        "turn_failure_budget_exhausted",
+        "invalid_tool_definition",
+        "tool_failure_policy",
         "loop_detected",
     }
     success = (

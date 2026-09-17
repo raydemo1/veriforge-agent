@@ -55,6 +55,14 @@ from .execution_planner import (
     ResourceClaim,
     ResourceCoordinator,
 )
+from .tool_call_validation import (
+    ToolCall,
+    ToolCallValidationResult,
+    ToolError,
+    strict_tool_schema,
+    validate_tool_arguments,
+    validate_tool_call,
+)
 from .tool_registry import (
     ToolRegistry,
     ToolSpec,

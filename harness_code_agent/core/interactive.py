@@ -48,7 +48,8 @@ from ..runtime.middleware import (
     MemoryMiddleware,
     StaticVerifierMiddleware,
     TimeBudgetMiddleware,
-    ToolPolicyMiddleware,
+    ToolFailurePolicyMiddleware,
+    ToolGuardMiddleware,
 )
 from ..runtime.permission_middleware import PermissionMiddleware
 from ..runtime.permissions import PermissionPolicy
@@ -231,7 +232,8 @@ class InteractiveSession:
             acceptance_criteria=acceptance_criteria,
         )
         middlewares = list(cfg.middlewares)
-        middlewares.append(ToolPolicyMiddleware())
+        middlewares.append(ToolGuardMiddleware())
+        middlewares.append(ToolFailurePolicyMiddleware(tool_registry=self.tool_registry))
         if getattr(cfg, "memory_enabled", True):
             middlewares.append(MemoryMiddleware(workspace=self.cwd))
         middlewares.append(

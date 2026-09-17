@@ -1,14 +1,20 @@
-"""Runtime policy guard for unsafe or wasteful tool usage."""
+"""Runtime policy guard for unsafe or wasteful tool usage.
+
+This middleware only *intercepts* calls (command-shape guards and per-turn
+exploration budgets). It never counts failure streaks and never requests a
+fallback stop: repeated blocked/policy failures are tracked once, centrally,
+by ``ToolFailurePolicyMiddleware`` via the canonical ``ToolFailure`` model.
+The intercepted results still carry ``status_source="tool_policy"``, which is
+the event-wire label for a policy interception (peer of permission/budget).
+"""
 from __future__ import annotations
 
-import hashlib
 import re
 import shlex
 
 from ..tool_result import ToolResult
-from .base import AgentMiddleware, tool_blocked
+from .base import AgentMiddleware
 
-REPEATED_FAILURE_THRESHOLD = 2
 SEARCH_TIMEOUT_SECONDS = 15
 BROAD_REPO_SEARCH_BUDGET = 4
 DEEP_ROOT_LIST_BUDGET = 2
@@ -66,24 +72,15 @@ SHELL_CONTROL_OPERATORS = ("|", "&&", "||", ";", ">", "<", "`")
 SHELL_CONTROL_TOKENS = {"|", "&&", "||", ";"}
 
 
-class ToolPolicyMiddleware(AgentMiddleware):
-    """Blocks repository browsing through shell and stops repeated same-class failures."""
+class ToolGuardMiddleware(AgentMiddleware):
+    """Blocks repository browsing through shell and wasteful exploration."""
 
-    def __init__(self, repeated_failure_threshold: int = REPEATED_FAILURE_THRESHOLD):
-        self.repeated_failure_threshold = max(1, int(repeated_failure_threshold))
-        self._last_failure_signature = ""
-        self._last_failure_summary = ""
-        self._last_failure_batch_key = ""
-        self._failure_count = 0
+    def __init__(self):
         self._broad_repo_search_count = 0
         self._deep_root_list_count = 0
 
     def begin_turn(self, task: str, messages: list[dict], runtime_state=None,
                    agent_name: str | None = None) -> None:
-        self._last_failure_signature = ""
-        self._last_failure_summary = ""
-        self._last_failure_batch_key = ""
-        self._failure_count = 0
         self._broad_repo_search_count = 0
         self._deep_root_list_count = 0
 
@@ -95,13 +92,12 @@ class ToolPolicyMiddleware(AgentMiddleware):
         runtime_state=None,
         agent_name: str | None = None,
     ) -> ToolResult | None:
-        batch_key = _tool_batch_key(messages)
         if tool_name == "run_bash":
-            return self._guard_shell(tool_args, runtime_state, batch_key=batch_key)
+            return self._guard_shell(tool_args, runtime_state)
         if tool_name == "repo_search":
-            return self._guard_repo_search(tool_args, runtime_state, batch_key=batch_key)
+            return self._guard_repo_search(tool_args, runtime_state)
         if tool_name == "list_files":
-            return self._guard_list_files(tool_args, runtime_state, batch_key=batch_key)
+            return self._guard_list_files(tool_args, runtime_state)
         if tool_name == "read_file":
             path = str((tool_args or {}).get("path") or "")
             if _is_observation_path(path):
@@ -112,17 +108,10 @@ class ToolPolicyMiddleware(AgentMiddleware):
                     runtime_state,
                     category="internal_observation_read",
                     summary=f"read_file:{_shape_path(path)}",
-                    batch_key=batch_key,
                 )
         return None
 
-    def _guard_repo_search(
-        self,
-        tool_args: dict,
-        runtime_state=None,
-        *,
-        batch_key: str = "",
-    ) -> ToolResult | None:
+    def _guard_repo_search(self, tool_args: dict, runtime_state=None) -> ToolResult | None:
         path = str((tool_args or {}).get("path") or ".").strip() or "."
         if not _path_is_root(path):
             return None
@@ -135,16 +124,9 @@ class ToolPolicyMiddleware(AgentMiddleware):
             runtime_state,
             category="exploration_budget",
             summary="repo_search:root",
-            batch_key=batch_key,
         )
 
-    def _guard_list_files(
-        self,
-        tool_args: dict,
-        runtime_state=None,
-        *,
-        batch_key: str = "",
-    ) -> ToolResult | None:
+    def _guard_list_files(self, tool_args: dict, runtime_state=None) -> ToolResult | None:
         directory = str((tool_args or {}).get("directory") or ".").strip() or "."
         try:
             depth = int((tool_args or {}).get("depth") or 2)
@@ -161,34 +143,9 @@ class ToolPolicyMiddleware(AgentMiddleware):
             runtime_state,
             category="exploration_budget",
             summary="list_files:deep_root",
-            batch_key=batch_key,
         )
 
-    def post_tool(self, tool_name: str, tool_args: dict, result: ToolResult,
-                  messages: list[dict], runtime_state=None,
-                  agent_name: str | None = None) -> str | None:
-        category = _result_failure_category(result)
-        if category is None:
-            self._reset_failure_streak()
-            return None
-        signature = _failure_signature(tool_name, category, _args_shape(tool_name, tool_args))
-        summary = f"{tool_name}:{category}:{_args_shape(tool_name, tool_args)}"
-        self._record_failure(
-            signature,
-            summary,
-            runtime_state,
-            tool_name,
-            batch_key=_tool_batch_key(messages),
-        )
-        return None
-
-    def _guard_shell(
-        self,
-        tool_args: dict,
-        runtime_state=None,
-        *,
-        batch_key: str = "",
-    ) -> ToolResult | None:
+    def _guard_shell(self, tool_args: dict, runtime_state=None) -> ToolResult | None:
         command = str((tool_args or {}).get("command") or "").strip()
         lowered = _collapse(command.lower())
         if not lowered:
@@ -202,7 +159,6 @@ class ToolPolicyMiddleware(AgentMiddleware):
                 runtime_state,
                 category="repo_browse_shell",
                 summary=f"run_bash:{_command_family(lowered)}",
-                batch_key=batch_key,
             )
 
         if _looks_like_rg(command):
@@ -224,7 +180,6 @@ class ToolPolicyMiddleware(AgentMiddleware):
                 runtime_state,
                 category="bare_rg",
                 summary="run_bash:rg_without_path",
-                batch_key=batch_key,
             )
 
         if _looks_like_shell_search_without_path(command):
@@ -234,7 +189,6 @@ class ToolPolicyMiddleware(AgentMiddleware):
                 runtime_state,
                 category="repo_browse_shell",
                 summary=f"run_bash:{_command_family(lowered)}",
-                batch_key=batch_key,
             )
 
         return None
@@ -247,16 +201,12 @@ class ToolPolicyMiddleware(AgentMiddleware):
         *,
         category: str,
         summary: str,
-        batch_key: str = "",
     ) -> ToolResult:
-        signature = _failure_signature(tool_name, category, summary)
-        self._record_failure(
-            signature,
-            summary,
-            runtime_state,
-            tool_name,
-            batch_key=batch_key,
-        )
+        # Record the blocked action for fallback fingerprints; streak counting
+        # and stop decisions live in ToolFailurePolicyMiddleware.
+        fallback = getattr(runtime_state, "fallback", None)
+        if fallback is not None:
+            fallback.record_action(summary)
         output = f"[blocked] {message}"
         return ToolResult(
             tool=tool_name,
@@ -268,45 +218,6 @@ class ToolPolicyMiddleware(AgentMiddleware):
                 "policy_violation": category,
             },
         )
-
-    def _record_failure(
-        self,
-        signature: str,
-        summary: str,
-        runtime_state,
-        tool_name: str,
-        *,
-        batch_key: str = "",
-    ) -> None:
-        if signature == self._last_failure_signature:
-            if not batch_key or batch_key != self._last_failure_batch_key:
-                self._failure_count += 1
-        else:
-            self._last_failure_signature = signature
-            self._last_failure_summary = summary
-            self._failure_count = 1
-        self._last_failure_batch_key = batch_key
-
-        fallback = getattr(runtime_state, "fallback", None)
-        if fallback is not None:
-            fallback.record_action(summary)
-        if self._failure_count < self.repeated_failure_threshold or fallback is None:
-            return
-        fallback.request_stop(
-            reason="repeated_tool_failure",
-            limit_type="tool_failure_signature",
-            used=self._failure_count,
-            limit=self.repeated_failure_threshold,
-            last_tool=tool_name,
-            fingerprint_hash=hashlib.sha256(signature.encode("utf-8")).hexdigest()[:16],
-            recent_action_summary=getattr(fallback, "recent_action_summary", []),
-        )
-
-    def _reset_failure_streak(self) -> None:
-        self._last_failure_signature = ""
-        self._last_failure_summary = ""
-        self._last_failure_batch_key = ""
-        self._failure_count = 0
 
 
 def _collapse(value: str) -> str:
@@ -479,25 +390,6 @@ def _has_bounded_search_output(command: str) -> bool:
     )
 
 
-def _tool_batch_key(messages: list[dict]) -> str:
-    for message in reversed(messages or []):
-        if message.get("role") != "assistant":
-            continue
-        tool_calls = message.get("tool_calls") or []
-        if not tool_calls:
-            continue
-        call_ids = [
-            str(call.get("id") or "")
-            for call in tool_calls
-            if isinstance(call, dict)
-        ]
-        stable_ids = [call_id for call_id in call_ids if call_id]
-        if stable_ids:
-            return "|".join(stable_ids)
-        return f"assistant-message:{id(message)}"
-    return ""
-
-
 def _looks_like_shell_search_without_path(command: str) -> bool:
     lowered = _collapse(command.lower())
     tokens = _tokens(command)
@@ -517,25 +409,6 @@ def _looks_like_shell_search_without_path(command: str) -> bool:
         non_options = [token for token in tokens[1:] if not str(token).startswith("-")]
         return len(non_options) < 2
     return False
-
-
-def _result_failure_category(result: ToolResult) -> str | None:
-    if result.status != "failed":
-        return None
-    if tool_blocked(result):
-        return "blocked"
-    text = (result.error or result.output or "").lower()
-    if "timed out" in text or "timeout" in text:
-        return "timeout"
-    return None
-
-
-def _args_shape(tool_name: str, tool_args: dict) -> str:
-    if tool_name == "run_bash":
-        return _command_family(str((tool_args or {}).get("command") or ""))
-    if tool_name in {"read_file", "list_files", "repo_search"}:
-        return _shape_path(str((tool_args or {}).get("path") or (tool_args or {}).get("directory") or "."))
-    return ",".join(sorted(str(key) for key in (tool_args or {})))
 
 
 def _command_family(command: str) -> str:
@@ -558,10 +431,6 @@ def _shape_path(path: str) -> str:
 def _path_is_root(path: str) -> bool:
     normalized = path.replace("\\", "/").strip()
     return normalized in {"", ".", "./"}
-
-
-def _failure_signature(tool_name: str, category: str, shape: str) -> str:
-    return f"{tool_name}|{category}|{shape}"
 
 
 def _is_observation_path(path: str) -> bool:

@@ -596,6 +596,22 @@ def classify_tool_failure(tool_result: Any) -> str:
     error = str(getattr(tool_result, "error", "") or "")
     combined = f"{output}\n{error}".lower()
 
+    # Canonical failure taxonomy (ToolFailure) takes precedence; the event
+    # category enum is kept stable for existing consumers.
+    canonical_category = metadata.get("failure_category")
+    if isinstance(canonical_category, str) and canonical_category:
+        kind = str(metadata.get("failure_kind", "") or "")
+        if canonical_category == "invalid_call":
+            return "validation_error"
+        if canonical_category == "policy":
+            return "user_cancelled" if kind == "approval_denied" else "tool_error"
+        if canonical_category == "resource":
+            return "runtime_error"
+        if canonical_category == "execution":
+            return "runtime_error" if source in {"runtime", "exception", "shell"} else "tool_error"
+        if canonical_category == "verification":
+            return "runtime_error"
+
     if source == "validation" or "validation" in combined or "empty file path" in combined:
         return "validation_error"
     if source == "approval" or "approval_denied" in combined or "cancelled" in combined or "canceled" in combined:

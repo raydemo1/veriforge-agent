@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 from abc import ABC
+from typing import TYPE_CHECKING
 
 from ..tool_result import ToolResult
+
+if TYPE_CHECKING:
+    from ..tool_failures import FailureAction, ToolFailure
 
 MAIN_AGENT_NAMES = {"main_agent"}
 
@@ -90,6 +94,22 @@ class AgentMiddleware(ABC):
                   messages: list[dict], runtime_state=None,
                   agent_name: str | None = None) -> str | None:
         """Called after each tool execution. Return a message to inject, or None."""
+        return None
+
+    def on_tool_failure(
+        self,
+        failure: "ToolFailure",
+        messages: list[dict],
+        runtime_state=None,
+        agent_name: str | None = None,
+    ) -> "FailureAction | None":
+        """Called exactly once per failed call, including intercepted calls.
+
+        Unlike post_tool, this hook also fires for validation/permission/budget
+        failures that never reached tool execution. The middleware is a pure
+        decision point: return a FailureAction (or None); the ToolExecutor is
+        the sole executor of side effects such as stop or injected guidance.
+        """
         return None
 
     def pre_exit(self, messages: list[dict], runtime_state=None,

@@ -1954,8 +1954,10 @@ class ProductRuntimeTests(unittest.TestCase):
             ]
 
             self.assertIn("[error] File not found: missing.txt", missing)
-            self.assertIn("[auto-fix] Empty file path", empty_write)
-            self.assertIn("[error] Empty file path", empty_patch)
+            self.assertIn("Empty file path", empty_write)
+            self.assertIn("kind=invalid_arguments", empty_write)
+            self.assertIn("Empty file path", empty_patch)
+            self.assertIn("kind=invalid_arguments", empty_patch)
             self.assertEqual(len(failed_results), 3)
             failures = [event for event in events if event["type"] == "failure"]
             self.assertEqual(len(failures), 3)
@@ -3198,7 +3200,8 @@ class ProductRuntimeTests(unittest.TestCase):
             ]
 
             self.assertIn("Patched note.txt", result)
-            self.assertIn("[error] ValueError", ambiguous)
+            self.assertIn("Patch search text must not be empty", ambiguous)
+            self.assertIn("kind=invalid_arguments", ambiguous)
             self.assertEqual((root / "note.txt").read_text(encoding="utf-8"), "new\n")
             self.assertTrue(any(event["type"] == "file_change" for event in events))
             self.assertFalse(any(event["type"] == "file_changed" for event in events))

@@ -16,7 +16,7 @@ from harness_code_agent.runtime.middleware.error_guidance import ErrorGuidanceMi
 from harness_code_agent.runtime.middleware.terminal_shell_edit import (
     TerminalShellEditPolicyMiddleware,
 )
-from harness_code_agent.runtime.middleware.tool_policy import ToolPolicyMiddleware
+from harness_code_agent.runtime.middleware.tool_guard import ToolGuardMiddleware
 from harness_code_agent.runtime.tool_result import ToolResult
 
 
@@ -71,7 +71,7 @@ class RepositoryToolPolicyTests(unittest.TestCase):
 
 class ShellPolicyTests(unittest.TestCase):
     def test_bare_rg_is_rewritten_with_explicit_path_and_short_timeout(self) -> None:
-        middleware = ToolPolicyMiddleware()
+        middleware = ToolGuardMiddleware()
         args = {"command": 'rg -n "needle" --type py', "timeout": 300}
 
         blocked = middleware.before_tool("run_bash", args, [], runtime_state=AgentRuntimeState())
@@ -80,8 +80,10 @@ class ShellPolicyTests(unittest.TestCase):
         self.assertEqual(args["command"], 'rg -n "needle" --type py .')
         self.assertEqual(args["timeout"], 15)
 
-    def test_recursive_shell_browse_repeated_once_triggers_fallback(self) -> None:
-        middleware = ToolPolicyMiddleware()
+    def test_recursive_shell_browse_is_blocked_without_stopping(self) -> None:
+        # ToolPolicy only intercepts; repeated-block stops are owned by
+        # ToolFailurePolicyMiddleware via the canonical failure model.
+        middleware = ToolGuardMiddleware()
         state = AgentRuntimeState()
         args = {"command": "Get-ChildItem -Recurse"}
 
@@ -90,11 +92,12 @@ class ShellPolicyTests(unittest.TestCase):
 
         self.assertIsNotNone(first)
         self.assertIsNotNone(second)
-        self.assertTrue(state.fallback.stop_requested)
-        self.assertEqual(state.fallback.stop_reason, "repeated_tool_failure")
+        self.assertIn("[blocked]", first.output)
+        self.assertIn("[blocked]", second.output)
+        self.assertFalse(state.fallback.stop_requested)
 
     def test_recursive_grep_over_explicit_file_globs_is_allowed(self) -> None:
-        middleware = ToolPolicyMiddleware()
+        middleware = ToolGuardMiddleware()
         state = AgentRuntimeState()
         args = {
             "command": (
@@ -110,7 +113,7 @@ class ShellPolicyTests(unittest.TestCase):
         self.assertFalse(state.fallback.stop_requested)
 
     def test_bounded_recursive_grep_on_explicit_absolute_path_is_allowed(self) -> None:
-        middleware = ToolPolicyMiddleware()
+        middleware = ToolGuardMiddleware()
         state = AgentRuntimeState()
         args = {
             "command": (
@@ -125,7 +128,7 @@ class ShellPolicyTests(unittest.TestCase):
         self.assertFalse(state.fallback.stop_requested)
 
     def test_unbounded_recursive_grep_on_absolute_directory_remains_blocked(self) -> None:
-        middleware = ToolPolicyMiddleware()
+        middleware = ToolGuardMiddleware()
         state = AgentRuntimeState()
         args = {"command": "grep -rn needle /build/gcc/libstdc++-v3/"}
 
@@ -134,8 +137,10 @@ class ShellPolicyTests(unittest.TestCase):
         self.assertIsNotNone(blocked)
         self.assertIn("[blocked]", blocked.output)
 
-    def test_parallel_policy_failures_in_one_assistant_batch_count_once(self) -> None:
-        middleware = ToolPolicyMiddleware(repeated_failure_threshold=2)
+    def test_repeated_blocks_never_stop_inside_guard_itself(self) -> None:
+        # Batch de-duplication and stop decisions moved to FailureTracker /
+        # ToolFailurePolicyMiddleware; the guard stays side-effect free here.
+        middleware = ToolGuardMiddleware()
         state = AgentRuntimeState()
         args = {"command": "grep -rn needle ."}
         first_batch = [
@@ -150,27 +155,16 @@ class ShellPolicyTests(unittest.TestCase):
 
         first = middleware.before_tool("run_bash", args, first_batch, runtime_state=state)
         second = middleware.before_tool("run_bash", args, first_batch, runtime_state=state)
+        third = middleware.before_tool("run_bash", args, [{"role": "assistant", "tool_calls": []}],
+                                       runtime_state=state)
 
         self.assertIsNotNone(first)
         self.assertIsNotNone(second)
+        self.assertIsNotNone(third)
         self.assertFalse(state.fallback.stop_requested)
 
-        next_batch = [
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {"id": "call-c", "function": {"name": "run_bash"}},
-                ],
-            }
-        ]
-        third = middleware.before_tool("run_bash", args, next_batch, runtime_state=state)
-
-        self.assertIsNotNone(third)
-        self.assertTrue(state.fallback.stop_requested)
-        self.assertEqual(state.fallback.stop_reason, "repeated_tool_failure")
-
     def test_whole_repo_search_budget_blocks_excessive_root_searches(self) -> None:
-        middleware = ToolPolicyMiddleware()
+        middleware = ToolGuardMiddleware()
         state = AgentRuntimeState()
         args = {"pattern": "needle", "path": "."}
 
@@ -180,19 +174,6 @@ class ShellPolicyTests(unittest.TestCase):
 
         self.assertIsNotNone(blocked)
         self.assertIn("[blocked]", blocked.output)
-
-    def test_successful_file_content_with_timeout_text_does_not_trigger_failure_fallback(self) -> None:
-        middleware = ToolPolicyMiddleware(repeated_failure_threshold=2)
-        state = AgentRuntimeState()
-        args = {"path": "eval/benchmarks/run_terminal_bench.py", "max_lines": 40}
-        result = "parser.add_argument('--task-wall-timeout', type=int, default=7200)\n"
-
-        first = middleware.post_tool("read_file", args, _result(result), [], runtime_state=state)
-        second = middleware.post_tool("read_file", args, _result(result), [], runtime_state=state)
-
-        self.assertIsNone(first)
-        self.assertIsNone(second)
-        self.assertFalse(state.fallback.stop_requested)
 
 
 class ErrorGuidanceTests(unittest.TestCase):

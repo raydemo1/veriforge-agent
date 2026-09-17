@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -13,6 +12,8 @@ from ..runtime.execution_planner import (
     ExecutionPlanner,
     acquire_concurrency,
 )
+from ..runtime.tool_call_validation import ToolCall, validate_tool_call
+from ..runtime.tool_failures import FailureMode, ToolFailure, failure_batch_key
 from ..runtime.tool_registry import tool_schemas_for_profile
 from ..runtime.tool_result import ToolResult
 from ..runtime.tool_runner import (
@@ -100,7 +101,7 @@ class ToolExecutor:
                 while next_record in buffered:
                     self._record_executed_result(buffered.pop(next_record))
                     next_record += 1
-                if stop_after_group:
+                if stop_after_group or self.runtime_state.fallback.stop_requested:
                     reason = self.runtime_state.fallback.stop_reason
                     for index in sorted(pending):
                         call = by_index[index]
@@ -143,52 +144,55 @@ class ToolExecutor:
             for message in self.conversation.messages
             if message.get("role") == "tool"
         }
-        orphans = [
-            tc
-            for tc in self._tool_calls
-            if tc.get("id") and tc.get("id") not in answered
-        ]
+        orphans: list[ToolCall] = []
+        for index, tc in enumerate(self._tool_calls):
+            call = ToolCall.from_raw(tc, index)
+            if call.tool_call_id not in answered:
+                orphans.append(call)
         if not orphans:
             return
         log.info("[%s] Answering %d cancelled tool calls", self.agent.name, len(orphans))
         self.conversation.trace.error("cancelled_tool_calls", f"{len(orphans)} unanswered")
-        for tc in orphans:
+        for call in orphans:
             self.conversation._append_message({
                 "role": "tool",
-                "tool_call_id": tc["id"],
+                "tool_call_id": call.tool_call_id,
                 "content": "[cancelled] Execution cancelled before this tool produced a result.",
             })
 
     def _prepare_calls(self, tool_calls: list) -> tuple[list[PreparedToolCall], bool]:
         prepared: list[PreparedToolCall] = []
         for index, tc in enumerate(tool_calls):
-            fn_name = tc["function"]["name"]
-            fn_arguments = tc["function"].get("arguments") or "{}"
-            try:
-                fn_args = json.loads(fn_arguments)
-            except json.JSONDecodeError:
-                log.warning("[%s] Bad JSON in tool call %s: %s", self.agent.name, fn_name, fn_arguments[:200])
-                self.conversation.trace.error("bad_json", f"{fn_name}: {fn_arguments[:200]}")
+            call = ToolCall.from_raw(tc, index)
+            fn_name = call.name or "<unknown>"
+            registry = _registry_for_context(self.agent.tool_context)
+            validation = validate_tool_call(call, registry, self.agent.tool_context)
+            if validation.error is not None:
+                log.warning(
+                    "[%s] Rejected tool call %s (%s): %s",
+                    self.agent.name,
+                    fn_name,
+                    validation.error.kind,
+                    validation.error.message,
+                )
+                self.conversation.trace.error(
+                    validation.error.kind,
+                    f"{fn_name}: {validation.error.message}",
+                )
                 prepared.append(
                     PreparedToolCall(
                         index=index,
-                        tool_call_id=tc["id"],
+                        tool_call_id=call.tool_call_id,
                         name=fn_name,
-                        args={},
+                        args=validation.arguments,
                         effect=CallEffect.global_exclusive(kind="blocked"),
                         raw=tc,
-                        blocked_result=ToolResult(
-                            tool=fn_name,
-                            status="failed",
-                            output=f"[error] Invalid JSON arguments: {fn_arguments[:200]}",
-                            error=f"Invalid JSON arguments: {fn_arguments[:200]}",
-                            metadata={"status_source": "validation"},
-                        ),
-                        emit_events=False,
+                        blocked_result=validation.error.to_result(fn_name),
                     )
                 )
                 continue
 
+            fn_args = validation.arguments
             effect, blocked = self._classify_call(fn_name, fn_args)
             if self.agent.allowed_tool_names is not None and fn_name not in self.agent.allowed_tool_names:
                 output = f"[blocked] Tool '{fn_name}' is not available to this agent profile."
@@ -393,6 +397,26 @@ class ToolExecutor:
     def _record_executed_result(self, item: ExecutedToolCall) -> None:
         prepared = item.prepared
         tool_result = item.result
+
+        # Normalize every outcome into the canonical failure model *before*
+        # finalization so events, messages and middleware all see it.
+        failure: ToolFailure | None = None
+        if tool_result.status == "failed":
+            failure = ToolFailure.from_result(
+                tool_call_id=prepared.tool_call_id,
+                tool_name=prepared.name,
+                result=tool_result,
+                intercepted=item.intercepted,
+            )
+            failure = self.runtime_state.failures.observe(
+                failure,
+                batch_key=failure_batch_key(self.conversation.messages),
+            )
+            tool_result = failure.stamp_metadata(tool_result)
+            item.result = tool_result
+        elif tool_result.status == "success":
+            self.runtime_state.failures.observe_success(prepared.name)
+
         if item.intercepted:
             if prepared.emit_events:
                 tool_result = finalize_intercepted_tool_result(
@@ -408,6 +432,8 @@ class ToolExecutor:
                 "tool_call_id": prepared.tool_call_id,
                 "content": result,
             })
+            if failure is not None:
+                self._dispatch_tool_failure(prepared, failure)
             self._emit_middleware_activity(prepared, fallback_outcome="blocked")
             return
 
@@ -470,7 +496,89 @@ class ToolExecutor:
                 self._deferred_user_messages.append(inject)
                 self.conversation.trace.middleware_inject(type(mw).__name__, "post_tool", inject)
         activity["duration_ms"] += (time.perf_counter() - post_started) * 1000
+        if failure is not None:
+            self._dispatch_tool_failure(prepared, failure)
         self._emit_middleware_activity(prepared)
+
+    def _dispatch_tool_failure(self, prepared: PreparedToolCall, failure: ToolFailure) -> None:
+        """Run the on_tool_failure chain and execute the first FailureAction.
+
+        Middleware only decides; the executor performs every side effect
+        (guidance injection / fallback stop), so policy stays replay-free.
+        Every decision is recorded in the activity stats, trace JSONL and as
+        a ``tool_failure_decision`` session event.
+        """
+        activity = self._middleware_activity.setdefault(
+            prepared.tool_call_id,
+            _new_middleware_activity(),
+        )
+        for mw in self.agent.middlewares:
+            activity["hooks"] += 1
+            action = mw.on_tool_failure(
+                failure,
+                self.conversation.messages,
+                runtime_state=self.runtime_state,
+                agent_name=self.agent.name,
+            )
+            if action is None:
+                continue
+
+            source_name = type(mw).__name__
+            activity["sources"].append(source_name)
+            if action.mode == FailureMode.STOP:
+                activity["outcome"] = "stopped"
+            elif activity["outcome"] == "passed":
+                # A silent protocol retry still changes what happens next;
+                # keep it distinguishable from a plain pass-through.
+                activity["outcome"] = "guided" if action.message else "retried"
+
+            if action.message:
+                self._deferred_user_messages.append(action.message)
+                self.conversation.trace.middleware_inject(
+                    source_name, "on_tool_failure", action.message
+                )
+            self.conversation.trace.tool_failure_policy(
+                source=source_name,
+                tool=failure.tool_name,
+                tool_call_id=failure.tool_call_id,
+                kind=failure.kind,
+                category=failure.category,
+                visibility=failure.visibility,
+                attempt=failure.attempt,
+                mode=action.mode,
+                intercepted=failure.intercepted,
+                turn_failure_count=self.runtime_state.failures.turn_failure_count,
+                stop_reason=action.stop_reason,
+            )
+            event_bus = getattr(self.agent.tool_context, "event_bus", None)
+            if event_bus is not None:
+                event_bus.emit(
+                    "tool_failure_decision",
+                    agent=self.agent.name,
+                    payload={
+                        "tool": failure.tool_name,
+                        "tool_call_id": failure.tool_call_id,
+                        "kind": failure.kind,
+                        "category": failure.category,
+                        "phase": failure.phase,
+                        "visibility": failure.visibility,
+                        "attempt": failure.attempt,
+                        "mode": action.mode,
+                        "stop_reason": action.stop_reason,
+                        "intercepted": failure.intercepted,
+                        "turn_failure_count": self.runtime_state.failures.turn_failure_count,
+                        "source": source_name,
+                    },
+                )
+            if action.mode == FailureMode.STOP:
+                self.runtime_state.fallback.request_stop(
+                    reason=action.stop_reason or "tool_failure_policy",
+                    limit_type=action.stop_limit_type or "failure_policy",
+                    used=failure.attempt,
+                    limit=action.stop_limit,
+                    last_tool=failure.tool_name,
+                )
+            return
 
     def _emit_middleware_activity(
         self,

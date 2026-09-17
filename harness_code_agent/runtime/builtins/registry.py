@@ -11,6 +11,7 @@ from ..permissions import (
     TOOL_PERMISSION_SHELL,
 )
 from ..shell_classification import analyze_shell_command
+from ..tool_call_validation import strict_tool_schema
 from ..tool_registry import (
     TOOL_CAPABILITY_MAIN,
     TOOL_CAPABILITY_READONLY_AGENT,
@@ -346,4 +347,4 @@ def _shell_effect(args, context):
 
 
 BUILTIN_TOOL_REGISTRY = _build_builtin_tool_registry()
-TOOL_SCHEMAS = CORE_TOOL_SCHEMAS
+TOOL_SCHEMAS = [strict_tool_schema(schema) for schema in CORE_TOOL_SCHEMAS]

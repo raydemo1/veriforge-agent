@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from .execution_planner import CallEffect
 from .permissions import VALID_TOOL_PERMISSIONS
+from .tool_call_validation import strict_tool_schema
 
 if TYPE_CHECKING:
     from .tool_context import ToolContext
@@ -79,7 +80,7 @@ class ToolRegistry:
             resolver = lambda _args, _context: CallEffect.global_exclusive()
         self._specs[name] = ToolSpec(
             name=name,
-            schema=schema,
+            schema=strict_tool_schema(schema),
             handler=handler,
             permission=permission,
             effect_resolver=resolver,
@@ -100,6 +101,13 @@ class ToolRegistry:
     def get(self, name: str) -> Callable | None:
         spec = self._specs.get(name)
         return spec.handler if spec is not None else None
+
+    def spec_for(self, name: str) -> ToolSpec | None:
+        return self._specs.get(name)
+
+    def schema_for(self, name: str) -> dict | None:
+        spec = self._specs.get(name)
+        return spec.schema if spec is not None else None
 
     def permission_for(self, name: str) -> str | None:
         spec = self._specs.get(name)

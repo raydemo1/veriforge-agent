@@ -74,6 +74,35 @@ class TraceWriter:
             "message": message[:300],
         })
 
+    def tool_failure_policy(
+        self,
+        *,
+        source: str,
+        tool: str,
+        tool_call_id: str,
+        kind: str,
+        category: str,
+        visibility: str,
+        attempt: int,
+        mode: str,
+        intercepted: bool,
+        turn_failure_count: int,
+        stop_reason: str = "",
+    ):
+        self._write("tool_failure_policy", {
+            "source": source,
+            "tool": tool,
+            "tool_call_id": tool_call_id,
+            "kind": kind,
+            "category": category,
+            "visibility": visibility,
+            "attempt": attempt,
+            "mode": mode,
+            "intercepted": intercepted,
+            "turn_failure_count": turn_failure_count,
+            "stop_reason": stop_reason,
+        })
+
     def context_event(self, event_type: str, reason: str = ""):
         self._write("context", {"type": event_type, "reason": reason})
 

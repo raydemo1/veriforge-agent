@@ -6,6 +6,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..runtime.tool_failures import FailureTracker
 from ..workspace.shell_jobs import ShellJobManager
 from ..workspace.shell_session import PersistentShellSession
 from .acceptance import AcceptanceState
@@ -145,6 +146,7 @@ class AgentRuntimeState:
     recovery: RecoveryState = field(default_factory=RecoveryState)
     fallback: AgentFallbackState = field(default_factory=AgentFallbackState)
     execution_facts: ExecutionFacts = field(default_factory=ExecutionFacts)
+    failures: FailureTracker = field(default_factory=FailureTracker)
     action_tool_count: int = 0
     current_turn_start_index: int = 0
     session_id: str = "default"

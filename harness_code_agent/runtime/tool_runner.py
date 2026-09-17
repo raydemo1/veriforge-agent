@@ -14,6 +14,7 @@ from ..sessions.events import (
     ToolResultEvent,
     classify_tool_failure,
 )
+from .tool_call_validation import validate_tool_arguments
 from .tool_context import ToolContext
 from .tool_registry import ToolRegistry
 from .tool_result import ToolResult, unstructured_tool_result_from_text
@@ -117,21 +118,20 @@ def execute_tool(
 
 def execute_tool_result(
     name: str,
-    arguments: dict,
+    arguments: Any,
     runtime_state=None,
     agent_name: str | None = None,
     tool_context: ToolContext | None = None,
     emit_events: bool = True,
     cancellation_token=None,
 ) -> ToolResult:
-    """Execute a tool by name with pre-validation and auto-correction."""
-    arguments = dict(arguments or {})
+    """Execute a registered tool only after the runtime validation boundary."""
     registry = _registry_for_context(tool_context)
 
     if emit_events and tool_context is not None:
         emit_tool_call_started(
             name=name,
-            arguments=arguments,
+            arguments=arguments if isinstance(arguments, dict) else {},
             tool_context=tool_context,
             agent_name=agent_name,
         )
@@ -151,24 +151,28 @@ def execute_tool_result(
             emit_events=emit_events,
         )
 
-    # Pre-validate and auto-correct arguments
-    arguments, fix_warning = _validate_and_fix(name, arguments)
+    fix_warning = None
+    if registry.schema_for(name) is not None:
+        validation = validate_tool_arguments(name, arguments, registry, tool_context)
+        if validation.error is not None:
+            return _finalize_tool_result_object(
+                validation.error.to_result(name),
+                tool_context=tool_context,
+                agent_name=agent_name,
+                emit_events=emit_events,
+            )
+        arguments = validation.arguments
+    else:
+        # Keep the legacy direct-call path usable for handlers injected by
+        # integrations that do not register a schema. Model tool calls never
+        # use this path: ToolExecutor requires a registered schema first.
+        arguments = dict(arguments or {})
+        arguments, fix_warning = _validate_and_fix(name, arguments)
 
-    # If validation returned a blocking error (no fix possible), return it.
-    if fix_warning and fix_warning.startswith("[auto-fix] Empty"):
-        return _finalize_tool_result_object(
-            ToolResult(
-                tool=name,
-                status="failed",
-                output=fix_warning,
-                error=fix_warning,
-                metadata={"status_source": "validation"},
-            ),
-            tool_context=tool_context,
-            agent_name=agent_name,
-            emit_events=emit_events,
-        )
-    if fix_warning and "interactive command" in fix_warning:
+    if fix_warning and (
+        fix_warning.startswith("[auto-fix] Empty")
+        or "interactive command" in fix_warning
+    ):
         return _finalize_tool_result_object(
             ToolResult(
                 tool=name,
@@ -375,12 +379,28 @@ def _emit_structured_tool_result(
     if tool_result.status == "failed":
         source = tool_result.metadata.get("status_source")
         message = tool_result.error or event_output
+        failure_metadata = {
+            key: event_metadata[key]
+            for key in (
+                "failure_category",
+                "failure_kind",
+                "failure_phase",
+                "failure_visibility",
+                "failure_retryable",
+                "failure_replan_required",
+                "failure_user_action",
+                "failure_attempt",
+                "failure_intercepted",
+            )
+            if key in event_metadata
+        }
         tool_context.event_bus.emit_event(
             FailureEvent(
                 category=classify_tool_failure(tool_result),
                 message=message,
                 tool=tool_result.tool,
                 source=str(source) if source else None,
+                metadata=failure_metadata or None,
                 agent=agent_name,
             ).to_event()
         )

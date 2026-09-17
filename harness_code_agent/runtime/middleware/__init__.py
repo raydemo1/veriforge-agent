@@ -10,7 +10,8 @@ from .recovery import RecoveryStrategyMiddleware
 from .task_tracking import TaskTrackingEnforcementMiddleware
 from .terminal_shell_edit import TerminalShellEditPolicyMiddleware
 from .time_budget import TimeBudgetMiddleware
-from .tool_policy import ToolPolicyMiddleware
+from .tool_failure_policy import ToolFailurePolicyMiddleware
+from .tool_guard import ToolGuardMiddleware
 from .verification import (
     ExitIntentDecision,
     PreExitVerificationMiddleware,
@@ -35,7 +36,8 @@ __all__ = [
     "TaskTrackingEnforcementMiddleware",
     "TerminalShellEditPolicyMiddleware",
     "TimeBudgetMiddleware",
-    "ToolPolicyMiddleware",
+    "ToolFailurePolicyMiddleware",
+    "ToolGuardMiddleware",
     "_check_py_compile",
     "_check_ruff_diff",
     "_git_diff_changed_py_files",
