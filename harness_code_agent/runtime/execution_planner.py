@@ -8,7 +8,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-_CONCURRENCY_LIMITS = {"network": 2, "subagent": 3}
+from .. import config
+
+_CONCURRENCY_LIMITS = {
+    "network": 2,
+    "subagent": max(1, int(config.MAX_CONCURRENT_AGENTS)),
+}
 _CONCURRENCY_SEMAPHORES = {key: threading.Semaphore(value) for key, value in _CONCURRENCY_LIMITS.items()}
 
 

@@ -21,8 +21,72 @@ class LlmStreamTimeoutError(TimeoutError):
     """Raised when a streaming model response stops making progress."""
 
 
+class LlmRequestTimeoutError(TimeoutError):
+    """Raised when a non-streaming model request exceeds the timeout."""
+
+
 class MultimodalRequestError(RuntimeError):
     """Configured endpoint rejected an image request."""
+
+
+_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+_RETRYABLE_ERROR_TOKENS = (
+    "rate_limit",
+    "429",
+    "apiconnectionerror",
+    "connectionerror",
+    "remoteprotocolerror",
+)
+
+
+def _is_retryable_llm_error(exc: BaseException) -> bool:
+    """Provider-side 429/5xx or a transport connection failure."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in _RETRYABLE_STATUS_CODES:
+        return True
+    haystack = f"{type(exc).__name__} {exc}".lower()
+    return any(token in haystack for token in _RETRYABLE_ERROR_TOKENS)
+
+
+def _retry_delay(attempt: int) -> float:
+    """Exponential backoff capped at 20s plus a small jitter."""
+    return min(2.0 ** (attempt + 1), 20.0) + random.uniform(0.0, 0.5)
+
+
+def _call_with_retry(action, *, operation: str, attempts: int, cancellation_token=None):
+    """Run ``action`` with bounded retries for retryable provider errors.
+
+    Application-level retries complement the OpenAI client's transport
+    retries: they cover error shapes the SDK surfaces directly (rate-limit
+    JSON, reset connections) and keep backoff visible in the logs.
+    """
+    attempts = max(1, int(attempts))
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        if cancellation_token is not None and cancellation_token.is_cancelled:
+            raise CancelledError("Turn cancelled by user")
+        try:
+            return action()
+        except CancelledError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if cancellation_token is not None and cancellation_token.is_cancelled:
+                raise CancelledError("Turn cancelled by user") from exc
+            if attempt + 1 >= attempts or not _is_retryable_llm_error(exc):
+                raise
+            delay = _retry_delay(attempt)
+            log.warning(
+                "%s hit a retryable provider error (attempt %d/%d), waiting %.1fs: %s",
+                operation,
+                attempt + 1,
+                attempts,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 def _is_multimodal_rejection(exc: Exception, messages: object) -> bool:
@@ -70,29 +134,32 @@ def _reset_client_after_stream_timeout(conv) -> None:
 
 def llm_call_simple(messages: list[dict]) -> str:
     """Simple LLM call without tools — used for summarization.
-    Retries on rate limits to avoid crashing the agent during context compaction."""
+
+    Retries 429/5xx/transport errors with bounded backoff so context
+    compaction does not crash the agent; a terminal failure still returns
+    a placeholder summary instead of propagating.
+    """
     profile = config.resolve_model_profile("fast")
     adapter = ProviderAdapter(profile.provider)
-    for attempt in range(4):
-        try:
-            with client_scope() as client:
-                resp = client.chat.completions.create(**adapter.chat_kwargs(
-                    profile=profile,
-                    messages=messages,
-                    max_tokens=10000,
-                ))
-            return resp.choices[0].message.content or ""
-        except Exception as e:
-            err_str = str(e)
-            if ("rate_limit" in err_str.lower() or "429" in err_str) and attempt < 3:
-                wait = min(2 ** (attempt + 1), 30) + random.uniform(0, 3)
-                log.warning(f"llm_call_simple rate limited, waiting {wait:.1f}s (attempt {attempt+1}/4)")
-                time.sleep(wait)
-                continue
-            log.error(f"llm_call_simple failed: {e}")
-            # Return a minimal summary rather than crashing
-            return "[context summarization failed — continuing with truncated context]"
-    return "[context summarization failed after retries]"
+    attempts = max(1, int(config.LLM_MAX_RETRIES) + 1)
+
+    def _invoke() -> str:
+        with client_scope() as client:
+            resp = client.chat.completions.create(**adapter.chat_kwargs(
+                profile=profile,
+                messages=messages,
+                max_tokens=10000,
+            ))
+        return resp.choices[0].message.content or ""
+
+    try:
+        return _call_with_retry(_invoke, operation="llm_call_simple", attempts=attempts)
+    except CancelledError:
+        raise
+    except Exception as e:
+        log.error("llm_call_simple failed: %s", e)
+        # Return a minimal summary rather than crashing
+        return "[context summarization failed — continuing with truncated context]"
 
 
 class LlmChannel:
@@ -210,6 +277,8 @@ class LlmChannel:
         except Exception as exc:
             if cancellation_token is not None and cancellation_token.is_cancelled:
                 raise CancelledError("Turn cancelled by user") from exc
+            if _is_timeout_error(exc):
+                raise LlmRequestTimeoutError("模型请求超时，请重试") from exc
             if _is_multimodal_rejection(exc, kwargs.get("messages")):
                 raise MultimodalRequestError(
                     "当前 endpoint 拒绝了图片输入。请检查模型的多模态能力和 "

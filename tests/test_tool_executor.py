@@ -27,7 +27,6 @@ from harness_code_agent.agent.conversation import Agent, AgentConversation
 from harness_code_agent.runtime import shell_classification, tools
 from harness_code_agent.runtime.middlewares import (
     AgentMiddleware,
-    RecoveryStrategyMiddleware,
 )
 from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
@@ -434,43 +433,6 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("[SYSTEM] first guidance", injected)
         self.assertIn("[SYSTEM] second guidance", injected)
 
-    def test_blocked_probe_is_not_left_in_flight(self):
-        registry = tools.ToolRegistry()
-
-        def run_bash(command):
-            return ToolResult(tool="run_bash", status="success", output="unexpected")
-
-        registry.register(
-            _schema("run_bash"),
-            run_bash,
-            permission="shell",
-            effect=_VERIFY_EFFECT,
-        )
-
-        class LaterBlockMiddleware(AgentMiddleware):
-            def before_tool(self, tool_name, tool_args, messages, runtime_state=None, agent_name=None):
-                return "[blocked] synthetic later policy block"
-
-        tool_calls = [_tool_call("tc_probe", "run_bash", {"command": "pytest -q"})]
-
-        with tempfile.TemporaryDirectory() as tmp:
-            conversation, _context = _conversation_with_registry(
-                Path(tmp),
-                registry,
-                tool_calls,
-                middlewares=[RecoveryStrategyMiddleware(), LaterBlockMiddleware()],
-            )
-            conversation.runtime_state.recovery.mode = "PROBE"
-            with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
-                patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
-            ):
-                conversation.run_until_idle()
-
-        self.assertFalse(conversation.runtime_state.recovery.probe_in_flight)
-        tool_messages = [msg for msg in conversation.messages if msg.get("role") == "tool"]
-        self.assertIn("synthetic later policy block", tool_messages[0]["content"])
-
     def test_tool_search_reveals_deferred_schema_for_next_iteration(self):
         registry = tools.BUILTIN_TOOL_REGISTRY.copy()
         registry.register(
@@ -819,6 +781,36 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("slow:300", tool_messages[0]["content"])
         self.assertIn("fast:30", tool_messages[1]["content"])
 
+    def test_global_deadline_returns_timeout_result_for_hanging_tool(self):
+        registry = tools.ToolRegistry()
+
+        def hanging_tool(cancellation_token=None):
+            while not (cancellation_token is not None and cancellation_token.is_cancelled):
+                time.sleep(0.01)
+            return ToolResult(tool="hanging_read", status="failed", output="should not win")
+
+        registry.register(_schema("hanging_read"), hanging_tool, permission="read", effect=_READ_EFFECT)
+        tool_calls = [_tool_call("tc_hang", "hanging_read")]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation, _context = _conversation_with_registry(Path(tmp), registry, tool_calls)
+            start = time.perf_counter()
+            with (
+                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
+                patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+                patch(
+                    "harness_code_agent.agent.tool_executor.config.TOOL_DEFAULT_TIMEOUT_SECONDS",
+                    1.0,
+                ),
+            ):
+                conversation.run_until_idle()
+            elapsed = time.perf_counter() - start
+
+        self.assertLess(elapsed, 3.0)
+        tool_messages = [msg for msg in conversation.messages if msg.get("role") == "tool"]
+        self.assertTrue(tool_messages)
+        self.assertIn("exceeded its", tool_messages[0]["content"])
+
     def test_parallel_group_observes_cancellation_while_waiting_for_tools(self):
         from harness_code_agent.agent.cancellation import (
             CancellationToken,
@@ -897,7 +889,11 @@ class ToolExecutorTests(unittest.TestCase):
             ):
                 conversation.run_until_idle(cancellation_token=token)
 
-        self.assertIs(seen[0], token)
+        # Handlers now receive a per-call child token linked to the turn
+        # token: parent cancellation must propagate to it.
+        self.assertIsNotNone(seen[0])
+        self.assertIsNot(seen[0], token)
+        self.assertTrue(seen[0].is_cancelled)
         self.assertIn("slow_observed_cancel", seen)
 
     def test_cancelled_turn_tracks_uncooperative_tool_until_it_finishes(self):

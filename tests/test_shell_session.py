@@ -8,8 +8,10 @@ from unittest.mock import patch
 from harness_code_agent import config
 from harness_code_agent.workspace.shell_session import (
     PersistentShellSession,
+    _docker_resource_args,
     _docker_user_arg,
     _DockerShellBackend,
+    _posix_capture_script,
     docker_shell_hint,
     sandbox_mode,
     validate_shell_configuration,
@@ -420,6 +422,70 @@ class PersistentShellSessionTests(unittest.TestCase):
         with patch.object(backend, "_cleanup_impl") as mock_cleanup:
             backend.close()
             mock_cleanup.assert_not_called()
+
+
+class CaptureScriptAndResourceTests(unittest.TestCase):
+    def test_posix_script_caps_output_and_preserves_braces_without_ulimits(self):
+        with patch.object(config, "SHELL_MAX_OUTPUT_BYTES", 1234), patch.object(
+            config, "SHELL_CPU_SECONDS", 0
+        ), patch.object(config, "SHELL_FSIZE_BLOCKS", 0), patch.object(
+            config, "SHELL_MEMORY_KB", 0
+        ):
+            script = _posix_capture_script("echo hi", "OUT", "ERR", "EXIT", prefix="__hca")
+        self.assertIn("__hca_max=1234", script)
+        self.assertIn('head -c "$__hca_max" "$1"', script)
+        self.assertIn("{\n", script)
+        self.assertNotIn("ulimit", script)
+
+    def test_posix_script_runs_command_in_subshell_when_ulimits_enabled(self):
+        with patch.object(config, "SHELL_MAX_OUTPUT_BYTES", 0), patch.object(
+            config, "SHELL_CPU_SECONDS", 10
+        ), patch.object(config, "SHELL_FSIZE_BLOCKS", 0), patch.object(
+            config, "SHELL_MEMORY_KB", 0
+        ):
+            script = _posix_capture_script("echo hi", "OUT", "ERR", "EXIT", prefix="__hca")
+        self.assertIn("ulimit -t 10", script)
+        self.assertIn("(\n", script)
+        self.assertIn("__hca_max=0", script)
+
+    def test_docker_resource_args_include_default_caps(self):
+        with patch.object(config, "DOCKER_MEMORY_MB", 2048), patch.object(
+            config, "DOCKER_CPUS", 2.0
+        ):
+            self.assertEqual(
+                _docker_resource_args(), ["--memory", "2048m", "--cpus", "2"]
+            )
+
+    def test_docker_resource_args_empty_when_caps_disabled(self):
+        with patch.object(config, "DOCKER_MEMORY_MB", 0), patch.object(
+            config, "DOCKER_CPUS", 0.0
+        ):
+            self.assertEqual(_docker_resource_args(), [])
+
+
+class ShellOutputCapIntegrationTests(unittest.TestCase):
+    @staticmethod
+    def _big_output_command() -> str:
+        if os.name == "nt" and windows_shell_kind() == "pwsh":
+            return "Write-Output ('a' * 50000)"
+        return "head -c 50000 /dev/zero | tr '\\0' 'a'"
+
+    def test_run_interrupts_output_over_cap_and_session_recovers(self):
+        temp_dir = tempfile.mkdtemp(dir=os.getcwd())
+        shell = PersistentShellSession(cwd=temp_dir)
+        try:
+            with patch.object(config, "SHELL_MAX_OUTPUT_BYTES", 20000):
+                result = shell.run(self._big_output_command(), timeout=30)
+            self.assertTrue(result.output_truncated)
+            self.assertGreaterEqual(result.output_bytes, 20000)
+            self.assertIn("a", result.stdout)
+
+            recovered = shell.run("echo recovered", timeout=30)
+            self.assertEqual(recovered.exit_code, 0)
+            self.assertIn("recovered", recovered.stdout)
+        finally:
+            shell.close()
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

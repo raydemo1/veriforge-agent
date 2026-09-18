@@ -14,6 +14,7 @@ import psutil
 
 from .. import config
 from .shell_session import (
+    _docker_resource_args,
     _docker_user_arg,
     docker_cli_path,
     sandbox_mode,
@@ -23,6 +24,40 @@ from .shell_session import (
 )
 
 ShellJobStatus = Literal["running", "exited", "stopped", "failed"]
+
+
+def _posix_rlimits_enabled() -> bool:
+    return os.name != "nt" and any(
+        int(getattr(config, name, 0) or 0) > 0
+        for name in ("SHELL_CPU_SECONDS", "SHELL_FSIZE_BLOCKS", "SHELL_MEMORY_KB")
+    )
+
+
+def _apply_posix_rlimits() -> None:
+    """Apply per-job rlimits in the forked child (POSIX host only).
+
+    Failures are swallowed to mirror the ``ulimit ... || true`` semantics
+    of the persistent-session path: an unsupported cap or a value above
+    the hard limit must not prevent the job from starting.
+    """
+    import resource
+
+    cpu = int(config.SHELL_CPU_SECONDS)
+    fsize = int(config.SHELL_FSIZE_BLOCKS)
+    memory_kb = int(config.SHELL_MEMORY_KB)
+    settings = []
+    if cpu > 0:
+        settings.append((resource.RLIMIT_CPU, (cpu, cpu)))
+    if fsize > 0:
+        settings.append((resource.RLIMIT_FSIZE, (fsize, fsize)))
+    if memory_kb > 0:
+        bytes_value = memory_kb * 1024
+        settings.append((resource.RLIMIT_AS, (bytes_value, bytes_value)))
+    for rlimit, value in settings:
+        try:
+            resource.setrlimit(rlimit, value)
+        except (ValueError, OSError):
+            pass
 
 
 class ShellJobNotFound(KeyError):
@@ -206,9 +241,13 @@ class ShellJobManager:
             encoding="utf-8",
             errors="replace",
             start_new_session=True,
+            preexec_fn=_apply_posix_rlimits if _posix_rlimits_enabled() else None,
         )
 
     def _start_windows_process(self, command: str) -> subprocess.Popen:
+        # Windows Job Objects are the native enforcement mechanism; the host
+        # backend intentionally applies no CPU/memory cap here — run with
+        # HARNESS_SANDBOX_MODE=docker when those caps are required.
         validate_shell_configuration()
         path = windows_shell_path()
         assert path is not None
@@ -255,6 +294,7 @@ class ShellJobManager:
             "-w",
             "/workspace",
         ]
+        args.extend(_docker_resource_args())
         args.extend(_docker_user_arg())
         args.extend([config.DOCKER_IMAGE, "bash", "--noprofile", "--norc", "-lc", command])
         process = subprocess.Popen(

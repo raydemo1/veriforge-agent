@@ -50,6 +50,12 @@ if MODEL_INPUT_MODE not in {"text", "multimodal"}:
 LLM_STREAM_IDLE_TIMEOUT_SECONDS = float(
     os.environ.get("HARNESS_LLM_STREAM_IDLE_TIMEOUT_SECONDS", "60")
 )
+# Hard ceiling for one non-streaming assistant request, plus bounded transport
+# retries (connection errors / 429 / 5xx) handled by the SDK and channel layer.
+LLM_REQUEST_TIMEOUT_SECONDS = float(
+    os.environ.get("HARNESS_LLM_REQUEST_TIMEOUT_SECONDS", "300")
+)
+LLM_MAX_RETRIES = int(os.environ.get("HARNESS_LLM_MAX_RETRIES", "2"))
 
 MODEL_INTENSITIES = ("fast", "normal", "hard", "max")
 MODEL_OVERRIDES = {
@@ -188,6 +194,45 @@ MAX_AGENT_TOTAL_TOKENS = int(os.environ.get("MAX_AGENT_TOTAL_TOKENS", "0"))
 MAX_AGENT_TOOL_CALLS = int(os.environ.get("MAX_AGENT_TOOL_CALLS", "200"))
 AGENT_BUDGET_WARN_FRACTION = float(os.environ.get("AGENT_BUDGET_WARN_FRACTION", "0.8"))
 MAX_TOOL_ERRORS = 5           # consecutive tool errors before abort
+
+# --- Subagent fan-out limits ---
+MAX_CONCURRENT_AGENTS = max(1, int(os.environ.get("HARNESS_MAX_CONCURRENT_AGENTS", "3")))
+MAX_OPEN_AGENTS = max(1, int(os.environ.get("HARNESS_MAX_OPEN_AGENTS", "8")))
+
+# --- Tool execution safety nets ---
+# Wall-clock deadline applied to every synchronous tool call that does not
+# declare its own timeout, and the hard ceiling for tool-supplied timeouts
+# (e.g. run_bash's timeout argument).
+TOOL_DEFAULT_TIMEOUT_SECONDS = float(
+    os.environ.get("HARNESS_TOOL_DEFAULT_TIMEOUT_SECONDS", "300")
+)
+TOOL_MAX_TIMEOUT_SECONDS = float(
+    os.environ.get("HARNESS_TOOL_MAX_TIMEOUT_SECONDS", "1800")
+)
+# Raw foreground shell output capture ceiling.  Commands that emit more are
+# interrupted at the byte boundary; 0 disables the cap.
+SHELL_MAX_OUTPUT_BYTES = int(os.environ.get("HARNESS_SHELL_MAX_OUTPUT_BYTES", str(10 * 1024 * 1024)))
+
+# --- Workspace write quota ---
+# Cumulative structured writes (write_file/apply_patch) allowed per session;
+# 0 disables the quota.  Writes also fail when free disk space drops below
+# HARNESS_MIN_FREE_DISK_MB.
+WORKSPACE_WRITE_QUOTA_BYTES = (
+    int(os.environ.get("HARNESS_WORKSPACE_WRITE_QUOTA_MB", "0")) * 1024 * 1024
+)
+MIN_FREE_DISK_BYTES = int(os.environ.get("HARNESS_MIN_FREE_DISK_MB", "100")) * 1024 * 1024
+
+# --- Shell process resource limits ---
+# Docker sandbox: passed to `docker run` as --memory / --cpus; 0 leaves them unset.
+DOCKER_MEMORY_MB = int(os.environ.get("HARNESS_DOCKER_MEMORY_MB", "2048"))
+DOCKER_CPUS = float(os.environ.get("HARNESS_DOCKER_CPUS", "2"))
+# POSIX host sandbox: injected as ulimit -v (address space KB), -t (CPU
+# seconds), -f (single-file blocks) before each command.  All default to 0
+# (disabled) because address-space caps can false-kill JVM/Node workloads.
+SHELL_MEMORY_KB = int(os.environ.get("HARNESS_SHELL_MEMORY_KB", "0"))
+SHELL_CPU_SECONDS = int(os.environ.get("HARNESS_SHELL_CPU_SECONDS", "0"))
+SHELL_FSIZE_BLOCKS = int(os.environ.get("HARNESS_SHELL_FSIZE_BLOCKS", "0"))
+
 TRACE_STDERR = os.environ.get("HARNESS_TRACE_STDERR", "").lower() in {"1", "true", "yes", "on"}
 WINDOWS_SHELL = os.environ.get("HARNESS_WINDOWS_SHELL", "pwsh")
 SANDBOX_MODE = os.environ.get("HARNESS_SANDBOX_MODE", "host")

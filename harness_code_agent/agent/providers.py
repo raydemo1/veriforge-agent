@@ -37,7 +37,12 @@ def client_scope():
 
 
 def _current_client_config() -> tuple[str | None, str | None, float, int]:
-    return (config.API_KEY, config.BASE_URL, 300.0, 2)
+    return (
+        config.API_KEY,
+        config.BASE_URL,
+        float(config.LLM_REQUEST_TIMEOUT_SECONDS),
+        int(config.LLM_MAX_RETRIES),
+    )
 
 
 def current_adapter() -> ProviderAdapter:

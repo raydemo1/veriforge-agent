@@ -17,16 +17,25 @@ from ..tool_result import ToolResult
 def run_bash(
     command: str,
     timeout: int = 300,
-    expected_exit_codes: list[int] | None = None,
     runtime_state=None,
     agent_name: str | None = None,
     tool_context=None,
     cancellation_token=None,
 ) -> ToolResult:
-    """Run one self-contained shell command from the workspace root."""
+    """Run one self-contained shell command from the workspace root.
+
+    ``status`` reflects only whether the tool invocation worked: a process
+    that started and completed is always ``success`` — including non-zero
+    exit codes such as a failing test run. The raw output and exit code are
+    returned for the model to interpret. Only transport/runtime problems
+    (no job manager, timeout, shell exception) are ``failed``.
+    """
     if cancellation_token is not None:
         cancellation_token.check()
-    expected_codes = _normalize_expected_exit_codes(expected_exit_codes)
+    try:
+        timeout = max(1, min(int(timeout), int(config.TOOL_MAX_TIMEOUT_SECONDS)))
+    except (TypeError, ValueError):
+        timeout = int(config.TOOL_DEFAULT_TIMEOUT_SECONDS)
     if analyze_shell_command(command).long_running:
         manager = _shell_job_manager(runtime_state)
         if manager is None:
@@ -51,27 +60,17 @@ def run_bash(
                 "Use read_shell_output to inspect logs and stop_shell_job to stop it."
             )
             return ToolResult(tool="run_bash", status="success", output=output, metadata=metadata)
-        tail = job.output_tail
-        if job.exit_code in expected_codes:
-            return ToolResult(
-                tool="run_bash",
-                status="success",
-                output=tail or f"Command exited with expected code {job.exit_code}.",
-                return_code=job.exit_code,
-                metadata={
-                    **metadata,
-                    "expected_exit_codes": sorted(expected_codes),
-                    "exit_code_expected": True,
-                },
-            )
-        output = f"[error] Long-running command exited immediately as {job.status}."
-        if tail:
-            output += f"\n\nRecent output:\n{tail}"
+        # The process started and ended on its own: an invocation success,
+        # even though the "long-running" command exited early (often an error
+        # the model needs to diagnose). Report it as content, not failure.
+        output = f"Long-running command exited immediately as {job.status}."
+        if job.output_tail:
+            output += f"\n\nRecent output:\n{job.output_tail}"
+        output += _exit_code_footer(job.exit_code)
         return ToolResult(
             tool="run_bash",
-            status="failed",
+            status="success",
             output=output,
-            error=f"Long-running command exited immediately as {job.status}",
             return_code=job.exit_code,
             metadata=metadata,
         )
@@ -117,18 +116,26 @@ def run_bash(
             )
         output = _build_shell_output(shell_result.stdout, shell_result.stderr)
         output = output or "(no output)"
-        ok = shell_result.exit_code in expected_codes
+        output += _exit_code_footer(shell_result.exit_code)
+        truncated = bool(getattr(shell_result, "output_truncated", False))
+        output_bytes = int(getattr(shell_result, "output_bytes", 0) or 0)
+        if truncated:
+            output += (
+                f"\n\n[output truncated after {output_bytes} bytes; "
+                "the command was interrupted. Narrow the command, paginate it, "
+                "or redirect output to a file and read selected ranges.]"
+            )
         return ToolResult(
             tool="run_bash",
-            status="success" if ok else "failed",
+            status="success",
             output=output,
-            error=None if ok else f"Command exited with code {shell_result.exit_code}",
+            error=None,
             return_code=shell_result.exit_code,
             metadata={
                 "timed_out": False,
+                "output_truncated": truncated,
+                "output_bytes": output_bytes,
                 "status_source": "shell",
-                "expected_exit_codes": sorted(expected_codes),
-                "exit_code_expected": ok,
             },
         )
     except CancelledError:
@@ -206,7 +213,28 @@ def _run_one_shot_powershell(command: str, timeout: int, tool_context, cancellat
         )
     finally:
         remove_cancel_callback()
-    return ShellResult(stdout=stdout, stderr=stderr, exit_code=process.returncode)
+    stdout, stderr, truncated, output_bytes = _cap_one_shot_output(stdout or "", stderr or "")
+    return ShellResult(
+        stdout=stdout,
+        stderr=stderr,
+        exit_code=process.returncode,
+        output_truncated=truncated,
+        output_bytes=output_bytes,
+    )
+
+
+def _cap_one_shot_output(stdout: str, stderr: str) -> tuple[str, str, bool, int]:
+    max_bytes = int(getattr(config, "SHELL_MAX_OUTPUT_BYTES", 0) or 0)
+    total = len(stdout.encode("utf-8", errors="replace")) + len(
+        stderr.encode("utf-8", errors="replace")
+    )
+    if not max_bytes or total <= max_bytes:
+        return stdout, stderr, False, total
+    encoding = "utf-8"
+    keep = max(0, max_bytes // 2)
+    stdout = stdout.encode(encoding, errors="replace")[:keep].decode(encoding, errors="replace")
+    stderr = stderr.encode(encoding, errors="replace")[:keep].decode(encoding, errors="replace")
+    return stdout, stderr, True, total
 
 
 def _terminate_process_tree(process: subprocess.Popen) -> None:
@@ -332,15 +360,10 @@ def _shell_job_manager(runtime_state):
     return getattr(runtime_state, "shell_job_manager", None) if runtime_state is not None else None
 
 
-def _normalize_expected_exit_codes(values: list[int] | None) -> set[int]:
-    if values is None:
-        return {0}
-    normalized = {
-        int(value)
-        for value in values[:16]
-        if not isinstance(value, bool) and isinstance(value, int)
-    }
-    return normalized or {0}
+def _exit_code_footer(exit_code) -> str:
+    if exit_code is None:
+        return ""
+    return f"\n\n[exit_code: {exit_code}]"
 
 
 def _workspace_root(tool_context=None) -> str:

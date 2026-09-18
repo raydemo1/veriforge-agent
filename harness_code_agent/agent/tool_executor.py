@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
+from .. import config
 from ..runtime.execution_planner import (
     CallEffect,
     ExecutionPlanner,
@@ -23,7 +24,7 @@ from ..runtime.tool_runner import (
     finalize_executed_tool_result,
     finalize_intercepted_tool_result,
 )
-from .cancellation import CancelledError
+from .cancellation import CancellationToken, CancelledError
 
 log = logging.getLogger("harness")
 
@@ -296,6 +297,8 @@ class ToolExecutor:
             return executed
         futures: dict[Future, PreparedToolCall] = {}
         pending: set[Future] = set()
+        deadlines: dict[Future, float] = {}
+        child_tokens: dict[Future, CancellationToken] = {}
         try:
             for prepared in ready:
                 if prepared.emit_events:
@@ -305,16 +308,21 @@ class ToolExecutor:
                         tool_context=self.agent.tool_context,
                         agent_name=self.agent.name,
                     )
-                future = self._executor.submit(self._execute_one, prepared)
+                child_token = self._make_child_token()
+                future = self._executor.submit(self._execute_one, prepared, child_token)
                 if self.agent.tool_context is not None:
                     self.agent.tool_context.tool_tasks.track(future)
                 futures[future] = prepared
+                child_tokens[future] = child_token
                 pending.add(future)
+                deadlines[future] = time.monotonic() + self._deadline_seconds(prepared)
             while pending:
                 self.conversation._check_cancelled(self.cancellation_token)
-                done, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
-                if not done:
-                    continue
+                wait_timeout = min(
+                    0.05,
+                    max(0.0, min(deadlines[future] - time.monotonic() for future in pending)),
+                )
+                done, pending = wait(pending, timeout=wait_timeout, return_when=FIRST_COMPLETED)
                 for future in done:
                     prepared = futures[future]
                     try:
@@ -333,6 +341,50 @@ class ToolExecutor:
                                 error=exc,
                             )
                         )
+                overdue = [
+                    future
+                    for future in pending
+                    if deadlines[future] <= time.monotonic()
+                ]
+                for future in overdue:
+                    prepared = futures[future]
+                    if future.done():
+                        # Race with natural completion: keep the real result.
+                        pending.discard(future)
+                        try:
+                            executed.append(future.result())
+                        except Exception as exc:
+                            executed.append(
+                                ExecutedToolCall(
+                                    prepared,
+                                    ToolResult(
+                                        tool=prepared.name,
+                                        status="failed",
+                                        output=f"[error] {type(exc).__name__}: {exc}",
+                                        error=f"{type(exc).__name__}: {exc}",
+                                        metadata={"status_source": "exception"},
+                                    ),
+                                    error=exc,
+                                )
+                            )
+                        continue
+                    timeout_seconds = self._deadline_seconds(prepared)
+                    child_token = child_tokens.get(future)
+                    if child_token is not None:
+                        child_token.cancel()
+                    # Python cannot kill a running thread: cooperative tools
+                    # (run_bash/web/mcp) honor the child token and unwind;
+                    # others keep running until they finish or session
+                    # shutdown reaps them via ToolTaskSupervisor.
+                    future.add_done_callback(lambda f: f.cancelled() or f.exception())
+                    pending.discard(future)
+                    log.warning(
+                        "[%s] Tool %s exceeded its %.0fs deadline; cancelling the call",
+                        self.agent.name,
+                        prepared.name,
+                        timeout_seconds,
+                    )
+                    executed.append(self._timeout_result(prepared, timeout_seconds))
             self.conversation._check_cancelled(self.cancellation_token)
         except Exception:
             for future in pending:
@@ -341,6 +393,43 @@ class ToolExecutor:
                 wait(pending, timeout=0.25)
             raise
         return executed
+
+    def _make_child_token(self) -> CancellationToken:
+        """Per-call token: parent turn cancellation always propagates down."""
+        child = CancellationToken()
+        parent = self.cancellation_token
+        if parent is None:
+            return child
+        if parent.is_cancelled:
+            child.cancel()
+        else:
+            parent.add_callback(child.cancel)
+        return child
+
+    def _deadline_seconds(self, prepared: PreparedToolCall) -> float:
+        if prepared.name == "run_bash":
+            try:
+                requested = float(prepared.args.get("timeout", config.TOOL_DEFAULT_TIMEOUT_SECONDS))
+            except (TypeError, ValueError):
+                requested = config.TOOL_DEFAULT_TIMEOUT_SECONDS
+            return max(1.0, min(requested, config.TOOL_MAX_TIMEOUT_SECONDS))
+        return max(1.0, float(config.TOOL_DEFAULT_TIMEOUT_SECONDS))
+
+    def _timeout_result(self, prepared: PreparedToolCall, timeout_seconds: float) -> ExecutedToolCall:
+        message = (
+            f"Tool '{prepared.name}' exceeded its {timeout_seconds:.0f}s deadline and was cancelled. "
+            "Retry with a narrower scope or an explicit timeout within the limit."
+        )
+        return ExecutedToolCall(
+            prepared,
+            ToolResult(
+                tool=prepared.name,
+                status="failed",
+                output=f"[error] {message}",
+                error=message,
+                metadata={"timed_out": True, "status_source": "timeout"},
+            ),
+        )
 
     def _run_before_tool(self, prepared: PreparedToolCall) -> ToolResult | None:
         activity = self._middleware_activity.setdefault(
@@ -376,13 +465,15 @@ class ToolExecutor:
         activity["duration_ms"] += (time.perf_counter() - started) * 1000
         return None
 
-    def _execute_one(self, prepared: PreparedToolCall) -> ExecutedToolCall:
+    def _execute_one(self, prepared: PreparedToolCall, cancellation_token=None) -> ExecutedToolCall:
         context = self.agent.tool_context
         resource_guard = context.resource_coordinator.acquire(prepared.effect.resources) if context is not None else nullcontext()
         with acquire_concurrency(prepared.effect.concurrency_key), resource_guard:
-            return self._execute_one_unlimited(prepared)
+            return self._execute_one_unlimited(prepared, cancellation_token)
 
-    def _execute_one_unlimited(self, prepared: PreparedToolCall) -> ExecutedToolCall:
+    def _execute_one_unlimited(
+        self, prepared: PreparedToolCall, cancellation_token=None
+    ) -> ExecutedToolCall:
         tool_result = execute_tool_result(
             prepared.name,
             prepared.args,
@@ -390,7 +481,7 @@ class ToolExecutor:
             agent_name=self.agent.name,
             tool_context=self.agent.tool_context,
             emit_events=False,
-            cancellation_token=self.cancellation_token,
+            cancellation_token=cancellation_token,
         )
         return ExecutedToolCall(prepared, tool_result)
 
@@ -407,6 +498,7 @@ class ToolExecutor:
                 tool_name=prepared.name,
                 result=tool_result,
                 intercepted=item.intercepted,
+                tool_args=prepared.args,
             )
             failure = self.runtime_state.failures.observe(
                 failure,
@@ -443,12 +535,6 @@ class ToolExecutor:
             tool_context=self.agent.tool_context,
             agent_name=self.agent.name,
             emit_call=False,
-        )
-        self.runtime_state.execution_facts.record_result(
-            prepared.name,
-            status=tool_result.status,
-            return_code=tool_result.return_code,
-            metadata=tool_result.metadata,
         )
         self._reveal_tool_schemas_from_result(tool_result)
         result = tool_result.to_text()
@@ -528,9 +614,9 @@ class ToolExecutor:
             if action.mode == FailureMode.STOP:
                 activity["outcome"] = "stopped"
             elif activity["outcome"] == "passed":
-                # A silent protocol retry still changes what happens next;
-                # keep it distinguishable from a plain pass-through.
-                activity["outcome"] = "guided" if action.message else "retried"
+                # A silent regeneration request still changes what happens
+                # next; keep it distinguishable from a plain pass-through.
+                activity["outcome"] = "guided" if action.message else "regenerated"
 
             if action.message:
                 self._deferred_user_messages.append(action.message)

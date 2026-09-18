@@ -22,8 +22,10 @@ log = logging.getLogger("harness")
 class ShellResult:
     stdout: str
     stderr: str
-    exit_code: int
+    exit_code: int | None
     timed_out: bool = False
+    output_truncated: bool = False
+    output_bytes: int = 0
 
 
 class PersistentShellSession:
@@ -93,7 +95,21 @@ class _BaseShellBackend:
             except queue.Empty:
                 return
 
-    def _read_until(self, token: str, timeout: float) -> str | None:
+    def _read_until(
+        self,
+        token: str,
+        timeout: float,
+        *,
+        max_bytes: int = 0,
+    ) -> tuple[str | None, bool]:
+        """Read until ``token`` (followed by a newline) or the deadline.
+
+        Returns ``(text, truncated)``.  ``text`` is None on timeout.  When
+        ``max_bytes`` > 0 and the capture buffer fills before the marker
+        arrives, reading stops immediately with the captured head and
+        ``truncated=True`` so the caller can interrupt the still-running
+        command instead of buffering unbounded output in process memory.
+        """
         deadline = time.time() + timeout
         buffer = bytearray()
         token_bytes = token.encode("utf-8")
@@ -106,19 +122,21 @@ class _BaseShellBackend:
                     break
                 continue
             buffer.extend(chunk)
+            if max_bytes and len(buffer) >= max_bytes:
+                return buffer.decode("utf-8", errors="replace"), True
             token_idx = buffer.find(token_bytes)
             if token_idx != -1:
                 tail = buffer[token_idx + len(token_bytes):]
                 if b"\n" in tail or b"\r" in tail:
-                    return buffer.decode("utf-8", errors="replace")
+                    return buffer.decode("utf-8", errors="replace"), False
 
-        return None
+        return None, False
 
     def _sync(self) -> None:
         marker = f"__CODEX_SYNC_{uuid.uuid4().hex}__"
         self._drain_queue()
         self._send(self._build_sync_command(marker))
-        synced = self._read_until(marker, timeout=self._SYNC_TIMEOUT_SECONDS)
+        synced, _ = self._read_until(marker, timeout=self._SYNC_TIMEOUT_SECONDS)
         if synced is None:
             raise RuntimeError("Shell failed to become ready")
 
@@ -130,7 +148,15 @@ class _BaseShellBackend:
 
         self._drain_queue()
         self._send(self._build_script(command, marker))
-        raw = self._read_until(exit_marker, timeout=timeout)
+        max_bytes = max(0, int(config.SHELL_MAX_OUTPUT_BYTES))
+        raw, truncated = self._read_until(exit_marker, timeout=timeout, max_bytes=max_bytes)
+        if truncated:
+            # The command is still producing output past the capture ceiling.
+            # Stop it immediately; parse the captured head on a best-effort
+            # basis so the model still sees the beginning of the output.
+            with contextlib.suppress(Exception):
+                self.interrupt()
+            return self._parse_truncated_result(raw or "", stdout_marker, stderr_marker)
         if raw is None:
             self.interrupt()
             return ShellResult(stdout="", stderr="", exit_code=130, timed_out=True)
@@ -189,6 +215,37 @@ class _BaseShellBackend:
             stderr=stderr_text,
             exit_code=exit_code,
             timed_out=False,
+            output_bytes=len(stdout_text.encode("utf-8", errors="replace"))
+            + len(stderr_text.encode("utf-8", errors="replace")),
+        )
+
+    def _parse_truncated_result(
+        self,
+        raw: str,
+        stdout_marker: str,
+        stderr_marker: str,
+    ) -> ShellResult:
+        """Best-effort head extraction when capture hit the byte ceiling."""
+        stdout_text = ""
+        stderr_text = ""
+        stdout_idx = raw.find(stdout_marker)
+        if stdout_idx != -1:
+            rest = raw[stdout_idx + len(stdout_marker):]
+            stderr_idx = rest.find(stderr_marker)
+            if stderr_idx != -1:
+                stdout_text = rest[:stderr_idx]
+                stderr_text = rest[stderr_idx + len(stderr_marker):]
+            else:
+                stdout_text = rest
+        else:
+            stdout_text = raw
+        stdout_text, stderr_text = self._normalize_output(stdout_text, stderr_text)
+        return ShellResult(
+            stdout=stdout_text,
+            stderr=stderr_text,
+            exit_code=None,
+            output_truncated=True,
+            output_bytes=len(raw.encode("utf-8", errors="replace")),
         )
 
 
@@ -288,8 +345,21 @@ def _docker_run_args(container_name: str, host_cwd: str) -> list[str]:
         "-w",
         "/workspace",
     ]
+    args.extend(_docker_resource_args())
     args.extend(_docker_user_arg())
     args.extend([image, "sleep", "infinity"])
+    return args
+
+
+def _docker_resource_args() -> list[str]:
+    """Container-level memory/CPU caps; zero means leave the Docker default."""
+    args: list[str] = []
+    memory_mb = int(getattr(config, "DOCKER_MEMORY_MB", 0) or 0)
+    if memory_mb > 0:
+        args.extend(["--memory", f"{memory_mb}m"])
+    cpus = float(getattr(config, "DOCKER_CPUS", 0) or 0)
+    if cpus > 0:
+        args.extend(["--cpus", f"{cpus:g}"])
     return args
 
 
@@ -458,19 +528,12 @@ class _DockerShellBackend(_BaseShellBackend):
         stdout_marker = f"__CODEX_STDOUT_{marker}__"
         stderr_marker = f"__CODEX_STDERR_{marker}__"
         exit_marker = f"__CODEX_EXIT_{marker}__"
-        return (
-            "__codex_out=$(mktemp)\n"
-            "__codex_err=$(mktemp)\n"
-            "{\n"
-            f"{command}\n"
-            "} 1>\"$__codex_out\" 2>\"$__codex_err\"\n"
-            "__codex_status=$?\n"
-            f"printf '%s\\n' '{stdout_marker}'\n"
-            "cat \"$__codex_out\"\n"
-            f"printf '\\n%s\\n' '{stderr_marker}'\n"
-            "cat \"$__codex_err\"\n"
-            f"printf '\\n%s:%s\\n' '{exit_marker}' \"$__codex_status\"\n"
-            "rm -f \"$__codex_out\" \"$__codex_err\"\n"
+        return _posix_capture_script(
+            command,
+            stdout_marker,
+            stderr_marker,
+            exit_marker,
+            prefix="__codex",
         )
 
 
@@ -544,20 +607,67 @@ class _WslShellBackend(_BaseShellBackend):
         stdout_marker = f"__CODEX_STDOUT_{marker}__"
         stderr_marker = f"__CODEX_STDERR_{marker}__"
         exit_marker = f"__CODEX_EXIT_{marker}__"
-        return (
-            "__hca_out=$(mktemp)\n"
-            "__hca_err=$(mktemp)\n"
-            "{\n"
-            f"{command}\n"
-            "} 1>\"$__hca_out\" 2>\"$__hca_err\"\n"
-            "__hca_status=$?\n"
-            f"printf '%s\\n' '{stdout_marker}'\n"
-            "cat \"$__hca_out\"\n"
-            f"printf '\\n%s\\n' '{stderr_marker}'\n"
-            "cat \"$__hca_err\"\n"
-            f"printf '\\n%s:%s\\n' '{exit_marker}' \"$__hca_status\"\n"
-            "rm -f \"$__hca_out\" \"$__hca_err\"\n"
+        return _posix_capture_script(
+            command,
+            stdout_marker,
+            stderr_marker,
+            exit_marker,
+            prefix="__hca",
         )
+
+
+# --- POSIX script construction shared by the Docker/WSL/native backends ---
+
+
+def _posix_ulimit_preamble() -> str:
+    """Resource-limit lines applied inside the per-command subshell.
+
+    Empty by default: address-space caps (-v) can false-kill JVM/Node
+    workloads, so every limit is opt-in via configuration.
+    """
+    lines = []
+    if config.SHELL_CPU_SECONDS > 0:
+        lines.append(f"ulimit -t {int(config.SHELL_CPU_SECONDS)} 2>/dev/null || true")
+    if config.SHELL_FSIZE_BLOCKS > 0:
+        lines.append(f"ulimit -f {int(config.SHELL_FSIZE_BLOCKS)} 2>/dev/null || true")
+    if config.SHELL_MEMORY_KB > 0:
+        lines.append(f"ulimit -v {int(config.SHELL_MEMORY_KB)} 2>/dev/null || true")
+    return "".join(f"{line}\n" for line in lines)
+
+
+def _posix_capture_script(
+    command: str,
+    stdout_marker: str,
+    stderr_marker: str,
+    exit_marker: str,
+    *,
+    prefix: str,
+) -> str:
+    max_bytes = max(0, int(config.SHELL_MAX_OUTPUT_BYTES))
+    preamble = _posix_ulimit_preamble()
+    # With resource limits configured the block runs in a subshell so the
+    # ulimit cannot leak onto the persistent shell; the default brace form
+    # preserves cwd/env side effects of the command as before.
+    block_open, block_close = ("(\n", ")\n") if preamble else ("{\n", "}\n")
+    inner = preamble + f"{command}\n"
+    return (
+        f"{prefix}_out=$(mktemp)\n"
+        f"{prefix}_err=$(mktemp)\n"
+        f"{prefix}_max={max_bytes}\n"
+        f"{prefix}_show() {{ if [ \"${prefix}_max\" -gt 0 ]; then "
+        f"head -c \"${prefix}_max\" \"$1\"; else cat \"$1\"; fi; }}\n"
+        f"{block_open}"
+        f"{inner}"
+        f"{block_close}"
+        f" 1>\"${prefix}_out\" 2>\"${prefix}_err\"\n"
+        f"{prefix}_status=$?\n"
+        f"printf '%s\\n' '{stdout_marker}'\n"
+        f"\"${prefix}_show\" \"${prefix}_out\"\n"
+        f"printf '\\n%s\\n' '{stderr_marker}'\n"
+        f"\"${prefix}_show\" \"${prefix}_err\"\n"
+        f"printf '\\n%s:%s\\n' '{exit_marker}' \"${prefix}_status\"\n"
+        f"rm -f \"${prefix}_out\" \"${prefix}_err\"\n"
+    )
 
 
 class _PowerShellBackend(_BaseShellBackend):
@@ -625,9 +735,15 @@ class _PowerShellBackend(_BaseShellBackend):
         stderr_marker = f"__CODEX_STDERR_{marker}__"
         exit_marker = f"__CODEX_EXIT_{marker}__"
         encoded_command = base64.b64encode(command.encode("utf-8")).decode("ascii")
+        max_chars = max(0, int(config.SHELL_MAX_OUTPUT_BYTES))
         return (
             f"$__hca_out = Join-Path ([System.IO.Path]::GetTempPath()) '{marker}.out'; "
             f"$__hca_err = Join-Path ([System.IO.Path]::GetTempPath()) '{marker}.err'; "
+            f"$__hca_max = {max_chars}; "
+            "function __hca_Show($p) { "
+            "$c = if (Test-Path -LiteralPath $p) { Get-Content -LiteralPath $p -Raw -Encoding utf8 -ErrorAction SilentlyContinue } else { '' }; "
+            "if ($__hca_max -gt 0 -and $c.Length -gt $__hca_max) { $c = $c.Substring(0, $__hca_max) }; "
+            "$c }; "
             f"$__hca_command = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_command}')); "
             "$global:LASTEXITCODE = $null; "
             "$global:__hca_last_success = $null; "
@@ -644,9 +760,9 @@ class _PowerShellBackend(_BaseShellBackend):
             "else { $__hca_status = 1 } "
             "} catch { $_ | Out-String | Set-Content -LiteralPath $__hca_err -Encoding utf8NoBOM; $__hca_status = 1 }; "
             f"Write-Output '{stdout_marker}'; "
-            "if (Test-Path -LiteralPath $__hca_out) { Get-Content -LiteralPath $__hca_out -Raw -Encoding utf8 -ErrorAction SilentlyContinue }; "
+            " __hca_Show $__hca_out; "
             f"Write-Output '{stderr_marker}'; "
-            "if (Test-Path -LiteralPath $__hca_err) { Get-Content -LiteralPath $__hca_err -Raw -Encoding utf8 -ErrorAction SilentlyContinue }; "
+            " __hca_Show $__hca_err; "
             f"Write-Output ('{exit_marker}:' + $__hca_status); "
             "Remove-Item -LiteralPath $__hca_out, $__hca_err -Force -ErrorAction SilentlyContinue\n"
         )
@@ -732,17 +848,10 @@ class _PosixShellBackend(_BaseShellBackend):
         stdout_marker = f"__CODEX_STDOUT_{marker}__"
         stderr_marker = f"__CODEX_STDERR_{marker}__"
         exit_marker = f"__CODEX_EXIT_{marker}__"
-        return (
-            "__codex_out=$(mktemp)\n"
-            "__codex_err=$(mktemp)\n"
-            "{\n"
-            f"{command}\n"
-            "} 1>\"$__codex_out\" 2>\"$__codex_err\"\n"
-            "__codex_status=$?\n"
-            f"printf '%s\\n' '{stdout_marker}'\n"
-            "cat \"$__codex_out\"\n"
-            f"printf '\\n%s\\n' '{stderr_marker}'\n"
-            "cat \"$__codex_err\"\n"
-            f"printf '\\n%s:%s\\n' '{exit_marker}' \"$__codex_status\"\n"
-            "rm -f \"$__codex_out\" \"$__codex_err\"\n"
+        return _posix_capture_script(
+            command,
+            stdout_marker,
+            stderr_marker,
+            exit_marker,
+            prefix="__codex",
         )

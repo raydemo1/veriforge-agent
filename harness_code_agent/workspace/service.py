@@ -8,7 +8,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
+from .. import config
 from .change_journal import WorkspaceChangeJournal
+
+
+class WorkspaceQuotaError(RuntimeError):
+    """Raised when a write would exceed the workspace write/disk quota."""
+
+    def __init__(self, reason: str, *, charged_bytes: int = 0, limit_bytes: int = 0):
+        super().__init__(reason)
+        self.reason = reason
+        self.charged_bytes = charged_bytes
+        self.limit_bytes = limit_bytes
 
 
 @dataclass
@@ -50,6 +61,10 @@ class WorkspaceService:
         self._metadata_lock = threading.RLock()
         self._path_locks_lock = threading.Lock()
         self._path_locks: dict[str, threading.RLock] = {}
+        # Cumulative net-new bytes written through this service; the cheap
+        # backstop against unbounded file generation. run_bash writes bypass
+        # this ledger and are expected to be bounded by ulimit/docker caps.
+        self._charged_bytes = 0
 
     def resolve(self, path: str | Path) -> Path:
         raw = Path(path)
@@ -71,9 +86,13 @@ class WorkspaceService:
         with self._path_lock(resolved):
             self._ensure_writable(resolved)
             old_content = resolved.read_text(encoding="utf-8", errors="replace") if resolved.exists() else None
+            old_size = resolved.stat().st_size if resolved.exists() else 0
+            new_size = len(content.encode("utf-8"))
+            self._check_write_quota(new_size - old_size)
             snapshot_path = self._snapshot_unlocked(resolved) if resolved.exists() else None
             resolved.parent.mkdir(parents=True, exist_ok=True)
             resolved.write_text(content, encoding="utf-8")
+            self._charge_quota(new_size - old_size)
             rel = resolved.relative_to(self.root)
             self._record_changed(rel, operation="write_file", snapshot_path=snapshot_path)
             return WorkspaceWriteResult(path=resolved, snapshot_path=snapshot_path, old_content=old_content)
@@ -92,6 +111,7 @@ class WorkspaceService:
                 stack.enter_context(self._path_lock(path))
             originals: dict[Path, tuple[bool, bytes | None]] = {}
             results: list[WorkspaceWriteResult] = []
+            total_net_new = 0
             for path in ordered:
                 self._ensure_writable(path)
                 existed = path.exists()
@@ -100,8 +120,11 @@ class WorkspaceService:
                 old_bytes = path.read_bytes() if existed else None
                 old_content = old_bytes.decode("utf-8", errors="replace") if old_bytes is not None else None
                 originals[path] = (existed, old_bytes)
+                new_bytes = resolved_changes[path].encode("utf-8")
+                total_net_new += len(new_bytes) - (len(old_bytes) if old_bytes is not None else 0)
                 snapshot_path = self._snapshot_unlocked(path) if existed else None
                 results.append(WorkspaceWriteResult(path=path, snapshot_path=snapshot_path, old_content=old_content))
+            self._check_write_quota(total_net_new)
             try:
                 for path in ordered:
                     path.parent.mkdir(parents=True, exist_ok=True)
@@ -115,6 +138,7 @@ class WorkspaceService:
                     elif path.exists():
                         path.unlink()
                 raise
+            self._charge_quota(total_net_new)
             for result in results:
                 self._record_changed(
                     result.path.relative_to(self.root),
@@ -143,7 +167,10 @@ class WorkspaceService:
                 raise ValueError(f"Patch search text must match exactly once; found {count}")
             snapshot_path = self._snapshot_unlocked(resolved)
             updated = original.replace(search, replace, 1)
+            net_new_bytes = len(updated.encode("utf-8")) - resolved.stat().st_size
+            self._check_write_quota(net_new_bytes)
             resolved.write_text(updated, encoding="utf-8")
+            self._charge_quota(net_new_bytes)
             rel = resolved.relative_to(self.root)
             self._record_changed(rel, operation="apply_patch", snapshot_path=snapshot_path)
             return WorkspacePatchResult(
@@ -228,6 +255,34 @@ class WorkspaceService:
             raise ValueError(f"Refusing to write inside .git: {rel}")
         if self._is_protected_name(path.name):
             raise ValueError(f"Refusing to write protected file: {rel}")
+
+    def _check_write_quota(self, net_new_bytes: int) -> None:
+        """Reject a write that would cross the free-disk floor or write quota."""
+        net_new_bytes = max(0, int(net_new_bytes))
+        if net_new_bytes <= 0:
+            return
+        min_free = int(getattr(config, "MIN_FREE_DISK_BYTES", 0) or 0)
+        if min_free > 0:
+            free = shutil.disk_usage(self.root).free
+            if free < min_free + net_new_bytes:
+                raise WorkspaceQuotaError(
+                    f"workspace disk floor reached: only {free} bytes free "
+                    f"(write needs {net_new_bytes}, floor is {min_free})",
+                    charged_bytes=self._charged_bytes,
+                    limit_bytes=min_free,
+                )
+        quota = int(getattr(config, "WORKSPACE_WRITE_QUOTA_BYTES", 0) or 0)
+        if quota > 0 and self._charged_bytes + net_new_bytes > quota:
+            raise WorkspaceQuotaError(
+                f"workspace write quota exceeded: {self._charged_bytes} bytes already written, "
+                f"quota is {quota} bytes (this write needs {net_new_bytes})",
+                charged_bytes=self._charged_bytes,
+                limit_bytes=quota,
+            )
+
+    def _charge_quota(self, net_new_bytes: int) -> None:
+        with self._metadata_lock:
+            self._charged_bytes += max(0, int(net_new_bytes))
 
     def _is_protected_name(self, name: str) -> bool:
         if name in self.protected_names:
