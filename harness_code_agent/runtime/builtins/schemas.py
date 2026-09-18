@@ -139,113 +139,40 @@ CORE_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "update_plan_state",
-            "description": "Update lightweight todo progress or tracked acceptance state. skip mode does not call this tool. This tool does not create formal plan.md files or approval gates.",
+            "name": "update_todo",
+            "description": (
+                "Create or update the current execution todo list. The call replaces the "
+                "whole list, so resend all items each time. Use this for concrete remaining "
+                "work on non-trivial multi-step tasks, not for reasoning notes or high-level "
+                "strategy. Skip this tool entirely for simple tasks. Update it at meaningful "
+                "milestones rather than after every tool call."
+            ),
             "parameters": {
                 "type": "object",
-                "required": ["mode", "update_kind", "goal", "steps", "current_step", "completed_steps", "blockers", "next_action", "requires_approval"],
+                "required": ["items"],
                 "properties": {
-                    "mode": {
-                        "type": "string",
-                        "description": "Use todo for small clear work and tracked only for complex or risky work needing acceptance gates. skip is the direct execution path and must not call this tool.",
-                        "enum": ["todo", "tracked"],
-                    },
-                    "update_kind": {
-                        "type": "string",
-                        "description": "Planning update kind.",
-                        "enum": ["start", "progress", "replan", "final"],
-                    },
-                    "goal": {"type": "string", "description": "Overall task goal"},
-                    "steps": {
+                    "items": {
                         "type": "array",
-                        "description": "Ordered list of planned steps",
-                        "items": {"type": "string"},
-                    },
-                    "current_step": {"type": "string", "description": "The step being worked on now"},
-                    "completed_steps": {
-                        "type": "array",
-                        "description": "Steps already completed",
-                        "items": {"type": "string"},
-                    },
-                    "blockers": {
-                        "type": "array",
-                        "description": "Current blockers, if any",
-                        "items": {"type": "string"},
-                    },
-                    "next_action": {"type": "string", "description": "The exact next action to take. May be empty or 'none' for final updates."},
-                    "plan_markdown": {
-                        "type": "string",
-                        "description": "Ignored by update_plan_state. Formal plan.md files belong to interactive planning flows, not tracked task execution.",
-                    },
-                    "replan_reason": {
-                        "type": "string",
-                        "description": "Required when update_kind is replan.",
-                    },
-                    "requires_approval": {
-                        "type": "boolean",
-                        "description": "Ignored by update_plan_state. Tracked execution never waits for approval through this tool.",
-                    },
-                    "result_status": {
-                        "type": "string",
-                        "description": "Required for final updates: success, partial, blocked, failed, or another concise status.",
-                    },
-                    "validation": {
-                        "type": "string",
-                        "description": "Required for final updates. Summarize validation commands/results or why validation could not run.",
-                    },
-                    "remaining_issues": {
-                        "type": "array",
-                        "description": "Required for final updates. Empty list means no known remaining issues.",
-                        "items": {"type": "string"},
-                    },
-                    "acceptance_checks": {
-                        "type": "array",
-                        "maxItems": 10,
-                        "description": "Optional on start. Concrete acceptance checks; IDs and origins are assigned by the framework.",
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "Complete todo list in execution order.",
                         "items": {
                             "type": "object",
-                            "required": ["text", "source", "verification_command"],
+                            "required": ["text", "status"],
                             "properties": {
-                                "text": {"type": "string"},
-                                "source": {"type": "string", "maxLength": 300},
-                                "verification_command": {"type": "string"},
-                            },
-                        },
-                    },
-                    "acceptance_revision": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "Required when changing acceptance checks and on final updates.",
-                    },
-                    "acceptance_operations": {
-                        "type": "array",
-                        "description": "Atomic ordered add/update/remove operations. Every operation requires a reason.",
-                        "items": {
-                            "type": "object",
-                            "required": ["operation", "reason"],
-                            "properties": {
-                                "operation": {"type": "string", "enum": ["add", "update", "remove"]},
-                                "id": {"type": "string"},
-                                "text": {"type": "string"},
-                                "source": {"type": "string", "maxLength": 300},
-                                "verification_command": {"type": "string"},
-                                "reason": {"type": "string"},
-                            },
-                        },
-                    },
-                    "check_results": {
-                        "type": "array",
-                        "description": "Final per-check results. Success requires every current check exactly once with status passed.",
-                        "items": {
-                            "type": "object",
-                            "required": ["id", "status", "summary"],
-                            "properties": {
-                                "id": {"type": "string"},
+                                "id": {
+                                    "type": "string",
+                                    "description": (
+                                        "Stable id you choose (short kebab/snake string). "
+                                        "Keep the same id across updates so an item can change "
+                                        "status. Omit it on first creation to get an assigned id."
+                                    ),
+                                },
+                                "text": {"type": "string", "maxLength": 500},
                                 "status": {
                                     "type": "string",
-                                    "enum": ["passed", "failed", "not_run"],
+                                    "enum": ["pending", "in_progress", "completed", "cancelled"],
                                 },
-                                "summary": {"type": "string"},
                             },
                         },
                     },
@@ -517,9 +444,10 @@ CORE_TOOL_SCHEMAS = [
                     else "On POSIX this runs a shell suitable for standard Bash-style commands. "
                 )
                 + "Use for installing deps, running builds, starting servers, running tests, etc. "
-                "Keep each call to one logical verification whenever practical. For a negative test where a non-zero exit is the expected success condition, set expected_exit_codes instead of letting recovery treat it as a failure. "
+                "Keep each call to one logical verification whenever practical. "
+                "A command that runs to completion is reported as success even when it exits non-zero (a failing test run or compiler error is a normal result for you to read and act on); the exit code is appended as [exit_code: N]. Only timeouts or tool/runtime errors are reported as failed. "
                 "Do not use shell for repository search or file listing; use repo_search/list_files/read_file. "
-                "Repository-browsing shell commands such as bare rg, recursive grep/findstr, Get-ChildItem -Recurse, or dir /s may be blocked or rewritten. "
+                "Repository-browsing shell commands such as bare rg without a path, recursive grep/findstr, Get-ChildItem -Recurse, or dir /s may be blocked. "
                 "For long-running verification commands (compilation, training), increase the timeout parameter. "
                 "For dev servers, watch mode, and runserver commands, this returns a background shell job id; use read_shell_output, list_shell_jobs, and stop_shell_job to manage it. "
                 "Prefer bounded inspection commands such as rg, head/tail, sed -n, Select-Object -First/-Last, or line counts instead of dumping whole files or logs. "
@@ -534,13 +462,6 @@ CORE_TOOL_SCHEMAS = [
                         "type": "integer",
                         "description": "Timeout in seconds (default 300). Increase for long builds/training.",
                         "default": 300,
-                    },
-                    "expected_exit_codes": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "maxItems": 16,
-                        "description": "Exit codes that count as success (default [0]); use this for deliberate negative tests.",
-                        "default": [0],
                     },
                 },
             },

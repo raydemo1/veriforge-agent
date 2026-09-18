@@ -43,9 +43,9 @@ from .filesystem import (
 )
 from .interaction import ask_user
 from .memory_tools import memory_search, read_memory_file, remember_memory
-from .planning import update_plan_state
 from .schemas import BROWSER_TOOL_SCHEMAS, CORE_TOOL_SCHEMAS
 from .shell import list_shell_jobs, read_shell_output, run_bash, stop_shell_job
+from .todo import update_todo
 from .web import web_fetch, web_search
 
 
@@ -226,8 +226,8 @@ def _build_builtin_tool_registry() -> ToolRegistry:
     )
     add("remember_memory", remember_memory, TOOL_PERMISSION_EDIT)
     add(
-        "update_plan_state",
-        update_plan_state,
+        "update_todo",
+        update_todo,
         TOOL_PERMISSION_CONTROL,
         CallEffect.global_exclusive(kind="control"),
     )
