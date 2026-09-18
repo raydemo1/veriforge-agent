@@ -230,7 +230,9 @@ def _run_hca_case(
         "turn_failure_budget_exhausted",
         "invalid_tool_definition",
         "tool_failure_policy",
+        "repeated_execution_failure",
         "loop_detected",
+        "replan_deadlock",
     }
     success = (
         returncode == 0

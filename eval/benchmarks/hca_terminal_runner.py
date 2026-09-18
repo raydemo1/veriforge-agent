@@ -35,7 +35,7 @@ def export_session_artifacts(
         "observations",
         "traces",
         "trajectory.jsonl",
-        "plan_history.jsonl",
+        "todo_history.jsonl",
         "manifest.json",
         "runner_error.txt",
     ):
@@ -69,27 +69,24 @@ def export_session_artifacts(
     events = _read_jsonl(events_path)
     _write_jsonl(export_root / "trajectory.jsonl", events)
 
-    plan_events = [
+    todo_events = [
         event
         for event in events
-        if (
-            event.get("type") in {"tool_call", "tool_result"}
-            and (event.get("payload") or {}).get("tool") == "update_plan_state"
-        )
-        or event.get("type") == "acceptance_review"
+        if event.get("type") in {"tool_call", "tool_result"}
+        and (event.get("payload") or {}).get("tool") == "update_todo"
     ]
-    _write_jsonl(export_root / "plan_history.jsonl", plan_events)
+    _write_jsonl(export_root / "todo_history.jsonl", todo_events)
 
     manifest = {
         "session_id": session_id,
         "event_count": len(events),
-        "plan_event_count": len(plan_events),
+        "todo_event_count": len(todo_events),
         "observations_exported": observations_exported,
         "traces_exported": traces_exported,
         "runner_error_exported": runner_error_exported,
         "session_path": "session",
         "trajectory_path": "trajectory.jsonl",
-        "plan_history_path": "plan_history.jsonl",
+        "todo_history_path": "todo_history.jsonl",
         "observations_path": "observations" if observations_exported else None,
         "traces_path": "traces" if traces_exported else None,
         "runner_error_path": "runner_error.txt" if runner_error_exported else None,

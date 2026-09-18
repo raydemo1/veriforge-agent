@@ -24,17 +24,17 @@ class TerminalRunnerArtifactTests(unittest.TestCase):
         self.assertEqual(args.task_name, "terminal-bench/overfull-hbox")
         self.assertEqual(args.prompt, "solve it")
 
-    def test_exports_raw_session_observations_and_plan_history(self):
+    def test_exports_raw_session_observations_and_todo_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             harness_root = root / ".harness"
             session_id = "session-123"
             session_root = harness_root / "sessions" / session_id
-            planning_root = session_root / "planning"
+            todo_root = session_root / "todo"
             observations_root = harness_root / "observations" / session_id
             traces_root = harness_root / "traces"
             artifacts_root = root / "artifacts"
-            planning_root.mkdir(parents=True)
+            todo_root.mkdir(parents=True)
             observations_root.mkdir(parents=True)
             traces_root.mkdir(parents=True)
 
@@ -44,11 +44,12 @@ class TerminalRunnerArtifactTests(unittest.TestCase):
                     "type": "tool_call",
                     "agent": "main_agent",
                     "payload": {
-                        "tool": "update_plan_state",
+                        "tool": "update_todo",
                         "args": {
-                            "update_kind": "start",
-                            "steps": ["inspect", "verify"],
-                            "next_action": "inspect files",
+                            "items": [
+                                {"id": "inspect", "text": "inspect", "status": "in_progress"},
+                                {"id": "verify", "text": "verify", "status": "pending"},
+                            ]
                         },
                     },
                 },
@@ -57,13 +58,15 @@ class TerminalRunnerArtifactTests(unittest.TestCase):
                     "type": "tool_result",
                     "agent": "main_agent",
                     "payload": {
-                        "tool": "update_plan_state",
+                        "tool": "update_todo",
                         "status": "success",
                         "metadata": {
-                            "planning_state": {
-                                "update_kind": "start",
-                                "steps": ["inspect", "verify"],
-                                "next_action": "inspect files",
+                            "todo_state": {
+                                "revision": 1,
+                                "items": [
+                                    {"id": "inspect", "text": "inspect", "status": "in_progress"},
+                                    {"id": "verify", "text": "verify", "status": "pending"},
+                                ],
                             }
                         },
                     },
@@ -93,23 +96,13 @@ class TerminalRunnerArtifactTests(unittest.TestCase):
                     "type": "tool_call",
                     "agent": "main_agent",
                     "payload": {
-                        "tool": "update_plan_state",
+                        "tool": "update_todo",
                         "args": {
-                            "update_kind": "final",
-                            "result_status": "failed",
-                            "validation": "pytest failed",
+                            "items": [
+                                {"id": "inspect", "text": "inspect", "status": "completed"},
+                                {"id": "verify", "text": "verify", "status": "completed"},
+                            ]
                         },
-                    },
-                },
-                {
-                    "sequence": 6,
-                    "type": "acceptance_review",
-                    "agent": "main_agent",
-                    "payload": {
-                        "status": "completed",
-                        "attempt": 1,
-                        "before_checks": [{"id": "check_1"}],
-                        "after_acceptance": {"revision": 2},
                     },
                 },
             ]
@@ -121,8 +114,8 @@ class TerminalRunnerArtifactTests(unittest.TestCase):
                 json.dumps({"id": session_id, "profile": "terminal"}),
                 encoding="utf-8",
             )
-            (planning_root / "state.json").write_text(
-                json.dumps({"update_kind": "final", "result_status": "failed"}),
+            (todo_root / "state.json").write_text(
+                json.dumps({"revision": 2}),
                 encoding="utf-8",
             )
             (observations_root / "obs_0001.txt").write_text(
@@ -160,18 +153,20 @@ class TerminalRunnerArtifactTests(unittest.TestCase):
                 "Traceback: synthetic runner failure\n",
             )
 
-            plan_history = [
+            todo_history = [
                 json.loads(line)
-                for line in (export_root / "plan_history.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in (export_root / "todo_history.jsonl").read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual([item["sequence"] for item in plan_history], [1, 2, 5, 6])
-            self.assertEqual(plan_history[0]["payload"]["args"]["update_kind"], "start")
+            self.assertEqual([item["sequence"] for item in todo_history], [1, 2, 5])
+            self.assertEqual(todo_history[0]["payload"]["args"]["items"][0]["text"], "inspect")
             self.assertEqual(
-                plan_history[1]["payload"]["metadata"]["planning_state"]["next_action"],
-                "inspect files",
+                todo_history[1]["payload"]["metadata"]["todo_state"]["revision"],
+                1,
             )
-            self.assertEqual(plan_history[2]["payload"]["args"]["update_kind"], "final")
-            self.assertEqual(plan_history[3]["payload"]["status"], "completed")
+            self.assertEqual(
+                todo_history[2]["payload"]["args"]["items"][1]["status"],
+                "completed",
+            )
 
             trajectory = [
                 json.loads(line)
@@ -184,7 +179,7 @@ class TerminalRunnerArtifactTests(unittest.TestCase):
             manifest = json.loads((export_root / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["session_id"], session_id)
             self.assertEqual(manifest["event_count"], len(events))
-            self.assertEqual(manifest["plan_event_count"], 4)
+            self.assertEqual(manifest["todo_event_count"], 3)
             self.assertTrue(manifest["observations_exported"])
             self.assertTrue(manifest["traces_exported"])
             self.assertTrue(manifest["runner_error_exported"])

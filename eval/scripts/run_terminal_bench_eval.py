@@ -415,16 +415,6 @@ def _extract_final_report_summary(*, stdout: str, job_dir: str, session_id: str)
             summary = str(payload.get("summary") or "").strip()
             if summary:
                 return summary[:500]
-        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-        if (
-            event.get("type") == "tool_call"
-            and payload.get("tool") == "update_plan_state"
-            and isinstance(payload.get("args"), dict)
-            and payload["args"].get("update_kind") == "final"
-        ):
-            validation = str(payload["args"].get("validation") or "").strip()
-            if validation:
-                return validation[:500]
     for line in (stdout or "").splitlines():
         stripped = line.strip()
         if stripped.lower().startswith("final report:"):
