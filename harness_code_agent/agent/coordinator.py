@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .. import config
 from ..runtime.execution_planner import acquire_concurrency, workspace_claim
 from ..runtime.middleware import AgentMiddleware
 from ..runtime.permission_middleware import PermissionMiddleware
@@ -30,8 +31,8 @@ AGENT_ROLES = {"explorer", "test_designer", "reviewer", "verifier", "worker"}
 READ_ONLY_ROLES = AGENT_ROLES - {"worker"}
 ACTIVE_STATES = {"queued", "running"}
 TERMINAL_STATES = {"completed", "blocked", "failed", "interrupted", "closed"}
-MAX_OPEN_AGENTS = 8
-MAX_CONCURRENT_AGENTS = 3
+MAX_OPEN_AGENTS = max(1, int(config.MAX_OPEN_AGENTS))
+MAX_CONCURRENT_AGENTS = max(1, int(config.MAX_CONCURRENT_AGENTS))
 
 @dataclass
 class AgentRecord:
@@ -51,6 +52,7 @@ class AgentRecord:
     proposal_id: str | None = None
     conversation: Any = None
     token: CancellationToken | None = None
+    parent_token: CancellationToken | None = None
     followups: list[str] = field(default_factory=list)
     future: Any = None
     created_at: float = field(default_factory=time.time)
@@ -112,6 +114,7 @@ class AgentCoordinator:
         model_intensity: str | None = None,
         max_turns: int = 6,
         max_seconds: int = 300,
+        parent_cancellation_token: CancellationToken | None = None,
     ) -> dict:
         role = str(role or "").strip().lower()
         task = str(task or "").strip()
@@ -125,6 +128,11 @@ class AgentCoordinator:
             raise ValueError("worker requires non-empty allowed_paths")
         if model_intensity is not None and model_intensity not in {"fast", "normal", "hard", "max"}:
             raise ValueError(f"unknown model_intensity: {model_intensity}")
+        if (
+            parent_cancellation_token is not None
+            and parent_cancellation_token.is_cancelled
+        ):
+            raise ValueError("cannot spawn agent: the requesting turn is cancelled")
         normalized_fork = _normalize_fork_turns(fork_turns)
         with self._condition:
             self._ensure_open()
@@ -146,9 +154,11 @@ class AgentCoordinator:
                 model_intensity=model_intensity,
                 max_turns=max(1, min(20, int(max_turns))),
                 max_seconds=max(30, min(1800, int(max_seconds))),
+                parent_token=parent_cancellation_token,
             )
             self._records[agent_id] = record
             self._names[clean_name] = agent_id
+            self._link_parent_cancel(record)
             record.future = self._executor.submit(self._run_record, agent_id)
             self._changed_locked()
         self._emit(record, "agent_spawned")
@@ -286,6 +296,9 @@ class AgentCoordinator:
                 while True:
                     with self._condition:
                         if self._closed:
+                            return
+                        if record.parent_token is not None and record.parent_token.is_cancelled:
+                            self._finish(record, "interrupted", error="Turn cancelled by user")
                             return
                         record.state = "running"
                         record.started_at = record.started_at or time.time()
@@ -444,6 +457,23 @@ class AgentCoordinator:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("agent coordinator is closed")
+
+    def _link_parent_cancel(self, record: AgentRecord) -> None:
+        """Cancel this agent's turn token whenever the spawning turn is stopped.
+
+        The callback is registered once at spawn and stays valid across
+        follow-up runs; a finished run simply has no active token to cancel.
+        """
+        parent_token = record.parent_token
+        if parent_token is None:
+            return
+
+        def cancel_active_run() -> None:
+            token = record.token
+            if token is not None:
+                token.cancel()
+
+        parent_token.add_callback(cancel_active_run)
 
 
 def _role_prompt(record: AgentRecord, parent_messages: list[dict]) -> str:

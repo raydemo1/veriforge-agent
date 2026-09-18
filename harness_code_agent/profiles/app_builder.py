@@ -3,16 +3,10 @@ App Builder profile for single-agent web app creation and browser verification.
 """
 from __future__ import annotations
 
-from typing import ClassVar
-
-from ..runtime.middleware import (
-    PreExitVerificationMiddleware,
-)
 from ..tracking_policy import TASK_TRACKING_POLICY
 from .base import (
     AgentConfig,
     BaseProfile,
-    build_execution_middlewares,
     build_profile_prompt,
 )
 
@@ -49,18 +43,6 @@ _APP_BUILDER_SYSTEM = build_profile_prompt(
 
 
 class AppBuilderProfile(BaseProfile):
-    _DEFAULTS: ClassVar[dict] = {
-        "task_budget": 3600,
-        "loop_file_edit_threshold": 4,
-        "loop_command_repeat_threshold": 3,
-        "acceptance_review_timeout": 10.0,
-        "time_warn_threshold": 0.60,
-        "time_critical_threshold": 0.85,
-    }
-
-    def _get(self, key: str):
-        return self.cfg.resolve(key, self.name(), self._DEFAULTS[key])
-
     def name(self) -> str:
         return "app-builder"
 
@@ -71,23 +53,4 @@ class AppBuilderProfile(BaseProfile):
         return AgentConfig(
             system_prompt=_APP_BUILDER_SYSTEM,
             blocked_tool_names=set(),
-            middlewares=build_execution_middlewares(
-                task_budget=self._get("task_budget"),
-                loop_file_edit_threshold=self._get("loop_file_edit_threshold"),
-                loop_command_repeat_threshold=self._get("loop_command_repeat_threshold"),
-                time_warn_threshold=self._get("time_warn_threshold"),
-                time_critical_threshold=self._get("time_critical_threshold"),
-                enforce_acceptance=True,
-                acceptance_review_timeout=self._get("acceptance_review_timeout"),
-                extra_before_time_budget=[
-                    PreExitVerificationMiddleware(
-                        verification_prompt=(
-                            "Verify the app against the original request. Run concrete checks, "
-                            "and use browser_test when a browser UI is involved."
-                        ),
-                        include_task_requirements=True,
-                    ),
-                ],
-            ),
-            time_budget=self._get("task_budget"),
         )

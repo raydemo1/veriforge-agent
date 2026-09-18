@@ -36,14 +36,15 @@ class GeneralProfile(BaseProfile):
                 ),
                 boundaries=(
                     "This profile is read-only. Do not modify files, run direct shell commands, manage jobs, "
-                    "start browser sessions, update planning state, use delegated agents, or turn a discussion into an "
-                    "implementation interview. Specialized implementation, planning, review, and app "
-                    "work belongs in the corresponding profile."
+                    "start browser sessions, maintain execution todo state, use delegated agents, or turn a "
+                    "discussion into an implementation interview. Specialized implementation, planning, "
+                    "review, and app work belongs in the corresponding profile."
                 ),
                 completion=(
-                    "Stop when the question is answered accurately. Say when an answer was not grounded "
-                    "in repository inspection, and never present a verification summary for checks that "
-                    "did not run."
+                    "Stop when the question is answered accurately, without unnecessary tool use. "
+                    "When the answer came from the repository, ground it in the focused read-only "
+                    "evidence you gathered; say plainly when an answer was not grounded that way, "
+                    "and never present a verification summary for checks that did not run."
                 ),
             ),
             allowed_tool_permissions={
@@ -54,7 +55,7 @@ class GeneralProfile(BaseProfile):
                 "write_file",
                 "apply_patch",
                 "remember_memory",
-                "update_plan_state",
+                "update_todo",
                 "ask_user",
                 "run_bash",
                 "list_shell_jobs",
@@ -76,10 +77,3 @@ class GeneralProfile(BaseProfile):
             },
             middlewares=[],
         )
-
-    def acceptance_criteria(self) -> list[str]:
-        return [
-            "Direct questions are answered without unnecessary tool use.",
-            "Repository answers are grounded in focused read-only evidence when needed.",
-            "The profile does not modify files, run direct shell commands, use delegated agents, or force coding-task verification.",
-        ]

@@ -21,10 +21,6 @@ from harness_code_agent.profiles.router import (
 from harness_code_agent.profiles.terminal import TerminalProfile
 from harness_code_agent.runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
 from harness_code_agent.runtime.middleware import (
-    AcceptanceReviewMiddleware,
-    PreExitVerificationMiddleware,
-    RecoveryStrategyMiddleware,
-    TaskTrackingEnforcementMiddleware,
     TerminalShellEditPolicyMiddleware,
 )
 from harness_code_agent.runtime.tool_registry import tool_schemas_for_profile
@@ -152,7 +148,6 @@ class ProfilePromptTests(unittest.TestCase):
             global_rules_docs=[
                 GlobalRulesDoc(source="HARNESS.md", content="Use focused checks.")
             ],
-            acceptance_criteria=["The requested behavior is verified."],
         )
 
         self.assertIn("## Agent Identity and Judgment", prefix.content)
@@ -166,6 +161,8 @@ class ProfilePromptTests(unittest.TestCase):
             prefix.content.index("## Profile Contract"),
             prefix.content.index("## Global Rules Bundle"),
         )
+        self.assertNotIn("Acceptance Criteria", prefix.content)
+        self.assertNotIn("acceptance_criteria_hash", prefix.hashes)
         self.assertIn("shared_identity_hash", prefix.hashes)
 
     def test_each_profile_has_role_working_style_boundaries_and_completion(self):
@@ -207,49 +204,40 @@ class ProfilePromptTests(unittest.TestCase):
         self.assertNotIn("parallel_agents", tool_names)
         self.assertNotIn("spawn_agent", tool_names)
 
-    def test_execution_profiles_share_acceptance_enforcement(self):
+    def test_execution_profiles_have_no_intervention_middlewares_or_hard_timeout(self):
         for name in ("coding-agent", "app-builder"):
             with self.subTest(profile=name):
                 cfg = get_profile(name).main_agent()
-                tracking = [
-                    mw for mw in cfg.middlewares
-                    if isinstance(mw, TaskTrackingEnforcementMiddleware)
-                ]
 
-                self.assertEqual(cfg.initial_planning_mode, "unset")
-                self.assertTrue(any(isinstance(mw, AcceptanceReviewMiddleware) for mw in cfg.middlewares))
-                self.assertEqual(len(tracking), 1)
-                self.assertTrue(tracking[0].enforce_acceptance)
-                self.assertIsNone(tracking[0].require_start_after_n_actions)
+                self.assertEqual(cfg.middlewares, [])
+                self.assertIsNone(cfg.time_budget)
 
                 prompt = cfg.system_prompt
-                self.assertIn("does not by itself make a task complex", prompt)
-                self.assertNotIn("at most 2 low-risk actions", prompt)
-                self.assertNotIn("up to 3 files", prompt)
+                self.assertIn("non-trivial multi-step execution", prompt)
+                self.assertIn("Do not update it after", prompt)
+                self.assertNotIn("tracked mode", prompt)
+                self.assertNotIn("acceptance_revision", prompt)
 
-    def test_read_only_and_planning_profiles_do_not_get_execution_acceptance_loop(self):
-        for name in ("general", "plan", "review"):
+    def test_read_only_profiles_block_todo_tool(self):
+        for name in ("general", "review"):
             with self.subTest(profile=name):
-                middlewares = get_profile(name).main_agent().middlewares
+                cfg = get_profile(name).main_agent()
+                self.assertIn("update_todo", cfg.blocked_tool_names)
 
-                self.assertFalse(any(isinstance(mw, AcceptanceReviewMiddleware) for mw in middlewares))
-                self.assertFalse(
-                    any(
-                        isinstance(mw, TaskTrackingEnforcementMiddleware)
-                        and mw.enforce_acceptance
-                        for mw in middlewares
-                    )
-                )
+        plan_cfg = get_profile("plan").main_agent()
+        self.assertIsNone(plan_cfg.time_budget)
+        self.assertIn("planning flow (plan.md)", plan_cfg.system_prompt)
 
-    def test_terminal_keeps_eval_specific_shell_policy_without_pre_exit_verifier(self):
+    def test_terminal_keeps_shell_policy_and_hard_timeout(self):
         cfg = get_profile("terminal").main_agent()
 
-        self.assertEqual(cfg.initial_planning_mode, "tracked")
-        self.assertTrue(any(isinstance(mw, AcceptanceReviewMiddleware) for mw in cfg.middlewares))
-        self.assertTrue(any(isinstance(mw, TerminalShellEditPolicyMiddleware) for mw in cfg.middlewares))
-        self.assertTrue(any(isinstance(mw, TaskTrackingEnforcementMiddleware) for mw in cfg.middlewares))
-        self.assertTrue(any(isinstance(mw, RecoveryStrategyMiddleware) for mw in cfg.middlewares))
-        self.assertFalse(any(isinstance(mw, PreExitVerificationMiddleware) for mw in cfg.middlewares))
+        self.assertEqual(
+            [type(mw) for mw in cfg.middlewares],
+            [TerminalShellEditPolicyMiddleware],
+        )
+        self.assertEqual(cfg.time_budget, 1800)
+        self.assertNotIn("tracked", cfg.system_prompt)
+        self.assertIn("non-trivial multi-step execution", cfg.system_prompt)
 
     def test_terminal_profile_resolves_timeout_from_task_name_env(self):
         with patch.dict(os.environ, {"HARNESS_TERMINAL_TASK_NAME": "terminal-bench/overfull-hbox"}):

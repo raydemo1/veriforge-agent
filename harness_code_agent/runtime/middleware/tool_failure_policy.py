@@ -11,16 +11,39 @@ Boundary (see ``runtime/tool_failures.py``):
 * Protocol-level failures (the tool never ran) get a *bounded* correction
   loop: at most ``schema_streak_stop - 1`` regenerations, with the allowed
   argument schema injected on the second failure.
-* Task-level failures (permission denied, non-zero exit, test failure, ...)
-  stay visible to the agent unchanged. The runtime never hides or replays
-  them; only the turn-level failure budget can force a stop as a global
-  circuit breaker.
+* A tool whose own schema is broken is a plain infrastructure error: the
+  result is exposed with a note that the *definition* is wrong (not the
+  arguments), so retrying unchanged cannot help. The turn is not stopped,
+  no replacement tool is suggested (capabilities are not interchangeable),
+  and no ``unavailable_tools`` state is kept.
+* Policy blocks (permission denied, blocked command shape, ...) stay
+  visible: the first block is returned as-is; repeating the *same* blocked
+  operation (same fingerprint) gets a guidance reminder phrased at the
+  *operation* level — comply with the policy or obtain permission. It never
+  says "use another tool", which would invite bypassing the policy through
+  a different tool.
+* Execution / resource / verification failures are always returned with
+  their raw result. The streak only advances while the objective
+  fingerprint (tool + kind + args + error signature) stays identical — a
+  changed command or a changed error is progress, and repeating one
+  identical failure only earns a guidance nudge, never a turn kill.
+* There is deliberately **no** global "N failures per turn" circuit
+  breaker: productive debugging produces many *different* failures.
+  Runaway protection belongs to the resource layer (tool timeout, LLM
+  request timeout, iteration/tool-call budgets, subagent depth, host
+  cancellation).
+* A non-zero process exit code (a failing test suite, a compiler error, ...)
+  is **not** a tool failure: ``run_bash`` started and completed normally, so
+  the result stays ``success`` with the raw output and exit code for the
+  model to interpret. Only transport/runtime failures (shell exception,
+  timeout, missing job manager) become ToolFailures.
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
 from ..tool_failures import (
+    FINGERPRINTED_CATEGORIES,
     FailureAction,
     FailureCategory,
     FailureKind,
@@ -35,10 +58,30 @@ if TYPE_CHECKING:
 DEFAULT_SCHEMA_STREAK_GUIDANCE = 2
 #: Stop after this many consecutive protocol failures for one tool.
 DEFAULT_SCHEMA_STREAK_STOP = 3
-#: Stop after this many consecutive blocking policy failures for one tool.
-DEFAULT_POLICY_STREAK_STOP = 2
-#: Turn-level circuit breaker for task-visible failures.
-DEFAULT_TURN_FAILURE_BUDGET = 10
+#: Attach a "do not repeat this blocked operation" nudge from this attempt on.
+DEFAULT_POLICY_STREAK_GUIDANCE = 2
+#: First strong nudge for one identical execution failure repeating.
+DEFAULT_EXECUTION_STREAK_GUIDANCE = 3
+
+
+def _schema_definition_error(tool_name: str) -> str:
+    return (
+        f"[tool error] `{tool_name}` has an invalid runtime schema and cannot "
+        "be invoked as currently defined.\n"
+        "This is a tool-definition error, not an argument error. Retrying the "
+        "same call unchanged will not fix it.\n"
+        "Continue if the task can be completed without this capability; "
+        "otherwise report the blocker."
+    )
+
+
+def _policy_repetition_guidance(attempt: int) -> str:
+    return (
+        f"[SYSTEM] This exact operation has just been blocked by policy "
+        f"({attempt} identical attempts). Retrying it unchanged will not succeed. "
+        "Change the requested operation so it complies with the policy, or "
+        "obtain the required permission if applicable."
+    )
 
 
 class ToolFailurePolicyMiddleware(AgentMiddleware):
@@ -50,18 +93,18 @@ class ToolFailurePolicyMiddleware(AgentMiddleware):
         tool_registry: Any | None = None,
         schema_streak_guidance: int = DEFAULT_SCHEMA_STREAK_GUIDANCE,
         schema_streak_stop: int = DEFAULT_SCHEMA_STREAK_STOP,
-        policy_streak_stop: int = DEFAULT_POLICY_STREAK_STOP,
-        turn_failure_budget: int = DEFAULT_TURN_FAILURE_BUDGET,
+        policy_streak_guidance: int = DEFAULT_POLICY_STREAK_GUIDANCE,
+        execution_streak_guidance: int = DEFAULT_EXECUTION_STREAK_GUIDANCE,
     ) -> None:
         self.tool_registry = tool_registry
         self.schema_streak_guidance = schema_streak_guidance
         self.schema_streak_stop = schema_streak_stop
-        self.policy_streak_stop = policy_streak_stop
-        self.turn_failure_budget = turn_failure_budget
+        self.policy_streak_guidance = policy_streak_guidance
+        self.execution_streak_guidance = execution_streak_guidance
 
     def begin_turn(self, task: str, messages: list[dict], runtime_state=None,
                    agent_name: str | None = None) -> None:
-        """Streaks and the turn budget are scoped to one user turn."""
+        """Streaks are scoped to one user turn."""
         if agent_name in MAIN_AGENT_NAMES and runtime_state is not None:
             runtime_state.failures.reset()
 
@@ -75,24 +118,6 @@ class ToolFailurePolicyMiddleware(AgentMiddleware):
         if agent_name not in MAIN_AGENT_NAMES or runtime_state is None:
             return None
 
-        # Global circuit breaker: too many task-visible failures this turn.
-        # Protocol failures do not consume this budget.
-        if (
-            failure.visibility == FailureVisibility.TASK
-            and failure.counted_in_tracker
-            and runtime_state.failures.turn_failure_count >= self.turn_failure_budget
-        ):
-            return FailureAction.stop(
-                reason="turn_failure_budget_exhausted",
-                message=(
-                    f"[stop] {runtime_state.failures.turn_failure_count} tool failures "
-                    f"in this turn (budget {self.turn_failure_budget}). Replan the task "
-                    "from the last successful state instead of issuing more failing calls."
-                ),
-                limit_type="turn_failures",
-                limit=self.turn_failure_budget,
-            )
-
         # Protocol-level: the tool never executed; bounded self-correction.
         if failure.visibility == FailureVisibility.PROTOCOL:
             if not failure.retryable:
@@ -102,26 +127,22 @@ class ToolFailurePolicyMiddleware(AgentMiddleware):
                     reason="retry_budget_exhausted",
                     message=(
                         f"[stop] {failure.attempt} consecutive validation failures for "
-                        f"`{failure.tool_name}`. Do not repeat the same call; use a "
-                        "different argument set or a different tool."
+                        f"`{failure.tool_name}`. Do not repeat the same call; fix the "
+                        "arguments according to the allowed schema."
                     ),
                     limit_type="schema_failures",
                     limit=self.schema_streak_stop,
                 )
             if failure.attempt >= self.schema_streak_guidance:
-                return FailureAction.auto_retry(message=self._schema_correction(failure))
-            return FailureAction.auto_retry()
+                return FailureAction.request_regeneration(message=self._schema_correction(failure))
+            return FailureAction.request_regeneration()
 
-        # invalid_call kinds that require reasoning rather than format repair.
+        # Broken tool *definition*: infrastructure/config error, not a model
+        # mistake. Expose it with the explanation every time; no retry, no
+        # stop, no suggestion of a substitute capability.
         if failure.kind == FailureKind.TOOL_SCHEMA_ERROR:
-            return FailureAction.stop(
-                reason="invalid_tool_definition",
-                message=(
-                    f"[stop] tool `{failure.tool_name}` has an invalid schema; it cannot "
-                    "be called. Choose a different tool."
-                ),
-                limit_type="schema_failures",
-                limit=1,
+            return FailureAction.return_to_agent(
+                message=_schema_definition_error(failure.tool_name)
             )
         if failure.kind == FailureKind.UNKNOWN_TOOL:
             if failure.attempt >= 2:
@@ -136,7 +157,7 @@ class ToolFailurePolicyMiddleware(AgentMiddleware):
                 )
             return FailureAction.return_to_agent()
 
-        # Human / external gates: never auto-retry, never count toward stop.
+        # Human / external gates: never request regeneration.
         if (
             failure.kind == FailureKind.APPROVAL_DENIED
             or failure.kind == FailureKind.USER_ATTENTION_REQUIRED
@@ -144,23 +165,40 @@ class ToolFailurePolicyMiddleware(AgentMiddleware):
         ):
             return FailureAction.return_to_agent()
 
-        # Blocking policy failures: visible once, stop on repetition.
+        # Blocking policy failures: the block itself already prevented the
+        # unsafe operation, so the turn is never killed for repeating one.
+        # The first identical block is returned as-is; repeating the very
+        # same blocked operation gets an operation-level nudge. A changed
+        # operation (different fingerprint) is new information and resets
+        # the streak. Guidance never names another tool: that would invite
+        # performing the same forbidden action through a different tool.
         if failure.category == FailureCategory.POLICY:
-            if failure.attempt >= self.policy_streak_stop:
-                return FailureAction.stop(
-                    reason="repeated_policy_failure",
-                    message=(
-                        f"[stop] {failure.attempt} consecutive blocked attempts for "
-                        f"`{failure.tool_name}`. This operation is not permitted; choose "
-                        "a different approach instead of repeating it."
-                    ),
-                    limit_type="policy_failures",
-                    limit=self.policy_streak_stop,
+            if failure.attempt >= self.policy_streak_guidance:
+                return FailureAction.return_to_agent(
+                    message=_policy_repetition_guidance(failure.attempt)
                 )
             return FailureAction.return_to_agent()
 
         # Execution / resource / verification failures: the raw result is the
-        # information the agent needs; never hide or replay it.
+        # information the agent needs; never hide or replay it. The streak only
+        # advances while the objective fingerprint (tool + kind + args + error
+        # signature) stays identical — changing commands or errors is progress,
+        # and a long productive debugging chain of *different* failures is
+        # fine. Repetition earns guidance, never a stop; runaway protection is
+        # owned by the resource layer (timeouts, iteration/call budgets).
+        if (
+            failure.category in FINGERPRINTED_CATEGORIES
+            and failure.attempt >= self.execution_streak_guidance
+        ):
+            return FailureAction.return_to_agent(
+                message=(
+                    f"[SYSTEM] The same `{failure.tool_name}` failure has now "
+                    f"occurred {failure.attempt} times in a row with the same "
+                    "arguments and error. Do not repeat this call unchanged: "
+                    "the error output shows what is wrong, so change the "
+                    "arguments or the underlying state before trying again."
+                )
+            )
         return FailureAction.return_to_agent()
 
     # ------------------------------------------------------------------

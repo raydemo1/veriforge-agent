@@ -387,7 +387,6 @@ def _emit_structured_tool_result(
                 "failure_phase",
                 "failure_visibility",
                 "failure_retryable",
-                "failure_replan_required",
                 "failure_user_action",
                 "failure_attempt",
                 "failure_intercepted",

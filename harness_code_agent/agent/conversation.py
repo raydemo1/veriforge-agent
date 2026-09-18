@@ -20,14 +20,17 @@ from ..workspace.shell_jobs import ShellJobManager
 from . import context
 from .cancellation import CancelledError
 from .compaction import CompactionGate, compaction_action, get_thresholds
-from .llm_channel import LlmChannel, LlmStreamTimeoutError, llm_call_simple
+from .llm_channel import (
+    LlmChannel,
+    LlmRequestTimeoutError,
+    LlmStreamTimeoutError,
+    llm_call_simple,
+)
 from .observations import FactTracker, ObservationStore
 from .providers import ProviderAdapter, current_adapter, get_client
 from .runtime_state import (
     AgentFallbackState,
     AgentRuntimeState,
-    RecoveryState,
-    TaskBoard,
 )
 from .session_emitter import SessionEmitter
 from .tool_executor import ToolExecutor
@@ -69,7 +72,6 @@ class Agent:
                  tool_context: ToolContext | None = None,
                  stream_callback=None,
                  prompt_cache_identity: dict[str, str] | None = None,
-                 initial_planning_mode: str = "unset",
                  model_intensity: str | None = None,
                  max_iterations: int | None = None):
         self.name = name
@@ -83,7 +85,6 @@ class Agent:
         self.tool_context = tool_context
         self.stream_callback = stream_callback
         self.prompt_cache_identity = prompt_cache_identity
-        self.initial_planning_mode = _normalize_initial_planning_mode(initial_planning_mode)
         self.model_intensity = model_intensity
         self.max_iterations = max_iterations
         self.current_task_metadata: dict = {}
@@ -92,16 +93,8 @@ class Agent:
     def _create_runtime_state(self, task: str) -> AgentRuntimeState:
         workspace = self.tool_context.workspace.root if self.tool_context is not None else Path.cwd()
         return AgentRuntimeState(
-            task_board=self._new_task_board(task),
-            shell_job_manager=ShellJobManager(workspace),
-        )
-
-    def _new_task_board(self, task: str) -> TaskBoard:
-        return TaskBoard(
-            original_task=task,
-            goal=task,
             task_metadata=dict(self.current_task_metadata or {}),
-            planning_mode=self.initial_planning_mode,
+            shell_job_manager=ShellJobManager(workspace),
         )
 
     def run(self, task: str) -> str:
@@ -190,7 +183,16 @@ class AgentConversation:
 
         The API prompt is the durable conversation log. Dynamic fact changes
         are represented as appended messages, not as a regenerated prelude.
+        The current todo list is exposed as a short transient reminder so the
+        model always knows what remains; it is never written to history.
         """
+        todo = self.runtime_state.todo
+        if todo is not None and todo.items:
+            reminder = (
+                "Current todo (state reminder; continue your work, "
+                "do not acknowledge this message):\n" + todo.render()
+            )
+            return [*self.messages, {"role": "user", "content": reminder}]
         return self.messages
 
     def rebind_agent(self, agent: Agent) -> None:
@@ -258,8 +260,8 @@ class AgentConversation:
     ) -> None:
         logical_task = task_text if task_text is not None else str(task)
         self.runtime_state.current_turn_start_index = len(self.messages)
-        self.runtime_state.task_board = self.agent._new_task_board(logical_task)
-        self.runtime_state.action_tool_count = 0
+        self.runtime_state.todo = None
+        self.runtime_state.task_metadata = dict(self.agent.current_task_metadata or {})
         self.runtime_state.fallback = AgentFallbackState()
         self.runtime_state.auto_compaction_turn_start_index = -1
         self.runtime_state.auto_compaction_suspended = False
@@ -513,7 +515,6 @@ class AgentConversation:
         self.runtime_state.auto_compaction_turn_start_index = -1
         self.runtime_state.context_anxiety_turn_start_index = -1
         self.runtime_state.fallback = AgentFallbackState()
-        self.runtime_state.recovery = RecoveryState()
         summary_text = _first_compacted_summary(self.messages)
         self._emit_compaction_committed(
             messages_before=messages_before,
@@ -525,9 +526,8 @@ class AgentConversation:
         self._refresh_dynamic_context_after_compaction(phase="handoff_reset")
 
     def _working_context_state(self) -> dict:
-        board = self.runtime_state.task_board
         recent_errors, failed_commands = self._recent_error_state()
-        files = list(dict.fromkeys(board.changed_files))
+        files = self._changed_workspace_files()
         observed_files = [
             key.removeprefix("file:")
             for observation in self.observation_store.observations
@@ -536,16 +536,26 @@ class AgentConversation:
         ]
         files_touched = list(dict.fromkeys([*files, *observed_files]))
         return {
-            "current_user_task": board.goal or self._latest_user_message(),
-            "active_plan_status": self._task_board_status(),
+            "current_user_task": self._latest_user_message(),
+            "current_todo": self._current_todo_text(),
             "changed_files": files,
             "files_touched": files_touched,
             "recent_errors": recent_errors,
             "failed_commands": failed_commands,
             "active_constraints": self._active_constraints(),
             "latest_checkpoint_summary": self._latest_checkpoint_summary(),
-            "next_recommended_action": board.next_action or "continue from the active task and verify the next smallest change",
+            "next_recommended_action": "continue from the active task and verify the next smallest change",
         }
+
+    def _changed_workspace_files(self) -> list[str]:
+        tool_context = getattr(self.agent, "tool_context", None)
+        workspace = getattr(tool_context, "workspace", None) if tool_context is not None else None
+        if workspace is None:
+            return []
+        journal = getattr(workspace, "change_journal", None)
+        if journal is not None:
+            return [str(path) for path in journal.changed_paths()]
+        return [str(path) for path in getattr(workspace, "changed_files", [])]
 
     def _latest_user_message(self) -> str:
         for msg in reversed(self.messages):
@@ -553,18 +563,11 @@ class AgentConversation:
                 return _safe_message_content(msg)
         return ""
 
-    def _task_board_status(self) -> str:
-        board = self.runtime_state.task_board
-        parts = []
-        if board.current_step:
-            parts.append(f"current_step: {board.current_step}")
-        if board.completed_steps:
-            parts.append("completed: " + ", ".join(board.completed_steps[-5:]))
-        if board.blockers:
-            parts.append("blockers: " + ", ".join(board.blockers[-5:]))
-        if board.result_status:
-            parts.append(f"result_status: {board.result_status}")
-        return "; ".join(parts) if parts else "none"
+    def _current_todo_text(self) -> str:
+        todo = self.runtime_state.todo
+        if todo is None or not todo.items:
+            return "none"
+        return todo.render()
 
     def _recent_error_state(self) -> tuple[list[str], list[str]]:
         errors: list[str] = []
@@ -574,7 +577,12 @@ class AgentConversation:
             lowered = content.lower()
             if "[error]" in lowered or "failed" in lowered or "traceback" in lowered:
                 errors.append(content[:500])
-            if msg.get("role") == "tool" and ("return_code:" in lowered or "status: failed" in lowered or "[error]" in lowered):
+            if msg.get("role") == "tool" and (
+                "return_code:" in lowered
+                or "status: failed" in lowered
+                or "[error]" in lowered
+                or ("[exit_code:" in lowered and "[exit_code: 0]" not in lowered)
+            ):
                 failed_commands.append(content[:300])
         return errors[-5:], failed_commands[-5:]
 
@@ -868,7 +876,7 @@ class AgentConversation:
                 completion = self.llm.request_assistant_message(kwargs, cancellation_token=cancellation_token)
             except CancelledError:
                 raise
-            except LlmStreamTimeoutError as e:
+            except (LlmStreamTimeoutError, LlmRequestTimeoutError) as e:
                 self.trace.error("api_timeout", str(e))
                 self.trace.finish("llm_timeout", iteration)
                 raise
@@ -1023,13 +1031,6 @@ def _tool_names_from_schemas(tool_schemas: list[dict] | None) -> set[str]:
         if isinstance(function, dict) and function.get("name"):
             names.add(str(function["name"]))
     return names
-
-
-def _normalize_initial_planning_mode(value: str) -> str:
-    mode = (value or "unset").strip().lower()
-    if mode not in {"unset", "skip", "tracked"}:
-        raise ValueError(f"Unsupported initial planning mode: {value!r}")
-    return mode
 
 
 def _assistant_message_from_response(msg) -> dict:

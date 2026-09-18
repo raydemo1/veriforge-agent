@@ -7,13 +7,10 @@ Key constraints:
   - No UI, no browser testing needed
   - Correctness is binary: tests pass or fail
 
-All tunable parameters are read via self.cfg.resolve(), so you can override
-them without touching this file:
+The hard timeout is configurable without touching this file:
 
   # Via environment variables:
   PROFILE_TERMINAL_TASK_BUDGET=1800
-  PROFILE_TERMINAL_LOOP_FILE_EDIT_THRESHOLD=4
-  PROFILE_TERMINAL_TIME_WARN_THRESHOLD=0.45
   # Or via ProfileConfig in code:
   from harness_code_agent.profiles.base import ProfileConfig
   cfg = ProfileConfig(task_budget=1200)
@@ -27,10 +24,10 @@ from typing import ClassVar
 from ..runtime.middleware import (
     TerminalShellEditPolicyMiddleware,
 )
+from ..tracking_policy import TASK_TRACKING_POLICY
 from .base import (
     AgentConfig,
     BaseProfile,
-    build_execution_middlewares,
     build_profile_prompt,
 )
 
@@ -40,11 +37,6 @@ class TerminalProfile(BaseProfile):
     # --- Default values (overridable via ProfileConfig or env vars) ---
     _DEFAULTS: ClassVar[dict] = {
         "task_budget": 1800,
-        "loop_file_edit_threshold": 4,
-        "loop_command_repeat_threshold": 3,
-        "time_warn_threshold": 0.45,
-        "time_critical_threshold": 0.75,
-        "acceptance_review_timeout": 10.0,
     }
 
     def _get(self, key: str):
@@ -62,47 +54,37 @@ class TerminalProfile(BaseProfile):
             system_prompt=build_profile_prompt(
                 role=(
                     "Solve a bounded terminal or CLI task under non-interactive benchmark conditions. "
-                    "Translate the specification into observable acceptance checks, execute the work, "
+                    "Translate the specification into concrete requirements, execute the work, "
                     "and close the loop with command evidence."
                 ),
                 working_style=(
-                    "This profile starts every non-trivial task in tracked mode. First read the task "
-                    "instruction carefully: identify the exact deliverables, constraints, example "
-                    "inputs/outputs, and what you still need to explore to understand the problem. "
-                    "Then run a few targeted exploratory actions — read source files, compile, run "
-                    "example commands — before committing to a plan. Once the task structure is "
-                    "clear, call update_plan_state(mode=\"tracked\", update_kind=\"start\") with 1-10 "
-                    "concrete acceptance_checks. "
-                    "Each check needs text, a short source grounded in the task, and a verification_command; "
-                    "use manual only when command verification is impossible. Do not use echo/no-op commands "
-                    "or 'checked by design' as verification; semantic constraints need scripts, diffs, greps, "
-                    "or tests that can fail. Make the start plan follow this compact verification-first rhythm: "
-                    "Spec: restate the external contract and non-goals; Risks: identify "
-                    "likely hidden-verifier checks such as paths, file counts, formats, protocols, ports, literal "
-                    "output, and cleanup state; Validation: design failing commands or small assertion scripts "
-                    "that prove those requirements; "
-                    "Implement: only then edit, debug, and rerun the acceptance commands. Each acceptance check "
-                    "should map to an observable requirement from the task text. Avoid checks that only prove one "
-                    "sample, a visible helper, a local substitute, an internal implementation detail, or that a "
-                    "command can run. Track the framework-assigned acceptance_revision and give a reason "
-                    "for every later add, update, or removal. On every replan, decide whether the current "
-                    "acceptance checks still validate the new strategy; if not, update them in the same replan.\n\n"
-                    "Follow the task's exact external contract: preserve literal field/function names, hosts, "
-                    "ports, URLs, protocols, branches, paths, filenames, shapes, signals/process behavior, "
-                    "formats, and exact output. "
+                    "First read the task instruction carefully: identify the exact deliverables, "
+                    "constraints, example inputs/outputs, and what you still need to explore to "
+                    "understand the problem. Then run a few targeted exploratory actions — read "
+                    "source files, compile, run example commands — before committing to changes.\n\n"
+                    f"{TASK_TRACKING_POLICY}\n\n"
+                    "Follow the task's exact external contract: preserve literal field/function names, "
+                    "hosts, ports, URLs, protocols, branches, paths, filenames, shapes, signals/process "
+                    "behavior, formats, and exact output. Requirements like file locations, file counts, "
+                    "output formats, protocols, ports, literal strings, and cleanup state are part of "
+                    "the contract and should each be backed by a failing command or a small assertion "
+                    "script that can fail. Do not use echo/no-op commands or 'checked by design' as "
+                    "verification.\n\n"
                     "Prefer command-driven evidence and syntax that matches the active shell. Each run_bash call "
                     "starts from the workspace root with fresh shell state, so keep dependent steps in one command. For "
                     "background services, verify readiness separately and capture the exact process, port, or "
                     "path evidence. When the task gives a user-visible workflow or command sequence, validation "
                     "should replay that literal workflow; do not replace it with a local substitute unless you "
-                    "also verify the literal workflow. When a command fails (non-zero exit, error message, or "
-                    "exception traceback), read stdout and stderr, classify the failure, and switch strategy "
-                    "rather than retrying blindly. The same applies when a command succeeds but its output "
-                    "does not answer the question you asked. Bounded parameter exploration is fine when each "
-                    "attempt tests a clear hypothesis or adds evidence; if several consecutive attempts show "
-                    "the same failure pattern without new information, change the strategy (different "
-                    "algorithm, different library, different decomposition of the problem) instead of trying "
-                    "another variation of the current one. "
+                    "also verify the literal workflow. Note that run_bash reports success for any command "
+                    "that completes; a non-zero exit code (shown as [exit_code: N]) is a normal result, not "
+                    "a tool error. When the command did not do what you needed (non-zero exit, error "
+                    "message, or exception traceback), read stdout and stderr, classify the failure, and "
+                    "switch strategy rather than retrying blindly. The same applies when a command "
+                    "succeeds but its output does not answer the question you asked. Bounded parameter "
+                    "exploration is fine when each attempt tests a clear hypothesis or adds evidence; if "
+                    "several consecutive attempts show the same failure pattern without new information, "
+                    "change the strategy (different algorithm, different library, different decomposition "
+                    "of the problem) instead of trying another variation of the current one. "
                     "When one issue pattern appears in many places, prefer a shell-driven batch workflow: "
                     "search the full workspace, dry-run or print the planned changes, apply a small "
                     "deterministic migration script, then run one convergence check that can fail. Keep "
@@ -117,28 +99,18 @@ class TerminalProfile(BaseProfile):
                     "mutations; constrain shell writes to the task workspace, preview or explain broad edits "
                     "before applying them, and follow mutations with verification or a convergence check. "
                     "Use delegation for parallel exploration, test design, independent review, verification, "
-                    "or isolated worker proposals when that reduces hidden-verifier risk; never treat delegated "
+                    "or isolated worker proposals when that reduces risk; never treat delegated "
                     "output as completed work until you integrate and verify it yourself."
                 ),
                 completion=(
-                    "Verify every active acceptance check and include the latest acceptance_revision plus one "
-                    "check_result per active check in the final planning update. Declare success only when every "
-                    "check passed, the last foreground run_bash succeeded, and a successful foreground command "
-                    "ran after the final structured file edit."
+                    "Re-check every requirement from the task text against fresh command output. Declare "
+                    "success only when each requirement is backed by a passing command, the last foreground "
+                    "run_bash succeeded, and a successful foreground command ran after the final structured "
+                    "file edit."
                 ),
             ),
-            middlewares=build_execution_middlewares(
-                task_budget=self._get("task_budget"),
-                loop_file_edit_threshold=self._get("loop_file_edit_threshold"),
-                loop_command_repeat_threshold=self._get("loop_command_repeat_threshold"),
-                time_warn_threshold=self._get("time_warn_threshold"),
-                time_critical_threshold=self._get("time_critical_threshold"),
-                enforce_acceptance=True,
-                acceptance_review_timeout=self._get("acceptance_review_timeout"),
-                extra_after_error=[TerminalShellEditPolicyMiddleware()],
-            ),
+            middlewares=[TerminalShellEditPolicyMiddleware()],
             time_budget=self._get("task_budget"),
-            initial_planning_mode="tracked",
         )
 
     # --- TB2 task metadata for dynamic timeout ---

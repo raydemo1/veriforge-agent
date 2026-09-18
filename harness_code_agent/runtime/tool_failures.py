@@ -17,6 +17,9 @@ Responsibility split:
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -83,9 +86,9 @@ class FailureKind:
 
 
 class FailureMode:
-    #: Feed a correction back and let the model regenerate the call. The
-    #: tool was never executed; no runtime replay happens.
-    AUTO_RETRY = "auto_retry"
+    #: The call never ran; feed a correction back to the model and let it
+    #: *regenerate* the call. The runtime never replays a tool itself.
+    REQUEST_REGENERATION = "request_regeneration"
     #: Keep the failure result visible; the agent decides what to do.
     RETURN_TO_AGENT = "return_to_agent"
     #: Budget exhausted or unrecoverable: stop the turn.
@@ -111,35 +114,31 @@ _NO_ACCOUNTING_KINDS = frozenset(
     }
 )
 
-# kind -> (category, default phase or None, retryable, replan, user_action)
-_KIND_SPECS: dict[str, tuple[str, str | None, bool, bool, bool]] = {
-    FailureKind.INVALID_JSON: (FailureCategory.INVALID_CALL, FailurePhase.PARSE, True, False, False),
-    FailureKind.INVALID_ARGUMENTS: (FailureCategory.INVALID_CALL, None, True, False, False),
+# kind -> (category, default phase or None, retryable, user_action)
+_KIND_SPECS: dict[str, tuple[str, str | None, bool, bool]] = {
+    FailureKind.INVALID_JSON: (FailureCategory.INVALID_CALL, FailurePhase.PARSE, True, False),
+    FailureKind.INVALID_ARGUMENTS: (FailureCategory.INVALID_CALL, None, True, False),
     FailureKind.INVALID_TOOL_CALL: (
         FailureCategory.INVALID_CALL,
         FailurePhase.SCHEMA_VALIDATION,
         True,
-        False,
         False,
     ),
     FailureKind.UNKNOWN_TOOL: (
         FailureCategory.INVALID_CALL,
         FailurePhase.SCHEMA_VALIDATION,
         False,
-        True,
         False,
     ),
     FailureKind.TOOL_SCHEMA_ERROR: (
         FailureCategory.INVALID_CALL,
         FailurePhase.SCHEMA_VALIDATION,
         False,
-        True,
         False,
     ),
     FailureKind.WORKSPACE_ESCAPE: (
         FailureCategory.POLICY,
         FailurePhase.SEMANTIC_VALIDATION,
-        True,
         True,
         False,
     ),
@@ -147,20 +146,17 @@ _KIND_SPECS: dict[str, tuple[str, str | None, bool, bool, bool]] = {
         FailureCategory.POLICY,
         FailurePhase.SEMANTIC_VALIDATION,
         False,
-        True,
         False,
     ),
     FailureKind.PERMISSION_DENIED: (
         FailureCategory.POLICY,
         FailurePhase.POLICY,
         False,
-        True,
         False,
     ),
     FailureKind.APPROVAL_DENIED: (
         FailureCategory.POLICY,
         FailurePhase.POLICY,
-        False,
         False,
         True,
     ),
@@ -168,20 +164,17 @@ _KIND_SPECS: dict[str, tuple[str, str | None, bool, bool, bool]] = {
         FailureCategory.POLICY,
         FailurePhase.POLICY,
         False,
-        True,
         False,
     ),
     FailureKind.PROFILE_BLOCKED: (
         FailureCategory.POLICY,
         FailurePhase.POLICY,
         False,
-        True,
         False,
     ),
     FailureKind.USER_ATTENTION_REQUIRED: (
         FailureCategory.POLICY,
         FailurePhase.POLICY,
-        False,
         False,
         True,
     ),
@@ -190,14 +183,12 @@ _KIND_SPECS: dict[str, tuple[str, str | None, bool, bool, bool]] = {
         FailurePhase.RESOURCE,
         False,
         False,
-        False,
     ),
-    FailureKind.TIMEOUT: (FailureCategory.RESOURCE, FailurePhase.RESOURCE, True, False, False),
+    FailureKind.TIMEOUT: (FailureCategory.RESOURCE, FailurePhase.RESOURCE, True, False),
     FailureKind.COMMAND_NOT_FOUND: (
         FailureCategory.EXECUTION,
         FailurePhase.EXECUTION,
         True,
-        False,
         False,
     ),
     FailureKind.FILE_NOT_FOUND: (
@@ -205,13 +196,11 @@ _KIND_SPECS: dict[str, tuple[str, str | None, bool, bool, bool]] = {
         FailurePhase.EXECUTION,
         True,
         False,
-        False,
     ),
     FailureKind.PROCESS_FAILED: (
         FailureCategory.EXECUTION,
         FailurePhase.EXECUTION,
         True,
-        False,
         False,
     ),
     FailureKind.TOOL_INTERNAL_ERROR: (
@@ -219,26 +208,23 @@ _KIND_SPECS: dict[str, tuple[str, str | None, bool, bool, bool]] = {
         FailurePhase.EXECUTION,
         True,
         False,
-        False,
     ),
     FailureKind.EXECUTION_FAILED: (
         FailureCategory.EXECUTION,
         FailurePhase.EXECUTION,
         True,
         False,
-        False,
     ),
     FailureKind.VERIFICATION_FAILED: (
         FailureCategory.VERIFICATION,
         FailurePhase.VERIFICATION,
         True,
-        True,
         False,
     ),
 }
 
-#: Policy kinds that block execution and should never be auto-retried
-#: (approval/user-action kinds excluded).
+#: Policy kinds that block execution and should never trigger a regeneration
+#: request (approval/user-action kinds excluded).
 BLOCKING_POLICY_KINDS = frozenset(
     {
         FailureKind.WORKSPACE_ESCAPE,
@@ -246,6 +232,19 @@ BLOCKING_POLICY_KINDS = frozenset(
         FailureKind.PERMISSION_DENIED,
         FailureKind.POLICY_VIOLATION,
         FailureKind.PROFILE_BLOCKED,
+    }
+)
+
+#: Categories where the streak must reflect *what exactly* keeps failing,
+#: not just the failure kind. A different error signature or different
+#: arguments means the agent changed something, so the consecutive streak
+#: resets ("new information"). Protocol streaks stay coarse.
+FINGERPRINTED_CATEGORIES = frozenset(
+    {
+        FailureCategory.POLICY,
+        FailureCategory.EXECUTION,
+        FailureCategory.RESOURCE,
+        FailureCategory.VERIFICATION,
     }
 )
 
@@ -313,11 +312,15 @@ class ToolFailure:
     category: str
     message: str
     retryable: bool
-    replan_required: bool = False
     user_action_required: bool = False
     attempt: int = 1
     intercepted: bool = False
     details: dict[str, Any] = field(default_factory=dict)
+    #: Call arguments, used to build the fine-grained repetition fingerprint.
+    tool_args: dict[str, Any] | None = None
+    #: Fine fingerprint (tool + kind + normalized args + error signature);
+    #: empty for failures constructed without repetition accounting.
+    fingerprint: str = ""
 
     @property
     def signature(self) -> str:
@@ -347,10 +350,10 @@ class ToolFailure:
                 "failure_phase": self.phase,
                 "failure_visibility": self.visibility,
                 "failure_retryable": self.retryable,
-                "failure_replan_required": self.replan_required,
                 "failure_user_action": self.user_action_required,
                 "failure_attempt": self.attempt,
                 "failure_intercepted": self.intercepted,
+                "failure_fingerprint": self.fingerprint,
             }
         )
         return replace(result, metadata=metadata)
@@ -363,27 +366,30 @@ class ToolFailure:
         tool_name: str,
         error: Any,
         intercepted: bool = True,
+        tool_args: dict[str, Any] | None = None,
     ) -> ToolFailure:
         """Build a failure from a validation ``ToolError`` (structural use)."""
         kind = str(getattr(error, "kind", "") or FailureKind.INVALID_ARGUMENTS)
-        category, phase, default_retryable, replan, user_action = _spec_for_kind(kind)
+        category, phase, default_retryable, user_action = _spec_for_kind(kind)
         legacy_phase = str(getattr(error, "phase", "") or "")
         if phase is None:
             phase = _LEGACY_VALIDATION_PHASE.get(
                 legacy_phase, FailurePhase.SCHEMA_VALIDATION
             )
         retryable = bool(getattr(error, "retryable", default_retryable))
+        message = str(getattr(error, "message", "") or "")
         return cls(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             phase=phase,
             kind=kind,
             category=category,
-            message=str(getattr(error, "message", "") or ""),
+            message=message,
             retryable=retryable,
-            replan_required=replan,
             user_action_required=user_action,
             intercepted=intercepted,
+            tool_args=tool_args,
+            fingerprint=failure_fingerprint(tool_name, kind, tool_args, message),
         )
 
     @classmethod
@@ -394,6 +400,7 @@ class ToolFailure:
         tool_name: str,
         result: ToolResult,
         intercepted: bool,
+        tool_args: dict[str, Any] | None = None,
     ) -> ToolFailure:
         """Normalize any failed ToolResult (validation, policy, execution...)."""
         metadata = dict(getattr(result, "metadata", None) or {})
@@ -401,20 +408,20 @@ class ToolFailure:
         # Already normalized (e.g. produced via ToolError.to_result).
         canonical_kind = metadata.get("failure_kind")
         if isinstance(canonical_kind, str) and canonical_kind:
-            category, _phase, default_retryable, replan, user_action = _spec_for_kind(
+            category, _phase, default_retryable, user_action = _spec_for_kind(
                 canonical_kind
             )
             phase = str(metadata.get("failure_phase") or _phase or FailurePhase.EXECUTION)
             retry_value = metadata.get("failure_retryable", default_retryable)
+            message = _result_message(result)
             return cls(
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
                 phase=phase,
                 kind=canonical_kind,
                 category=str(metadata.get("failure_category") or category),
-                message=_result_message(result),
+                message=message,
                 retryable=bool(retry_value),
-                replan_required=bool(metadata.get("failure_replan_required", replan)),
                 user_action_required=bool(
                     metadata.get("failure_user_action", user_action)
                 ),
@@ -422,6 +429,8 @@ class ToolFailure:
                 intercepted=bool(
                     metadata.get("failure_intercepted", intercepted)
                 ),
+                tool_args=tool_args,
+                fingerprint=failure_fingerprint(tool_name, canonical_kind, tool_args, message),
             )
 
         source = str(metadata.get("status_source", "") or "").strip().lower()
@@ -430,7 +439,7 @@ class ToolFailure:
 
         if source == "validation":
             kind = str(metadata.get("error_kind", "") or FailureKind.INVALID_ARGUMENTS)
-            category, phase, default_retryable, replan, user_action = _spec_for_kind(kind)
+            category, phase, default_retryable, user_action = _spec_for_kind(kind)
             legacy_phase = str(metadata.get("validation_phase", "") or "")
             if phase is None:
                 phase = _LEGACY_VALIDATION_PHASE.get(
@@ -445,9 +454,10 @@ class ToolFailure:
                 category=category,
                 message=text,
                 retryable=retryable,
-                replan_required=replan,
                 user_action_required=user_action,
                 intercepted=intercepted,
+                tool_args=tool_args,
+                fingerprint=failure_fingerprint(tool_name, kind, tool_args, text),
             )
 
         if not source and "[approval_denied]" in lowered:
@@ -457,7 +467,7 @@ class ToolFailure:
         else:
             kind = _SOURCE_DEFAULT_KIND.get(source, FailureKind.EXECUTION_FAILED)
 
-        category, phase, retryable, replan, user_action = _spec_for_kind(kind)
+        category, phase, retryable, user_action = _spec_for_kind(kind)
 
         if kind in {FailureKind.EXECUTION_FAILED, FailureKind.PROCESS_FAILED} and (
             source in _TEXT_REFINABLE_SOURCES
@@ -472,9 +482,10 @@ class ToolFailure:
             category=category,
             message=text,
             retryable=retryable,
-            replan_required=replan,
             user_action_required=user_action,
             intercepted=intercepted,
+            tool_args=tool_args,
+            fingerprint=failure_fingerprint(tool_name, kind, tool_args, text),
         )
 
 
@@ -492,12 +503,12 @@ class FailureAction:
     stop_limit: int | None = None
 
     @classmethod
-    def auto_retry(cls, message: str | None = None) -> FailureAction:
-        return cls(mode=FailureMode.AUTO_RETRY, message=message)
+    def request_regeneration(cls, message: str | None = None) -> FailureAction:
+        return cls(mode=FailureMode.REQUEST_REGENERATION, message=message)
 
     @classmethod
-    def return_to_agent(cls) -> FailureAction:
-        return cls(mode=FailureMode.RETURN_TO_AGENT)
+    def return_to_agent(cls, message: str | None = None) -> FailureAction:
+        return cls(mode=FailureMode.RETURN_TO_AGENT, message=message)
 
     @classmethod
     def stop(
@@ -533,6 +544,9 @@ class FailureStreak:
     kind: str
     count: int
     last_batch_key: str = ""
+    #: Fine fingerprint for execution/resource/verification streaks; the
+    #: count only advances while this stays identical.
+    fingerprint: str = ""
 
 
 @dataclass
@@ -560,15 +574,35 @@ class FailureTracker:
         if not failure.counted_in_tracker:
             return failure
 
+        fingerprint = failure.fingerprint or failure_fingerprint(
+            failure.tool_name,
+            failure.kind,
+            failure.tool_args,
+            failure.message,
+        )
         previous = self._streaks.get(failure.tool_name)
         same_batch = bool(batch_key) and previous is not None and previous.last_batch_key == batch_key
-        if (
+        same_kind = (
             previous is not None
             and previous.category == failure.category
             and previous.kind == failure.kind
-        ):
+        )
+        # For real execution outcomes a changed fingerprint is new
+        # information: the agent changed the command or got a different
+        # error, so the "same failure repeated" streak restarts at 1.
+        fingerprint_resets = (
+            same_kind
+            and failure.category in FINGERPRINTED_CATEGORIES
+            and previous.fingerprint != fingerprint
+        )
+        if same_kind and not fingerprint_resets:
             count = previous.count if same_batch else previous.count + 1
-            streak = replace(previous, count=count, last_batch_key=batch_key)
+            streak = replace(
+                previous,
+                count=count,
+                last_batch_key=batch_key,
+                fingerprint=fingerprint,
+            )
         else:
             count = 1
             streak = FailureStreak(
@@ -577,13 +611,14 @@ class FailureTracker:
                 kind=failure.kind,
                 count=count,
                 last_batch_key=batch_key,
+                fingerprint=fingerprint,
             )
         self._streaks[failure.tool_name] = streak
 
         if failure.visibility == FailureVisibility.TASK:
             self.turn_failure_count += 1
 
-        return replace(failure, attempt=count)
+        return replace(failure, attempt=count, fingerprint=fingerprint)
 
     def observe_success(self, tool_name: str) -> None:
         self._streaks.pop(tool_name, None)
@@ -624,7 +659,7 @@ def failure_batch_key(messages: list[dict] | None) -> str:
 
 def _spec_for_kind(
     kind: str,
-) -> tuple[str, str | None, bool, bool, bool]:
+) -> tuple[str, str | None, bool, bool]:
     spec = _KIND_SPECS.get(kind)
     if spec is None:
         return (
@@ -632,13 +667,65 @@ def _spec_for_kind(
             FailurePhase.EXECUTION,
             True,
             False,
-            False,
         )
     return spec
 
 
 def _result_message(result: ToolResult) -> str:
     return str(result.error or result.output or "")
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+#: Keep the fingerprint material compact and focused on the discriminating
+#: part of the error; pytest/traceback headers are usually much longer.
+_FAILURE_TEXT_LIMIT = 800
+
+
+def _normalize_failure_args(args: Any) -> str:
+    if not isinstance(args, dict):
+        return ""
+    try:
+        return json.dumps(
+            args,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        return str(args)
+
+
+def _normalize_failure_text(text: str) -> str:
+    normalized = _ANSI_ESCAPE_RE.sub("", str(text or "")).lower()
+    normalized = _WHITESPACE_RE.sub(" ", normalized).strip()
+    return normalized[:_FAILURE_TEXT_LIMIT]
+
+
+def failure_fingerprint(
+    tool_name: str,
+    kind: str,
+    args: Any,
+    message: str,
+) -> str:
+    """Hash the objective identity of a repeated failure.
+
+    Material: tool name + failure kind + canonical arguments JSON + the
+    normalized error text. Different commands or different error output
+    produce different fingerprints, so genuine progress across attempts is
+    not mistaken for repetition.
+    """
+    material = "\x1f".join(
+        (
+            str(tool_name),
+            str(kind),
+            _normalize_failure_args(args),
+            _normalize_failure_text(message),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
 
 
 def _optional_bool(value: Any, default: bool) -> bool:

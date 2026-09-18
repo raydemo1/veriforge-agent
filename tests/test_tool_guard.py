@@ -9,10 +9,8 @@ from harness_code_agent import config
 from harness_code_agent.agent.runtime_state import AgentRuntimeState
 from harness_code_agent.runtime.builtins.filesystem import (
     list_files,
-    read_file,
     repo_search,
 )
-from harness_code_agent.runtime.middleware.error_guidance import ErrorGuidanceMiddleware
 from harness_code_agent.runtime.middleware.terminal_shell_edit import (
     TerminalShellEditPolicyMiddleware,
 )
@@ -37,8 +35,6 @@ class RepositoryToolPolicyTests(unittest.TestCase):
         config.WORKSPACE = str(self.workspace)
         (self.workspace / "pkg").mkdir()
         (self.workspace / "pkg" / "target.py").write_text("VALUE = 'needle'\n", encoding="utf-8")
-        (self.workspace / ".harness" / "observations" / "s").mkdir(parents=True)
-        (self.workspace / ".harness" / "observations" / "s" / "obs.txt").write_text("secret", encoding="utf-8")
         (self.workspace / "pkg" / "__pycache__").mkdir()
         (self.workspace / "pkg" / "__pycache__" / "ignored.pyc").write_text("needle", encoding="utf-8")
 
@@ -62,23 +58,27 @@ class RepositoryToolPolicyTests(unittest.TestCase):
         self.assertIn("pkg/target.py", result.output.replace("\\", "/"))
         self.assertNotIn(".harness", result.output)
 
-    def test_read_file_blocks_observation_artifacts(self) -> None:
-        result = read_file(".harness/observations/s/obs.txt")
-
-        self.assertEqual(result.status, "failed")
-        self.assertIn("[blocked]", result.output)
-
 
 class ShellPolicyTests(unittest.TestCase):
-    def test_bare_rg_is_rewritten_with_explicit_path_and_short_timeout(self) -> None:
+    def test_bare_rg_without_path_is_blocked_without_mutating_args(self) -> None:
         middleware = ToolGuardMiddleware()
         args = {"command": 'rg -n "needle" --type py', "timeout": 300}
+        original = dict(args)
+
+        blocked = middleware.before_tool("run_bash", args, [], runtime_state=AgentRuntimeState())
+
+        self.assertIsNotNone(blocked)
+        self.assertIn("[blocked]", blocked.output)
+        # The guard is a pure decision point: the model's request is unchanged.
+        self.assertEqual(args, original)
+
+    def test_rg_with_explicit_path_is_allowed(self) -> None:
+        middleware = ToolGuardMiddleware()
+        args = {"command": 'rg -n "needle" --type py src/pkg', "timeout": 300}
 
         blocked = middleware.before_tool("run_bash", args, [], runtime_state=AgentRuntimeState())
 
         self.assertIsNone(blocked)
-        self.assertEqual(args["command"], 'rg -n "needle" --type py .')
-        self.assertEqual(args["timeout"], 15)
 
     def test_recursive_shell_browse_is_blocked_without_stopping(self) -> None:
         # ToolPolicy only intercepts; repeated-block stops are owned by
@@ -162,70 +162,6 @@ class ShellPolicyTests(unittest.TestCase):
         self.assertIsNotNone(second)
         self.assertIsNotNone(third)
         self.assertFalse(state.fallback.stop_requested)
-
-    def test_whole_repo_search_budget_blocks_excessive_root_searches(self) -> None:
-        middleware = ToolGuardMiddleware()
-        state = AgentRuntimeState()
-        args = {"pattern": "needle", "path": "."}
-
-        for _ in range(4):
-            self.assertIsNone(middleware.before_tool("repo_search", args, [], runtime_state=state))
-        blocked = middleware.before_tool("repo_search", args, [], runtime_state=state)
-
-        self.assertIsNotNone(blocked)
-        self.assertIn("[blocked]", blocked.output)
-
-
-class ErrorGuidanceTests(unittest.TestCase):
-    def test_matching_error_returns_guidance_without_runtime_exception(self) -> None:
-        middleware = ErrorGuidanceMiddleware()
-
-        guidance = middleware.post_tool(
-            "run_bash",
-            {"command": "python app.py"},
-            _result("[error] No such file or directory: missing.py"),
-            [],
-            runtime_state=AgentRuntimeState(),
-        )
-
-        self.assertIsNotNone(guidance)
-        self.assertIn("file or directory", guidance.lower())
-
-    def test_powershell_command_not_found_guidance_uses_powershell_commands(self) -> None:
-        middleware = ErrorGuidanceMiddleware()
-
-        with (
-            patch("harness_code_agent.runtime.middleware.error_guidance.os.name", "nt"),
-            patch("harness_code_agent.runtime.middleware.error_guidance.config.WINDOWS_SHELL", "pwsh"),
-        ):
-            guidance = middleware.post_tool(
-                "run_bash",
-                {"command": "missing-tool"},
-                _result("[error] command not found: missing-tool"),
-                [],
-                runtime_state=AgentRuntimeState(),
-            )
-
-        self.assertIn("Get-Command", guidance)
-        self.assertIn("winget", guidance)
-        self.assertNotIn("apt-get", guidance)
-
-    def test_wsl_command_not_found_guidance_keeps_linux_commands(self) -> None:
-        middleware = ErrorGuidanceMiddleware()
-
-        with (
-            patch("harness_code_agent.runtime.middleware.error_guidance.os.name", "nt"),
-            patch("harness_code_agent.runtime.middleware.error_guidance.config.WINDOWS_SHELL", "wsl"),
-        ):
-            guidance = middleware.post_tool(
-                "run_bash",
-                {"command": "missing-tool"},
-                _result("[error] command not found: missing-tool"),
-                [],
-                runtime_state=AgentRuntimeState(),
-            )
-
-        self.assertIn("apt-get", guidance)
 
 
 class TerminalShellEditPolicyTests(unittest.TestCase):

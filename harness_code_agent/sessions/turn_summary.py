@@ -47,9 +47,7 @@ def should_summarize_turn(
         return True
     if any(_event_type(event) == "agent_fallback" for event in events):
         return True
-    if duration_seconds >= LONG_TURN_SECONDS_THRESHOLD:
-        return True
-    return any(_is_final_plan_update(event) for event in events)
+    return duration_seconds >= LONG_TURN_SECONDS_THRESHOLD
 
 
 def generate_turn_summary(
@@ -177,21 +175,6 @@ def _failure_summaries(events: list[dict[str, Any]]) -> list[str]:
         message = _one_line(str(payload.get("message") or ""), 180)
         failures.append(f"{category}: {message}" if message else str(category))
     return failures
-
-
-def _is_final_plan_update(event: dict[str, Any]) -> bool:
-    if _event_type(event) != "tool_result":
-        return False
-    payload = _payload(event)
-    if payload.get("tool") != "update_plan_state":
-        return False
-    metadata = payload.get("metadata")
-    if not isinstance(metadata, dict):
-        return False
-    planning_state = metadata.get("planning_state")
-    if not isinstance(planning_state, dict):
-        return False
-    return planning_state.get("update_kind") == "final"
 
 
 def _one_line(text: str, limit: int) -> str:

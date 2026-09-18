@@ -385,7 +385,6 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
         conv = agent.start_conversation("first")
         conv.runtime_state.context_refill_streak = 1
         conv.runtime_state.fallback.request_stop(reason="loop_detected")
-        conv.runtime_state.recovery.mode = "SPEC_RECHECK"
 
         with (
             patch(
@@ -414,7 +413,6 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
         self.assertIn("C:/tmp/handoff.md", conv.messages[1]["content"])
         self.assertEqual(conv.runtime_state.context_refill_streak, 0)
         self.assertFalse(conv.runtime_state.fallback.stop_requested)
-        self.assertEqual(conv.runtime_state.recovery.mode, "NORMAL")
 
     def test_context_anxiety_below_threshold_only_records_soft_signal(self):
         from harness_code_agent.agent.compaction import get_thresholds

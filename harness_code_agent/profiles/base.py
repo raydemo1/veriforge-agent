@@ -3,7 +3,7 @@
 A Profile encapsulates everything scenario-specific:
   - The main-agent prompt
   - Extra tools and middleware for that agent
-  - Acceptance criteria and task-specific timeout metadata
+  - Task-specific timeout metadata
 
 Configuration hierarchy (highest priority wins):
   1. Environment variables: PROFILE_<PROFILE_NAME>_<KEY> (e.g. PROFILE_TERMINAL_TASK_BUDGET=1200)
@@ -17,14 +17,6 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from ..runtime.middleware import (
-    AcceptanceReviewMiddleware,
-    ErrorGuidanceMiddleware,
-    LoopDetectionMiddleware,
-    RecoveryStrategyMiddleware,
-    TaskTrackingEnforcementMiddleware,
-    TimeBudgetMiddleware,
-)
 from ..runtime.permissions import (
     TOOL_PERMISSION_CONTROL,
     TOOL_PERMISSION_EDIT,
@@ -60,50 +52,6 @@ def build_profile_prompt(
     )
 
 
-def build_execution_middlewares(
-    *,
-    task_budget: float,
-    loop_file_edit_threshold: int,
-    loop_command_repeat_threshold: int,
-    time_warn_threshold: float = 0.60,
-    time_critical_threshold: float = 0.85,
-    enforce_acceptance: bool = False,
-    require_start_after_n_actions: int | None = None,
-    acceptance_review_timeout: float | None = None,
-    extra_after_error: list | None = None,
-    extra_before_time_budget: list | None = None,
-) -> list:
-    """Build the shared execution loop used by write-capable profiles."""
-    middlewares = [
-        LoopDetectionMiddleware(
-            file_edit_threshold=loop_file_edit_threshold,
-            command_repeat_threshold=loop_command_repeat_threshold,
-        ),
-        ErrorGuidanceMiddleware(),
-    ]
-    middlewares.extend(extra_after_error or [])
-    if acceptance_review_timeout is not None:
-        middlewares.append(AcceptanceReviewMiddleware(timeout_seconds=acceptance_review_timeout))
-    middlewares.extend(
-        [
-            TaskTrackingEnforcementMiddleware(
-                enforce_acceptance=enforce_acceptance,
-                require_start_after_n_actions=require_start_after_n_actions,
-            ),
-            RecoveryStrategyMiddleware(),
-        ]
-    )
-    middlewares.extend(extra_before_time_budget or [])
-    middlewares.append(
-        TimeBudgetMiddleware(
-            budget_seconds=task_budget,
-            warn_threshold=time_warn_threshold,
-            critical_threshold=time_critical_threshold,
-        )
-    )
-    return middlewares
-
-
 @dataclass
 class AgentConfig:
     """Configuration for the main agent."""
@@ -115,7 +63,6 @@ class AgentConfig:
     middlewares: list = field(default_factory=list)  # list[AgentMiddleware]
     time_budget: float | None = None  # seconds; None = no limit
     memory_enabled: bool = True
-    initial_planning_mode: str = "unset"
 
 
 @dataclass
@@ -123,22 +70,12 @@ class ProfileConfig:
     """
     Tunable parameters for a profile, separated from code.
 
-    This lets you adjust thresholds, time budgets, and middleware settings
-    without touching the profile's Python code. Useful for:
-      - Rapid iteration on benchmark tuning
-      - Per-model adjustments (different models need different settings)
-      - A/B testing different configurations
+    Only profiles that run under an external benchmark with a hard wall-clock
+    limit (e.g. terminal/TB2) set ``task_budget``. Interactive product
+    profiles leave it unset.
     """
-    # --- Time budgets (seconds) ---
-    task_budget: float | None = None          # total time for the task
-
-    # --- Middleware thresholds ---
-    loop_file_edit_threshold: int | None = None      # edits before loop warning
-    loop_command_repeat_threshold: int | None = None  # repeats before loop warning
-    require_start_after_n_actions: int | None = None  # action tools before tracked start is required
-    acceptance_review_timeout: float | None = None    # fast-model acceptance review timeout
-    time_warn_threshold: float | None = None          # fraction of budget for warning
-    time_critical_threshold: float | None = None      # fraction of budget for critical
+    # --- Time budget (seconds) ---
+    task_budget: float | None = None          # hard task timeout; None = no limit
 
     def _env_key(self, profile_name: str, field_name: str) -> str:
         """Build environment variable name: PROFILE_TERMINAL_TASK_BUDGET."""
@@ -211,25 +148,19 @@ class BaseProfile(ABC):
                 "shell commands return job IDs; inspect and clean them up through the shell-job tools."
             ),
             boundaries=(
-                "The task text and profile acceptance criteria are the source of truth. Delegation "
-                "is evidence or an isolated proposal, not completed work. Keep integration, final verification, "
-                "and the stop decision with the main agent."
+                "The task text is the source of truth. Delegation is evidence or an isolated "
+                "proposal, not completed work. Keep integration, final verification, and the stop "
+                "decision with the main agent."
             ),
             completion=(
-                "Run concrete verification and read its output. If it fails, diagnose the evidence "
-                "and continue. In tracked mode, finish with a final planning update "
-                "that records result_status, validation, and remaining_issues."
+                "Make any required code or test changes yourself; delegated findings or proposals are "
+                "not completed work until you integrate them. Run concrete verification commands and "
+                "read their output; if anything fails, diagnose the evidence and continue. Keep your "
+                "todo list aligned with the remaining work, and mark the final items complete only "
+                "after verification passes."
             ),
         )
         return AgentConfig(system_prompt=prompt)
-
-    def acceptance_criteria(self) -> list[str]:
-        """High-level completion criteria for the main agent."""
-        return [
-            "The main agent made any required code or test changes itself.",
-            "The main agent ran concrete verification commands.",
-            "The main agent checked verification output before stopping.",
-        ]
 
     def resolve_task_timeout(self, user_prompt: str) -> float | None:
         """

@@ -1,205 +1,65 @@
-"""Pre-exit and static verification middleware."""
+"""Static pre-exit verification middleware.
+
+Deterministic, objective gate (defense in depth — not a security boundary):
+if Python files changed *during the current turn*, check them before the
+agent is allowed to finish the turn.
+"""
 from __future__ import annotations
 
+import ast
 import json
-import logging
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from .base import AgentMiddleware
 
-log = logging.getLogger("harness")
+#: Rule-code prefixes that block the exit; everything else is a one-time warn.
+_RUFF_BLOCK_PREFIXES = ("E", "F")
+_MAX_REPORT_ITEMS = 20
+_SUBPROCESS_TIMEOUT_SECONDS = 30
 
 
 @dataclass(frozen=True)
-class ExitIntentDecision:
-    mode: str
-    confidence: float = 0.0
-    reason: str = ""
+class _TurnBaseline:
+    """Turn-local snapshot taken in ``begin_turn`` (and at construction)."""
 
-    @property
-    def should_continue(self) -> bool:
-        return self.mode == "continue" and self.confidence >= 0.75
-
-
-class PreExitVerificationMiddleware(AgentMiddleware):
-    """
-    Forces the agent to run a verification pass before it's allowed to stop.
-
-    Three-level exit gate:
-    1. First exit attempt with NO tool calls ever made → force agent to start working
-    2. First exit attempt after some work → force verification pass
-    3. Second exit attempt after verification → allow exit
-
-    This prevents the "3-second exit" problem where weak models return text
-    without calling any tools, and PreExitVerification lets them go after
-    just one retry.
-    """
-
-    def __init__(self, verification_prompt: str | None = None,
-                 include_task_requirements: bool = True):
-        self._exit_attempts = 0
-        self._verification_prompt = verification_prompt
-        self._include_task_requirements = include_task_requirements
-
-    def begin_turn(self, task: str, messages: list[dict], runtime_state=None,
-                   agent_name: str | None = None) -> None:
-        self._exit_attempts = 0
-
-    @staticmethod
-    def _current_user_task(messages: list[dict], runtime_state=None) -> str | None:
-        start = getattr(runtime_state, "current_turn_start_index", 0) if runtime_state is not None else 0
-        user_messages: list[str] = []
-        for msg in messages[start:]:
-            if msg.get("role") != "user":
-                continue
-            content = msg.get("content", "")
-            if not isinstance(content, str):
-                continue
-            content = content.strip()
-            if not content or _is_middleware_user_message(content):
-                continue
-            user_messages.append(content)
-        return user_messages[-1] if user_messages else None
-
-    @staticmethod
-    def _has_done_work(messages: list[dict], runtime_state=None) -> bool:
-        """Check if the agent has used any non-planning tool this turn."""
-        ignored_tools = {"update_plan_state"}
-        start = getattr(runtime_state, "current_turn_start_index", 0) if runtime_state is not None else 0
-        for msg in messages[start:]:
-            if msg.get("role") == "assistant":
-                for tc in msg.get("tool_calls", []):
-                    fn_name = tc.get("function", {}).get("name", "")
-                    if fn_name and fn_name not in ignored_tools:
-                        return True
-        return False
-
-    @staticmethod
-    def _tool_names_used(messages: list[dict], runtime_state=None) -> list[str]:
-        start = getattr(runtime_state, "current_turn_start_index", 0) if runtime_state is not None else 0
-        names: list[str] = []
-        for msg in messages[start:]:
-            if msg.get("role") != "assistant":
-                continue
-            for tc in msg.get("tool_calls", []):
-                fn_name = tc.get("function", {}).get("name", "")
-                if fn_name:
-                    names.append(fn_name)
-        return names
-
-    @staticmethod
-    def _last_assistant_text(messages: list[dict], runtime_state=None) -> str:
-        start = getattr(runtime_state, "current_turn_start_index", 0) if runtime_state is not None else 0
-        for msg in reversed(messages[start:]):
-            if msg.get("role") == "assistant":
-                content = msg.get("content") or ""
-                return content if isinstance(content, str) else ""
-        return ""
-
-    @staticmethod
-    def _extract_task_requirements(messages: list[dict], runtime_state=None) -> str | None:
-        """Extract the current turn's task requirements from the conversation."""
-        content = PreExitVerificationMiddleware._current_user_task(messages, runtime_state)
-        if content:
-            if len(content) > 3000:
-                content = content[:3000] + "\n... (truncated)"
-            return content
-        return None
-
-    def pre_exit(self, messages: list[dict], runtime_state=None,
-                 agent_name: str | None = None) -> str | None:
-        self._exit_attempts += 1
-        has_worked = self._has_done_work(messages, runtime_state)
-        task_text = self._current_user_task(messages, runtime_state) or ""
-        assistant_text = self._last_assistant_text(messages, runtime_state)
-        tool_names = self._tool_names_used(messages, runtime_state)
-        decision = classify_exit_intent(
-            user_task=task_text,
-            assistant_text=assistant_text,
-            tool_names=tool_names,
-        )
-        if not decision.should_continue:
-            log.info(
-                "Pre-exit: allowing exit after intent gate mode=%s confidence=%.2f reason=%s",
-                decision.mode,
-                decision.confidence,
-                decision.reason,
-            )
-            return None
-
-        # Gate 1: Agent hasn't done ANY work — force it to start
-        if not has_worked:
-            log.warning(f"Pre-exit: agent wants to stop but has done NO work (attempt {self._exit_attempts})")
-            if self._exit_attempts == 1:
-                return (
-                    "[SYSTEM] The user request appears to require workspace action before answering.\n"
-                    "Continue with the smallest relevant tool action, such as inspecting files or "
-                    "running a check. Edit or create files only when the user explicitly requested "
-                    "a change or a file edit is necessary to satisfy the task."
-                )
-            return None
-
-        # Gate 2: Agent has done work, first exit → force verification
-        if self._exit_attempts == 1:
-            log.info("Pre-exit verification: forcing verification pass")
-
-            parts = []
-            parts.append(
-                "[SYSTEM] MANDATORY VERIFICATION — You are about to finish, "
-                "but you MUST verify your work first."
-            )
-
-            if self._include_task_requirements:
-                task_text = self._extract_task_requirements(messages, runtime_state)
-                if task_text:
-                    parts.append(
-                        "\n--- ORIGINAL TASK REQUIREMENTS (verify against these, not your memory) ---\n"
-                        f"{task_text}\n"
-                        "--- END ORIGINAL TASK REQUIREMENTS ---"
-                    )
-
-            if self._verification_prompt:
-                parts.append(f"\n{self._verification_prompt}")
-            else:
-                parts.append(
-                    "\nDo NOT just re-read your code. Run actual test/check commands:\n"
-                    "1. Go through EACH requirement above one by one.\n"
-                    "2. For each, run a concrete verification command "
-                    "(cat, ls -la, test -f, diff, grep, python3 -c, etc.)\n"
-                    "3. Compare ACTUAL output against what the task asked for.\n"
-                    "4. Pay special attention to exact formats, column orders, "
-                    "file paths, and edge-case rules mentioned in the task.\n"
-                    "5. If ANY check fails, fix it before stopping.\n"
-                    "Think like an automated test script — would your solution pass?"
-                )
-
-            return "\n".join(parts)
-
-        # Gate 3: Agent has done work and verified → allow exit
-        log.info("Pre-exit verification: agent verified, allowing exit")
-        return None
-
+    #: Workspace change-journal cursor — covers edits made through the
+    #: workspace service (write_file / apply_patch).
+    journal_cursor: int
+    #: Files already dirty in git when the turn started (tracked changes plus
+    #: untracked files), POSIX-relative. Pre-existing dirty work must never be
+    #: counted as a current-turn change.
+    git_files: frozenset[str]
 
 
 class StaticVerifierMiddleware(AgentMiddleware):
     """Pre-exit lint gate for Python files changed in the current turn.
 
-    - ``py_compile`` (stdlib): syntax errors on any changed .py → block
-    - ``ruff --diff`` (optional): only reports errors on *new/changed lines*,
-      E/F → block, W/C/N → warn.  Gracefully skipped if ruff is not installed.
+    Scope is strictly turn-local:
+
+    * ``begin_turn`` records a baseline (change-journal cursor + the set of
+      files already dirty in git). A file is verified only if it became dirty
+      *after* the baseline, regardless of which tool changed it — this also
+      covers files written through ``run_bash`` (scripts, formatters,
+      heredocs), which never touch the change journal.
+    * ``ast.parse`` (stdlib): a syntax error on any changed ``.py`` blocks the
+      exit. Parsing emits no bytecode and needs no external tool.
+    * ``ruff check --output-format=json`` (optional): scoped to the changed
+      files only; E/F findings block, other rule families (W/C/N/...) produce
+      a one-time non-blocking warning. Ruff missing, timing out or returning
+      unusable output is skipped — tooling problems never block the exit.
     """
 
     def __init__(self, workspace_root: str | None = None, workspace=None):
         self._workspace_root = workspace_root
         self._workspace = workspace
-        self._turn_changed_start = _workspace_change_cursor(workspace)
-        self._reported_warning_signatures: set[tuple[str, ...]] = set()
+        self._baseline: _TurnBaseline = self._capture_baseline()
+        self._reported_warning_signatures: set[tuple] = set()
 
     def begin_turn(self, task: str, messages: list[dict], runtime_state=None,
                    agent_name: str | None = None) -> None:
-        if self._workspace is not None:
-            self._turn_changed_start = _workspace_change_cursor(self._workspace)
+        self._baseline = self._capture_baseline()
         self._reported_warning_signatures.clear()
 
     def pre_exit(self, messages: list[dict], runtime_state=None,
@@ -207,35 +67,37 @@ class StaticVerifierMiddleware(AgentMiddleware):
         py_files = _turn_changed_py_files(
             self._workspace_root,
             self._workspace,
-            self._turn_changed_start,
+            self._baseline,
         )
         if not py_files:
             return None
 
         blocks: list[str] = []
-        warns: list[str] = []
-
-        # --- py_compile: syntax errors on changed files ---
-        for path, msg in _check_py_compile(self._workspace_root, py_files):
+        # --- ast.parse: syntax errors on changed files ---
+        for path, msg in _check_python_syntax(self._workspace_root, py_files):
             blocks.append(f"  [syntax] {path}: {msg}")
 
-        # --- ruff --diff: only errors on changed lines, E/F → block ---
-        for path, code, msg in _check_ruff_diff(self._workspace_root):
-            line = f"  [{code}] {path}: {msg}" if path else f"  [{code}] {msg}"
-            if code and code[0] in {"E", "F"}:
-                blocks.append(line)
+        # --- ruff (JSON): only the changed files; E/F -> block, rest -> warn ---
+        warns: list[str] = []
+        warning_ids: list[tuple] = []
+        for rel_path, code, msg, row in _check_ruff(self._workspace_root, py_files):
+            if code[:1] in _RUFF_BLOCK_PREFIXES:
+                location = f"{rel_path}:{row}" if row else rel_path
+                blocks.append(f"  [{code}] {location}: {msg}")
             else:
-                warns.append(line)
+                location = f"{rel_path}:{row}" if row else rel_path
+                warns.append(f"  [{code}] {location}: {msg}")
+                warning_ids.append((rel_path, code, row))
 
         if blocks:
-            details = "\n".join(blocks[:20])
+            details = "\n".join(blocks[:_MAX_REPORT_ITEMS])
             return (
                 "[SYSTEM] LINT CHECK FAILED -- fix these errors before stopping:\n"
                 f"{details}"
             )
         if warns:
-            details = "\n".join(warns[:20])
-            signature = tuple(warns[:20])
+            details = "\n".join(warns[:_MAX_REPORT_ITEMS])
+            signature = tuple(warning_ids[:_MAX_REPORT_ITEMS])
             if signature in self._reported_warning_signatures:
                 return None
             self._reported_warning_signatures.add(signature)
@@ -245,22 +107,59 @@ class StaticVerifierMiddleware(AgentMiddleware):
             )
         return None
 
+    # ------------------------------------------------------------------
+    # Baseline
+    # ------------------------------------------------------------------
 
-def _turn_changed_py_files(workspace_root: str | None, workspace, start_index: int) -> list[str]:
-    if workspace is None:
-        return _git_diff_changed_py_files(workspace_root)
+    def _capture_baseline(self) -> _TurnBaseline:
+        return _TurnBaseline(
+            journal_cursor=_workspace_change_cursor(self._workspace),
+            git_files=frozenset(_git_dirty_files(self._workspace_root)),
+        )
+
+
+def _turn_changed_py_files(
+    workspace_root: str | None,
+    workspace,
+    baseline: _TurnBaseline,
+) -> list[str]:
+    """Return ``.py`` files that became dirty after the turn baseline.
+
+    Two turn-local sources are unioned:
+
+    1. the workspace change journal (edits through write_file/apply_patch);
+    2. the git dirty-set delta (tracked + untracked), which also catches
+       files created or modified through the shell, including in runs that
+       have no :class:`WorkspaceService` at all.
+
+    A file that was already dirty at baseline and is merely kept dirty is not
+    reported (a shell-only re-edit of an already-dirty file is the one
+    unavoidable blind spot of the git-set-delta approach).
+    """
+    candidates: set[str] = set()
+
+    if workspace is not None:
+        journal = getattr(workspace, "change_journal", None)
+        if journal is not None:
+            candidates.update(
+                Path(path).as_posix()
+                for path in journal.paths_since(baseline.journal_cursor)
+            )
+        else:
+            candidates.update(
+                Path(path).as_posix()
+                for path in getattr(workspace, "changed_files", [])[baseline.journal_cursor:]
+            )
+
+    if workspace_root:
+        candidates.update(_git_dirty_files(workspace_root) - set(baseline.git_files))
+
     root = Path(workspace_root or getattr(workspace, "root", ".")).resolve()
-    journal = getattr(workspace, "change_journal", None)
-    if journal is not None:
-        changed = journal.paths_since(start_index)
-    else:
-        changed = getattr(workspace, "changed_files", [])[start_index:]
-    files: set[str] = set()
-    for path in changed:
-        rel = Path(path)
-        rel_text = rel.as_posix()
-        if rel_text.endswith(".py") and (root / rel).exists():
-            files.add(rel_text)
+    files = {
+        rel
+        for rel in candidates
+        if rel.endswith(".py") and (root / rel).exists()
+    }
     return sorted(files)
 
 
@@ -273,13 +172,11 @@ def _workspace_change_cursor(workspace) -> int:
     return len(getattr(workspace, "changed_files", []))
 
 
-def _git_diff_changed_py_files(workspace_root: str | None) -> list[str]:
-    """Return .py files with uncommitted changes (tracked + untracked)."""
-    import subprocess
+def _git_dirty_files(workspace_root: str | None) -> set[str]:
+    """Return files dirty vs HEAD (tracked changes + untracked), POSIX-relative."""
     if not workspace_root:
-        return []
-    files: list[str] = []
-    # Tracked changes (modified, added, renamed)
+        return set()
+    files: set[str] = set()
     try:
         result = subprocess.run(
             ["git", "diff", "--name-only", "--diff-filter=ACMR", "HEAD"],
@@ -288,10 +185,9 @@ def _git_diff_changed_py_files(workspace_root: str | None) -> list[str]:
             check=False,
         )
         if result.returncode == 0:
-            files.extend(result.stdout.splitlines())
+            files.update(result.stdout.splitlines())
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    # Untracked files
+        return set()
     try:
         result = subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"],
@@ -300,17 +196,16 @@ def _git_diff_changed_py_files(workspace_root: str | None) -> list[str]:
             cwd=workspace_root,
         )
         if result.returncode == 0:
-            files.extend(result.stdout.splitlines())
+            files.update(result.stdout.splitlines())
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    return list({f.strip().replace("\\", "/") for f in files if f.strip().endswith(".py")})
+    return {line.strip().replace("\\", "/") for line in files if line.strip()}
 
 
-def _check_py_compile(
+def _check_python_syntax(
     workspace_root: str | None, py_files: list[str],
 ) -> list[tuple[str, str]]:
-    """Parse each file for syntax errors without writing bytecode."""
-    import ast
+    """``ast.parse`` each file: syntax errors without writing bytecode."""
     errors: list[tuple[str, str]] = []
     for rel_path in py_files:
         full_path = Path(workspace_root) / rel_path if workspace_root else Path(rel_path)
@@ -322,133 +217,70 @@ def _check_py_compile(
     return errors
 
 
-def _check_ruff_diff(workspace_root: str | None) -> list[tuple[str, str, str]]:
-    """Run ``ruff check --diff`` — only reports findings on changed lines."""
-    import subprocess
-    if not workspace_root:
+def _check_ruff(
+    workspace_root: str | None, py_files: list[str],
+) -> list[tuple[str, str, str, int | None]]:
+    """Run ruff on the given files via JSON output.
+
+    Returns ``[(relative_path, rule_code, message, row)]``. Returns an empty
+    list when ruff is absent or its output is unusable; ruff-invocation
+    problems come back as a single non-blocking warning item (rule code not
+    starting with E/F), so tooling trouble never blocks an exit.
+    """
+    if not workspace_root or not py_files:
         return []
     try:
         result = subprocess.run(
-            ["ruff", "check", "--diff", "--no-fix", "--output-format=text"],
+            [
+                "ruff", "check",
+                "--output-format=json",
+                "--no-cache",
+                *py_files,
+            ],
             check=False,
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT_SECONDS,
             cwd=workspace_root,
         )
     except FileNotFoundError:
         return []
     except subprocess.TimeoutExpired:
-        return [("", "TIMEOUT", "ruff check timed out after 30s")]
-    if result.returncode == 0:
+        return [("", "RUFF-TIMEOUT", f"ruff check timed out after {_SUBPROCESS_TIMEOUT_SECONDS}s", None)]
+
+    stdout = (result.stdout or "").strip()
+    if not stdout:
+        # exit 0 = clean; exit >=2 with stderr is a ruff/config error.
+        if result.returncode >= 2 and (result.stderr or "").strip():
+            detail = result.stderr.strip().splitlines()[-1][:200]
+            return [("", "RUFF", f"ruff could not run: {detail}", None)]
         return []
-    findings: list[tuple[str, str, str]] = []
-    for line in result.stdout.strip().splitlines():
-        parts = line.split(":", 3)
-        if len(parts) >= 4:
-            path = parts[0].strip()
-            rest = parts[3].strip()
-            code_end = rest.find(" ")
-            if code_end > 0:
-                code, msg = rest[:code_end], rest[code_end + 1:]
-            else:
-                code, msg = rest, ""
-            findings.append((path, code, msg))
-        else:
-            findings.append(("", "", line))
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+
+    root = Path(workspace_root).resolve()
+    findings: list[tuple[str, str, str, int | None]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "").strip()
+        if not code:
+            continue
+        rel_path = _relative_display_path(str(item.get("filename") or ""), root)
+        message = str(item.get("message") or "").strip()
+        location = item.get("location")
+        row = location.get("row") if isinstance(location, dict) else None
+        findings.append((rel_path, code, message, row))
     return findings
 
 
-def _is_middleware_user_message(content: str) -> bool:
-    stripped = content.lstrip()
-    return stripped.startswith(("[SYSTEM]", "[blocked]"))
-
-
-def classify_exit_intent(
-    *,
-    user_task: str,
-    assistant_text: str = "",
-    tool_names: list[str] | None = None,
-) -> ExitIntentDecision:
-    """Use a small LLM gate to decide whether the agent should continue.
-
-    The safe fallback is intentionally permissive: if the gate is unavailable,
-    ambiguous, or malformed, allow the assistant to exit instead of pushing it
-    into unnecessary tool calls.
-    """
-    user_task = str(user_task or "").strip()
-    if not user_task:
-        return ExitIntentDecision(mode="exit", reason="empty user task")
-
+def _relative_display_path(filename: str, root: Path) -> str:
+    if not filename:
+        return ""
+    path = Path(filename)
     try:
-        from ... import config
-        from ...agent.providers import ProviderAdapter, client_scope
-
-        profile = config.resolve_model_profile("fast")
-        adapter = ProviderAdapter(profile.provider)
-        with client_scope() as client:
-            response = client.chat.completions.create(**adapter.chat_kwargs(
-                profile=profile,
-                messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an exit gate for a local coding agent. Decide whether "
-                        "the agent may stop now or should continue with tools.\n"
-                        "Return JSON only with keys: mode, confidence, reason.\n"
-                        "mode must be exactly \"exit\" or \"continue\".\n"
-                        "Be lenient: choose exit for greetings, identity/capability "
-                        "questions, conceptual explanations, general advice, and anything "
-                        "that can be honestly answered from the conversation.\n"
-                        "Choose continue only when the user's request cannot be satisfied "
-                        "without actual local workspace action: inspecting repository state, "
-                        "running commands/tests/builds, editing code, producing an on-disk "
-                        "artifact, or verifying a concrete local result.\n"
-                        "Do not require file edits merely because tools may be useful. "
-                        "If ambiguous, choose exit."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "user_task": user_task,
-                            "assistant_about_to_send": str(assistant_text or "")[:2000],
-                            "tools_used_this_turn": list(tool_names or []),
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
-                ],
-                max_tokens=160,
-            ))
-        raw = response.choices[0].message.content or ""
-        return _parse_exit_intent_decision(raw)
-    except Exception as exc:
-        log.info("Pre-exit intent gate failed open: %s", exc)
-        return ExitIntentDecision(mode="exit", reason="intent gate unavailable")
-
-
-def _parse_exit_intent_decision(raw: str) -> ExitIntentDecision:
-    text = str(raw or "").strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return ExitIntentDecision(mode="exit", reason="invalid gate JSON")
-
-    mode = str(data.get("mode") or "exit").strip().lower()
-    if mode not in {"exit", "continue"}:
-        mode = "exit"
-    try:
-        confidence = float(data.get("confidence") or 0.0)
-    except (TypeError, ValueError):
-        confidence = 0.0
-    confidence = max(0.0, min(1.0, confidence))
-    reason = str(data.get("reason") or "").strip()[:300]
-    return ExitIntentDecision(mode=mode, confidence=confidence, reason=reason)
+        return path.resolve().relative_to(root).as_posix()
+    except (ValueError, OSError):
+        return path.as_posix()

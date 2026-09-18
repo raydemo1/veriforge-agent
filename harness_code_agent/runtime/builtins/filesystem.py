@@ -8,6 +8,7 @@ from pathlib import Path
 
 from ... import config
 from ...agent.context import count_text_tokens
+from ...workspace.service import WorkspaceQuotaError
 from ..tool_context import ToolContext
 from ..tool_result import ToolResult
 
@@ -134,16 +135,6 @@ def _clamp_int(value: int | None, *, default: int, minimum: int, maximum: int) -
     return max(minimum, min(maximum, parsed))
 
 
-def _observation_path_blocked(path: Path, workspace: Path) -> bool:
-    if os.environ.get("HARNESS_ALLOW_OBSERVATION_READ", "").strip() in {"1", "true", "yes"}:
-        return False
-    try:
-        rel = path.resolve().relative_to(workspace.resolve())
-    except ValueError:
-        return True
-    return ".harness" in rel.parts and "observations" in rel.parts
-
-
 def repo_search(
     pattern: str,
     path: str = ".",
@@ -264,18 +255,6 @@ def read_file(
     tool_context: ToolContext | None = None,
 ) -> ToolResult:
     p = _resolve_with_context(path, tool_context)
-    workspace = _workspace_root(tool_context)
-    if _observation_path_blocked(p, workspace):
-        return ToolResult(
-            tool="read_file",
-            status="failed",
-            output=(
-                "[blocked] read_file cannot read raw .harness/observations artifacts during normal runs. "
-                "Use the summarized tool result in the conversation, or set HARNESS_ALLOW_OBSERVATION_READ=1 for diagnosis."
-            ),
-            error="read_file blocked for .harness/observations",
-            metadata={"path": path, "status_source": "permission", "reason": "internal_observation_artifact"},
-        )
     if not p.exists():
         return ToolResult(
             tool="read_file",
@@ -438,6 +417,25 @@ def read_skill_file(path: str) -> ToolResult:
     )
 
 
+def _quota_result(tool: str, path: str, exc: WorkspaceQuotaError) -> ToolResult:
+    return ToolResult(
+        tool=tool,
+        status="failed",
+        output=(
+            f"[blocked] {exc.reason}. Stop generating new files, clean up existing "
+            "workspace files, or ask the user to raise HARNESS_WORKSPACE_WRITE_QUOTA_MB / "
+            "HARNESS_MIN_FREE_DISK_MB."
+        ),
+        error=exc.reason,
+        metadata={
+            "path": path,
+            "status_source": "quota",
+            "charged_bytes": exc.charged_bytes,
+            "limit_bytes": exc.limit_bytes,
+        },
+    )
+
+
 def write_file(
     path: str,
     content: str,
@@ -454,7 +452,10 @@ def write_file(
     metadata = {"path": path, "status_source": "native"}
     if tool_context is not None:
         workspace = tool_context.workspace
-        write_result = workspace.write_text(path, content)
+        try:
+            write_result = workspace.write_text(path, content)
+        except WorkspaceQuotaError as exc:
+            return _quota_result("write_file", path, exc)
         old = write_result.old_content
         rel = write_result.path.relative_to(workspace.root)
         additions, deletions = _change_stats(old, content)
@@ -497,11 +498,14 @@ def apply_patch(
         )
     if tool_context is not None:
         workspace = tool_context.workspace
-        patch_result = workspace.apply_text_patch(
-            path,
-            search=search,
-            replace=replace,
-        )
+        try:
+            patch_result = workspace.apply_text_patch(
+                path,
+                search=search,
+                replace=replace,
+            )
+        except WorkspaceQuotaError as exc:
+            return _quota_result("apply_patch", path, exc)
         rel = patch_result.path.relative_to(workspace.root)
         old = patch_result.old_content
         new = patch_result.new_content

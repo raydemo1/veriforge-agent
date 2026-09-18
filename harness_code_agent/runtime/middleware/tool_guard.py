@@ -1,11 +1,19 @@
-"""Runtime policy guard for unsafe or wasteful tool usage.
+"""Runtime policy guard for deterministic, objectively bad tool calls.
 
-This middleware only *intercepts* calls (command-shape guards and per-turn
-exploration budgets). It never counts failure streaks and never requests a
-fallback stop: repeated blocked/policy failures are tracked once, centrally,
-by ``ToolFailurePolicyMiddleware`` via the canonical ``ToolFailure`` model.
-The intercepted results still carry ``status_source="tool_policy"``, which is
-the event-wire label for a policy interception (peer of permission/budget).
+Scope is deliberately narrow: this middleware only intercepts calls whose
+shape is wrong independent of history — e.g. a bare ``rg`` that would block
+on stdin, or a recursive repository-wide listing through shell where a
+bounded built-in tool exists. It holds no per-turn counters and implements
+no "Nth repetition is wasteful" heuristics; resource control belongs to
+output limits, timeouts and explicit tool-call budgets.
+
+It is a pure decision point: it returns an intercepted
+:class:`~harness_code_agent.runtime.tool_result.ToolResult` and never
+replays, sleeps, records actions or requests a fallback stop. Repetition of
+blocked calls is tracked once, centrally, by
+``ToolFailurePolicyMiddleware`` via the canonical ``ToolFailure`` model.
+The intercepted results carry ``status_source="tool_policy"``, the
+event-wire label for a policy interception (peer of permission/budget).
 """
 from __future__ import annotations
 
@@ -15,9 +23,6 @@ import shlex
 from ..tool_result import ToolResult
 from .base import AgentMiddleware
 
-SEARCH_TIMEOUT_SECONDS = 15
-BROAD_REPO_SEARCH_BUDGET = 4
-DEEP_ROOT_LIST_BUDGET = 2
 RG_OPTIONS_WITH_VALUE = {
     "-A",
     "-B",
@@ -68,21 +73,11 @@ GREP_OPTIONS_WITH_VALUE = {
     "--regexp",
     "--file",
 }
-SHELL_CONTROL_OPERATORS = ("|", "&&", "||", ";", ">", "<", "`")
 SHELL_CONTROL_TOKENS = {"|", "&&", "||", ";"}
 
 
 class ToolGuardMiddleware(AgentMiddleware):
-    """Blocks repository browsing through shell and wasteful exploration."""
-
-    def __init__(self):
-        self._broad_repo_search_count = 0
-        self._deep_root_list_count = 0
-
-    def begin_turn(self, task: str, messages: list[dict], runtime_state=None,
-                   agent_name: str | None = None) -> None:
-        self._broad_repo_search_count = 0
-        self._deep_root_list_count = 0
+    """Blocks objectively unsafe/unbounded shell command shapes."""
 
     def before_tool(
         self,
@@ -92,63 +87,10 @@ class ToolGuardMiddleware(AgentMiddleware):
         runtime_state=None,
         agent_name: str | None = None,
     ) -> ToolResult | None:
-        if tool_name == "run_bash":
-            return self._guard_shell(tool_args, runtime_state)
-        if tool_name == "repo_search":
-            return self._guard_repo_search(tool_args, runtime_state)
-        if tool_name == "list_files":
-            return self._guard_list_files(tool_args, runtime_state)
-        if tool_name == "read_file":
-            path = str((tool_args or {}).get("path") or "")
-            if _is_observation_path(path):
-                return self._blocked(
-                    tool_name,
-                    "read_file cannot read raw .harness/observations artifacts during normal runs. "
-                    "Use summarized tool output, or set HARNESS_ALLOW_OBSERVATION_READ=1 for diagnosis.",
-                    runtime_state,
-                    category="internal_observation_read",
-                    summary=f"read_file:{_shape_path(path)}",
-                )
-        return None
-
-    def _guard_repo_search(self, tool_args: dict, runtime_state=None) -> ToolResult | None:
-        path = str((tool_args or {}).get("path") or ".").strip() or "."
-        if not _path_is_root(path):
+        if tool_name != "run_bash":
             return None
-        self._broad_repo_search_count += 1
-        if self._broad_repo_search_count <= BROAD_REPO_SEARCH_BUDGET:
-            return None
-        return self._blocked(
-            "repo_search",
-            "Too many whole-repository searches in this turn. Narrow path/glob based on existing evidence before searching again.",
-            runtime_state,
-            category="exploration_budget",
-            summary="repo_search:root",
-        )
-
-    def _guard_list_files(self, tool_args: dict, runtime_state=None) -> ToolResult | None:
-        directory = str((tool_args or {}).get("directory") or ".").strip() or "."
-        try:
-            depth = int((tool_args or {}).get("depth") or 2)
-        except (TypeError, ValueError):
-            depth = 2
-        if depth <= 2 or not _path_is_root(directory):
-            return None
-        self._deep_root_list_count += 1
-        if self._deep_root_list_count <= DEEP_ROOT_LIST_BUDGET:
-            return None
-        return self._blocked(
-            "list_files",
-            "Too many deep root listings in this turn. Narrow directory or use repo_search with a specific path/glob.",
-            runtime_state,
-            category="exploration_budget",
-            summary="list_files:deep_root",
-        )
-
-    def _guard_shell(self, tool_args: dict, runtime_state=None) -> ToolResult | None:
         command = str((tool_args or {}).get("command") or "").strip()
-        lowered = _collapse(command.lower())
-        if not lowered:
+        if not command:
             return None
 
         if _is_broad_recursive_shell_listing(command):
@@ -156,57 +98,27 @@ class ToolGuardMiddleware(AgentMiddleware):
                 "run_bash",
                 "Recursive repository listing/search through shell is blocked. "
                 "Use list_files(depth=..., max_results=...) for file discovery or repo_search for text search.",
-                runtime_state,
                 category="repo_browse_shell",
-                summary=f"run_bash:{_command_family(lowered)}",
             )
 
-        if _looks_like_rg(command):
-            if _rg_has_explicit_path(command):
-                return None
-            if _is_simple_rg_search(command):
-                tool_args["command"] = command.rstrip() + " ."
-                current_timeout = tool_args.get("timeout")
-                try:
-                    timeout = int(current_timeout) if current_timeout is not None else SEARCH_TIMEOUT_SECONDS
-                except (TypeError, ValueError):
-                    timeout = SEARCH_TIMEOUT_SECONDS
-                tool_args["timeout"] = min(timeout, SEARCH_TIMEOUT_SECONDS)
-                return None
+        if _looks_like_rg(command) and not _rg_has_explicit_path(command):
             return self._blocked(
                 "run_bash",
                 "Bare rg without an explicit search path is blocked because it can wait on stdin. "
                 "Use repo_search(pattern=..., path=...) or provide an explicit bounded path.",
-                runtime_state,
                 category="bare_rg",
-                summary="run_bash:rg_without_path",
             )
 
         if _looks_like_shell_search_without_path(command):
             return self._blocked(
                 "run_bash",
                 "Repository search through shell is blocked for this command shape. Use repo_search(pattern=..., path=...).",
-                runtime_state,
                 category="repo_browse_shell",
-                summary=f"run_bash:{_command_family(lowered)}",
             )
 
         return None
 
-    def _blocked(
-        self,
-        tool_name: str,
-        message: str,
-        runtime_state,
-        *,
-        category: str,
-        summary: str,
-    ) -> ToolResult:
-        # Record the blocked action for fallback fingerprints; streak counting
-        # and stop decisions live in ToolFailurePolicyMiddleware.
-        fallback = getattr(runtime_state, "fallback", None)
-        if fallback is not None:
-            fallback.record_action(summary)
+    def _blocked(self, tool_name: str, message: str, *, category: str) -> ToolResult:
         output = f"[blocked] {message}"
         return ToolResult(
             tool=tool_name,
@@ -237,12 +149,6 @@ def _looks_like_rg(command: str) -> bool:
         return False
     executable = tokens[0].strip("\"'").lower()
     return executable in {"rg", "rg.exe"}
-
-
-def _is_simple_rg_search(command: str) -> bool:
-    if any(operator in command for operator in SHELL_CONTROL_OPERATORS):
-        return False
-    return _looks_like_rg(command)
 
 
 def _rg_has_explicit_path(command: str) -> bool:
@@ -409,30 +315,3 @@ def _looks_like_shell_search_without_path(command: str) -> bool:
         non_options = [token for token in tokens[1:] if not str(token).startswith("-")]
         return len(non_options) < 2
     return False
-
-
-def _command_family(command: str) -> str:
-    tokens = _tokens(command)
-    if not tokens:
-        return "empty"
-    executable = tokens[0].strip("\"'").lower()
-    executable = executable.removesuffix(".exe")
-    return executable
-
-
-def _shape_path(path: str) -> str:
-    normalized = path.replace("\\", "/").strip()
-    if not normalized or normalized == ".":
-        return "."
-    parts = [part for part in normalized.split("/") if part and part != "."]
-    return "/".join(parts[:2]) if parts else "."
-
-
-def _path_is_root(path: str) -> bool:
-    normalized = path.replace("\\", "/").strip()
-    return normalized in {"", ".", "./"}
-
-
-def _is_observation_path(path: str) -> bool:
-    normalized = path.replace("\\", "/").lower()
-    return "/.harness/observations/" in f"/{normalized}/"

@@ -47,7 +47,6 @@ from ..runtime.mcp import McpClientManager
 from ..runtime.middleware import (
     MemoryMiddleware,
     StaticVerifierMiddleware,
-    TimeBudgetMiddleware,
     ToolFailurePolicyMiddleware,
     ToolGuardMiddleware,
 )
@@ -182,7 +181,6 @@ class InteractiveSession:
         self.last_user_task: str = ""
         self.last_assistant_text: str = ""
         self.profile_history: list[ProfileSwitchEvent] = []
-        self._started_at: float | None = None
         self._resolved_task_timeout: float | None = None
         self._closed = False
         self._close_lock = threading.Lock()
@@ -220,16 +218,10 @@ class InteractiveSession:
         self.tool_context.blocked_tool_names = set(cfg.blocked_tool_names)
         harness_rules = _load_harness_rules(self.cwd)
         catalog = self.skill_registry.build_catalog_prompt()
-        acceptance_criteria = (
-            profile.acceptance_criteria()
-            if hasattr(profile, "acceptance_criteria")
-            else []
-        )
         prefix = PromptPrefixBuilder().build(
             profile_prompt=cfg.system_prompt,
             global_rules_docs=[harness_rules] if harness_rules is not None else [],
             skill_catalog=catalog,
-            acceptance_criteria=acceptance_criteria,
         )
         middlewares = list(cfg.middlewares)
         middlewares.append(ToolGuardMiddleware())
@@ -255,7 +247,6 @@ class InteractiveSession:
             tool_context=self.tool_context,
             stream_callback=self.stream_sink,
             prompt_cache_identity=prefix.cache_identity,
-            initial_planning_mode=cfg.initial_planning_mode,
         )
 
     def _load_mcp_tools(self) -> None:
@@ -331,13 +322,6 @@ class InteractiveSession:
             )
             slot.agent.update_tool_schemas(schemas)
 
-    def _sync_time_budget(self) -> None:
-        if self.agent is None:
-            return
-        for mw in self.agent.middlewares:
-            if isinstance(mw, TimeBudgetMiddleware):
-                mw.sync_start_time(self._started_at)
-
     def _apply_profile_task_timeout(self, user_prompt: str) -> None:
         if self.agent is None:
             return
@@ -372,12 +356,6 @@ class InteractiveSession:
             return
         self._resolved_task_timeout = timeout
         self.agent.time_budget = timeout
-        for mw in self.agent.middlewares:
-            if isinstance(mw, TimeBudgetMiddleware):
-                mw.budget_seconds = timeout
-                mw._warned = False
-                mw._critical = False
-                mw.sync_start_time(self._started_at)
         if self.event_bus is not None:
             self.event_bus.emit(
                 "task_timeout_resolved",
@@ -630,7 +608,6 @@ class InteractiveSession:
             self.tool_context.agent_coordinator.close,
             order=30,
         )
-        self._started_at = time.time()
         self._activate_profile_runtime(self.profile.name())
         self.event_bus.emit(
             "session_started",
@@ -695,7 +672,6 @@ class InteractiveSession:
         self.conversation = slot.conversation
         # Profile handoff messages used to split the conversation and hide
         # history. Approved plans are now carried by the execution turn itself.
-        self._sync_time_budget()
         return created
 
     def _submit_to_current_agent(

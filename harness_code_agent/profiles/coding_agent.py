@@ -4,37 +4,19 @@ Coding Agent profile - product-oriented local coding assistant.
 This profile is the default for the explicit `harness run` product command. It
 keeps the single-owner main-agent model while sharing the same runtime
 permissions, workspace snapshots, session events, and planning tools as the
-benchmark profiles.
+terminal profile.
 """
 from __future__ import annotations
 
-from typing import ClassVar
-
-from ..runtime.middleware import (
-    PreExitVerificationMiddleware,
-)
 from ..tracking_policy import TASK_TRACKING_POLICY
 from .base import (
     AgentConfig,
     BaseProfile,
-    build_execution_middlewares,
     build_profile_prompt,
 )
 
 
 class CodingAgentProfile(BaseProfile):
-    _DEFAULTS: ClassVar[dict] = {
-        "task_budget": 3600,
-        "loop_file_edit_threshold": 5,
-        "loop_command_repeat_threshold": 3,
-        "acceptance_review_timeout": 10.0,
-        "time_warn_threshold": 0.60,
-        "time_critical_threshold": 0.85,
-    }
-
-    def _get(self, key: str):
-        return self.cfg.resolve(key, self.name(), self._DEFAULTS[key])
-
     def name(self) -> str:
         return "coding-agent"
 
@@ -68,37 +50,11 @@ class CodingAgentProfile(BaseProfile):
                     "user explicitly requests them."
                 ),
                 completion=(
-                    "Check the original request against actual files and fresh command output. Run focused "
-                    "verification in proportion to risk, fix failures that are in scope, and report exactly "
-                    "what changed, what ran, and what remains unverified. In tracked mode, record the "
-                    "same facts in the final planning update."
+                    "Inspect the relevant repository state before editing and make the required "
+                    "changes yourself. Check the original request against actual files and fresh "
+                    "command output. Run focused verification in proportion to risk, fix failures "
+                    "that are in scope, and report exactly what changed, what ran, and what remains "
+                    "unverified."
                 ),
             ),
-            middlewares=build_execution_middlewares(
-                task_budget=self._get("task_budget"),
-                loop_file_edit_threshold=self._get("loop_file_edit_threshold"),
-                loop_command_repeat_threshold=self._get("loop_command_repeat_threshold"),
-                time_warn_threshold=self._get("time_warn_threshold"),
-                time_critical_threshold=self._get("time_critical_threshold"),
-                enforce_acceptance=True,
-                acceptance_review_timeout=self._get("acceptance_review_timeout"),
-                extra_before_time_budget=[
-                    PreExitVerificationMiddleware(
-                        verification_prompt=(
-                            "Verify the original coding request against the repository state. "
-                            "Run the most relevant tests or checks available. If any check fails, fix it before stopping."
-                        ),
-                        include_task_requirements=True,
-                    ),
-                ],
-            ),
-            time_budget=self._get("task_budget"),
         )
-
-    def acceptance_criteria(self) -> list[str]:
-        return [
-            "The main agent inspected the relevant repository state before editing.",
-            "The main agent made any required code or test changes itself.",
-            "The main agent ran concrete verification commands.",
-            "The main agent checked verification output before stopping.",
-        ]

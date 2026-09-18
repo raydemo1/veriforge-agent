@@ -38,7 +38,6 @@ from .builtins.filesystem import (
 )
 from .builtins.interaction import ask_user
 from .builtins.memory_tools import memory_search, read_memory_file, remember_memory
-from .builtins.planning import update_plan_state
 from .builtins.registry import BUILTIN_TOOL_REGISTRY, TOOL_SCHEMAS
 from .builtins.schemas import BROWSER_TOOL_SCHEMAS, CORE_TOOL_SCHEMAS
 from .builtins.shell import (
@@ -48,6 +47,7 @@ from .builtins.shell import (
     run_bash,
     stop_shell_job,
 )
+from .builtins.todo import update_todo
 from .builtins.web import web_fetch, web_search
 from .execution_planner import (
     CallEffect,

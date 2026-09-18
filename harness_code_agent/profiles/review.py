@@ -16,7 +16,7 @@ from .base import AgentConfig, BaseProfile, build_profile_prompt
 
 
 class ReviewOnlyMiddleware(AgentMiddleware):
-    """Keep review mode from editing the real workspace or changing planning state."""
+    """Keep review mode from editing the real workspace or updating todo state."""
 
     def __init__(self, *, profile_label: str = "review profile"):
         self._profile_label = profile_label
@@ -24,7 +24,7 @@ class ReviewOnlyMiddleware(AgentMiddleware):
     _WRITE_OR_CONTROL_TOOLS: ClassVar[set] = {
         "write_file",
         "apply_patch",
-        "update_plan_state",
+        "update_todo",
         "ask_user",
     }
 
@@ -40,8 +40,8 @@ class ReviewOnlyMiddleware(AgentMiddleware):
             return ToolResult(
                 tool=tool_name,
                 status="failed",
-                output=f"[blocked] {self._profile_label} cannot modify workspace files, change planning state, or ask the user.",
-                error=f"{self._profile_label} cannot modify workspace files or control planning",
+                output=f"[blocked] {self._profile_label} cannot modify workspace files, update the todo list, or ask the user.",
+                error=f"{self._profile_label} cannot modify workspace files or update todo state",
                 metadata={"status_source": self._profile_label.replace(" ", "_")},
             )
         if tool_name == "run_bash":
@@ -80,10 +80,10 @@ class ReviewProfile(BaseProfile):
                     "location when available, explain the evidence and impact, and give a concrete recommendation."
                 ),
                 boundaries=(
-                    "Review mode is not repair mode or planning mode. Do not modify workspace files, update "
-                    "planning state, or ask the user to choose an implementation direction. You may run "
-                    "tests, browser checks, server checks, and diagnostics, but direct workspace writes "
-                    "remain blocked."
+                    "Review mode is not repair mode or planning mode. Do not modify workspace files, "
+                    "maintain an execution todo list, or ask the user to choose an implementation "
+                    "direction. You may run tests, browser checks, server checks, and diagnostics, "
+                    "but direct workspace writes remain blocked."
                 ),
                 completion=(
                     "Stop when the review surface has been examined deeply enough to support the findings. "
@@ -100,16 +100,8 @@ class ReviewProfile(BaseProfile):
             blocked_tool_names={
                 "write_file",
                 "apply_patch",
-                "update_plan_state",
+                "update_todo",
                 "ask_user",
             },
             middlewares=[ReviewOnlyMiddleware()],
         )
-
-    def acceptance_criteria(self) -> list[str]:
-        return [
-            "The review did not modify workspace files.",
-            "Findings, if any, are listed first and ordered by severity.",
-            "Each finding includes evidence, impact, and a concrete recommendation.",
-            "If no issues were found, the response says so clearly and names residual risk or test gaps.",
-        ]

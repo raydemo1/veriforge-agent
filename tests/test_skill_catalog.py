@@ -90,11 +90,11 @@ class SkillCatalogTests(unittest.TestCase):
             self.assertIn("Inspect the full issue before deciding.", invocation.prompt)
             self.assertIn("Arguments: 42", invocation.prompt)
 
-    def test_catalog_points_execution_tracking_to_runtime_state(self):
+    def test_catalog_points_execution_tracking_to_todo_tool(self):
         prompt = SkillRegistry().build_catalog_prompt()
 
-        self.assertIn("Task Tracking Self-Check", prompt)
-        self.assertIn("update_plan_state", prompt)
+        self.assertIn("update_todo", prompt)
+        self.assertNotIn("update_plan_state", prompt)
         self.assertNotIn("PRD.md", prompt)
         self.assertNotIn("skills/catalog/prd", prompt)
         self.assertNotIn('**vibe-execution-guard**: "', prompt)

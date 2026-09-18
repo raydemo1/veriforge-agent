@@ -61,15 +61,12 @@ class PromptPrefixBuilder:
         profile_prompt: str,
         global_rules_docs: list[GlobalRulesDoc] | None = None,
         skill_catalog: str = "",
-        acceptance_criteria: list[str] | None = None,
     ) -> StablePromptPrefix:
         global_rules_docs = global_rules_docs or []
-        criteria = acceptance_criteria or []
 
         global_rules_content = "\n\n".join(
             _global_rules_section(doc) for doc in global_rules_docs if doc.content.strip()
         )
-        criteria_content = "\n".join(f"- {item}" for item in criteria) or "- Verify the task requirements before stopping."
 
         sections = [
             ("Agent Identity and Judgment", SHARED_AGENT_IDENTITY.strip()),
@@ -77,7 +74,6 @@ class PromptPrefixBuilder:
         ]
         if global_rules_content:
             sections.append(("Global Rules Bundle", global_rules_content))
-        sections.append(("Profile Acceptance Criteria", criteria_content))
         if skill_catalog.strip():
             sections.append(("Stable Skill Catalog", skill_catalog.strip()))
 
@@ -90,7 +86,6 @@ class PromptPrefixBuilder:
             "profile_prompt_hash": _hash_text(profile_prompt),
             "global_rules_hash": _hash_text(global_hash_payload),
             "skill_catalog_hash": _hash_text(skill_catalog),
-            "acceptance_criteria_hash": _hash_text(criteria_content),
             "stable_prefix_hash": _hash_text(content),
         }
         return StablePromptPrefix(content=content, hashes=hashes)

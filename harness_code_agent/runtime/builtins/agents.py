@@ -20,20 +20,35 @@ def spawn_agent(
     max_turns: int = 6,
     max_seconds: int = 300,
     tool_context: ToolContext | None = None,
+    cancellation_token=None,
 ) -> ToolResult:
     coordinator = _coordinator(tool_context)
-    result = coordinator.spawn(
-        name=name,
-        role=role,
-        task=task,
-        expected_output=expected_output,
-        allowed_paths=allowed_paths,
-        fork_turns=fork_turns,
-        model_intensity=model_intensity,
-        max_turns=max_turns,
-        max_seconds=max_seconds,
-    )
+    try:
+        result = coordinator.spawn(
+            name=name,
+            role=role,
+            task=task,
+            expected_output=expected_output,
+            allowed_paths=allowed_paths,
+            fork_turns=fork_turns,
+            model_intensity=model_intensity,
+            max_turns=max_turns,
+            max_seconds=max_seconds,
+            parent_cancellation_token=cancellation_token,
+        )
+    except ValueError as exc:
+        return _policy_error("spawn_agent", str(exc))
     return _result("spawn_agent", result)
+
+
+def _policy_error(tool: str, reason: str) -> ToolResult:
+    return ToolResult(
+        tool=tool,
+        status="failed",
+        output=f"[blocked] {reason}",
+        error=reason,
+        metadata={"status_source": "agent_policy"},
+    )
 
 
 def send_agent_message(agent_id: str, message: str, tool_context: ToolContext | None = None) -> ToolResult:

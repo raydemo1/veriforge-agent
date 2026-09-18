@@ -84,8 +84,7 @@ def _looks_like_system_path_write(
 
 
 def _allows_container_absolute_path_mutation(runtime_state) -> bool:
-    board = getattr(runtime_state, "task_board", None)
-    metadata = getattr(board, "task_metadata", {}) if board is not None else {}
+    metadata = getattr(runtime_state, "task_metadata", {}) or {}
     metadata = metadata if isinstance(metadata, dict) else {}
     permission_mode = (
         str(getattr(runtime_state, "permission_mode", "") or "")

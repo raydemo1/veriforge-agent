@@ -284,7 +284,8 @@ class NormalizationTests(unittest.TestCase):
 
 
 class FailureTrackerTests(unittest.TestCase):
-    def _observe(self, tracker, *, kind=FailureKind.INVALID_ARGUMENTS, tool="probe", message="bad"):
+    def _observe(self, tracker, *, kind=FailureKind.INVALID_ARGUMENTS, tool="probe",
+                 message="bad", args=None):
         result = ToolResult(
             tool=tool,
             status="failed",
@@ -293,7 +294,8 @@ class FailureTrackerTests(unittest.TestCase):
             metadata={"failure_kind": kind},
         )
         failure = ToolFailure.from_result(
-            tool_call_id="tc", tool_name=tool, result=result, intercepted=True
+            tool_call_id="tc", tool_name=tool, result=result,
+            intercepted=True, tool_args=args,
         )
         return tracker.observe(failure)
 
@@ -342,6 +344,70 @@ class FailureTrackerTests(unittest.TestCase):
 
         self.assertEqual(attempts, [1, 2, 3])
 
+    def test_identical_execution_failure_accumulates_by_fingerprint(self):
+        tracker = FailureTracker()
+
+        attempts = [
+            self._observe(
+                tracker,
+                kind=FailureKind.PROCESS_FAILED,
+                message="tests/test_x.py::test_a assert 1 == 2",
+                args={"command": "pytest tests/test_x.py"},
+            ).attempt
+            for _ in range(4)
+        ]
+
+        self.assertEqual(attempts, [1, 2, 3, 4])
+
+    def test_changed_error_signature_resets_execution_streak(self):
+        tracker = FailureTracker()
+
+        a1 = self._observe(
+            tracker, kind=FailureKind.PROCESS_FAILED,
+            message="ModuleNotFoundError: No module named 'numpy'",
+            args={"command": "pytest"},
+        )
+        a2 = self._observe(
+            tracker, kind=FailureKind.PROCESS_FAILED,
+            message="ModuleNotFoundError: No module named 'numpy'",
+            args={"command": "pytest"},
+        )
+        a3 = self._observe(
+            tracker, kind=FailureKind.PROCESS_FAILED,
+            message="AssertionError: expected 2 got 3",
+            args={"command": "pytest"},
+        )
+
+        self.assertEqual([a1.attempt, a2.attempt, a3.attempt], [1, 2, 1])
+        # Progressing failures are still task-visible and keep paying turn cost.
+        self.assertEqual(tracker.turn_failure_count, 3)
+
+    def test_changed_args_reset_execution_streak(self):
+        tracker = FailureTracker()
+
+        a1 = self._observe(
+            tracker, kind=FailureKind.PROCESS_FAILED, message="1 failed",
+            args={"command": "pytest tests/test_a.py"},
+        )
+        a2 = self._observe(
+            tracker, kind=FailureKind.PROCESS_FAILED, message="1 failed",
+            args={"command": "pytest tests/test_b.py"},
+        )
+
+        self.assertEqual([a1.attempt, a2.attempt], [1, 1])
+        self.assertNotEqual(a1.fingerprint, a2.fingerprint)
+
+    def test_protocol_streak_stays_coarse_across_messages(self):
+        tracker = FailureTracker()
+
+        attempts = [
+            self._observe(tracker, message=f"invalid value {i}").attempt
+            for i in range(3)
+        ]
+
+        self.assertEqual(attempts, [1, 2, 3])
+        self.assertEqual(tracker.turn_failure_count, 0)
+
     def test_success_clears_streak_and_reset_clears_everything(self):
         tracker = FailureTracker()
         self._observe(tracker)
@@ -363,7 +429,8 @@ class PolicyDecisionTests(unittest.TestCase):
         self.middleware = ToolFailurePolicyMiddleware(tool_registry=_FakeRegistry(_PROBE_SCHEMA))
         self.state = AgentRuntimeState()
 
-    def _observe(self, kind=FailureKind.INVALID_ARGUMENTS, *, tool="probe", message="bad"):
+    def _observe(self, kind=FailureKind.INVALID_ARGUMENTS, *, tool="probe",
+                 message="bad", args=None):
         result = ToolResult(
             tool=tool,
             status="failed",
@@ -372,7 +439,8 @@ class PolicyDecisionTests(unittest.TestCase):
             metadata={"failure_kind": kind},
         )
         failure = ToolFailure.from_result(
-            tool_call_id="tc", tool_name=tool, result=result, intercepted=True
+            tool_call_id="tc", tool_name=tool, result=result,
+            intercepted=True, tool_args=args,
         )
         return self.state.failures.observe(failure)
 
@@ -381,13 +449,13 @@ class PolicyDecisionTests(unittest.TestCase):
             failure, [], runtime_state=self.state, agent_name="main_agent"
         )
 
-    def test_schema_streak_retry_then_correction_then_stop(self):
+    def test_schema_streak_regenerate_then_correction_then_stop(self):
         first = self._decide(self._observe())
-        self.assertEqual(first.mode, FailureMode.AUTO_RETRY)
+        self.assertEqual(first.mode, FailureMode.REQUEST_REGENERATION)
         self.assertIsNone(first.message)
 
         second = self._decide(self._observe())
-        self.assertEqual(second.mode, FailureMode.AUTO_RETRY)
+        self.assertEqual(second.mode, FailureMode.REQUEST_REGENERATION)
         self.assertIn("Allowed arguments are exactly", second.message)
         self.assertIn("value: string (required)", second.message)
         self.assertIn("limit: integer", second.message)
@@ -409,10 +477,33 @@ class PolicyDecisionTests(unittest.TestCase):
         self.assertEqual(second.mode, FailureMode.STOP)
         self.assertEqual(second.stop_reason, "retry_budget_exhausted")
 
-    def test_tool_schema_error_stops_immediately(self):
-        action = self._decide(self._observe(FailureKind.TOOL_SCHEMA_ERROR))
-        self.assertEqual(action.mode, FailureMode.STOP)
-        self.assertEqual(action.stop_reason, "invalid_tool_definition")
+    def test_tool_schema_error_is_exposed_as_infrastructure_error(self):
+        first = self._decide(self._observe(FailureKind.TOOL_SCHEMA_ERROR))
+        self.assertEqual(first.mode, FailureMode.RETURN_TO_AGENT)
+        # The explanation is attached on the first occurrence: it is a
+        # tool-definition error, not an argument error the model could repair.
+        self.assertIn("invalid runtime schema", first.message)
+        self.assertIn("tool-definition error, not an argument error", first.message)
+        self.assertIn("Retrying the same call unchanged will not fix it", first.message)
+        self.assertIn("report the blocker", first.message)
+        # No substitute capability is ever suggested.
+        self.assertNotIn("another tool", first.message)
+        self.assertNotIn("different tool", first.message)
+        self.assertFalse(self.state.fallback.stop_requested)
+
+        # Repeating the broken tool keeps exposing the same infra error.
+        # No regeneration (the schema cannot change mid-turn), no stop.
+        actions = [
+            self._decide(self._observe(FailureKind.TOOL_SCHEMA_ERROR))
+            for _ in range(3)
+        ]
+        for action in actions:
+            self.assertEqual(action.mode, FailureMode.RETURN_TO_AGENT)
+            self.assertIn("tool-definition error", action.message)
+        self.assertFalse(self.state.fallback.stop_requested)
+        # Failures are still counted for observability, but nothing acts on
+        # the count as a circuit breaker.
+        self.assertEqual(self.state.failures.turn_failure_count, 4)
 
     def test_approval_denied_never_stops_or_counts(self):
         for _ in range(5):
@@ -421,31 +512,158 @@ class PolicyDecisionTests(unittest.TestCase):
         self.assertFalse(self.state.fallback.stop_requested)
         self.assertEqual(self.state.failures.turn_failure_count, 0)
 
-    def test_blocking_policy_visible_once_then_stops(self):
-        first = self._decide(self._observe(FailureKind.PERMISSION_DENIED))
+    def test_blocking_policy_exposes_once_then_guides_but_never_stops(self):
+        args = {"command": "grep -r secret ."}
+
+        first = self._decide(self._observe(FailureKind.POLICY_VIOLATION, args=args))
         self.assertEqual(first.mode, FailureMode.RETURN_TO_AGENT)
-        second = self._decide(self._observe(FailureKind.PERMISSION_DENIED))
-        self.assertEqual(second.mode, FailureMode.STOP)
-        self.assertEqual(second.stop_reason, "repeated_policy_failure")
-        self.assertEqual(second.stop_limit_type, "policy_failures")
+        self.assertIsNone(first.message)
+
+        second = self._decide(self._observe(FailureKind.POLICY_VIOLATION, args=args))
+        self.assertEqual(second.mode, FailureMode.RETURN_TO_AGENT)
+        self.assertIn("blocked by policy", second.message)
+        self.assertIn("2 identical attempts", second.message)
+        # Operation-level wording: comply or get permission, never "switch
+        # tool" (which would invite performing the same forbidden action via
+        # another tool).
+        self.assertNotIn("another tool", second.message)
+        self.assertNotIn("different tool", second.message)
+        self.assertIn("complies with the policy", second.message)
+
+        third = self._decide(self._observe(FailureKind.POLICY_VIOLATION, args=args))
+        self.assertEqual(third.mode, FailureMode.RETURN_TO_AGENT)
+        self.assertIn("3 identical attempts", third.message)
+
+        # The block itself already prevented the action: no turn kill.
+        self.assertFalse(self.state.fallback.stop_requested)
+        self.assertEqual(self.state.failures.turn_failure_count, 3)
+
+    def test_changed_blocked_call_resets_policy_streak(self):
+        first = self._decide(
+            self._observe(FailureKind.POLICY_VIOLATION, args={"command": "grep -r a ."})
+        )
+        self.assertIsNone(first.message)
+        guided = self._decide(
+            self._observe(FailureKind.POLICY_VIOLATION, args={"command": "grep -r a ."})
+        )
+        self.assertIsNotNone(guided.message)
+
+        # Different command shape is new information: streak restarts, so the
+        # next block is a plain exposure again.
+        changed = self._decide(
+            self._observe(FailureKind.POLICY_VIOLATION, args={"command": "grep -r b src"})
+        )
+        self.assertEqual(changed.mode, FailureMode.RETURN_TO_AGENT)
+        self.assertIsNone(changed.message)
+        self.assertFalse(self.state.fallback.stop_requested)
+        # The counter remains as observability; nothing stops on it.
+        self.assertEqual(self.state.failures.turn_failure_count, 3)
+
+    def test_many_policy_blocks_never_stop_without_a_global_budget(self):
+        args = {"command": "grep -r secret ."}
+        for _ in range(12):
+            action = self._decide(self._observe(FailureKind.POLICY_VIOLATION, args=args))
+            self.assertEqual(action.mode, FailureMode.RETURN_TO_AGENT)
+        self.assertFalse(self.state.fallback.stop_requested)
 
     def test_execution_failures_are_always_returned_without_message(self):
         action = self._decide(self._observe(FailureKind.PROCESS_FAILED, message="exit 1"))
         self.assertEqual(action.mode, FailureMode.RETURN_TO_AGENT)
         self.assertIsNone(action.message)
 
-    def test_turn_failure_budget_circuit_breaker(self):
-        self.state.failures.turn_failure_count = 9
-        action = self._decide(self._observe(FailureKind.PROCESS_FAILED))
-        self.assertEqual(action.mode, FailureMode.STOP)
-        self.assertEqual(action.stop_reason, "turn_failure_budget_exhausted")
-        self.assertEqual(action.stop_limit_type, "turn_failures")
-        self.assertEqual(action.stop_limit, 10)
+    def test_identical_execution_failure_guides_third_and_keeps_guiding(self):
+        args = {"command": "pytest tests/test_x.py"}
+        message = "tests/test_x.py::test_a assert 1 == 2"
 
-    def test_protocol_failure_does_not_trigger_exhausted_turn_budget(self):
+        first = self._decide(self._observe(FailureKind.PROCESS_FAILED, message=message, args=args))
+        second = self._decide(self._observe(FailureKind.PROCESS_FAILED, message=message, args=args))
+        third = self._decide(self._observe(FailureKind.PROCESS_FAILED, message=message, args=args))
+
+        self.assertEqual(first.mode, FailureMode.RETURN_TO_AGENT)
+        self.assertIsNone(first.message)
+        self.assertEqual(second.mode, FailureMode.RETURN_TO_AGENT)
+        self.assertIsNone(second.message)
+        # Third identical failure stays return_to_agent (never auto-replays),
+        # but carries an explicit do-not-repeat reminder.
+        self.assertEqual(third.mode, FailureMode.RETURN_TO_AGENT)
+        self.assertIsNotNone(third.message)
+        self.assertIn("3 times in a row", third.message)
+        self.assertIn("probe", third.message)
+
+        # Further identical repeats keep guiding; they never kill the turn.
+        fourth = self._decide(self._observe(FailureKind.PROCESS_FAILED, message=message, args=args))
+        self.assertEqual(fourth.mode, FailureMode.RETURN_TO_AGENT)
+        self.assertIsNotNone(fourth.message)
+        self.assertEqual(fourth.stop_reason, "")
+        self.assertFalse(self.state.fallback.stop_requested)
+
+    def test_progressing_execution_errors_never_trigger_streak_action(self):
+        messages = [
+            "ModuleNotFoundError: No module named 'numpy'",
+            "ModuleNotFoundError: No module named 'pandas'",
+            "SyntaxError: invalid syntax",
+            "AssertionError: expected 2 got 3",
+        ]
+
+        actions = [
+            self._decide(
+                self._observe(
+                    FailureKind.PROCESS_FAILED,
+                    message=msg,
+                    args={"command": "pytest"},
+                )
+            )
+            for msg in messages
+        ]
+
+        for action in actions:
+            self.assertEqual(action.mode, FailureMode.RETURN_TO_AGENT)
+            self.assertIsNone(action.message)
+        self.assertFalse(self.state.fallback.stop_requested)
+        self.assertEqual(self.state.failures.turn_failure_count, 4)
+
+    def test_progressing_args_never_trigger_streak_action(self):
+        actions = [
+            self._decide(
+                self._observe(
+                    FailureKind.PROCESS_FAILED,
+                    message="1 failed",
+                    args={"command": f"pytest tests/test_{i}.py"},
+                )
+            )
+            for i in range(4)
+        ]
+
+        for action in actions:
+            self.assertEqual(action.mode, FailureMode.RETURN_TO_AGENT)
+            self.assertIsNone(action.message)
+        self.assertFalse(self.state.fallback.stop_requested)
+
+    def test_high_failure_count_does_not_stop_a_productively_changing_chain(self):
+        # A normal debugging chain produces many *different* failures: the
+        # global failure count is telemetry only, never a circuit breaker.
+        for index in range(12):
+            action = self._decide(
+                self._observe(
+                    FailureKind.PROCESS_FAILED,
+                    message=f"distinct error {index}",
+                    args={"command": f"pytest tests/test_{index}.py"},
+                )
+            )
+            self.assertEqual(action.mode, FailureMode.RETURN_TO_AGENT)
+            self.assertIsNone(action.message)
+        self.assertFalse(self.state.fallback.stop_requested)
+
+    def test_high_failure_count_alone_never_stops_even_identical_failures(self):
+        self.state.failures.turn_failure_count = 99
+        action = self._decide(self._observe(FailureKind.PROCESS_FAILED))
+        self.assertEqual(action.mode, FailureMode.RETURN_TO_AGENT)
+        self.assertEqual(action.stop_reason, "")
+
+    def test_protocol_failure_unaffected_by_high_turn_count(self):
         self.state.failures.turn_failure_count = 10
         action = self._decide(self._observe(FailureKind.INVALID_ARGUMENTS))
-        self.assertEqual(action.mode, FailureMode.AUTO_RETRY)
+        self.assertEqual(action.mode, FailureMode.REQUEST_REGENERATION)
 
     def test_subagent_is_not_policy_governed(self):
         action = self.middleware.on_tool_failure(
@@ -649,7 +867,7 @@ class FailureObservabilityTests(unittest.TestCase):
         self.assertEqual([item["attempt"] for item in decisions], [1, 2, 3])
         self.assertEqual(
             [item["mode"] for item in decisions],
-            [FailureMode.AUTO_RETRY, FailureMode.AUTO_RETRY, FailureMode.STOP],
+            [FailureMode.REQUEST_REGENERATION, FailureMode.REQUEST_REGENERATION, FailureMode.STOP],
         )
         for item in decisions:
             self.assertEqual(item["tool"], "probe")
@@ -665,7 +883,7 @@ class FailureObservabilityTests(unittest.TestCase):
         self.assertEqual(decisions[1]["stop_reason"], "")
         self.assertEqual(decisions[2]["stop_reason"], "retry_budget_exhausted")
 
-    def test_middleware_activity_outcomes_track_retried_guided_stopped(self):
+    def test_middleware_activity_outcomes_track_regenerated_guided_stopped(self):
         with tempfile.TemporaryDirectory() as tmp:
             _conversation, context, _registry = _run_schema_streak(Path(tmp))
 
@@ -675,7 +893,7 @@ class FailureObservabilityTests(unittest.TestCase):
         ]
         self.assertEqual(
             [item["outcome"] for item in activities],
-            ["retried", "guided", "stopped"],
+            ["regenerated", "guided", "stopped"],
         )
         for item in activities:
             self.assertIn("ToolFailurePolicyMiddleware", item["sources"])
@@ -696,7 +914,7 @@ class FailureObservabilityTests(unittest.TestCase):
         self.assertEqual(len(decisions), 3)
         self.assertEqual(
             [(line["attempt"], line["mode"]) for line in decisions],
-            [(1, FailureMode.AUTO_RETRY), (2, FailureMode.AUTO_RETRY), (3, FailureMode.STOP)],
+            [(1, FailureMode.REQUEST_REGENERATION), (2, FailureMode.REQUEST_REGENERATION), (3, FailureMode.STOP)],
         )
         final = decisions[-1]
         self.assertEqual(final["kind"], "invalid_arguments")
@@ -792,7 +1010,7 @@ class FailureObservabilityTests(unittest.TestCase):
             [event for event in context.event_bus.events if event.type == "tool_failure_decision"]
         )
 
-    def test_guard_blocks_are_stopped_by_failure_policy_on_second_batch(self):
+    def test_guard_blocks_are_exposed_and_guided_but_never_stop(self):
         spy = FailureSpyMiddleware()
         with tempfile.TemporaryDirectory() as tmp:
             conversation, context = _conversation(
@@ -809,17 +1027,31 @@ class FailureObservabilityTests(unittest.TestCase):
                 conversation.run_until_idle()
             state = conversation.runtime_state
 
-        self.assertEqual([failure.attempt for failure in spy.calls], [1, 2])
-        self.assertTrue(state.fallback.stop_requested)
-        self.assertEqual(state.fallback.stop_reason, "repeated_policy_failure")
-        self.assertEqual(state.fallback.stop_limit_type, "policy_failures")
+        self.assertEqual([failure.attempt for failure in spy.calls], [1, 2, 3])
+        # A blocked call is already prevented; repetition only adds guidance,
+        # never a stop.
+        self.assertFalse(state.fallback.stop_requested)
         decision = [
             event.payload for event in context.event_bus.events
             if event.type == "tool_failure_decision"
         ]
-        self.assertEqual([item["mode"] for item in decision],
-                         [FailureMode.RETURN_TO_AGENT, FailureMode.STOP])
+        self.assertEqual(
+            [item["mode"] for item in decision],
+            [
+                FailureMode.RETURN_TO_AGENT,
+                FailureMode.RETURN_TO_AGENT,
+                FailureMode.RETURN_TO_AGENT,
+            ],
+        )
         self.assertEqual(decision[-1]["kind"], FailureKind.POLICY_VIOLATION)
+        # Guidance is injected as user-role messages: none on the first
+        # identical block, one for each repeated block.
+        guidance = [
+            msg["content"]
+            for msg in conversation.messages
+            if msg.get("role") == "user" and "blocked by policy" in str(msg.get("content"))
+        ]
+        self.assertEqual(len(guidance), 2)
 
     def test_parallel_guard_blocks_in_one_batch_do_not_stop(self):
         spy = FailureSpyMiddleware()

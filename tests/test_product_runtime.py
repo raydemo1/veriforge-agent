@@ -684,13 +684,6 @@ class ProductRuntimeTests(unittest.TestCase):
             {"type": "tool_result", "payload": {"tool": "read_file"}},
             {"type": "tool_result", "payload": {"tool": "read_file"}},
         ]
-        final_plan_update = [{
-            "type": "tool_result",
-            "payload": {
-                "tool": "update_plan_state",
-                "metadata": {"planning_state": {"update_kind": "final"}},
-            },
-        }]
 
         self.assertFalse(should_summarize_turn(simple, profile_name="coding-agent", duration_seconds=1))
         self.assertFalse(should_summarize_turn(three_tools, profile_name="plan", duration_seconds=1))
@@ -699,7 +692,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertTrue(should_summarize_turn([{"type": "tool_result", "payload": {"tool": "run_bash"}}], profile_name="coding-agent", duration_seconds=1))
         self.assertTrue(should_summarize_turn([{"type": "agent_fallback", "payload": {"reason": "max_iterations"}}], profile_name="coding-agent", duration_seconds=1))
         self.assertTrue(should_summarize_turn(simple, profile_name="coding-agent", duration_seconds=45))
-        self.assertTrue(should_summarize_turn(final_plan_update, profile_name="coding-agent", duration_seconds=1))
 
     def test_generate_turn_summary_uses_configured_fast_profile(self):
         from harness_code_agent import config
@@ -1253,7 +1245,7 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertEqual(result.status, "success")
         self.assertFalse(dead_shell.closed)
 
-    def test_run_bash_accepts_explicit_expected_nonzero_exit_code(self):
+    def test_run_bash_reports_nonzero_exit_as_success_with_exit_code_footer(self):
         from harness_code_agent.runtime import tools
 
         class ExpectedFailureShell:
@@ -1270,14 +1262,13 @@ class ProductRuntimeTests(unittest.TestCase):
         with patch("harness_code_agent.workspace.shell_session.PersistentShellSession", return_value=shell):
             result = tools.run_bash(
                 'python focusflow.py "Task" 0',
-                expected_exit_codes=[2],
                 runtime_state=SimpleNamespace(shell_job_manager=None),
             )
 
         self.assertEqual(result.status, "success")
+        self.assertIsNone(result.error)
         self.assertEqual(result.return_code, 2)
-        self.assertTrue(result.metadata["exit_code_expected"])
-        self.assertEqual(result.metadata["expected_exit_codes"], [2])
+        self.assertIn("[exit_code: 2]", result.output)
 
     def test_run_bash_uses_one_shot_shell_for_powershell_exit(self):
         from unittest.mock import Mock
@@ -1310,7 +1301,7 @@ class ProductRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(result.status, "success")
-        self.assertEqual(result.output, "ready")
+        self.assertEqual(result.output, "ready\n\n[exit_code: 0]")
         one_shot.assert_called_once()
         persistent_shell.run.assert_not_called()
 
@@ -2357,7 +2348,10 @@ class ProductRuntimeTests(unittest.TestCase):
         repo_search_decision = workspace_policy.decide_tool_call("repo_search", {"pattern": "needle"})
         agent_decision = workspace_policy.decide_tool_call("spawn_agent", {"role": "explorer"})
         edit_decision = workspace_policy.decide_tool_call("write_file", {"path": "x.txt"})
-        plan_decision = workspace_policy.decide_tool_call("update_plan_state", {"mode": "tracked"})
+        todo_decision = workspace_policy.decide_tool_call(
+            "update_todo",
+            {"items": [{"text": "do work", "status": "in_progress"}]},
+        )
         safe_shell_decision = workspace_policy.decide_tool_call(
             "run_bash",
             {"command": "git status --short"},
@@ -2396,7 +2390,10 @@ class ProductRuntimeTests(unittest.TestCase):
         llm_read_decision = llm_auto_policy.decide_tool_call("read_file", {"path": "x.txt"})
         llm_repo_search_decision = llm_auto_policy.decide_tool_call("repo_search", {"pattern": "needle"})
         llm_edit_decision = llm_auto_policy.decide_tool_call("write_file", {"path": "x.txt"})
-        llm_plan_decision = llm_auto_policy.decide_tool_call("update_plan_state", {"mode": "tracked"})
+        llm_todo_decision = llm_auto_policy.decide_tool_call(
+            "update_todo",
+            {"items": [{"text": "do work", "status": "in_progress"}]},
+        )
         llm_safe_shell_decision = llm_auto_policy.decide_tool_call(
             "run_bash",
             {"command": "git status --short"},
@@ -2434,7 +2431,7 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertTrue(repo_search_decision.allowed)
         self.assertTrue(agent_decision.allowed)
         self.assertTrue(edit_decision.allowed)
-        self.assertTrue(plan_decision.allowed)
+        self.assertTrue(todo_decision.allowed)
         self.assertTrue(safe_shell_decision.allowed)
         self.assertTrue(risky_shell_decision.requires_approval)
         self.assertEqual(risky_shell_decision.risk, "shell_risky")
@@ -2452,7 +2449,7 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertTrue(llm_read_decision.allowed)
         self.assertTrue(llm_repo_search_decision.allowed)
         self.assertTrue(llm_edit_decision.allowed)
-        self.assertTrue(llm_plan_decision.allowed)
+        self.assertTrue(llm_todo_decision.allowed)
         self.assertTrue(llm_safe_shell_decision.allowed)
         self.assertTrue(llm_risky_shell_decision.requires_approval)
         self.assertTrue(llm_unknown_decision.requires_approval)
@@ -3340,6 +3337,54 @@ class ProductRuntimeTests(unittest.TestCase):
 
             self.assertIsNone(result)
 
+    def test_static_verifier_git_baseline_ignores_preexisting_dirty_files(self):
+        import subprocess
+
+        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, check=False)
+            (root / "ok.py").write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, check=False)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, check=False)
+            # Broken file is already dirty *before* the turn starts.
+            (root / "bad.py").write_text("def f(\n", encoding="utf-8")
+
+            mw = StaticVerifierMiddleware(workspace_root=str(root))
+            mw.begin_turn("task", messages=[])
+            result = mw.pre_exit(messages=[])
+
+            self.assertIsNone(result)
+
+    def test_static_verifier_catches_shell_written_file_via_git_delta(self):
+        import subprocess
+
+        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, check=False)
+            (root / "ok.py").write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, check=False)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, check=False)
+
+            mw = StaticVerifierMiddleware(workspace_root=str(root))
+            mw.begin_turn("task", messages=[])
+            # A file created out-of-band (e.g. via run_bash) — no workspace
+            # service, no change journal, only the git delta can see it.
+            (root / "bad.py").write_text("def f(\n", encoding="utf-8")
+
+            with patch(
+                "harness_code_agent.runtime.middleware.verification._check_ruff",
+                return_value=[],
+            ):
+                result = mw.pre_exit(messages=[])
+
+            self.assertIsNotNone(result)
+            self.assertIn("LINT CHECK FAILED", result)
+            self.assertIn("bad.py", result)
+
     def test_static_verifier_blocks_syntax_error_from_current_turn_workspace_change(self):
         from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
         from harness_code_agent.workspace.service import WorkspaceService
@@ -3351,7 +3396,11 @@ class ProductRuntimeTests(unittest.TestCase):
             mw.begin_turn("task", messages=[])
             workspace.write_text("bad.py", "def f(\n")
 
-            result = mw.pre_exit(messages=[])
+            with patch(
+                "harness_code_agent.runtime.middleware.verification._check_ruff",
+                return_value=[],
+            ):
+                result = mw.pre_exit(messages=[])
 
             self.assertIsNotNone(result)
             self.assertIn("LINT CHECK FAILED", result)
@@ -3369,8 +3418,8 @@ class ProductRuntimeTests(unittest.TestCase):
             workspace.write_text("warn.py", "x = 1\n")
 
             with patch(
-                "harness_code_agent.runtime.middleware.verification._check_ruff_diff",
-                return_value=[("warn.py", "W292", "no newline at end of file")],
+                "harness_code_agent.runtime.middleware.verification._check_ruff",
+                return_value=[("warn.py", "W292", "no newline at end of file", 1)],
             ):
                 first = mw.pre_exit(messages=[])
                 second = mw.pre_exit(messages=[])
@@ -3378,6 +3427,69 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertIsNotNone(first)
             self.assertIn("Lint warnings", first)
             self.assertIsNone(second)
+
+    def test_static_verifier_ruff_blocks_error_findings_scoped_to_turn_files(self):
+        import json
+        from unittest.mock import MagicMock
+
+        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+        from harness_code_agent.workspace.service import WorkspaceService
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "old.py").write_text("x = 1\n", encoding="utf-8")  # pre-existing
+            workspace = WorkspaceService(root=root)
+            mw = StaticVerifierMiddleware(workspace_root=str(root), workspace=workspace)
+            mw.begin_turn("task", messages=[])
+            workspace.write_text("new.py", "value = 1\n")
+
+            payload = json.dumps([
+                {
+                    "code": "F821",
+                    "message": "Undefined name `value`",
+                    "filename": str(root / "new.py"),
+                    "location": {"row": 3, "column": 1},
+                }
+            ])
+            fake_run = MagicMock(return_value=SimpleNamespace(
+                returncode=1, stdout=payload, stderr="",
+            ))
+            with patch(
+                "harness_code_agent.runtime.middleware.verification.subprocess.run",
+                fake_run,
+            ):
+                result = mw.pre_exit(messages=[])
+
+            self.assertIsNotNone(result)
+            self.assertIn("LINT CHECK FAILED", result)
+            self.assertIn("F821", result)
+            self.assertIn("new.py:3", result)
+            # Ruff only ever sees the current-turn file, never the whole tree.
+            argv = fake_run.call_args.args[0]
+            self.assertIn("new.py", argv)
+            self.assertNotIn("old.py", argv)
+
+    def test_static_verifier_ruff_unusable_output_does_not_block_exit(self):
+        from unittest.mock import MagicMock
+
+        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+        from harness_code_agent.workspace.service import WorkspaceService
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceService(root=root)
+            mw = StaticVerifierMiddleware(workspace_root=str(root), workspace=workspace)
+            mw.begin_turn("task", messages=[])
+            workspace.write_text("ok.py", "x = 1\n")
+
+            fake_run = MagicMock(return_value=SimpleNamespace(
+                returncode=1, stdout="this is not json", stderr="",
+            ))
+            with patch(
+                "harness_code_agent.runtime.middleware.verification.subprocess.run",
+                fake_run,
+            ):
+                self.assertIsNone(mw.pre_exit(messages=[]))
 
     def test_static_verifier_skips_non_python_files(self):
         import subprocess
@@ -3396,18 +3508,36 @@ class ProductRuntimeTests(unittest.TestCase):
 
             self.assertIsNone(result)
 
-    def test_static_verifier_ruff_diff_not_installed_gracefully_skips(self):
+    def test_check_ruff_not_installed_gracefully_skips(self):
         from unittest.mock import patch as _patch
 
-        from harness_code_agent.runtime.middlewares import _check_ruff_diff
+        from harness_code_agent.runtime.middlewares import _check_ruff
 
         def fake_run(*a, **kw):
             raise FileNotFoundError
 
         with _patch("subprocess.run", side_effect=fake_run):
-            result = _check_ruff_diff("/tmp")
+            result = _check_ruff("/tmp", ["x.py"])
 
         self.assertEqual(result, [])
+
+    def test_check_ruff_timeout_is_non_blocking_warning(self):
+        import subprocess
+
+        from unittest.mock import patch as _patch
+
+        from harness_code_agent.runtime.middlewares import _check_ruff
+
+        def fake_run(*a, **kw):
+            raise subprocess.TimeoutExpired(cmd="ruff", timeout=30)
+
+        with _patch("subprocess.run", side_effect=fake_run):
+            result = _check_ruff("/tmp", ["x.py"])
+
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0][1].startswith("RUFF"))
+        self.assertNotIn("E", result[0][1][:1])
+        self.assertNotIn("F", result[0][1][:1])
 
     # ------------------------------------------------------------------
     # safe_args_preview
@@ -3466,31 +3596,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn('"jwt": "[redacted]"', result)
         self.assertIn('"token": "[redacted]"', result)
         self.assertNotIn("short-secret", result)
-
-    # ------------------------------------------------------------------
-    # _file_warned reset per turn
-    # ------------------------------------------------------------------
-
-    def test_loop_detection_file_warned_resets_per_turn(self):
-        from harness_code_agent.runtime.middlewares import LoopDetectionMiddleware
-
-        mw = LoopDetectionMiddleware(file_edit_threshold=2)
-
-        # First turn — writes to file twice, triggers warning
-        mw.begin_turn("task 1", [])
-        self.assertEqual(len(mw._file_warned), 0)
-
-        mw.post_tool("write_file", {"path": "a.py", "content": "x"}, _result("ok"), [])
-        mw.post_tool("write_file", {"path": "a.py", "content": "y"}, _result("ok"), [])
-        self.assertIn("a.py", mw._file_warned)
-
-        # Next turn — _file_warned is cleared, same file triggers warning again
-        mw.begin_turn("task 2", [])
-        self.assertEqual(len(mw._file_warned), 0)
-
-        mw.post_tool("write_file", {"path": "a.py", "content": "z"}, _result("ok"), [])
-        mw.post_tool("write_file", {"path": "a.py", "content": "w"}, _result("ok"), [])
-        self.assertIn("a.py", mw._file_warned)
 
 
 if __name__ == "__main__":
