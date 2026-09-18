@@ -34,7 +34,7 @@ class TranscriptBlock:
 
 
 @dataclass(frozen=True)
-class PlanStep:
+class TodoStep:
     text: str
     status: str
 
@@ -43,7 +43,7 @@ class PlanStep:
 class TuiState:
     snapshot: SessionStatusSnapshot
     blocks: list[TranscriptBlock] = field(default_factory=list)
-    plan_steps: list[PlanStep] = field(default_factory=list)
+    todo_steps: list[TodoStep] = field(default_factory=list)
     active_tool_blocks: dict[str, list[TranscriptBlock]] = field(default_factory=dict)
     tool_call_counter: int = 0
     active_thought_block: TranscriptBlock | None = None
@@ -243,13 +243,13 @@ class TuiState:
         status = str(payload.get("status", "unknown"))
         if tool == "ask_user":
             return None
-        if tool == "update_plan_state" and status == "success":
-            self._update_plan_steps_from_metadata(payload.get("metadata"))
+        if tool == "update_todo" and status == "success":
+            self._update_todo_steps_from_metadata(payload.get("metadata"))
             self.snapshot.status = "running"
             return TranscriptBlock(
-                "plan",
-                "计划",
-                _format_plan_steps(self.plan_steps),
+                "todo",
+                "待办",
+                _format_todo_steps(self.todo_steps),
                 "updated",
                 turn=self.snapshot.turn,
             )
@@ -257,7 +257,7 @@ class TuiState:
         error = str(payload.get("error") or "")
         return_code = payload.get("return_code")
         parts = []
-        if return_code is not None and status != "success":
+        if return_code not in (None, 0):
             parts.append(f"退出码 {return_code}")
         body = "  ".join(parts)
         if error:
@@ -293,37 +293,26 @@ class TuiState:
             body += f"\n执行工具：{tool}"
         return TranscriptBlock("failure", "错误", body, "failed", turn=self.snapshot.turn)
 
-    def _update_plan_steps_from_metadata(self, metadata: Any) -> None:
+    def _update_todo_steps_from_metadata(self, metadata: Any) -> None:
         if not isinstance(metadata, dict):
             return
-        planning_state = metadata.get("planning_state")
-        if not isinstance(planning_state, dict):
+        todo_state = metadata.get("todo_state")
+        if not isinstance(todo_state, dict):
+            return
+        raw_items = todo_state.get("items")
+        if not isinstance(raw_items, list):
             return
 
-        raw_steps = planning_state.get("steps")
-        if not isinstance(raw_steps, list):
-            return
-        steps = [str(step).strip() for step in raw_steps if str(step).strip()]
-        current_step = str(planning_state.get("current_step") or "").strip()
-        raw_completed_steps = planning_state.get("completed_steps")
-        if not isinstance(raw_completed_steps, list):
-            raw_completed_steps = []
-        completed_steps = {
-            str(step).strip()
-            for step in raw_completed_steps
-            if str(step).strip()
-        }
-
-        plan_steps: list[PlanStep] = []
-        for step in steps:
-            if step in completed_steps:
-                status = "completed"
-            elif step == current_step:
-                status = "current"
-            else:
-                status = "pending"
-            plan_steps.append(PlanStep(step, status))
-        self.plan_steps = plan_steps
+        todo_steps: list[TodoStep] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            text = str(raw.get("text") or "").strip()
+            if not text:
+                continue
+            status = str(raw.get("status") or "pending").strip()
+            todo_steps.append(TodoStep(text, status))
+        self.todo_steps = todo_steps
 
 
 _FILE_OPERATION_LABELS = {
@@ -442,7 +431,7 @@ _TOOL_PRIMARY_ARGS = {
     "web_fetch": "url",
 }
 
-_HIDDEN_TOOL_CALLS = {"ask_user", "update_plan_state"}
+_HIDDEN_TOOL_CALLS = {"ask_user", "update_todo"}
 
 _TOOL_DISPLAY_LABELS = {
     "list_files": "查看目录",
@@ -515,11 +504,12 @@ _TOOL_RESULT_LABELS = {
 }
 
 
-def _format_plan_steps(steps: list[PlanStep]) -> str:
+def _format_todo_steps(steps: list[TodoStep]) -> str:
     markers = {
         "completed": "✓",
-        "current": "›",
+        "in_progress": "›",
         "pending": "○",
+        "cancelled": "—",
     }
     return "\n".join(f"{markers.get(step.status, '○')} {step.text}" for step in steps)
 

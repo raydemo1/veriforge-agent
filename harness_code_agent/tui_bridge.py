@@ -492,6 +492,7 @@ class BridgeServer:
             "error": "error",
             "failure": "error",
             "plan": "plan",
+            "todo": "todo",
             "user": "user",
             "file": "file",
             "thought": "thought",

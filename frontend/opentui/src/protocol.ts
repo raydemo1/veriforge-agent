@@ -40,7 +40,7 @@ export type SubmitResult = {
 export type CommandItem = { name: string; description: string; category?: string };
 export type TranscriptItem = {
   id: string;
-  kind: "user" | "assistant" | "tool" | "status" | "plan" | "error" | "file" | "thought" | "profile";
+  kind: "user" | "assistant" | "tool" | "status" | "plan" | "todo" | "error" | "file" | "thought" | "profile";
   title: string;
   body: string;
   state?: "running" | "success" | "failed" | "pending" | "changed";
