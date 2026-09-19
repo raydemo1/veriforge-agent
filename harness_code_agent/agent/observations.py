@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,12 +15,23 @@ from ..runtime.shell_classification import (
 )
 from ..runtime.tool_result import ToolResult
 
+log = logging.getLogger("harness")
+
 FRESH_DETAIL_LIMIT = 12_000
 _OBS_ID_PREFIX = "[OBS "
 
 # Preview budget for compact tool-output refs: head + tail chars shown inline
 # when the full output is stored to file.
 PREVIEW_TOTAL_CHARS = 1000
+
+
+def observation_dir_for(root: str | Path, session_id: str | None) -> Path:
+    """Directory for observation files and streamed tool-output artifacts."""
+    safe_session_id = "".join(
+        ch if ch.isalnum() or ch in {"-", "_"} else "_"
+        for ch in str(session_id or "default")
+    )
+    return Path(root) / ".harness" / "observations" / safe_session_id
 
 
 def _output_preview(output: str) -> str:
@@ -53,6 +65,9 @@ class ToolObservation:
     output_hash: str
     created_at: float = field(default_factory=time.time)
     stale: bool = False
+    # True when raw_output_path is a tool-managed artifact adopted by the
+    # store (located inside the store directory, so safe to unlink later).
+    artifact_adopted: bool = False
 
 
 class FactTracker:
@@ -161,10 +176,32 @@ class ObservationStore:
         self._counter += 1
         obs_id = f"obs_{self._counter:04d}"
         output = result.to_text()
-        output_hash = hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()[:16]
-        raw_path = self.root / f"{obs_id}.txt"
-        raw_path.write_text(output, encoding="utf-8")
         resource_keys = fact_tracker.resource_keys_for(tool, args)
+        artifact_path = result.metadata.get("artifact_path")
+        adopted_path = self._adoptable_artifact(artifact_path)
+        if adopted_path is not None:
+            # The tool (e.g. run_bash) already streamed the full output to an
+            # artifact while it ran.  Adopt it instead of spilling a second
+            # copy; the short ToolResult text is only the preview.
+            raw_path = adopted_path
+            output_chars = int(result.metadata.get("output_chars") or len(output))
+            output_hash = str(
+                result.metadata.get("artifact_sha256")
+                or hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()
+            )[:16]
+        else:
+            if artifact_path:
+                # Untrusted/out-of-tree path: never adopt (the store unlinks
+                # old observations), fall back to the normal spill path.
+                log.warning(
+                    "Ignoring artifact_path outside observation store (%s not under %s)",
+                    artifact_path,
+                    self.root,
+                )
+            output_hash = hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()[:16]
+            raw_path = self.root / f"{obs_id}.txt"
+            raw_path.write_text(output, encoding="utf-8")
+            output_chars = len(output)
         observation = ToolObservation(
             id=obs_id,
             tool=tool,
@@ -174,12 +211,31 @@ class ObservationStore:
             resource_keys=resource_keys,
             observed_file_generations=fact_tracker.observed_file_generations(resource_keys),
             observed_workspace_generation=fact_tracker.workspace_generation,
-            output_chars=len(output),
+            output_chars=output_chars,
             output_hash=output_hash,
+            artifact_adopted=adopted_path is not None,
         )
         self.observations.append(observation)
         self._cleanup_old()
         return observation
+
+    def _adoptable_artifact(self, artifact_path: object) -> Path | None:
+        """Return a safe artifact path to adopt, else None.
+
+        Adoption means the store later owns and may unlink the file during
+        observation eviction, so the path must resolve to an existing file
+        inside the store directory — never an arbitrary external path.
+        """
+        if not artifact_path:
+            return None
+        try:
+            candidate = Path(str(artifact_path)).resolve(strict=False)
+            root = self.root.resolve()
+        except (OSError, ValueError):
+            return None
+        if not candidate.is_relative_to(root) or not candidate.is_file():
+            return None
+        return candidate
 
     def _cleanup_old(self) -> None:
         excess = len(self.observations) - self.MAX_OBSERVATIONS
@@ -196,6 +252,28 @@ class ObservationStore:
         output = result.to_text()
         from .. import config as _cfg
         inline_limit = getattr(_cfg, "TOOL_OUTPUT_INLINE_LIMIT", 4000)
+
+        if observation.artifact_adopted:
+            # Full output was streamed to the adopted artifact while the
+            # command ran; the ToolResult text is a bounded head+tail preview.
+            total_bytes = result.metadata.get("output_bytes", observation.output_chars)
+            return (
+                f"[OBS {observation.id} observed]\n"
+                f"tool: {observation.tool}\n"
+                f"args: {observation.args_summary}\n"
+                f"output_chars: {observation.output_chars}\n"
+                f"output_sha256: {observation.output_hash}\n"
+                f"resource_keys: {', '.join(observation.resource_keys) or 'none'}\n"
+                f"raw_output: {observation.raw_output_path}\n"
+                f"output_bytes: {total_bytes}\n"
+                f"summary: {observation.summary}\n"
+                "observation: Full output is stored in this artifact and the "
+                "command was not interrupted by its output volume; the "
+                "preview below shows head and tail only. "
+                "Read the artifact path if you need the middle, or rerun a "
+                "narrower command.\n\n"
+                + output
+            )
 
         if len(output) <= inline_limit:
             # Small output — full inline (existing path, unchanged)

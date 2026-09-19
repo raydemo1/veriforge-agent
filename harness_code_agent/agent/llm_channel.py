@@ -5,9 +5,12 @@ fallback, thought events) live apart from conversation orchestration.
 """
 from __future__ import annotations
 
+import datetime
 import logging
 import random
 import time
+from collections.abc import Callable
+from email.utils import parsedate_to_datetime
 
 from .. import config
 from .cancellation import CancelledError
@@ -15,6 +18,9 @@ from .providers import ProviderAdapter, client_scope
 from .utils import _usage_to_dict
 
 log = logging.getLogger("harness")
+
+# Upper bound for how long a single server-issued Retry-After may pause us.
+_RETRY_AFTER_CAP_SECONDS = 60.0
 
 
 class LlmStreamTimeoutError(TimeoutError):
@@ -48,18 +54,55 @@ def _is_retryable_llm_error(exc: BaseException) -> bool:
     return any(token in haystack for token in _RETRYABLE_ERROR_TOKENS)
 
 
-def _retry_delay(attempt: int) -> float:
-    """Exponential backoff capped at 20s plus a small jitter."""
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Parse a Retry-After header (delta-seconds or HTTP-date) from an error."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    value = headers.get("retry-after")
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return min(max(0.0, float(value)), _RETRY_AFTER_CAP_SECONDS)
+    except ValueError:
+        pass
+    try:
+        target = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if target.tzinfo is None:
+        return None
+    delta = (target - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    return min(max(0.0, delta), _RETRY_AFTER_CAP_SECONDS)
+
+
+def _retry_delay(attempt: int, exc: BaseException | None = None) -> float:
+    """Retry-After when the server provides one, else exp. backoff + jitter."""
+    if exc is not None:
+        retry_after = _retry_after_seconds(exc)
+        if retry_after is not None:
+            # Honour the server's wait, with a small de-sync jitter.
+            return retry_after + random.uniform(0.0, 0.25)
     return min(2.0 ** (attempt + 1), 20.0) + random.uniform(0.0, 0.5)
 
 
-def _call_with_retry(action, *, operation: str, attempts: int, cancellation_token=None):
+def _call_with_retry(
+    action,
+    *,
+    operation: str,
+    attempts: int,
+    cancellation_token=None,
+    is_retryable: Callable[[BaseException], bool] | None = None,
+):
     """Run ``action`` with bounded retries for retryable provider errors.
 
-    Application-level retries complement the OpenAI client's transport
-    retries: they cover error shapes the SDK surfaces directly (rate-limit
-    JSON, reset connections) and keep backoff visible in the logs.
+    The OpenAI client is configured with ``max_retries=0``; this function is
+    the single owner of transport/provider retry policy (429/5xx/connection
+    errors, Retry-After, exponential backoff with jitter).
     """
+    retryable = is_retryable or _is_retryable_llm_error
     attempts = max(1, int(attempts))
     last_exc: Exception | None = None
     for attempt in range(attempts):
@@ -73,9 +116,9 @@ def _call_with_retry(action, *, operation: str, attempts: int, cancellation_toke
             last_exc = exc
             if cancellation_token is not None and cancellation_token.is_cancelled:
                 raise CancelledError("Turn cancelled by user") from exc
-            if attempt + 1 >= attempts or not _is_retryable_llm_error(exc):
+            if attempt + 1 >= attempts or not retryable(exc):
                 raise
-            delay = _retry_delay(attempt)
+            delay = _retry_delay(attempt, exc)
             log.warning(
                 "%s hit a retryable provider error (attempt %d/%d), waiting %.1fs: %s",
                 operation,
@@ -84,7 +127,13 @@ def _call_with_retry(action, *, operation: str, attempts: int, cancellation_toke
                 delay,
                 exc,
             )
-            time.sleep(delay)
+            # Cancellable wait: a user Stop during a 60s Retry-After must
+            # surface immediately, not after the sleep finishes.
+            if cancellation_token is not None:
+                if cancellation_token.wait(delay):
+                    raise CancelledError("Turn cancelled by user")
+            else:
+                time.sleep(delay)
     assert last_exc is not None
     raise last_exc
 
@@ -172,6 +221,7 @@ class LlmChannel:
 
     def request_assistant_message(self, kwargs: dict, cancellation_token=None) -> tuple[dict, str | None] | None:
         conv = self.conversation
+        attempts = max(1, int(config.LLM_MAX_RETRIES) + 1)
         if getattr(conv, "_client_needs_refresh", False):
             conv.refresh_client()
         if conv.agent.stream_callback is not None:
@@ -228,14 +278,26 @@ class LlmChannel:
             try:
                 if conv.provider.supports_prompt_cache_key:
                     stream_kwargs.setdefault("stream_options", {"include_usage": True})
-                stream = _stream_client(conv.client).chat.completions.create(**stream_kwargs)
-                result = conv.provider.assistant_message_from_stream(
-                    stream,
-                    on_text_delta=on_text_delta,
-                    on_chunk=on_chunk,
-                    on_reasoning_start=on_reasoning_start,
-                    on_reasoning_delta=on_reasoning_delta,
+
+                def _stream_attempt():
+                    # Only errors before the first chunk are safe to retry;
+                    # once deltas were produced the caller already saw them.
+                    stream = _stream_client(conv.client).chat.completions.create(**stream_kwargs)
+                    return conv.provider.assistant_message_from_stream(
+                        stream,
+                        on_text_delta=on_text_delta,
+                        on_chunk=on_chunk,
+                        on_reasoning_start=on_reasoning_start,
+                        on_reasoning_delta=on_reasoning_delta,
+                        cancellation_token=cancellation_token,
+                    )
+
+                result = _call_with_retry(
+                    _stream_attempt,
+                    operation="stream chat completion",
+                    attempts=attempts,
                     cancellation_token=cancellation_token,
+                    is_retryable=lambda exc: not saw_chunk and _is_retryable_llm_error(exc),
                 )
                 finish_thought()
                 conv.emitter.emit_llm_response_finished(
@@ -263,6 +325,12 @@ class LlmChannel:
                     ) from exc
                 if saw_chunk:
                     raise
+                if _is_retryable_llm_error(exc):
+                    # 429/5xx/connection retries were already owned and
+                    # exhausted inside _call_with_retry. Switching to
+                    # non-streaming does not fix rate limits or transport,
+                    # and would silently double the attempt budget.
+                    raise
                 conv.trace.error("stream_fallback", str(exc))
             finally:
                 remove_cancel_callback()
@@ -273,7 +341,15 @@ class LlmChannel:
         conv.emitter.emit_llm_request_started(call_id, streamed=False, model=str(kwargs.get("model") or config.MODEL))
         remove_cancel_callback = self._interrupt_client_on_cancel(cancellation_token)
         try:
-            response = conv.client.chat.completions.create(**kwargs)
+            def _nonstream_attempt():
+                return conv.client.chat.completions.create(**kwargs)
+
+            response = _call_with_retry(
+                _nonstream_attempt,
+                operation="chat completion",
+                attempts=attempts,
+                cancellation_token=cancellation_token,
+            )
         except Exception as exc:
             if cancellation_token is not None and cancellation_token.is_cancelled:
                 raise CancelledError("Turn cancelled by user") from exc

@@ -15,11 +15,20 @@ from .change_journal import WorkspaceChangeJournal
 class WorkspaceQuotaError(RuntimeError):
     """Raised when a write would exceed the workspace write/disk quota."""
 
-    def __init__(self, reason: str, *, charged_bytes: int = 0, limit_bytes: int = 0):
+    def __init__(
+        self,
+        reason: str,
+        *,
+        charged_bytes: int = 0,
+        limit_bytes: int = 0,
+        resource_kind: str = "workspace_quota",
+    ):
         super().__init__(reason)
         self.reason = reason
         self.charged_bytes = charged_bytes
         self.limit_bytes = limit_bytes
+        #: "workspace_quota" or "free_disk" — feeds the failure taxonomy.
+        self.resource_kind = resource_kind
 
 
 @dataclass
@@ -270,6 +279,7 @@ class WorkspaceService:
                     f"(write needs {net_new_bytes}, floor is {min_free})",
                     charged_bytes=self._charged_bytes,
                     limit_bytes=min_free,
+                    resource_kind="free_disk",
                 )
         quota = int(getattr(config, "WORKSPACE_WRITE_QUOTA_BYTES", 0) or 0)
         if quota > 0 and self._charged_bytes + net_new_bytes > quota:

@@ -173,10 +173,12 @@ class AgentConversation:
             self.add_user_turn(initial_task)
 
     def _observation_dir(self) -> Path:
-        session_id = getattr(self.runtime_state, "session_id", None) or "default"
-        safe_session_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(session_id))
-        root = self._workspace_root()
-        return root / ".harness" / "observations" / safe_session_id
+        from .observations import observation_dir_for
+
+        return observation_dir_for(
+            self._workspace_root(),
+            getattr(self.runtime_state, "session_id", None),
+        )
 
     def _build_prompt(self) -> list[dict]:
         """Build the messages list that will be sent to the LLM.

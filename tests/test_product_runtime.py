@@ -1226,7 +1226,7 @@ class ProductRuntimeTests(unittest.TestCase):
             def __init__(self):
                 self.closed = False
 
-            def run(self, command, timeout=300):
+            def run(self, command, timeout=300, artifact_dir=None):
                 raise RuntimeError("Shell failed to become ready")
 
             def close(self):
@@ -1236,7 +1236,9 @@ class ProductRuntimeTests(unittest.TestCase):
         runtime_state = SimpleNamespace(shell_session=dead_shell, shell_job_manager=None)
 
         fresh_shell = SimpleNamespace(
-            run=lambda command, timeout=300: SimpleNamespace(stdout="hi", stderr="", exit_code=0, timed_out=False),
+            run=lambda command, timeout=300, artifact_dir=None: SimpleNamespace(
+                stdout="hi", stderr="", exit_code=0, timed_out=False, output_spilled=False
+            ),
             close=lambda: None,
         )
         with patch("harness_code_agent.workspace.shell_session.PersistentShellSession", return_value=fresh_shell):
@@ -1249,12 +1251,13 @@ class ProductRuntimeTests(unittest.TestCase):
         from harness_code_agent.runtime import tools
 
         class ExpectedFailureShell:
-            def run(self, command, timeout=300):
+            def run(self, command, timeout=300, artifact_dir=None):
                 return SimpleNamespace(
                     stdout="",
                     stderr="error: minutes must be between 1 and 120",
                     exit_code=2,
                     timed_out=False,
+                    output_spilled=False,
                 )
 
         shell = ExpectedFailureShell()

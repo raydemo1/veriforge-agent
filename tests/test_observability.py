@@ -146,5 +146,112 @@ class ObservabilityAggregationTests(unittest.TestCase):
         self.assertEqual(payload["snapshot"]["session_id"], session.id)
 
 
+class ObservationArtifactAdoptionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.root = Path(self.temp_dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_streamed_artifact_is_adopted_without_second_spill(self):
+        import hashlib
+
+        from harness_code_agent.agent.observations import FactTracker, ObservationStore
+        from harness_code_agent.runtime.tool_result import ToolResult
+
+        art_dir = self.root / "artifacts"
+        art_dir.mkdir(parents=True)
+        artifact = art_dir / "shell_output_deadbeef.txt"
+        full_output = "x" * 20000
+        artifact.write_text(full_output, encoding="utf-8")
+        sha = hashlib.sha256(full_output.encode("utf-8")).hexdigest()
+        preview = "x" * 100 + "...omitted..." + "x" * 100
+
+        result = ToolResult(
+            tool="run_bash",
+            status="success",
+            output=preview,
+            metadata={
+                "status_source": "shell",
+                "output_spilled": True,
+                "artifact_path": str(artifact),
+                "artifact_sha256": sha,
+                "output_chars": 20000,
+                "output_bytes": 20000,
+            },
+        )
+        store = ObservationStore(art_dir)
+        observation = store.create(
+            tool="run_bash",
+            args={"command": "big"},
+            result=result,
+            fact_tracker=FactTracker(),
+        )
+
+        # The observation points at the streamed artifact, not a new .txt.
+        self.assertEqual(observation.raw_output_path, artifact)
+        self.assertTrue(observation.artifact_adopted)
+        self.assertEqual(observation.output_chars, 20000)
+        self.assertEqual(observation.output_hash, sha[:16])
+        self.assertEqual(list(art_dir.glob("obs_*.txt")), [])
+
+        message = store.observed_message(observation, result)
+        self.assertIn(f"raw_output: {artifact}", message)
+        self.assertIn("omitted", message)
+
+    def test_artifact_outside_store_is_not_adopted_or_unlinked(self):
+        from harness_code_agent.agent.observations import FactTracker, ObservationStore
+        from harness_code_agent.runtime.tool_result import ToolResult
+
+        external = self.root / "outside.txt"
+        external.write_text("do not delete me", encoding="utf-8")
+        result = ToolResult(
+            tool="run_bash",
+            status="success",
+            output="preview text",
+            metadata={
+                "status_source": "shell",
+                "output_spilled": True,
+                "artifact_path": str(external),
+                "output_chars": 17,
+            },
+        )
+        store = ObservationStore(self.root / "obs")
+        observation = store.create(
+            tool="run_bash",
+            args={"command": "big"},
+            result=result,
+            fact_tracker=FactTracker(),
+        )
+        # Not adopted; the store spills its own copy and leaves the external
+        # file untouched.
+        self.assertFalse(observation.artifact_adopted)
+        self.assertNotEqual(observation.raw_output_path, external)
+        self.assertTrue(external.exists())
+        self.assertEqual(external.read_text(encoding="utf-8"), "do not delete me")
+        self.assertTrue(observation.raw_output_path.exists())
+
+    def test_small_output_is_spilled_by_the_store_as_before(self):
+        from harness_code_agent.agent.observations import FactTracker, ObservationStore
+        from harness_code_agent.runtime.tool_result import ToolResult
+
+        result = ToolResult(
+            tool="run_bash",
+            status="success",
+            output="small",
+            metadata={"status_source": "shell"},
+        )
+        store = ObservationStore(self.root / "obs")
+        observation = store.create(
+            tool="run_bash",
+            args={"command": "echo small"},
+            result=result,
+            fact_tracker=FactTracker(),
+        )
+        self.assertTrue(observation.raw_output_path.exists())
+        self.assertEqual(observation.raw_output_path.read_text(encoding="utf-8"), "small")
+
+
 if __name__ == "__main__":
     unittest.main()

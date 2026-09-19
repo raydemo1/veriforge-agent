@@ -247,7 +247,7 @@ class NormalizationTests(unittest.TestCase):
 
     def test_text_refines_generic_execution_failure(self):
         cases = [
-            ("The operation timed out", FailureKind.TIMEOUT, FailureCategory.RESOURCE),
+            ("The operation timed out", FailureKind.TIMEOUT, FailureCategory.EXECUTION),
             ("bash: pytest: command not found", FailureKind.COMMAND_NOT_FOUND, FailureCategory.EXECUTION),
             ("cat: missing.txt: No such file or directory", FailureKind.FILE_NOT_FOUND, FailureCategory.EXECUTION),
             ("Traceback: ModuleNotFoundError: x", FailureKind.TOOL_INTERNAL_ERROR, FailureCategory.EXECUTION),
@@ -281,6 +281,67 @@ class NormalizationTests(unittest.TestCase):
         self.assertEqual(failure.kind, FailureKind.EXECUTION_FAILED)
         self.assertEqual(failure.category, FailureCategory.EXECUTION)
         self.assertEqual(failure.visibility, "task")
+
+    def test_resource_status_source_kind_taxonomy(self):
+        cases = [
+            (
+                {"status_source": "resource", "resource_kind": "subagent_capacity"},
+                FailureKind.SUBAGENT_CAPACITY,
+                FailureCategory.RESOURCE,
+                True,
+            ),
+            (
+                {"status_source": "resource", "resource_kind": "workspace_quota"},
+                FailureKind.QUOTA_EXCEEDED,
+                FailureCategory.RESOURCE,
+                False,
+            ),
+            (
+                {"status_source": "resource", "resource_kind": "free_disk"},
+                FailureKind.QUOTA_EXCEEDED,
+                FailureCategory.RESOURCE,
+                False,
+            ),
+            # Legacy emitter of the pre-taxonomy source keeps mapping.
+            (
+                {"status_source": "quota"},
+                FailureKind.QUOTA_EXCEEDED,
+                FailureCategory.RESOURCE,
+                False,
+            ),
+        ]
+        for metadata, kind, category, retryable in cases:
+            with self.subTest(metadata=metadata):
+                result = ToolResult(
+                    tool="spawn_agent",
+                    status="failed",
+                    output="busy",
+                    error="busy",
+                    metadata=metadata,
+                )
+                failure = ToolFailure.from_result(
+                    tool_call_id="tc", tool_name="spawn_agent", result=result,
+                    intercepted=False,
+                )
+                self.assertEqual(failure.kind, kind)
+                self.assertEqual(failure.category, category)
+                self.assertIs(failure.retryable, retryable)
+                self.assertTrue(failure.counted_in_tracker)
+
+    def test_backend_timeout_is_execution_not_resource(self):
+        result = ToolResult(
+            tool="run_bash",
+            status="failed",
+            output="timed out",
+            error="timed out",
+            metadata={"status_source": "shell", "timed_out": True},
+        )
+        failure = ToolFailure.from_result(
+            tool_call_id="tc", tool_name="run_bash", result=result, intercepted=False
+        )
+        self.assertEqual(failure.kind, FailureKind.TIMEOUT)
+        self.assertEqual(failure.category, FailureCategory.EXECUTION)
+        self.assertEqual(failure.phase, "execution")
 
 
 class FailureTrackerTests(unittest.TestCase):

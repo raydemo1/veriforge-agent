@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from harness_code_agent import config
 from harness_code_agent.agent import llm_channel
-from harness_code_agent.agent.cancellation import CancellationToken
+from harness_code_agent.agent.cancellation import CancelledError, CancellationToken
 from harness_code_agent.agent.coordinator import AgentCoordinator
 from harness_code_agent.agent.tool_executor import ToolExecutor
 from harness_code_agent.runtime import tools
@@ -78,25 +78,77 @@ class LlmRetryHelperTests(unittest.TestCase):
         self.assertFalse(llm_channel._is_retryable_llm_error(ValueError("nope")))
 
 
-class ToolDeadlineTests(unittest.TestCase):
-    def _deadline(self, name: str, args: dict | None = None):
-        prepared = SimpleNamespace(name=name, args=args or {})
-        return ToolExecutor._deadline_seconds(None, prepared)
+class RunBashTimeoutClampTests(unittest.TestCase):
+    """run_bash owns its own timeout; the clamp is observable via metadata."""
+
+    def _run_with_timeout(self, timeout):
+        calls = []
+
+        def fake_run(command, timeout=300, artifact_dir=None):
+            calls.append(timeout)
+            return SimpleNamespace(
+                stdout="ok",
+                stderr="",
+                exit_code=0,
+                timed_out=False,
+                output_spilled=False,
+                output_bytes=2,
+            )
+
+        fake_session = SimpleNamespace(
+            run=fake_run, close=lambda: None, interrupt=lambda: None
+        )
+        with patch(
+            "harness_code_agent.workspace.shell_session.PersistentShellSession",
+            return_value=fake_session,
+        ):
+            result = tools.run_bash("echo ok", timeout=timeout)
+        return result, calls[0]
 
     def test_run_bash_timeout_is_clamped_to_maximum(self):
-        with patch.object(config, "TOOL_MAX_TIMEOUT_SECONDS", 1800.0):
-            self.assertEqual(self._deadline("run_bash", {"timeout": 999999}), 1800.0)
+        with patch.object(config, "TOOL_MAX_TIMEOUT_SECONDS", 1800):
+            result, effective = self._run_with_timeout(999999)
+        self.assertEqual(effective, 1800)
+        self.assertEqual(result.metadata["requested_timeout"], 999999)
+        self.assertEqual(result.metadata["effective_timeout"], 1800)
 
     def test_run_bash_timeout_is_clamped_to_floor(self):
-        self.assertEqual(self._deadline("run_bash", {"timeout": 0}), 1.0)
+        result, effective = self._run_with_timeout(0)
+        self.assertEqual(effective, 1)
+        self.assertEqual(result.metadata["requested_timeout"], 0)
+        self.assertEqual(result.metadata["effective_timeout"], 1)
 
-    def test_invalid_timeout_falls_back_to_default(self):
-        with patch.object(config, "TOOL_DEFAULT_TIMEOUT_SECONDS", 300.0):
-            self.assertEqual(self._deadline("run_bash", {"timeout": "soon"}), 300.0)
+    def test_invalid_timeout_falls_back_to_shell_default(self):
+        with patch.object(config, "SHELL_DEFAULT_TIMEOUT_SECONDS", 300):
+            result, effective = self._run_with_timeout("soon")
+        self.assertEqual(effective, 300)
+        self.assertEqual(result.metadata["requested_timeout"], "soon")
+        self.assertEqual(result.metadata["effective_timeout"], 300)
 
-    def test_other_tools_get_default_deadline(self):
-        with patch.object(config, "TOOL_DEFAULT_TIMEOUT_SECONDS", 42.0):
-            self.assertEqual(self._deadline("read_file"), 42.0)
+    def test_timeout_result_carries_requested_and_effective_timeout(self):
+        def fake_run(command, timeout=300, artifact_dir=None):
+            return SimpleNamespace(
+                stdout="", stderr="", exit_code=130, timed_out=True, output_spilled=False
+            )
+
+        fake_session = SimpleNamespace(
+            run=fake_run, close=lambda: None, interrupt=lambda: None
+        )
+        with patch(
+            "harness_code_agent.workspace.shell_session.PersistentShellSession",
+            return_value=fake_session,
+        ):
+            result = tools.run_bash("slow", timeout=999999)
+        self.assertEqual(result.status, "failed")
+        self.assertTrue(result.metadata["timed_out"])
+        self.assertEqual(result.metadata["requested_timeout"], 999999)
+        self.assertEqual(result.metadata["effective_timeout"], 1800)
+
+    def test_no_global_tool_deadline_exists(self):
+        # The global per-tool deadline was removed: timeout is a backend
+        # capability (run_bash, HTTP, MCP...), not a ToolExecutor concept.
+        self.assertFalse(hasattr(ToolExecutor, "_deadline_seconds"))
+        self.assertFalse(hasattr(config, "TOOL_DEFAULT_TIMEOUT_SECONDS"))
 
 
 class WorkspaceQuotaTests(unittest.TestCase):
@@ -152,7 +204,8 @@ class WorkspaceQuotaTests(unittest.TestCase):
             result = tools.write_file("big.txt", "z" * 500, tool_context=context)
 
         self.assertEqual(result.status, "failed")
-        self.assertEqual(result.metadata["status_source"], "quota")
+        self.assertEqual(result.metadata["status_source"], "resource")
+        self.assertEqual(result.metadata["resource_kind"], "workspace_quota")
         self.assertFalse((self.temp / "big.txt").exists())
 
 
@@ -222,11 +275,13 @@ class SubagentControlTests(unittest.TestCase):
             self.assertNotIn("spawn_agent", names, msg=f"role {role} can spawn agents")
 
     def test_open_agent_limit_is_enforced(self):
+        from harness_code_agent.agent.coordinator import SubagentCapacityError
+
         with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent), patch(
             "harness_code_agent.agent.coordinator.MAX_OPEN_AGENTS", 1
         ):
             self.coordinator.spawn(name="only", role="explorer", task="one")
-            with self.assertRaisesRegex(ValueError, "at most 1"):
+            with self.assertRaises(SubagentCapacityError):
                 self.coordinator.spawn(name="second", role="explorer", task="two")
 
     def test_spawn_is_rejected_when_parent_turn_is_cancelled(self):
@@ -256,6 +311,167 @@ class SubagentControlTests(unittest.TestCase):
             terminal = self.coordinator.wait([spawned["agent_id"]], timeout_seconds=5)
             self.assertFalse(terminal["timed_out"])
             self.assertEqual(terminal["agents"][0]["status"], "interrupted")
+
+
+# --- Cancellation token tree -----------------------------------------------
+
+
+class CancellationTokenTreeTests(unittest.TestCase):
+    def test_parent_cancel_propagates_to_child_and_grandchild(self):
+        root = CancellationToken()
+        child = root.create_child()
+        grandchild = CancellationToken(parent=child)
+        root.cancel()
+        self.assertTrue(child.is_cancelled)
+        self.assertTrue(grandchild.is_cancelled)
+
+    def test_child_cancel_does_not_propagate_upward(self):
+        root = CancellationToken()
+        child = root.create_child()
+        child.cancel()
+        self.assertTrue(child.is_cancelled)
+        self.assertFalse(root.is_cancelled)
+
+    def test_child_is_born_cancelled(self):
+        root = CancellationToken()
+        root.cancel()
+        child = CancellationToken(parent=root)
+        self.assertTrue(child.is_cancelled)
+
+    def test_close_detaches_child_from_parent(self):
+        root = CancellationToken()
+        child = root.create_child()
+        self.assertEqual(len(root._callbacks), 1)
+        child.close()
+        self.assertEqual(len(root._callbacks), 0)
+        root.cancel()
+        self.assertFalse(child.is_cancelled)
+
+    def test_close_is_idempotent_and_safe_for_root_token(self):
+        root = CancellationToken()
+        root.close()
+        root.close()
+        child = root.create_child()
+        child.close()
+        child.close()
+        root.cancel()
+        self.assertFalse(child.is_cancelled)
+
+    def test_new_children_after_close_are_independent_of_old_one(self):
+        root = CancellationToken()
+        old = root.create_child()
+        old.close()
+        new = root.create_child()
+        root.cancel()
+        self.assertFalse(old.is_cancelled)
+        self.assertTrue(new.is_cancelled)
+
+    def test_wait_returns_true_on_cancel_and_false_on_timeout(self):
+        token = CancellationToken()
+        self.assertFalse(token.wait(0.02))
+        token.cancel()
+        self.assertTrue(token.wait(1.0))
+
+    def test_wait_unblocks_immediately_when_cancelled_from_another_thread(self):
+        import threading
+        import time as _time
+
+        token = CancellationToken()
+
+        def cancel_later():
+            _time.sleep(0.1)
+            token.cancel()
+
+        threading.Thread(target=cancel_later, daemon=True).start()
+        start = _time.monotonic()
+        self.assertTrue(token.wait(30.0))
+        self.assertLess(_time.monotonic() - start, 1.0)
+
+
+# --- Retry-After handling --------------------------------------------------
+
+
+class RetryAfterTests(unittest.TestCase):
+    def _exc(self, header=None):
+        headers = {"retry-after": header} if header is not None else None
+        return SimpleNamespace(status_code=429, response=SimpleNamespace(headers=headers))
+
+    def test_delta_seconds_header(self):
+        with patch.object(llm_channel.random, "uniform", return_value=0.0):
+            self.assertEqual(llm_channel._retry_delay(0, self._exc("3")), 3.0)
+
+    def test_missing_header_uses_exponential_backoff(self):
+        no_header = SimpleNamespace(
+            status_code=500, response=SimpleNamespace(headers=None)
+        )
+        with patch.object(llm_channel.random, "uniform", return_value=0.0):
+            self.assertEqual(llm_channel._retry_delay(0, no_header), 2.0)
+
+    def test_header_is_capped(self):
+        self.assertEqual(
+            llm_channel._retry_after_seconds(self._exc("9999")),
+            llm_channel._RETRY_AFTER_CAP_SECONDS,
+        )
+
+    def test_malformed_header_falls_back_to_backoff(self):
+        self.assertIsNone(llm_channel._retry_after_seconds(self._exc("soon")))
+        self.assertIsNone(
+            llm_channel._retry_after_seconds(SimpleNamespace(status_code=503))
+        )
+
+    def test_retry_loop_honours_retry_after(self):
+        class RateLimit(Exception):
+            def __init__(self):
+                super().__init__("rate limited")
+                self.status_code = 429
+                self.response = SimpleNamespace(headers={"retry-after": "0"})
+
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RateLimit()
+            return "ok"
+
+        with patch.object(llm_channel.time, "sleep") as slept:
+            self.assertEqual(
+                llm_channel._call_with_retry(flaky, operation="t", attempts=3), "ok"
+            )
+        self.assertEqual(calls["n"], 2)
+        slept.assert_called_once()
+
+    def test_cancellation_during_backoff_raises_immediately(self):
+        import threading
+        import time as _time
+
+        class RateLimited(Exception):
+            def __init__(self):
+                super().__init__("429")
+                self.status_code = 429
+                self.response = SimpleNamespace(headers={"retry-after": "30"})
+
+        token = CancellationToken()
+        calls = {"n": 0}
+
+        def always_429():
+            calls["n"] += 1
+            raise RateLimited()
+
+        threading.Thread(
+            target=lambda: (_time.sleep(0.15), token.cancel()), daemon=True
+        ).start()
+        start = _time.monotonic()
+        with self.assertRaises(CancelledError):
+            llm_channel._call_with_retry(
+                always_429,
+                operation="t",
+                attempts=5,
+                cancellation_token=token,
+            )
+        # Must surface well inside the 30s Retry-After window.
+        self.assertLess(_time.monotonic() - start, 2.0)
+        self.assertEqual(calls["n"], 1)
 
 
 if __name__ == "__main__":

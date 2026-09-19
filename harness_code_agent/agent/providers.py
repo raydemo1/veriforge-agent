@@ -37,11 +37,13 @@ def client_scope():
 
 
 def _current_client_config() -> tuple[str | None, str | None, float, int]:
+    # The SDK never retries: LlmChannel is the single owner of 429/5xx/
+    # connection retries, backoff and Retry-After handling.
     return (
         config.API_KEY,
         config.BASE_URL,
         float(config.LLM_REQUEST_TIMEOUT_SECONDS),
-        int(config.LLM_MAX_RETRIES),
+        0,
     )
 
 

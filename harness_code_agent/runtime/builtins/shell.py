@@ -6,6 +6,9 @@ import json
 import os
 import re
 import subprocess
+import tempfile
+import threading
+from pathlib import Path
 
 from ... import config
 from ...agent.cancellation import CancelledError
@@ -32,10 +35,12 @@ def run_bash(
     """
     if cancellation_token is not None:
         cancellation_token.check()
+    requested_timeout = timeout
     try:
-        timeout = max(1, min(int(timeout), int(config.TOOL_MAX_TIMEOUT_SECONDS)))
+        effective_timeout = max(1, min(int(timeout), int(config.TOOL_MAX_TIMEOUT_SECONDS)))
     except (TypeError, ValueError):
-        timeout = int(config.TOOL_DEFAULT_TIMEOUT_SECONDS)
+        effective_timeout = int(config.SHELL_DEFAULT_TIMEOUT_SECONDS)
+    timeout = effective_timeout
     if is_long_running_shell_command(command):
         manager = _shell_job_manager(runtime_state)
         if manager is None:
@@ -77,6 +82,7 @@ def run_bash(
 
     from ...workspace.shell_session import PersistentShellSession
 
+    artifact_dir = _artifact_dir(tool_context, runtime_state)
     one_shot_powershell = _requires_one_shot_powershell(command)
     shell_session = PersistentShellSession(_workspace_root(tool_context))
     remove_cancel_callback = lambda: None
@@ -95,14 +101,15 @@ def run_bash(
                 timeout,
                 tool_context,
                 cancellation_token,
+                artifact_dir,
             )
         else:
-            shell_result = shell_session.run(command, timeout=timeout)
+            shell_result = shell_session.run(command, timeout=timeout, artifact_dir=artifact_dir)
         if cancellation_token is not None:
             cancellation_token.check()
         if shell_result.timed_out:
             output = (
-                f"[error] Command timed out after {timeout}s. "
+                f"[error] Command timed out after {effective_timeout}s. "
                 f"If this command legitimately needs more time (e.g. compilation, training), "
                 f"retry with a larger timeout parameter."
             )
@@ -110,33 +117,45 @@ def run_bash(
                 tool="run_bash",
                 status="failed",
                 output=output,
-                error=f"Command timed out after {timeout}s",
+                error=f"Command timed out after {effective_timeout}s",
                 return_code=shell_result.exit_code,
-                metadata={"timed_out": True, "status_source": "shell"},
+                metadata={
+                    "timed_out": True,
+                    "status_source": "shell",
+                    "requested_timeout": requested_timeout,
+                    "effective_timeout": effective_timeout,
+                },
             )
         output = _build_shell_output(shell_result.stdout, shell_result.stderr)
         output = output or "(no output)"
-        output += _exit_code_footer(shell_result.exit_code)
-        truncated = bool(getattr(shell_result, "output_truncated", False))
-        output_bytes = int(getattr(shell_result, "output_bytes", 0) or 0)
-        if truncated:
+        metadata = {
+            "timed_out": False,
+            "status_source": "shell",
+            "output_bytes": int(getattr(shell_result, "output_bytes", 0) or 0),
+            "requested_timeout": requested_timeout,
+            "effective_timeout": effective_timeout,
+        }
+        if getattr(shell_result, "output_spilled", False):
+            # The command ran to completion; only a head+tail preview is held
+            # in memory, the full output is in the streamed artifact.
+            metadata["output_spilled"] = True
+            metadata["artifact_path"] = shell_result.artifact_path
+            metadata["artifact_sha256"] = shell_result.artifact_sha256
+            metadata["output_chars"] = getattr(shell_result, "output_chars", 0)
             output += (
-                f"\n\n[output truncated after {output_bytes} bytes; "
-                "the command was interrupted. Narrow the command, paginate it, "
-                "or redirect output to a file and read selected ranges.]"
+                f"\n\n[output streamed to artifact after {metadata['output_bytes']} bytes; "
+                f"full output: {shell_result.artifact_path}. "
+                "The preview above shows the head and tail; read the artifact "
+                "or rerun a narrower command for the omitted middle.]"
             )
+        output += _exit_code_footer(shell_result.exit_code)
         return ToolResult(
             tool="run_bash",
             status="success",
             output=output,
             error=None,
             return_code=shell_result.exit_code,
-            metadata={
-                "timed_out": False,
-                "output_truncated": truncated,
-                "output_bytes": output_bytes,
-                "status_source": "shell",
-            },
+            metadata=metadata,
         )
     except CancelledError:
         raise
@@ -170,8 +189,23 @@ def _interrupt_shell_session(shell_session) -> None:
         shell_session.interrupt()
 
 
-def _run_one_shot_powershell(command: str, timeout: int, tool_context, cancellation_token=None):
-    from ...workspace.shell_session import ShellResult, windows_shell_path
+def _run_one_shot_powershell(
+    command: str,
+    timeout: int,
+    tool_context,
+    cancellation_token=None,
+    artifact_dir=None,
+):
+    # Only used for a bare `exit`.  Pipes are drained by reader threads into
+    # bounded sinks (head+tail in memory, full output spooled to disk), so
+    # this path — like the persistent shell — is bounded-memory no matter how
+    # much the process prints.
+    from ...workspace.shell_session import (
+        ShellResult,
+        _BoundedPipeSink,
+        _stream_sinks_to_artifact,
+        windows_shell_path,
+    )
 
     executable = windows_shell_path()
     if executable is None:
@@ -186,55 +220,93 @@ def _run_one_shot_powershell(command: str, timeout: int, tool_context, cancellat
         errors="replace",
         creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
     )
+    preview_chars = int(config.SHELL_OUTPUT_PREVIEW_CHARS)
+    spool_dir = Path(tempfile.mkdtemp(prefix="hca_oneshot_"))
+    stdout_sink = _BoundedPipeSink(preview_chars=preview_chars, spool_dir=spool_dir)
+    stderr_sink = _BoundedPipeSink(preview_chars=preview_chars, spool_dir=spool_dir)
+
+    def _drain(pipe, sink) -> None:
+        with contextlib.suppress(Exception):
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                sink.feed(chunk)
+        with contextlib.suppress(Exception):
+            pipe.close()
+
+    readers = [
+        threading.Thread(target=_drain, args=(process.stdout, stdout_sink), daemon=True),
+        threading.Thread(target=_drain, args=(process.stderr, stderr_sink), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
     remove_cancel_callback = lambda: None
     if cancellation_token is not None:
         remove_cancel_callback = cancellation_token.add_callback(
             lambda: _terminate_process_tree(process)
         )
+    timed_out = False
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        _terminate_process_tree(process)
         try:
-            stdout, stderr = process.communicate(timeout=5)
+            process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            timed_out = True
             _terminate_process_tree(process)
-            stdout = str(exc.stdout or "")
-            stderr = str(exc.stderr or "")
-            for stream in (process.stdout, process.stderr, process.stdin):
-                if stream is not None:
-                    with contextlib.suppress(Exception):
-                        stream.close()
-        return ShellResult(
-            stdout=str(stdout or exc.stdout or ""),
-            stderr=str(stderr or exc.stderr or ""),
-            exit_code=130,
-            timed_out=True,
-        )
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(timeout=5)
+        for reader in readers:
+            reader.join(timeout=5)
     finally:
         remove_cancel_callback()
-    stdout, stderr, truncated, output_bytes = _cap_one_shot_output(stdout or "", stderr or "")
-    return ShellResult(
-        stdout=stdout,
-        stderr=stderr,
-        exit_code=process.returncode,
-        output_truncated=truncated,
-        output_bytes=output_bytes,
-    )
 
+    stdout_sink.finish_writing()
+    stderr_sink.finish_writing()
+    try:
+        if timed_out:
+            return ShellResult(
+                stdout=stdout_sink.head_text.strip(),
+                stderr=stderr_sink.head_text.strip(),
+                exit_code=130,
+                timed_out=True,
+            )
 
-def _cap_one_shot_output(stdout: str, stderr: str) -> tuple[str, str, bool, int]:
-    max_bytes = int(getattr(config, "SHELL_MAX_OUTPUT_BYTES", 0) or 0)
-    total = len(stdout.encode("utf-8", errors="replace")) + len(
-        stderr.encode("utf-8", errors="replace")
-    )
-    if not max_bytes or total <= max_bytes:
-        return stdout, stderr, False, total
-    encoding = "utf-8"
-    keep = max(0, max_bytes // 2)
-    stdout = stdout.encode(encoding, errors="replace")[:keep].decode(encoding, errors="replace")
-    stderr = stderr.encode(encoding, errors="replace")[:keep].decode(encoding, errors="replace")
-    return stdout, stderr, True, total
+        total_seen = stdout_sink.total_chars + stderr_sink.total_chars
+        if total_seen <= preview_chars and not stdout_sink.spilled and not stderr_sink.spilled:
+            stdout = stdout_sink.buffered_text().strip()
+            stderr = stderr_sink.buffered_text().strip()
+            combined = _build_shell_output(
+                stdout_sink.buffered_text(), stderr_sink.buffered_text()
+            )
+            return ShellResult(
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=process.returncode,
+                output_bytes=len(combined.encode("utf-8", errors="replace")),
+                output_chars=len(combined),
+            )
+
+        path, preview, total_bytes, total_chars, sha = _stream_sinks_to_artifact(
+            stdout_sink,
+            stderr_sink,
+            artifact_dir=artifact_dir if artifact_dir is not None else spool_dir,
+            preview_chars=preview_chars,
+        )
+        return ShellResult(
+            stdout=preview,
+            stderr="",
+            exit_code=process.returncode,
+            output_spilled=True,
+            output_bytes=total_bytes,
+            output_chars=total_chars,
+            artifact_path=path,
+            artifact_sha256=sha,
+        )
+    finally:
+        stdout_sink.discard()
+        stderr_sink.discard()
+        with contextlib.suppress(OSError):
+            spool_dir.rmdir()
 
 
 def _terminate_process_tree(process: subprocess.Popen) -> None:
@@ -382,10 +454,15 @@ def _clamp_shell_output_chars(value: int) -> int:
 
 def _build_shell_output(stdout: str, stderr: str) -> str:
     """Build shell output string from stdout and stderr."""
-    stderr = (stderr or "").strip()
-    stdout = (stdout or "").strip()
-    if stderr:
-        if stdout:
-            return stdout + "\n\n--- STDERR ---\n" + stderr
-        return "--- STDERR ---\n" + stderr
-    return stdout
+    from ...workspace.shell_session import combine_output
+
+    return combine_output(stdout, stderr)
+
+
+def _artifact_dir(tool_context, runtime_state):
+    """Session observation dir, where streamed output artifacts live."""
+    from ...agent.observations import observation_dir_for
+
+    root = _workspace_root(tool_context)
+    session_id = getattr(runtime_state, "session_id", None) if runtime_state is not None else None
+    return observation_dir_for(root, session_id)

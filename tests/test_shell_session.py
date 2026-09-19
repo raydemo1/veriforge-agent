@@ -8,14 +8,18 @@ from unittest.mock import patch
 from harness_code_agent import config
 from harness_code_agent.workspace.shell_session import (
     PersistentShellSession,
+    _BoundedPipeSink,
     _docker_resource_args,
     _docker_user_arg,
     _DockerShellBackend,
     _posix_capture_script,
+    _stream_sinks_to_artifact,
+    combine_output,
     docker_shell_hint,
     sandbox_mode,
     validate_shell_configuration,
     windows_shell_kind,
+    windows_shell_path,
 )
 
 
@@ -425,30 +429,34 @@ class PersistentShellSessionTests(unittest.TestCase):
 
 
 class CaptureScriptAndResourceTests(unittest.TestCase):
-    def test_posix_script_caps_output_and_preserves_braces_without_ulimits(self):
-        with patch.object(config, "SHELL_MAX_OUTPUT_BYTES", 1234), patch.object(
-            config, "SHELL_CPU_SECONDS", 0
-        ), patch.object(config, "SHELL_FSIZE_BLOCKS", 0), patch.object(
-            config, "SHELL_MEMORY_KB", 0
-        ):
+    def test_posix_script_does_not_cap_output_and_preserves_braces_without_ulimits(self):
+        # Output volume never interrupts a command: streaming/artifact
+        # handling lives in the backend, not in the capture script.
+        with patch.object(config, "SHELL_CPU_SECONDS", 0), patch.object(
+            config, "SHELL_FSIZE_BLOCKS", 0
+        ), patch.object(config, "SHELL_MEMORY_KB", 0):
             script = _posix_capture_script("echo hi", "OUT", "ERR", "EXIT", prefix="__hca")
-        self.assertIn("__hca_max=1234", script)
-        self.assertIn('head -c "$__hca_max" "$1"', script)
+        self.assertNotIn("__hca_max", script)
+        self.assertNotIn("head -c", script)
         self.assertIn("{\n", script)
         self.assertNotIn("ulimit", script)
 
     def test_posix_script_runs_command_in_subshell_when_ulimits_enabled(self):
-        with patch.object(config, "SHELL_MAX_OUTPUT_BYTES", 0), patch.object(
-            config, "SHELL_CPU_SECONDS", 10
-        ), patch.object(config, "SHELL_FSIZE_BLOCKS", 0), patch.object(
-            config, "SHELL_MEMORY_KB", 0
-        ):
+        with patch.object(config, "SHELL_CPU_SECONDS", 10), patch.object(
+            config, "SHELL_FSIZE_BLOCKS", 0
+        ), patch.object(config, "SHELL_MEMORY_KB", 0):
             script = _posix_capture_script("echo hi", "OUT", "ERR", "EXIT", prefix="__hca")
         self.assertIn("ulimit -t 10", script)
         self.assertIn("(\n", script)
-        self.assertIn("__hca_max=0", script)
+        self.assertNotIn("__hca_max", script)
 
-    def test_docker_resource_args_include_default_caps(self):
+    def test_docker_resource_args_default_unlimited(self):
+        with patch.object(config, "DOCKER_MEMORY_MB", 0), patch.object(
+            config, "DOCKER_CPUS", 0
+        ):
+            self.assertEqual(_docker_resource_args(), [])
+
+    def test_docker_resource_args_present_when_explicitly_configured(self):
         with patch.object(config, "DOCKER_MEMORY_MB", 2048), patch.object(
             config, "DOCKER_CPUS", 2.0
         ):
@@ -456,29 +464,35 @@ class CaptureScriptAndResourceTests(unittest.TestCase):
                 _docker_resource_args(), ["--memory", "2048m", "--cpus", "2"]
             )
 
-    def test_docker_resource_args_empty_when_caps_disabled(self):
-        with patch.object(config, "DOCKER_MEMORY_MB", 0), patch.object(
-            config, "DOCKER_CPUS", 0.0
-        ):
-            self.assertEqual(_docker_resource_args(), [])
 
-
-class ShellOutputCapIntegrationTests(unittest.TestCase):
+class ShellOutputStreamingTests(unittest.TestCase):
     @staticmethod
     def _big_output_command() -> str:
         if os.name == "nt" and windows_shell_kind() == "pwsh":
-            return "Write-Output ('a' * 50000)"
-        return "head -c 50000 /dev/zero | tr '\\0' 'a'"
+            return "Write-Output ('a' * 20000)"
+        return "head -c 20000 /dev/zero | tr '\\0' 'a'"
 
-    def test_run_interrupts_output_over_cap_and_session_recovers(self):
+    def test_large_output_streams_to_artifact_and_session_recovers(self):
         temp_dir = tempfile.mkdtemp(dir=os.getcwd())
+        artifact_dir = Path(temp_dir) / "observations"
         shell = PersistentShellSession(cwd=temp_dir)
         try:
-            with patch.object(config, "SHELL_MAX_OUTPUT_BYTES", 20000):
-                result = shell.run(self._big_output_command(), timeout=30)
-            self.assertTrue(result.output_truncated)
+            with patch.object(config, "SHELL_OUTPUT_PREVIEW_CHARS", 2000):
+                result = shell.run(
+                    self._big_output_command(), timeout=60, artifact_dir=artifact_dir
+                )
+            self.assertTrue(result.output_spilled)
             self.assertGreaterEqual(result.output_bytes, 20000)
-            self.assertIn("a", result.stdout)
+            self.assertIsNotNone(result.artifact_path)
+            artifact = Path(result.artifact_path)
+            self.assertTrue(artifact.exists())
+            # Full content survives in the artifact, not just the cap window.
+            body = artifact.read_text(encoding="utf-8").strip()
+            self.assertEqual(len(body), 20000)
+            self.assertEqual(set(body), {"a"})
+            # Preview is bounded and clearly marked; raw spool is cleaned up.
+            self.assertLess(len(result.stdout), result.output_bytes)
+            self.assertFalse(list(artifact_dir.glob("*.raw")))
 
             recovered = shell.run("echo recovered", timeout=30)
             self.assertEqual(recovered.exit_code, 0)
@@ -486,6 +500,109 @@ class ShellOutputCapIntegrationTests(unittest.TestCase):
         finally:
             shell.close()
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+class BoundedPipeSinkTests(unittest.TestCase):
+    def test_small_output_stays_buffered(self):
+        d = Path(tempfile.mkdtemp())
+        sink = _BoundedPipeSink(preview_chars=100, spool_dir=d)
+        sink.feed("hello "); sink.feed("world")
+        sink.finish_writing()
+        self.assertFalse(sink.spilled)
+        self.assertEqual(sink.buffered_text(), "hello world")
+        self.assertEqual("".join(sink.iter_content()), "hello world")
+
+    def test_large_output_spools_with_full_content_recoverable(self):
+        d = Path(tempfile.mkdtemp())
+        sink = _BoundedPipeSink(preview_chars=200, spool_dir=d)
+        for i in range(50):
+            sink.feed("a" * 10)
+        sink.finish_writing()
+        self.assertTrue(sink.spilled)
+        self.assertEqual(sink.total_chars, 500)
+        self.assertEqual("".join(sink.iter_content()), "a" * 500)
+        self.assertLessEqual(
+            len(sink.head_text) + len(sink.tail_text), sink.preview_chars
+        )
+        sink.discard()
+        self.assertFalse(list(d.glob("*.raw")))
+
+    def test_combined_artifact_matches_canonical_layout(self):
+        d = Path(tempfile.mkdtemp())
+        out = _BoundedPipeSink(preview_chars=50, spool_dir=d)
+        err = _BoundedPipeSink(preview_chars=50, spool_dir=d)
+        out.feed("  out line\n\n"); err.feed("\nerr line  \n")
+        out.finish_writing(); err.finish_writing()
+        path, _preview, total_bytes, total_chars, _sha = _stream_sinks_to_artifact(
+            out, err, artifact_dir=d / "art", preview_chars=50
+        )
+        content = Path(path).read_text(encoding="utf-8")
+        self.assertEqual(
+            content, combine_output("  out line\n\n", "\nerr line  \n")
+        )
+        self.assertEqual(total_bytes, len(content.encode("utf-8")))
+        self.assertEqual(total_chars, len(content))
+
+    def test_large_combined_artifact_preserves_full_streams(self):
+        import hashlib
+
+        d = Path(tempfile.mkdtemp())
+        out = _BoundedPipeSink(preview_chars=300, spool_dir=d)
+        err = _BoundedPipeSink(preview_chars=300, spool_dir=d)
+        for _ in range(40):
+            out.feed("x" * 100)
+        err.feed("boom")
+        out.finish_writing(); err.finish_writing()
+        path, preview, total_bytes, _total_chars, sha = _stream_sinks_to_artifact(
+            out, err, artifact_dir=d / "art", preview_chars=300
+        )
+        content = Path(path).read_text(encoding="utf-8")
+        self.assertEqual(content.count("x"), 4000)
+        self.assertIn("--- STDERR ---", content)
+        self.assertTrue(content.endswith("boom"))
+        self.assertEqual(
+            hashlib.sha256(content.encode("utf-8")).hexdigest(), sha
+        )
+        self.assertIn("omitted", preview)
+        self.assertLess(len(preview), 1200)
+
+
+@unittest.skipUnless(
+    os.name == "nt" and windows_shell_kind() == "pwsh" and windows_shell_path(),
+    "requires Windows PowerShell 7",
+)
+class OneShotPowerShellStreamingTests(unittest.TestCase):
+    def test_one_shot_large_output_is_bounded_and_artifact_complete(self):
+        from harness_code_agent.runtime.builtins.shell import _run_one_shot_powershell
+
+        with patch.object(config, "SHELL_OUTPUT_PREVIEW_CHARS", 2000):
+            # Calling the one-shot path directly: it is normally gated to
+            # bare `exit`, but the drain machinery is the same.
+            result = _run_one_shot_powershell(
+                "Write-Output ('q' * 20000)",
+                timeout=30,
+                tool_context=None,
+                artifact_dir=Path(tempfile.mkdtemp()),
+            )
+        self.assertTrue(result.output_spilled)
+        self.assertEqual(result.exit_code, 0)
+        artifact = Path(result.artifact_path)
+        body = artifact.read_text(encoding="utf-8").strip()
+        self.assertEqual(len(body), 20000)
+        self.assertEqual(set(body), {"q"})
+
+    def test_one_shot_small_output_stays_inline(self):
+        from harness_code_agent.runtime.builtins.shell import _run_one_shot_powershell
+
+        result = _run_one_shot_powershell(
+            "Write-Output hi",
+            timeout=30,
+            tool_context=None,
+            artifact_dir=Path(tempfile.mkdtemp()),
+        )
+        self.assertFalse(result.output_spilled)
+        self.assertEqual(result.stdout.strip(), "hi")
+        self.assertEqual(result.exit_code, 0)
 
 
 if __name__ == "__main__":

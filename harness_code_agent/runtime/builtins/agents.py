@@ -5,6 +5,7 @@ import json
 import time
 from typing import Any
 
+from ...agent.coordinator import SubagentCapacityError
 from ..tool_context import ToolContext
 from ..tool_result import ToolResult
 
@@ -36,6 +37,8 @@ def spawn_agent(
             max_seconds=max_seconds,
             parent_cancellation_token=cancellation_token,
         )
+    except SubagentCapacityError as exc:
+        return _capacity_error("spawn_agent", str(exc))
     except ValueError as exc:
         return _policy_error("spawn_agent", str(exc))
     return _result("spawn_agent", result)
@@ -48,6 +51,16 @@ def _policy_error(tool: str, reason: str) -> ToolResult:
         output=f"[blocked] {reason}",
         error=reason,
         metadata={"status_source": "agent_policy"},
+    )
+
+
+def _capacity_error(tool: str, reason: str) -> ToolResult:
+    return ToolResult(
+        tool=tool,
+        status="failed",
+        output=f"[resource_unavailable] {reason}",
+        error=reason,
+        metadata={"status_source": "resource", "resource_kind": "subagent_capacity"},
     )
 
 

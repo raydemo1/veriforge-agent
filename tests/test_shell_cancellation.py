@@ -21,10 +21,10 @@ class _BlockingShellSession:
         self.interrupted = False
         self.closed = False
 
-    def run(self, _command: str, timeout: int = 300) -> ShellResult:
+    def run(self, _command: str, timeout: int = 300, artifact_dir=None) -> ShellResult:
         self.started.set()
         self.released.wait(timeout=timeout)
-        return ShellResult("", "", 130)
+        return ShellResult("", "", 130, timed_out=False)
 
     def interrupt(self) -> None:
         self.interrupted = True
@@ -89,12 +89,22 @@ class ShellCancellationTests(unittest.TestCase):
         ):
             execute_tool_result("cancel_tool", {}, cancellation_token=token)
 
-    def test_one_shot_timeout_has_a_bounded_second_communicate(self):
+    def test_one_shot_timeout_kills_tree_and_keeps_bounded_drain_preview(self):
+        class FakePipe:
+            def __init__(self, chunks):
+                self._chunks = list(chunks)
+                self.closed = False
+
+            def read(self, _n):
+                return self._chunks.pop(0) if self._chunks else ""
+
+            def close(self):
+                self.closed = True
+
         process = MagicMock()
-        process.communicate.side_effect = [
-            subprocess.TimeoutExpired("command", 1, output="partial", stderr="warning"),
-            subprocess.TimeoutExpired("command", 5),
-        ]
+        process.stdout = FakePipe(["partial"])
+        process.stderr = FakePipe(["warning"])
+        process.wait.side_effect = [subprocess.TimeoutExpired("command", 1), None]
         tool_context = SimpleNamespace(workspace=SimpleNamespace(root=Path.cwd()))
 
         with (
@@ -105,12 +115,13 @@ class ShellCancellationTests(unittest.TestCase):
             result = _run_one_shot_powershell("command", 1, tool_context)
 
         self.assertTrue(result.timed_out)
+        self.assertEqual(result.exit_code, 130)
         self.assertEqual(result.stdout, "partial")
         self.assertEqual(result.stderr, "warning")
-        self.assertEqual(process.communicate.call_count, 2)
-        self.assertEqual(terminate.call_count, 2)
-        process.stdout.close.assert_called_once()
-        process.stderr.close.assert_called_once()
+        # The tree is killed once; reader threads drain and close the pipes.
+        self.assertEqual(terminate.call_count, 1)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
 
 
 if __name__ == "__main__":

@@ -31,6 +31,16 @@ TERMINAL_STATES = {"completed", "blocked", "failed", "interrupted", "closed"}
 MAX_OPEN_AGENTS = max(1, int(config.MAX_OPEN_AGENTS))
 MAX_CONCURRENT_AGENTS = max(1, int(config.MAX_CONCURRENT_AGENTS))
 
+
+class SubagentCapacityError(ValueError):
+    """Raised when the open-agent slot cap (not a policy rule) is reached.
+
+    Subclasses ValueError so existing ``except ValueError`` callers keep
+    working; spawn_agent distinguishes it to emit a resource-class failure.
+    Note: the concurrency semaphore (MAX_CONCURRENT_AGENTS) blocks queued
+    workers rather than raising; this error covers the hard open cap.
+    """
+
 @dataclass
 class AgentRecord:
     id: str
@@ -112,7 +122,9 @@ class AgentCoordinator:
         with self._condition:
             self._ensure_open()
             if len(self._records) >= MAX_OPEN_AGENTS:
-                raise ValueError(f"at most {MAX_OPEN_AGENTS} agent threads may remain open")
+                raise SubagentCapacityError(
+                    f"at most {MAX_OPEN_AGENTS} agent threads may remain open"
+                )
             if clean_name in self._names:
                 raise ValueError(f"agent name is already in use: {clean_name}")
             if role == "worker":
@@ -133,7 +145,6 @@ class AgentCoordinator:
             )
             self._records[agent_id] = record
             self._names[clean_name] = agent_id
-            self._link_parent_cancel(record)
             record.future = self._executor.submit(self._run_record, agent_id)
             self._changed_locked()
         self._emit(record, "agent_spawned")
@@ -278,7 +289,10 @@ class AgentCoordinator:
                         record.state = "running"
                         record.started_at = record.started_at or time.time()
                         record.ended_at = None
-                        record.token = CancellationToken()
+                        previous_token = record.token
+                        record.token = CancellationToken(parent=record.parent_token)
+                        if previous_token is not None:
+                            previous_token.close()
                         token = record.token
                         self._changed_locked()
                     self._emit(record, "agent_status", status="running")
@@ -360,6 +374,10 @@ class AgentCoordinator:
             record.conversation.queue_message(message)
 
     def _role_registry(self, role: str) -> ToolRegistry:
+        # Depth limit: subagent registries are capability-filtered views of
+        # the parent registry. spawn_agent carries no *_AGENT capability, so
+        # workers/subagents cannot spawn further agents (hard depth = 1,
+        # enforced structurally — there is no depth counter or state machine).
         source = self.context.tool_registry
         if source is None:
             raise RuntimeError("parent tool registry is unavailable")
@@ -377,8 +395,13 @@ class AgentCoordinator:
             record.state = state
             record.error = error
             record.ended_at = time.time()
+            token = record.token
             record.token = None
             self._changed_locked()
+        # Detach the run token from the parent turn token outside the
+        # coordinator lock so finished runs do not leak parent callbacks.
+        if token is not None:
+            token.close()
         self._emit(record, "agent_status", previous=previous, status=state)
 
     def _take_followup(self, record: AgentRecord) -> str | None:
@@ -436,23 +459,6 @@ class AgentCoordinator:
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("agent coordinator is closed")
-
-    def _link_parent_cancel(self, record: AgentRecord) -> None:
-        """Cancel this agent's turn token whenever the spawning turn is stopped.
-
-        The callback is registered once at spawn and stays valid across
-        follow-up runs; a finished run simply has no active token to cancel.
-        """
-        parent_token = record.parent_token
-        if parent_token is None:
-            return
-
-        def cancel_active_run() -> None:
-            token = record.token
-            if token is not None:
-                token.cancel()
-
-        parent_token.add_callback(cancel_active_run)
 
 
 def _role_prompt(record: AgentRecord, parent_messages: list[dict]) -> str:

@@ -74,8 +74,13 @@ class FailureKind:
     USER_ATTENTION_REQUIRED = "user_attention_required"
     # resource
     BUDGET_EXCEEDED = "budget_exceeded"
-    TIMEOUT = "timeout"
+    #: Workspace write quota or free-disk floor reached.
+    QUOTA_EXCEEDED = "quota_exceeded"
+    #: Subagent concurrency/open-agent capacity is full.
+    SUBAGENT_CAPACITY = "subagent_capacity"
     # execution
+    #: A backend-specific timeout was hit (run_bash, HTTP, MCP transport...).
+    TIMEOUT = "timeout"
     COMMAND_NOT_FOUND = "command_not_found"
     FILE_NOT_FOUND = "file_not_found"
     PROCESS_FAILED = "process_failed"
@@ -184,7 +189,21 @@ _KIND_SPECS: dict[str, tuple[str, str | None, bool, bool]] = {
         False,
         False,
     ),
-    FailureKind.TIMEOUT: (FailureCategory.RESOURCE, FailurePhase.RESOURCE, True, False),
+    FailureKind.QUOTA_EXCEEDED: (
+        FailureCategory.RESOURCE,
+        FailurePhase.RESOURCE,
+        False,
+        False,
+    ),
+    FailureKind.SUBAGENT_CAPACITY: (
+        FailureCategory.RESOURCE,
+        FailurePhase.RESOURCE,
+        True,
+        False,
+    ),
+    # Timeout is a backend execution outcome (the backend killed its own
+    # work), not a resource-capacity classification.
+    FailureKind.TIMEOUT: (FailureCategory.EXECUTION, FailurePhase.EXECUTION, True, False),
     FailureKind.COMMAND_NOT_FOUND: (
         FailureCategory.EXECUTION,
         FailurePhase.EXECUTION,
@@ -266,6 +285,8 @@ _SOURCE_DEFAULT_KIND = {
     "user_question": FailureKind.USER_ATTENTION_REQUIRED,
     "budget": FailureKind.BUDGET_EXCEEDED,
     "fallback": FailureKind.BUDGET_EXCEEDED,
+    "quota": FailureKind.QUOTA_EXCEEDED,
+    "resource": FailureKind.SUBAGENT_CAPACITY,
     "timeout": FailureKind.TIMEOUT,
     "exception": FailureKind.TOOL_INTERNAL_ERROR,
     "registry": FailureKind.UNKNOWN_TOOL,
@@ -278,6 +299,14 @@ _SOURCE_DEFAULT_KIND = {
     "browser": FailureKind.EXECUTION_FAILED,
     "unstructured": FailureKind.EXECUTION_FAILED,
     "": FailureKind.EXECUTION_FAILED,
+}
+
+#: metadata.resource_kind values for status_source="resource"/"quota".
+_RESOURCE_KIND_MAP = {
+    "subagent_capacity": FailureKind.SUBAGENT_CAPACITY,
+    "workspace_quota": FailureKind.QUOTA_EXCEEDED,
+    "free_disk": FailureKind.QUOTA_EXCEEDED,
+    "quota": FailureKind.QUOTA_EXCEEDED,
 }
 
 #: Sources where output text may refine the generic execution kind.
@@ -464,6 +493,12 @@ class ToolFailure:
             kind = FailureKind.APPROVAL_DENIED
         elif metadata.get("timed_out"):
             kind = FailureKind.TIMEOUT
+        elif source in {"resource", "quota"}:
+            resource_kind = str(metadata.get("resource_kind", "") or "").strip().lower()
+            kind = _RESOURCE_KIND_MAP.get(
+                resource_kind,
+                _SOURCE_DEFAULT_KIND.get(source, FailureKind.EXECUTION_FAILED),
+            )
         else:
             kind = _SOURCE_DEFAULT_KIND.get(source, FailureKind.EXECUTION_FAILED)
 
@@ -741,7 +776,7 @@ def _refine_by_text(
     phase: str,
 ) -> tuple[str, str, str]:
     if "timed out" in lowered or "timeout" in lowered:
-        return FailureKind.TIMEOUT, FailureCategory.RESOURCE, FailurePhase.RESOURCE
+        return FailureKind.TIMEOUT, FailureCategory.EXECUTION, FailurePhase.EXECUTION
     if "command not found" in lowered:
         return FailureKind.COMMAND_NOT_FOUND, category, phase
     if "no such file or directory" in lowered or "file not found" in lowered:

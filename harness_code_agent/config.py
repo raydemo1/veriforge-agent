@@ -200,18 +200,24 @@ MAX_CONCURRENT_AGENTS = max(1, int(os.environ.get("HARNESS_MAX_CONCURRENT_AGENTS
 MAX_OPEN_AGENTS = max(1, int(os.environ.get("HARNESS_MAX_OPEN_AGENTS", "8")))
 
 # --- Tool execution safety nets ---
-# Wall-clock deadline applied to every synchronous tool call that does not
-# declare its own timeout, and the hard ceiling for tool-supplied timeouts
-# (e.g. run_bash's timeout argument).
-TOOL_DEFAULT_TIMEOUT_SECONDS = float(
-    os.environ.get("HARNESS_TOOL_DEFAULT_TIMEOUT_SECONDS", "300")
+# There is deliberately no global per-tool wall-clock deadline: timeout is a
+# capability of the concrete execution backend, not a universal tool semantic.
+# run_bash owns its own timeout (default below, hard ceiling enforced by clamp;
+# the backend kills the process tree when it fires).
+SHELL_DEFAULT_TIMEOUT_SECONDS = float(
+    os.environ.get("HARNESS_SHELL_DEFAULT_TIMEOUT_SECONDS", "300")
 )
 TOOL_MAX_TIMEOUT_SECONDS = float(
     os.environ.get("HARNESS_TOOL_MAX_TIMEOUT_SECONDS", "1800")
 )
-# Raw foreground shell output capture ceiling.  Commands that emit more are
-# interrupted at the byte boundary; 0 disables the cap.
-SHELL_MAX_OUTPUT_BYTES = int(os.environ.get("HARNESS_SHELL_MAX_OUTPUT_BYTES", str(10 * 1024 * 1024)))
+# Host-memory safety for shell output capture: the reader drains continuously
+# (commands are never interrupted for producing too much output), keeping at
+# most this many characters of head+tail preview in memory.  Output larger
+# than the budget is streamed to an artifact file and the ToolResult carries
+# preview + artifact ref + total size.
+SHELL_OUTPUT_PREVIEW_CHARS = int(
+    os.environ.get("HARNESS_SHELL_OUTPUT_PREVIEW_CHARS", "8192")
+)
 
 # --- Workspace write quota ---
 # Cumulative structured writes (write_file/apply_patch) allowed per session;
@@ -224,8 +230,8 @@ MIN_FREE_DISK_BYTES = int(os.environ.get("HARNESS_MIN_FREE_DISK_MB", "100")) * 1
 
 # --- Shell process resource limits ---
 # Docker sandbox: passed to `docker run` as --memory / --cpus; 0 leaves them unset.
-DOCKER_MEMORY_MB = int(os.environ.get("HARNESS_DOCKER_MEMORY_MB", "2048"))
-DOCKER_CPUS = float(os.environ.get("HARNESS_DOCKER_CPUS", "2"))
+DOCKER_MEMORY_MB = int(os.environ.get("HARNESS_DOCKER_MEMORY_MB", "0"))
+DOCKER_CPUS = float(os.environ.get("HARNESS_DOCKER_CPUS", "0"))
 # POSIX host sandbox: injected as ulimit -v (address space KB), -t (CPU
 # seconds), -f (single-file blocks) before each command.  All default to 0
 # (disabled) because address-space caps can false-kill JVM/Node workloads.

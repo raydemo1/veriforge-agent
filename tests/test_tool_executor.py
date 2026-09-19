@@ -795,36 +795,6 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("slow:300", tool_messages[0]["content"])
         self.assertIn("fast:30", tool_messages[1]["content"])
 
-    def test_global_deadline_returns_timeout_result_for_hanging_tool(self):
-        registry = tools.ToolRegistry()
-
-        def hanging_tool(cancellation_token=None):
-            while not (cancellation_token is not None and cancellation_token.is_cancelled):
-                time.sleep(0.01)
-            return ToolResult(tool="hanging_read", status="failed", output="should not win")
-
-        registry.register(_schema("hanging_read"), hanging_tool, permission="read", effect=_READ_EFFECT)
-        tool_calls = [_tool_call("tc_hang", "hanging_read")]
-
-        with tempfile.TemporaryDirectory() as tmp:
-            conversation, _context = _conversation_with_registry(Path(tmp), registry, tool_calls)
-            start = time.perf_counter()
-            with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
-                patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
-                patch(
-                    "harness_code_agent.agent.tool_executor.config.TOOL_DEFAULT_TIMEOUT_SECONDS",
-                    1.0,
-                ),
-            ):
-                conversation.run_until_idle()
-            elapsed = time.perf_counter() - start
-
-        self.assertLess(elapsed, 3.0)
-        tool_messages = [msg for msg in conversation.messages if msg.get("role") == "tool"]
-        self.assertTrue(tool_messages)
-        self.assertIn("exceeded its", tool_messages[0]["content"])
-
     def test_parallel_group_observes_cancellation_while_waiting_for_tools(self):
         from harness_code_agent.agent.cancellation import (
             CancellationToken,
@@ -865,6 +835,54 @@ class ToolExecutorTests(unittest.TestCase):
             elapsed = time.perf_counter() - start
 
         self.assertLess(elapsed, 0.25)
+
+    def test_child_tokens_detach_from_turn_token_on_abnormal_cancel_path(self):
+        from harness_code_agent.agent.cancellation import (
+            CancellationToken,
+            CancelledError,
+        )
+
+        registry = tools.ToolRegistry()
+        token = CancellationToken()
+        settled = threading.Event()
+
+        def slow_tool(cancellation_token=None):
+            deadline = time.time() + 1.0
+            while time.time() < deadline:
+                if cancellation_token is not None and cancellation_token.is_cancelled:
+                    break
+                time.sleep(0.01)
+            settled.set()
+            return ToolResult(tool="slow_read", status="failed", output="cancelled")
+
+        def cancel_tool():
+            token.cancel()
+            return ToolResult(tool="cancel_read", status="success", output="cancelled")
+
+        registry.register(_schema("slow_read"), slow_tool, permission="read", effect=_READ_EFFECT)
+        registry.register(_schema("cancel_read"), cancel_tool, permission="read", effect=_READ_EFFECT)
+        tool_calls = [
+            _tool_call("tc_slow", "slow_read"),
+            _tool_call("tc_cancel", "cancel_read"),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation, _context = _conversation_with_registry(Path(tmp), registry, tool_calls)
+            with (
+                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
+                patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+                self.assertRaises(CancelledError),
+            ):
+                conversation.run_until_idle(cancellation_token=token)
+            # The group exited via its abnormal path; once the cooperative
+            # tool unwinds, the future done-callback must detach the child
+            # from the turn token (no callback leak onto a long-lived token).
+            self.assertTrue(settled.wait(2))
+            deadline = time.time() + 1.0
+            while token._callbacks and time.time() < deadline:
+                time.sleep(0.02)
+
+        self.assertEqual(token._callbacks, [])
 
     def test_parallel_group_passes_cancellation_token_to_tool_handlers(self):
         from harness_code_agent.agent.cancellation import (

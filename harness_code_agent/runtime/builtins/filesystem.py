@@ -429,7 +429,8 @@ def _quota_result(tool: str, path: str, exc: WorkspaceQuotaError) -> ToolResult:
         error=exc.reason,
         metadata={
             "path": path,
-            "status_source": "quota",
+            "status_source": "resource",
+            "resource_kind": getattr(exc, "resource_kind", "workspace_quota"),
             "charged_bytes": exc.charged_bytes,
             "limit_bytes": exc.limit_bytes,
         },

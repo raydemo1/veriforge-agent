@@ -317,9 +317,8 @@ class ToolExecutor:
         if not ready:
             return executed
         futures: dict[Future, PreparedToolCall] = {}
-        pending: set[Future] = set()
-        deadlines: dict[Future, float] = {}
         child_tokens: dict[Future, CancellationToken] = {}
+        pending: set[Future] = set()
         try:
             for prepared in ready:
                 if prepared.emit_events:
@@ -331,21 +330,30 @@ class ToolExecutor:
                     )
                 child_token = self._make_child_token()
                 future = self._executor.submit(self._execute_one, prepared, child_token)
+                if child_token is not None:
+                    child_tokens[future] = child_token
+                    # Single lifecycle owner for the parent callback: the
+                    # detach runs whether the call succeeds, raises, or its
+                    # future is cancelled — so abnormal exits cannot leak
+                    # callbacks onto the long-lived turn token.
+                    future.add_done_callback(
+                        lambda _f, token=child_token: token.close()
+                    )
                 if self.agent.tool_context is not None:
                     self.agent.tool_context.tool_tasks.track(future)
                 futures[future] = prepared
-                child_tokens[future] = child_token
                 pending.add(future)
-                deadlines[future] = time.monotonic() + self._deadline_seconds(prepared)
+            # No generic per-call deadline: a tool runs until it finishes or
+            # the turn token is cancelled.  Timeout is a capability of the
+            # concrete backend (run_bash kills its process tree, HTTP/MCP
+            # clients have their own limits), not a universal tool semantic.
             while pending:
                 self.conversation._check_cancelled(self.cancellation_token)
-                wait_timeout = min(
-                    0.05,
-                    max(0.0, min(deadlines[future] - time.monotonic() for future in pending)),
-                )
-                done, pending = wait(pending, timeout=wait_timeout, return_when=FIRST_COMPLETED)
+                done, pending = wait(pending, timeout=0.05, return_when=FIRST_COMPLETED)
                 for future in done:
                     prepared = futures[future]
+                    # The future's done callback detaches the child token.
+                    child_tokens.pop(future, None)
                     try:
                         executed.append(future.result())
                     except Exception as exc:
@@ -362,95 +370,29 @@ class ToolExecutor:
                                 error=exc,
                             )
                         )
-                overdue = [
-                    future
-                    for future in pending
-                    if deadlines[future] <= time.monotonic()
-                ]
-                for future in overdue:
-                    prepared = futures[future]
-                    if future.done():
-                        # Race with natural completion: keep the real result.
-                        pending.discard(future)
-                        try:
-                            executed.append(future.result())
-                        except Exception as exc:
-                            executed.append(
-                                ExecutedToolCall(
-                                    prepared,
-                                    ToolResult(
-                                        tool=prepared.name,
-                                        status="failed",
-                                        output=f"[error] {type(exc).__name__}: {exc}",
-                                        error=f"{type(exc).__name__}: {exc}",
-                                        metadata={"status_source": "exception"},
-                                    ),
-                                    error=exc,
-                                )
-                            )
-                        continue
-                    timeout_seconds = self._deadline_seconds(prepared)
-                    child_token = child_tokens.get(future)
-                    if child_token is not None:
-                        child_token.cancel()
-                    # Python cannot kill a running thread: cooperative tools
-                    # (run_bash/web/mcp) honor the child token and unwind;
-                    # others keep running until they finish or session
-                    # shutdown reaps them via ToolTaskSupervisor.
-                    future.add_done_callback(lambda f: f.cancelled() or f.exception())
-                    pending.discard(future)
-                    log.warning(
-                        "[%s] Tool %s exceeded its %.0fs deadline; cancelling the call",
-                        self.agent.name,
-                        prepared.name,
-                        timeout_seconds,
-                    )
-                    executed.append(self._timeout_result(prepared, timeout_seconds))
             self.conversation._check_cancelled(self.cancellation_token)
         except Exception:
+            # Cooperative cancellation: Python cannot kill a running thread,
+            # so started calls unwind themselves when they observe their
+            # (already-cancelled-via-parent, or explicitly cancelled below)
+            # child token.  Detach still happens via each future's done
+            # callback once the call settles.
             for future in pending:
+                token = child_tokens.get(future)
+                if token is not None:
+                    token.cancel()
                 future.cancel()
             if pending:
                 wait(pending, timeout=0.25)
             raise
         return executed
 
-    def _make_child_token(self) -> CancellationToken:
-        """Per-call token: parent turn cancellation always propagates down."""
-        child = CancellationToken()
+    def _make_child_token(self) -> CancellationToken | None:
+        """Per-call child token: parent turn cancellation propagates down."""
         parent = self.cancellation_token
         if parent is None:
-            return child
-        if parent.is_cancelled:
-            child.cancel()
-        else:
-            parent.add_callback(child.cancel)
-        return child
-
-    def _deadline_seconds(self, prepared: PreparedToolCall) -> float:
-        if prepared.name == "run_bash":
-            try:
-                requested = float(prepared.args.get("timeout", config.TOOL_DEFAULT_TIMEOUT_SECONDS))
-            except (TypeError, ValueError):
-                requested = config.TOOL_DEFAULT_TIMEOUT_SECONDS
-            return max(1.0, min(requested, config.TOOL_MAX_TIMEOUT_SECONDS))
-        return max(1.0, float(config.TOOL_DEFAULT_TIMEOUT_SECONDS))
-
-    def _timeout_result(self, prepared: PreparedToolCall, timeout_seconds: float) -> ExecutedToolCall:
-        message = (
-            f"Tool '{prepared.name}' exceeded its {timeout_seconds:.0f}s deadline and was cancelled. "
-            "Retry with a narrower scope or an explicit timeout within the limit."
-        )
-        return ExecutedToolCall(
-            prepared,
-            ToolResult(
-                tool=prepared.name,
-                status="failed",
-                output=f"[error] {message}",
-                error=message,
-                metadata={"timed_out": True, "status_source": "timeout"},
-            ),
-        )
+            return None
+        return parent.create_child()
 
     def _run_before_tool(self, prepared: PreparedToolCall) -> ToolResult | None:
         activity = self._middleware_activity.setdefault(
