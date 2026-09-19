@@ -86,6 +86,7 @@ class ToolGuardMiddleware(AgentMiddleware):
         messages: list[dict],
         runtime_state=None,
         agent_name: str | None = None,
+        permission_decision=None,
     ) -> ToolResult | None:
         if tool_name != "run_bash":
             return None

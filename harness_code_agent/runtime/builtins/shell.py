@@ -10,7 +10,7 @@ import subprocess
 from ... import config
 from ...agent.cancellation import CancelledError
 from ...workspace.shell_jobs import ShellJobNotFound
-from ..shell_classification import analyze_shell_command
+from ..shell_classification import is_long_running_shell_command
 from ..tool_result import ToolResult
 
 
@@ -36,7 +36,7 @@ def run_bash(
         timeout = max(1, min(int(timeout), int(config.TOOL_MAX_TIMEOUT_SECONDS)))
     except (TypeError, ValueError):
         timeout = int(config.TOOL_DEFAULT_TIMEOUT_SECONDS)
-    if analyze_shell_command(command).long_running:
+    if is_long_running_shell_command(command):
         manager = _shell_job_manager(runtime_state)
         if manager is None:
             return ToolResult(

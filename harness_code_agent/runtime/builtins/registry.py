@@ -10,7 +10,14 @@ from ..permissions import (
     TOOL_PERMISSION_READ,
     TOOL_PERMISSION_SHELL,
 )
-from ..shell_classification import analyze_shell_command
+from ..shell_classification import (
+    ShellEffect,
+    ShellTrait,
+    TargetScope,
+    analyze_shell_command,
+    is_long_running_shell_command,
+    is_verify_shell_command,
+)
 from ..tool_call_validation import strict_tool_schema
 from ..tool_registry import (
     TOOL_CAPABILITY_MAIN,
@@ -332,18 +339,77 @@ def _conflict_effect(args, context):
 
 
 def _shell_effect(args, context):
-    analysis = analyze_shell_command(str(args.get("command") or ""))
-    workspace = workspace_claim(_root(context), ".", scope="global", access="read")
-    if analysis.kind == "inspect":
-        return CallEffect((workspace,), kind="inspect")
-    if analysis.kind == "verify":
+    command = str(args.get("command") or "")
+    root = _root(context)
+    sandbox = getattr(
+        getattr(context, "permission_policy", None), "sandbox_mode", None
+    )
+    analysis = analyze_shell_command(command, root, sandbox)
+    effects = analysis.effects
+    traits = analysis.traits
+    scopes = {t.scope for t in analysis.targets}
+
+    workspace_read = workspace_claim(root, ".", scope="global", access="read")
+
+    if is_long_running_shell_command(command):
+        return CallEffect.global_exclusive(kind="long_running")
+    non_workspace = scopes & {
+        TargetScope.SYSTEM,
+        TargetScope.EXTERNAL,
+        TargetScope.UNKNOWN,
+    }
+    if ShellTrait.DESTRUCTIVE in traits and non_workspace:
+        return CallEffect.global_exclusive(kind="destructive")
+    if ShellTrait.RECURSIVE in traits:
+        return CallEffect.global_exclusive(kind="recursive_delete")
+    if ShellTrait.UNKNOWN_EFFECT in traits:
+        # Unknown programs may touch anything: run alone as a batch barrier.
+        return CallEffect.global_exclusive(kind="unknown_execution")
+    if ShellEffect.GIT_MUTATION in effects:
+        # Git index lock + whole-repo state: serialize against other mutations.
+        return CallEffect.global_exclusive(
+            kind="git_remote_mutation" if ShellEffect.NETWORK in effects else "git_mutation"
+        )
+    if effects & {ShellEffect.WRITE, ShellEffect.DELETE}:
+        if TargetScope.SYSTEM in scopes:
+            return CallEffect.global_exclusive(kind="system_mutation")
+        if TargetScope.EXTERNAL in scopes or TargetScope.UNKNOWN in scopes:
+            return CallEffect.global_exclusive(kind="external_mutation")
+        claims = _shell_target_write_claims(analysis, root)
+        if not claims:
+            claims = (workspace_claim(root, ".", scope="global", access="write"),)
+        return CallEffect(claims, kind="workspace_mutation")
+    if is_verify_shell_command(command):
         return CallEffect(
-            (workspace, ResourceClaim("workspace:derived", "*", "global", "write")),
+            (workspace_read, ResourceClaim("workspace:derived", "*", "global", "write")),
             kind="verify",
         )
-    if analysis.kind == "long_running":
-        return CallEffect.global_exclusive(kind="long_running")
-    return CallEffect.global_exclusive(kind=analysis.kind)
+    if ShellEffect.NETWORK in effects:
+        claims = [ResourceClaim("network", "*", "global", "read"), workspace_read]
+        return CallEffect(tuple(claims), kind="inspect")
+    return CallEffect((workspace_read,), kind="inspect")
+
+
+def _shell_target_write_claims(analysis, root) -> tuple[ResourceClaim, ...]:
+    claims: list[ResourceClaim] = []
+    for target in analysis.targets:
+        if target.scope is not TargetScope.WORKSPACE or not target.raw:
+            continue
+        raw = target.raw.rstrip("/\\")
+        claims.append(
+            workspace_claim(
+                root,
+                raw or ".",
+                scope="subtree" if _looks_like_directory_target(raw) else "exact",
+                access="write",
+            )
+        )
+    return tuple(claims)
+
+
+def _looks_like_directory_target(raw: str) -> bool:
+    tail = raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return "." not in tail
 
 
 BUILTIN_TOOL_REGISTRY = _build_builtin_tool_registry()

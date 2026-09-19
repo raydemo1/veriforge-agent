@@ -1005,6 +1005,7 @@ class InteractiveSession:
 
     def toggle_permission_mode(self) -> str:
         modes = [
+            PermissionPolicy.READ_ONLY,
             PermissionPolicy.WORKSPACE_WRITE,
             PermissionPolicy.LLM_AUTO,
             PermissionPolicy.DANGER_FULL_ACCESS,

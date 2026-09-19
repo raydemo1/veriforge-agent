@@ -20,9 +20,6 @@ from harness_code_agent.profiles.router import (
 )
 from harness_code_agent.profiles.terminal import TerminalProfile
 from harness_code_agent.runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
-from harness_code_agent.runtime.middleware import (
-    TerminalShellEditPolicyMiddleware,
-)
 from harness_code_agent.runtime.tool_registry import tool_schemas_for_profile
 
 
@@ -228,13 +225,10 @@ class ProfilePromptTests(unittest.TestCase):
         self.assertIsNone(plan_cfg.time_budget)
         self.assertIn("planning flow (plan.md)", plan_cfg.system_prompt)
 
-    def test_terminal_keeps_shell_policy_and_hard_timeout(self):
+    def test_terminal_has_no_intervention_middleware_and_hard_timeout(self):
         cfg = get_profile("terminal").main_agent()
 
-        self.assertEqual(
-            [type(mw) for mw in cfg.middlewares],
-            [TerminalShellEditPolicyMiddleware],
-        )
+        self.assertEqual(cfg.middlewares, [])
         self.assertEqual(cfg.time_budget, 1800)
         self.assertNotIn("tracked", cfg.system_prompt)
         self.assertIn("non-trivial multi-step execution", cfg.system_prompt)

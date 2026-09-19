@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from .base import MAIN_AGENT_NAMES, AgentMiddleware
 from .memory import MemoryMiddleware
-from .terminal_shell_edit import TerminalShellEditPolicyMiddleware
 from .tool_failure_policy import ToolFailurePolicyMiddleware
 from .tool_guard import ToolGuardMiddleware
 from .verification import (
@@ -19,7 +18,6 @@ __all__ = [
     "AgentMiddleware",
     "MemoryMiddleware",
     "StaticVerifierMiddleware",
-    "TerminalShellEditPolicyMiddleware",
     "ToolFailurePolicyMiddleware",
     "ToolGuardMiddleware",
     "_check_python_syntax",

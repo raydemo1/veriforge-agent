@@ -63,9 +63,10 @@ _PROFILE_COPY = {
 }
 
 _PERMISSION_COPY = {
-    PermissionPolicy.WORKSPACE_WRITE: ("请求批准", "编辑外部文件和使用互联网时始终询问"),
+    PermissionPolicy.WORKSPACE_WRITE: ("请求批准", "工作区内修改与执行未知程序时询问，工作区外写入直接拒绝"),
     PermissionPolicy.LLM_AUTO: ("替我审批", "由模型判断风险并自动批准具体、范围明确的安全操作"),
-    PermissionPolicy.DANGER_FULL_ACCESS: ("完全访问权限", "不受限制地访问互联网和电脑上的任何文件"),
+    PermissionPolicy.DANGER_FULL_ACCESS: ("完全访问权限", "工作区内外修改均不询问；灾难性命令（如 rm -rf /、git reset --hard）仍会被拦截"),
+    PermissionPolicy.READ_ONLY: ("只读", "禁止一切修改与未知程序执行"),
 }
 
 _MODEL_COPY = {

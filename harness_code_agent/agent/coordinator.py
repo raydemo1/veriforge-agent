@@ -12,17 +12,14 @@ from typing import Any
 
 from .. import config
 from ..runtime.execution_planner import acquire_concurrency, workspace_claim
-from ..runtime.middleware import AgentMiddleware
 from ..runtime.permission_middleware import PermissionMiddleware
 from ..runtime.permissions import PermissionPolicy
-from ..runtime.shell_classification import analyze_shell_command
 from ..runtime.tool_context import ToolContext
 from ..runtime.tool_registry import (
     TOOL_CAPABILITY_READONLY_AGENT,
     TOOL_CAPABILITY_WORKER_AGENT,
     ToolRegistry,
 )
-from ..runtime.tool_result import ToolResult
 from ..workspace.service import WorkspaceService
 from .cancellation import CancellationToken, CancelledError
 from .change_proposal import ChangeProposalStore
@@ -58,28 +55,6 @@ class AgentRecord:
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     ended_at: float | None = None
-
-
-class AgentRoleMiddleware(AgentMiddleware):
-    """Keep delegated tools inside the role and isolated-workspace contract."""
-
-    def __init__(self, role: str, *, allowed_paths: list[str]):
-        self.role = role
-        self.allowed_paths = [_normalize_rel(path) for path in allowed_paths]
-
-    def before_tool(self, tool_name, tool_args, messages, runtime_state=None, agent_name=None):
-        if self.role in READ_ONLY_ROLES and tool_name in {"write_file", "apply_patch"}:
-            return _blocked(tool_name, "this role cannot modify the workspace")
-        if self.role == "worker" and tool_name in {"write_file", "apply_patch"}:
-            path = _normalize_rel(str(tool_args.get("path") or ""))
-            if not path or not _path_allowed(path, self.allowed_paths):
-                return _blocked(tool_name, f"write path is outside allowed_paths: {path or '<empty>'}")
-        if tool_name == "run_bash":
-            analysis = analyze_shell_command(str(tool_args.get("command") or ""))
-            allowed = {"inspect", "verify"} if self.role in READ_ONLY_ROLES else {"inspect", "verify", "workspace_mutation"}
-            if analysis.kind not in allowed:
-                return _blocked(tool_name, f"shell command kind is not allowed for {self.role}: {analysis.kind}")
-        return None
 
 
 class AgentCoordinator:
@@ -351,9 +326,14 @@ class AgentCoordinator:
         else:
             workspace = self.context.workspace
         registry = self._role_registry(record.role)
+        policy = PermissionPolicy.for_role(
+            record.role,
+            allowed_paths=record.allowed_paths,
+            sandbox_mode="host",
+        )
         sub_context = ToolContext(
             workspace=workspace,
-            permission_policy=PermissionPolicy(mode="danger-full-access"),
+            permission_policy=policy,
             event_bus=self.context.event_bus,
             session_id=self.context.session_id,
             tool_registry=registry,
@@ -361,13 +341,12 @@ class AgentCoordinator:
         )
         sub_context.resource_coordinator = self.context.resource_coordinator
         sub_context.tool_tasks = self.context.tool_tasks
-        middleware = AgentRoleMiddleware(record.role, allowed_paths=record.allowed_paths)
         agent = Agent(
             name=record.name,
             system_prompt=_role_prompt(record, self._parent_messages()),
             use_tools=True,
             tool_schemas=registry.schemas(),
-            middlewares=[middleware, PermissionMiddleware(tool_context=sub_context, tool_registry=registry)],
+            middlewares=[PermissionMiddleware(tool_context=sub_context, tool_registry=registry)],
             time_budget=float(record.max_seconds),
             tool_context=sub_context,
             model_intensity=record.model_intensity,
@@ -558,13 +537,3 @@ def _path_allowed(path: str, allowed: list[str]) -> bool:
 
 def _paths_overlap(left: str, right: str) -> bool:
     return _path_allowed(left, [right]) or _path_allowed(right, [left])
-
-
-def _blocked(tool_name: str, reason: str) -> ToolResult:
-    return ToolResult(
-        tool=tool_name,
-        status="failed",
-        output=f"[blocked] {reason}",
-        error=reason,
-        metadata={"status_source": "agent_policy"},
-    )

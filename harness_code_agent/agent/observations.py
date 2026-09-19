@@ -7,7 +7,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..runtime.shell_classification import analyze_shell_command
+from ..runtime.shell_classification import (
+    ShellEffect,
+    ShellTrait,
+    analyze_shell_command,
+)
 from ..runtime.tool_result import ToolResult
 
 FRESH_DETAIL_LIMIT = 12_000
@@ -126,7 +130,15 @@ class FactTracker:
         return False
 
     def _shell_may_mutate(self, command: str) -> bool:
-        return analyze_shell_command(command).risk != "shell_safe"
+        analysis = analyze_shell_command(command)
+        return bool(
+            analysis.effects & {
+                ShellEffect.WRITE,
+                ShellEffect.DELETE,
+                ShellEffect.GIT_MUTATION,
+            }
+            or ShellTrait.UNKNOWN_EFFECT in analysis.traits
+        )
 
 
 class ObservationStore:

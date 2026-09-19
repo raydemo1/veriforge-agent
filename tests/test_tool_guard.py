@@ -11,10 +11,14 @@ from harness_code_agent.runtime.builtins.filesystem import (
     list_files,
     repo_search,
 )
-from harness_code_agent.runtime.middleware.terminal_shell_edit import (
-    TerminalShellEditPolicyMiddleware,
-)
 from harness_code_agent.runtime.middleware.tool_guard import ToolGuardMiddleware
+from harness_code_agent.runtime.permissions import PermissionPolicy
+from harness_code_agent.runtime.shell_classification import (
+    ShellEffect,
+    ShellTrait,
+    TargetScope,
+    analyze_shell_command,
+)
 from harness_code_agent.runtime.tool_result import ToolResult
 
 
@@ -164,114 +168,96 @@ class ShellPolicyTests(unittest.TestCase):
         self.assertFalse(state.fallback.stop_requested)
 
 
-class TerminalShellEditPolicyTests(unittest.TestCase):
-    def test_allows_explicit_shell_file_edit_inside_workspace(self):
-        middleware = TerminalShellEditPolicyMiddleware()
+class ShellPermissionPolicyTests(unittest.TestCase):
+    """Facts come from the analyzer; allow/ask/deny comes only from the policy."""
 
-        blocked = middleware.before_tool(
-            "run_bash",
-            {"command": "Set-Content -Path app.py -Value 'changed'"},
-            messages=[],
-            runtime_state=AgentRuntimeState(),
-            agent_name="main_agent",
-        )
+    def setUp(self) -> None:
+        self.workspace = PermissionPolicy("workspace-write", sandbox_mode="host")
+        self.eval = PermissionPolicy("terminal-eval", sandbox_mode="docker")
+        self.full = PermissionPolicy("danger-full-access", sandbox_mode="host")
 
-        self.assertIsNone(blocked)
+    def _decide(self, policy, command):
+        return policy.decide_tool_call("run_bash", {"command": command})
 
-    def test_allows_build_command_that_generates_artifacts(self):
-        middleware = TerminalShellEditPolicyMiddleware()
+    # --- reads: allowed in every mode -------------------------------------
 
-        blocked = middleware.before_tool(
-            "run_bash",
-            {"command": "python -m pip install -e . && python -m pytest"},
-            messages=[],
-            runtime_state=AgentRuntimeState(),
-            agent_name="main_agent",
-        )
-
-        self.assertIsNone(blocked)
-
-    def test_allows_stderr_to_stdout_redirection(self):
-        middleware = TerminalShellEditPolicyMiddleware()
-
-        blocked = middleware.before_tool(
-            "run_bash",
-            {"command": "python -m pytest 2>&1"},
-            messages=[],
-            runtime_state=AgentRuntimeState(),
-            agent_name="main_agent",
-        )
-
-        self.assertIsNone(blocked)
-
-    def test_allows_output_redirection_to_dev_null(self):
-        middleware = TerminalShellEditPolicyMiddleware()
-
+    def test_read_only_commands_are_allowed_everywhere(self):
         commands = [
+            "python -m pytest 2>&1",
+            "git status --short",
             "ls /app/polyglot 2>/dev/null || echo missing",
             "find /app -name '*.js' 2>/dev/null",
             "command -v rg >/dev/null && rg foo",
             "curl -sf http://localhost:8080/index.html &>/dev/null",
         ]
+        for policy in (self.workspace, self.eval, self.full):
+            for command in commands:
+                with self.subTest(mode=policy.mode, command=command):
+                    self.assertTrue(self._decide(policy, command).allowed)
 
-        for command in commands:
-            with self.subTest(command=command):
-                blocked = middleware.before_tool(
-                    "run_bash",
-                    {"command": command},
-                    messages=[],
-                    runtime_state=AgentRuntimeState(),
-                    agent_name="main_agent",
-                )
-                self.assertIsNone(blocked)
+    # --- workspace writes: ask in workspace-write, allow in eval ----------
 
-    def test_allows_shell_file_writes_inside_workspace(self):
-        middleware = TerminalShellEditPolicyMiddleware()
-
+    def test_workspace_writes_ask_in_workspace_mode_and_run_in_eval(self):
         commands = [
+            "Set-Content -Path app.py -Value 'changed'",
             "echo x > file.txt",
             "python test.py 2> error.log",
             "cat > file.txt <<'EOF'\nhello\nEOF",
             "printf x &> combined.log",
             "rg foo . | tee out.txt",
-            "python -c \"open('out.txt','w').write('x')\"",
-        ]
-
-        for command in commands:
-            with self.subTest(command=command):
-                blocked = middleware.before_tool(
-                    "run_bash",
-                    {"command": command},
-                    messages=[],
-                    runtime_state=AgentRuntimeState(),
-                    agent_name="main_agent",
-                )
-                self.assertIsNone(blocked)
-
-    def test_allows_formatter_and_patch_style_workspace_edits(self):
-        middleware = TerminalShellEditPolicyMiddleware()
-
-        commands = [
             "sed -i 's/foo/bar/g' app.py",
             "python -m ruff check --fix .",
             "gofmt -w main.go",
             "git apply fix.patch",
+            "git commit --allow-empty -m test",
+            "rm -rf build",
         ]
-
         for command in commands:
             with self.subTest(command=command):
-                blocked = middleware.before_tool(
-                    "run_bash",
-                    {"command": command},
-                    messages=[],
-                    runtime_state=AgentRuntimeState(),
-                    agent_name="main_agent",
-                )
-                self.assertIsNone(blocked)
+                decision = self._decide(self.workspace, command)
+                self.assertTrue(decision.requires_approval, command)
+                self.assertTrue(self._decide(self.eval, command).allowed, command)
 
-    def test_blocks_destructive_or_outside_workspace_shell_commands(self):
-        middleware = TerminalShellEditPolicyMiddleware()
+    def test_container_absolute_paths_are_workspace_targets_in_docker(self):
+        analysis = analyze_shell_command("rm -rf /tests/build", sandbox_mode="docker")
+        target = analysis.targets[0]
+        self.assertIs(target.scope, TargetScope.WORKSPACE)
+        self.assertIn(ShellEffect.DELETE, analysis.effects)
+        self.assertTrue(
+            self._decide(self.eval, "rm -rf /tests/build").allowed
+        )
+        # The same absolute path on a host is outside the workspace.
+        host_analysis = analyze_shell_command("rm -rf /tests/build", sandbox_mode="host")
+        self.assertIs(host_analysis.targets[0].scope, TargetScope.EXTERNAL)
+        self.assertFalse(
+            self._decide(self.workspace, "rm -rf /tests/build").allowed
+        )
 
+    # --- unknown execution: ask / allow, never proven safe ---------------
+
+    def test_interpreter_payloads_are_unknown_execution(self):
+        analysis = analyze_shell_command("python script.py")
+        self.assertIn(ShellEffect.EXECUTE, analysis.effects)
+        self.assertIn(ShellTrait.UNKNOWN_EFFECT, analysis.traits)
+        self.assertTrue(
+            self._decide(self.workspace, "python script.py").requires_approval
+        )
+        self.assertTrue(self._decide(self.eval, "python script.py").allowed)
+        # We deliberately do not parse Python to find embedded writes.
+        decision = self._decide(
+            self.workspace, "python -c \"open('/etc/passwd','w').write('x')\""
+        )
+        self.assertTrue(decision.requires_approval)
+
+    def test_sudo_wrapper_is_normalized_before_dispatch(self):
+        analysis = analyze_shell_command("sudo rm -rf /etc")
+        self.assertIn(ShellTrait.PRIVILEGED, analysis.traits)
+        self.assertIn(ShellEffect.DELETE, analysis.effects)
+        self.assertIs(analysis.targets[0].scope, TargetScope.SYSTEM)
+
+    # --- catastrophic guardrail: denied in EVERY mode ---------------------
+
+    def test_catastrophic_commands_are_denied_in_every_mode(self):
         commands = [
             "rm -rf /",
             "rm -r -f /",
@@ -282,108 +268,46 @@ class TerminalShellEditPolicyTests(unittest.TestCase):
             "rm -rf C:\\",
             "Remove-Item -Force -Recurse C:\\",
             "Remove-Item -LiteralPath C:\\ -Recurse -Force",
+            "sudo rm -rf /etc",
             "git reset --hard HEAD",
             "git clean -fd",
             "git clean -xdf",
             "git restore --source HEAD -- .",
-            "echo x > /etc/profile",
-            "python -c \"open('/etc/passwd','w').write('x')\"",
+            "git push --force origin main",
+            "mkfs.ext4 /dev/sda",
+            "dd if=/dev/zero of=/dev/sda",
         ]
-
-        for command in commands:
-            with self.subTest(command=command):
-                blocked = middleware.before_tool(
-                    "run_bash",
-                    {"command": command},
-                    messages=[],
-                    runtime_state=AgentRuntimeState(),
-                    agent_name="main_agent",
-                )
-                self.assertIsNotNone(blocked)
-
-    def test_blocks_system_config_writes_without_system_admin_context(self):
-        middleware = TerminalShellEditPolicyMiddleware()
-
-        blocked = middleware.before_tool(
-            "run_bash",
-            {"command": "cat > /etc/nginx/conf.d/git-site.conf <<'EOF'\nserver {}\nEOF"},
-            messages=[],
-            runtime_state=AgentRuntimeState(),
-            agent_name="main_agent",
-        )
-
-        self.assertIsNotNone(blocked)
-
-    def test_allows_container_absolute_path_mutations_in_eval_danger_full_access(self):
-        middleware = TerminalShellEditPolicyMiddleware()
-        state = AgentRuntimeState(permission_mode="danger-full-access")
-
-        commands = [
-            "cat > /etc/nginx/conf.d/git-site.conf <<'EOF'\nserver {}\nEOF",
-            "python -c \"open('/usr/local/bin/x','w').write('x')\"",
-            "rm -rf /var/www/app",
-        ]
-
-        with patch.dict("os.environ", {"HCA_TERMINAL_EVAL_MODE": "1"}):
+        for policy in (self.workspace, self.eval, self.full):
             for command in commands:
-                with self.subTest(command=command):
-                    blocked = middleware.before_tool(
-                        "run_bash",
-                        {"command": command},
-                        messages=[],
-                        runtime_state=state,
-                        agent_name="main_agent",
-                    )
-                    self.assertIsNone(blocked)
+                with self.subTest(mode=policy.mode, command=command):
+                    decision = self._decide(policy, command)
+                    self.assertFalse(decision.allowed)
+                    self.assertFalse(decision.requires_approval)
+                    self.assertEqual(decision.risk, "shell_blocked")
 
-    def test_danger_full_access_without_eval_marker_still_blocks_system_path_writes(self):
-        middleware = TerminalShellEditPolicyMiddleware()
-        state = AgentRuntimeState(permission_mode="danger-full-access")
+    # --- system, non-destructive writes -----------------------------------
 
-        blocked = middleware.before_tool(
-            "run_bash",
-            {"command": "cat > /etc/nginx/conf.d/git-site.conf <<'EOF'\nserver {}\nEOF"},
-            messages=[],
-            runtime_state=state,
-            agent_name="main_agent",
-        )
+    def test_system_config_writes_follow_mode_presets(self):
+        command = "cat > /etc/nginx/conf.d/git-site.conf <<'EOF'\nserver {}\nEOF"
+        self.assertFalse(self._decide(self.workspace, command).allowed)
+        self.assertFalse(self._decide(self.eval, command).allowed)
+        # Full access permits ordinary system writes but not destructive ones.
+        self.assertTrue(self._decide(self.full, command).allowed)
+        self.assertFalse(self._decide(self.full, "rm -rf /etc").allowed)
 
-        self.assertIsNotNone(blocked)
-
-    def test_danger_full_access_still_blocks_destructive_system_commands(self):
-        middleware = TerminalShellEditPolicyMiddleware()
-        state = AgentRuntimeState(permission_mode="danger-full-access")
-
-        commands = [
-            "rm -rf /etc",
-            "git reset --hard HEAD",
-        ]
-
+    def test_legacy_eval_env_marker_selects_eval_preset(self):
         with patch.dict("os.environ", {"HCA_TERMINAL_EVAL_MODE": "1"}):
-            for command in commands:
-                with self.subTest(command=command):
-                    blocked = middleware.before_tool(
-                        "run_bash",
-                        {"command": command},
-                        messages=[],
-                        runtime_state=state,
-                        agent_name="main_agent",
-                    )
-                    self.assertIsNotNone(blocked)
-
-    def test_container_system_config_write_requires_danger_full_access(self):
-        middleware = TerminalShellEditPolicyMiddleware()
-        state = AgentRuntimeState(permission_mode="workspace-write")
-
-        blocked = middleware.before_tool(
-            "run_bash",
-            {"command": "cat > /etc/nginx/conf.d/git-site.conf <<'EOF'\nserver {}\nEOF"},
-            messages=[],
-            runtime_state=state,
-            agent_name="main_agent",
-        )
-
-        self.assertIsNotNone(blocked)
+            policy = PermissionPolicy("danger-full-access")
+            self.assertEqual(policy.sandbox_mode, "docker")
+            self.assertTrue(
+                self._decide(policy, "rm -rf /tests/build").allowed
+            )
+            self.assertFalse(
+                self._decide(policy, "cat > /etc/profile").allowed
+            )
+            self.assertFalse(
+                self._decide(policy, "git reset --hard").allowed
+            )
 
 
 if __name__ == "__main__":

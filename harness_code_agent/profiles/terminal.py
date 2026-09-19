@@ -21,9 +21,6 @@ from __future__ import annotations
 import os
 from typing import ClassVar
 
-from ..runtime.middleware import (
-    TerminalShellEditPolicyMiddleware,
-)
 from ..tracking_policy import TASK_TRACKING_POLICY
 from .base import (
     AgentConfig,
@@ -109,7 +106,7 @@ class TerminalProfile(BaseProfile):
                     "file edit."
                 ),
             ),
-            middlewares=[TerminalShellEditPolicyMiddleware()],
+            middlewares=[],
             time_budget=self._get("task_budget"),
         )
 

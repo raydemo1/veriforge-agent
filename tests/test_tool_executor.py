@@ -186,14 +186,25 @@ class ToolExecutorTests(unittest.TestCase):
             "bun run check": "verify",
             "npm run dev": "long_running",
             "cd web && npm run dev": "long_running",
-            "python script.py": "workspace_mutation",
-            "cd src; pwd": "workspace_mutation",
-            "cat > file.txt": "blocked",
+            "python script.py": "unknown_execution",
+            "cd src; pwd": "unknown_execution",
+            "cat > file.txt": "workspace_mutation",
+            "rm -rf build": "recursive_delete",
+            "rm -rf /": "destructive",
         }
 
-        for command, expected in cases.items():
-            with self.subTest(command=command):
-                self.assertEqual(shell_classification.analyze_shell_command(command).kind, expected)
+        with tempfile.TemporaryDirectory() as tmp:
+            context = ToolContext(
+                workspace=WorkspaceService(root=Path(tmp)),
+                permission_policy=PermissionPolicy(mode="workspace-write"),
+                event_bus=EventBus(),
+            )
+            for command, expected in cases.items():
+                with self.subTest(command=command):
+                    effect = tools.BUILTIN_TOOL_REGISTRY.effect_for(
+                        "run_bash", {"command": command}, context
+                    )
+                    self.assertEqual(effect.kind, expected)
 
     def test_run_bash_uses_a_self_contained_shell(self):
         from harness_code_agent import config
@@ -237,10 +248,13 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("leak", second.output)
 
     def test_shell_effect_uses_shared_stateful_classifier(self):
-        with patch("harness_code_agent.runtime.shell_classification.contains_stateful_shell_operation", return_value=True):
-            shell_classification.analyze_shell_command.cache_clear()
-            self.assertEqual(shell_classification.analyze_shell_command("rg needle .").kind, "workspace_mutation")
-            shell_classification.analyze_shell_command.cache_clear()
+        # Stateful shell prefixes (cd/export/source/...) cannot be analyzed
+        # statically, so they run conservatively as unknown serial executions.
+        shell_classification.analyze_shell_command.cache_clear()
+        analysis = shell_classification.analyze_shell_command("cd src; rg needle .")
+        from harness_code_agent.runtime.shell_classification import ShellTrait
+        self.assertIn(ShellTrait.UNKNOWN_EFFECT, analysis.traits)
+        shell_classification.analyze_shell_command.cache_clear()
 
     def test_parallel_read_tools_finish_faster_but_results_keep_original_order(self):
         registry = tools.ToolRegistry()

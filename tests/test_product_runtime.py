@@ -2371,8 +2371,6 @@ class ProductRuntimeTests(unittest.TestCase):
         blocked_commands = [
             "rm -rf /",
             "rm -rf ~",
-            "rm -rf *",
-            "rm -rf build",
             "Remove-Item C:\\ -Recurse",
             "git reset --hard",
             "git clean -fd",
@@ -2384,6 +2382,12 @@ class ProductRuntimeTests(unittest.TestCase):
             workspace_policy.decide_tool_call("run_bash", {"command": command})
             for command in blocked_commands
         ]
+        workspace_delete_decision = workspace_policy.decide_tool_call(
+            "run_bash", {"command": "rm -rf build"}
+        )
+        glob_delete_decision = workspace_policy.decide_tool_call(
+            "run_bash", {"command": "rm -rf *"}
+        )
         unknown_decision = workspace_policy.decide_tool_call("new_tool", {})
 
         llm_auto_policy = PermissionPolicy(mode="llm-auto")
@@ -2443,8 +2447,11 @@ class ProductRuntimeTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertFalse(blocked_decision.allowed)
                 self.assertFalse(blocked_decision.requires_approval)
-                expected_risk = "shell_write_blocked" if command == "rm -rf build" else "shell_blocked"
-                self.assertEqual(blocked_decision.risk, expected_risk)
+                self.assertEqual(blocked_decision.risk, "shell_blocked")
+        # Recursive deletion inside the workspace is not catastrophic: it
+        # follows the workspace-write action (ask) rather than a hard deny.
+        self.assertTrue(workspace_delete_decision.requires_approval)
+        self.assertTrue(glob_delete_decision.requires_approval)
         self.assertTrue(unknown_decision.requires_approval)
         self.assertTrue(llm_read_decision.allowed)
         self.assertTrue(llm_repo_search_decision.allowed)
@@ -2459,15 +2466,24 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertEqual(llm_blocked_decision.risk, "shell_blocked")
         self.assertTrue(full_access_decision.allowed)
         self.assertFalse(full_access_blocked_decision.allowed)
-        self.assertFalse(overwrite_decision.allowed)
-        self.assertEqual(overwrite_decision.risk, "shell_write_blocked")
+        self.assertTrue(overwrite_decision.allowed)
         self.assertEqual(full_access_blocked_decision.risk, "shell_blocked")
 
-    def test_permission_policy_rejects_read_only_mode(self):
+    def test_read_only_mode_denies_mutations(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy
 
-        with self.assertRaisesRegex(ValueError, "Unknown permission mode"):
-            PermissionPolicy(mode="read-only")
+        policy = PermissionPolicy(mode="read-only")
+        self.assertTrue(
+            policy.decide_tool_call("read_file", {"path": "x.txt"}).allowed
+        )
+        edit_decision = policy.decide_tool_call("write_file", {"path": "x.txt"})
+        self.assertFalse(edit_decision.allowed)
+        shell_decision = policy.decide_tool_call(
+            "run_bash", {"command": "mkdir generated"}
+        )
+        self.assertFalse(shell_decision.allowed)
+        read_shell = policy.decide_tool_call("run_bash", {"command": "git status"})
+        self.assertTrue(read_shell.allowed)
 
     def test_permission_policy_rejects_unknown_mode_names(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy
@@ -2653,7 +2669,7 @@ class ProductRuntimeTests(unittest.TestCase):
                                 type="function",
                                 function=SimpleNamespace(
                                     name="run_bash",
-                                    arguments='{"command":"rm -rf build"}',
+                                    arguments='{"command":"rm -rf /"}',
                                 ),
                             )
                         ],
@@ -3152,14 +3168,14 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertIn("[blocked]", blocked)
             self.assertIn("安全黑名单", blocked)
 
-    def test_env_shell_command_requires_approval(self):
+    def test_env_shell_command_is_treated_as_read(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy
 
         policy = PermissionPolicy(mode="workspace-write")
         decision = policy.decide_tool_call("run_bash", {"command": "env"})
 
-        self.assertTrue(decision.requires_approval)
-        self.assertEqual(decision.risk, "shell_risky")
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.risk, "shell_safe")
 
     def test_execute_tool_apply_patch_records_snapshot_and_rejects_ambiguous_patch(self):
         from harness_code_agent.runtime import tools

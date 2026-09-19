@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..runtime.approvals import ApprovalRequest
-from ..runtime.shell_classification import analyze_shell_command, command_matches_prefix
+from ..runtime.shell_classification import command_matches_prefix, derive_persistent_prefix
 
 
 class ApprovalAllowlist:
@@ -78,7 +78,7 @@ class ApprovalAllowlist:
 def _persistent_prefix_for_request(request: ApprovalRequest) -> list[str] | None:
     if request.tool_name != "run_bash":
         return None
-    prefix = analyze_shell_command(str(request.args.get("command", ""))).approval_prefix
+    prefix = derive_persistent_prefix(str(request.args.get("command", "")))
     return list(prefix) if prefix else None
 
 

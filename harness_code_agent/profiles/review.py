@@ -35,6 +35,7 @@ class ReviewOnlyMiddleware(AgentMiddleware):
         messages: list[dict],
         runtime_state=None,
         agent_name: str | None = None,
+        permission_decision=None,
     ) -> ToolResult | None:
         if tool_name in self._WRITE_OR_CONTROL_TOOLS:
             return ToolResult(

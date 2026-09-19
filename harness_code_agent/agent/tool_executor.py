@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 from .. import config
@@ -42,6 +44,18 @@ class PreparedToolCall:
     raw: Any
     blocked_result: ToolResult | None = None
     emit_events: bool = True
+    permission_decision: Any = None
+
+
+@lru_cache(maxsize=None)
+def _middleware_accepts_decision(middleware_type) -> bool:
+    try:
+        params = inspect.signature(middleware_type.before_tool).parameters
+    except (TypeError, ValueError):
+        return True
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return "permission_decision" in params
 
 
 @dataclass
@@ -215,6 +229,7 @@ class ToolExecutor:
                     effect=effect,
                     raw=tc,
                     blocked_result=blocked,
+                    permission_decision=self._permission_decision(fn_name, fn_args, registry),
                 )
             )
         return prepared, False
@@ -223,19 +238,25 @@ class ToolExecutor:
         registry = _registry_for_context(self.agent.tool_context)
         return registry.effect_for(name, args, self.agent.tool_context), None
 
+    def _permission_decision(self, name: str, args: dict, registry):
+        context = self.agent.tool_context
+        if context is None:
+            return None
+        workspace = getattr(context, "workspace", None)
+        root = str(workspace.root) if workspace is not None and getattr(workspace, "root", None) is not None else None
+        return context.permission_policy.decide_tool_call(
+            name,
+            args,
+            tool_permission=registry.permission_for(name),
+            workspace_root=root,
+        )
+
     def _requires_approval(self, prepared: PreparedToolCall) -> bool:
         if prepared.blocked_result is not None:
             return False
-        context = self.agent.tool_context
-        if context is None:
+        if prepared.permission_decision is None:
             return False
-        registry = _registry_for_context(context)
-        decision = context.permission_policy.decide_tool_call(
-            prepared.name,
-            prepared.args,
-            tool_permission=registry.permission_for(prepared.name),
-        )
-        return decision.action == "ask"
+        return prepared.permission_decision.action == "ask"
 
     def _execute_group(self, group: ExecutionGroup) -> list[ExecutedToolCall]:
         ready: list[PreparedToolCall] = []
@@ -439,13 +460,25 @@ class ToolExecutor:
         started = time.perf_counter()
         for mw in self.agent.middlewares:
             activity["hooks"] += 1
-            blocked = mw.before_tool(
-                prepared.name,
-                prepared.args,
-                self.conversation.messages,
-                runtime_state=self.runtime_state,
-                agent_name=self.agent.name,
-            )
+            if _middleware_accepts_decision(type(mw)):
+                blocked = mw.before_tool(
+                    prepared.name,
+                    prepared.args,
+                    self.conversation.messages,
+                    runtime_state=self.runtime_state,
+                    agent_name=self.agent.name,
+                    permission_decision=prepared.permission_decision,
+                )
+            else:
+                # Backward compatibility for custom middlewares written
+                # against the older before_tool signature.
+                blocked = mw.before_tool(
+                    prepared.name,
+                    prepared.args,
+                    self.conversation.messages,
+                    self.runtime_state,
+                    self.agent.name,
+                )
             if not blocked:
                 continue
             activity["outcome"] = "blocked"

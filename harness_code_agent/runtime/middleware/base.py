@@ -75,8 +75,14 @@ class AgentMiddleware(ABC):
         messages: list[dict],
         runtime_state=None,
         agent_name: str | None = None,
+        permission_decision=None,
     ) -> str | None:
-        """Called before each tool execution. Return a blocking message, or None."""
+        """Called before each tool execution. Return a blocking message, or None.
+
+        ``permission_decision`` is the single :class:`PermissionDecision`
+        computed once during call preparation; middlewares must not re-run the
+        policy themselves.
+        """
         return None
 
     def on_tool_allowed(
