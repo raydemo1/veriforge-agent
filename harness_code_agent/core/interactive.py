@@ -44,13 +44,7 @@ from ..runtime.approvals import (
 from ..runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
 from ..runtime.lifecycle import LifecycleScope
 from ..runtime.mcp import McpClientManager
-from ..runtime.middleware import (
-    MemoryMiddleware,
-    StaticVerifierMiddleware,
-    ToolFailurePolicyMiddleware,
-    ToolGuardMiddleware,
-)
-from ..runtime.permission_middleware import PermissionMiddleware
+from ..runtime.middleware.stack import build_main_agent_middlewares
 from ..runtime.permissions import PermissionPolicy
 from ..runtime.questions import ConsoleQuestionProvider, QuestionProvider
 from ..runtime.tool_context import ToolContext
@@ -223,19 +217,11 @@ class InteractiveSession:
             global_rules_docs=[harness_rules] if harness_rules is not None else [],
             skill_catalog=catalog,
         )
-        middlewares = list(cfg.middlewares)
-        middlewares.append(ToolGuardMiddleware())
-        middlewares.append(ToolFailurePolicyMiddleware(tool_registry=self.tool_registry))
-        if getattr(cfg, "memory_enabled", True):
-            middlewares.append(MemoryMiddleware(workspace=self.cwd))
-        middlewares.append(
-            PermissionMiddleware(
-                tool_context=self.tool_context,
-                tool_registry=self.tool_registry,
-            )
-        )
-        middlewares.append(
-            StaticVerifierMiddleware(workspace_root=str(self.cwd), workspace=self.tool_context.workspace)
+        middlewares = build_main_agent_middlewares(
+            agent_config=cfg,
+            tool_context=self.tool_context,
+            tool_registry=self.tool_registry,
+            workspace=self.cwd,
         )
         return Agent(
             "main_agent",

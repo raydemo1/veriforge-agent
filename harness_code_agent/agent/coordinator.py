@@ -12,7 +12,7 @@ from typing import Any
 
 from .. import config
 from ..runtime.execution_planner import acquire_concurrency, workspace_claim
-from ..runtime.permission_middleware import PermissionMiddleware
+from ..runtime.middleware.stack import build_subagent_middlewares
 from ..runtime.permissions import PermissionPolicy
 from ..runtime.tool_context import ToolContext
 from ..runtime.tool_registry import (
@@ -355,7 +355,10 @@ class AgentCoordinator:
             system_prompt=_role_prompt(record, self._parent_messages()),
             use_tools=True,
             tool_schemas=registry.schemas(),
-            middlewares=[PermissionMiddleware(tool_context=sub_context, tool_registry=registry)],
+            middlewares=build_subagent_middlewares(
+                tool_context=sub_context,
+                tool_registry=registry,
+            ),
             time_budget=float(record.max_seconds),
             tool_context=sub_context,
             model_intensity=record.model_intensity,
