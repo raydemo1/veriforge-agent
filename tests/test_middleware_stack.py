@@ -18,7 +18,7 @@ from harness_code_agent.workspace.service import WorkspaceService
 
 
 class _MarkerMiddleware(AgentMiddleware):
-    """A profile-provided middleware that must stay first in the stack."""
+    """A user-provided middleware that runs before the structural guards."""
 
 
 class MiddlewareStackFactoryTests(unittest.TestCase):
@@ -32,11 +32,40 @@ class MiddlewareStackFactoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             context, registry, workspace = self._context(root)
-            marker = _MarkerMiddleware()
-            agent_config = SimpleNamespace(middlewares=[marker])
 
             stack = build_main_agent_middlewares(
-                agent_config=agent_config,
+                user_middlewares=[],
+                tool_context=context,
+                tool_registry=registry,
+                workspace=root,
+            )
+
+            self.assertEqual(
+                [type(mw) for mw in stack],
+                [
+                    ToolGuardMiddleware,
+                    ToolFailurePolicyMiddleware,
+                    PermissionMiddleware,
+                    StaticVerifierMiddleware,
+                ],
+            )
+            self.assertIs(stack[1].tool_registry, registry)
+            self.assertIs(stack[2]._ctx, context)
+            self.assertIs(stack[2]._registry, registry)
+            self.assertEqual(stack[3]._workspace_root, str(root))
+            self.assertIs(stack[3]._workspace, workspace)
+
+    def test_user_middlewares_run_before_guards(self):
+        # User middlewares from ~/.harness/middlewares.json run before the
+        # structural guards. Memory lives outside the middleware stack (its
+        # index is injected into the system prompt).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            context, registry, _ = self._context(root)
+            user_middleware = _MarkerMiddleware()
+
+            stack = build_main_agent_middlewares(
+                user_middlewares=[user_middleware],
                 tool_context=context,
                 tool_registry=registry,
                 workspace=root,
@@ -52,40 +81,8 @@ class MiddlewareStackFactoryTests(unittest.TestCase):
                     StaticVerifierMiddleware,
                 ],
             )
-            # Profile-provided middleware is the same instance, not copied.
-            self.assertIs(stack[0], marker)
-            self.assertIs(stack[2].tool_registry, registry)
-            self.assertIs(stack[3]._ctx, context)
-            self.assertIs(stack[3]._registry, registry)
-            self.assertEqual(stack[4]._workspace_root, str(root))
-            self.assertIs(stack[4]._workspace, workspace)
-
-    def test_main_agent_stack_has_no_memory_middleware(self):
-        # Memory lives outside the middleware stack (index injected into
-        # the system prompt), so memory_enabled must not alter the stack.
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            context, registry, _ = self._context(root)
-
-            expected = [
-                ToolGuardMiddleware,
-                ToolFailurePolicyMiddleware,
-                PermissionMiddleware,
-                StaticVerifierMiddleware,
-            ]
-            for config in (
-                SimpleNamespace(middlewares=[], memory_enabled=True),
-                SimpleNamespace(middlewares=[], memory_enabled=False),
-                SimpleNamespace(middlewares=[]),
-            ):
-                with self.subTest(config=config):
-                    stack = build_main_agent_middlewares(
-                        agent_config=config,
-                        tool_context=context,
-                        tool_registry=registry,
-                        workspace=root,
-                    )
-                    self.assertEqual([type(mw) for mw in stack], expected)
+            # The same instance, loaded once per session.
+            self.assertIs(stack[0], user_middleware)
 
     def test_subagent_stack_is_permission_only(self):
         context = SimpleNamespace(workspace=object())

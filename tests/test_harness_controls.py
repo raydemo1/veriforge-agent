@@ -14,7 +14,9 @@ from harness_code_agent.agent import llm_channel
 from harness_code_agent.agent.cancellation import CancelledError, CancellationToken
 from harness_code_agent.agent.coordinator import AgentCoordinator
 from harness_code_agent.agent.tool_executor import ToolExecutor
-from harness_code_agent.runtime import tools
+from harness_code_agent.runtime.builtins.filesystem import write_file
+from harness_code_agent.runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
+from harness_code_agent.runtime.builtins.shell import run_bash
 from harness_code_agent.runtime.execution_planner import _CONCURRENCY_LIMITS
 from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
@@ -102,7 +104,7 @@ class RunBashTimeoutClampTests(unittest.TestCase):
             "harness_code_agent.workspace.shell_session.PersistentShellSession",
             return_value=fake_session,
         ):
-            result = tools.run_bash("echo ok", timeout=timeout)
+            result = run_bash("echo ok", timeout=timeout)
         return result, calls[0]
 
     def test_run_bash_timeout_is_clamped_to_maximum(self):
@@ -138,7 +140,7 @@ class RunBashTimeoutClampTests(unittest.TestCase):
             "harness_code_agent.workspace.shell_session.PersistentShellSession",
             return_value=fake_session,
         ):
-            result = tools.run_bash("slow", timeout=999999)
+            result = run_bash("slow", timeout=999999)
         self.assertEqual(result.status, "failed")
         self.assertTrue(result.metadata["timed_out"])
         self.assertEqual(result.metadata["requested_timeout"], 999999)
@@ -198,10 +200,10 @@ class WorkspaceQuotaTests(unittest.TestCase):
             workspace=self.workspace,
             permission_policy=PermissionPolicy(mode="danger-full-access"),
             event_bus=EventBus(),
-            tool_registry=tools.BUILTIN_TOOL_REGISTRY,
+            tool_registry=BUILTIN_TOOL_REGISTRY,
         )
         with patch.object(config, "WORKSPACE_WRITE_QUOTA_BYTES", 5):
-            result = tools.write_file("big.txt", "z" * 500, tool_context=context)
+            result = write_file("big.txt", "z" * 500, tool_context=context)
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.metadata["status_source"], "resource")
@@ -254,7 +256,7 @@ class SubagentControlTests(unittest.TestCase):
             workspace=WorkspaceService(root=self.temp),
             permission_policy=PermissionPolicy(mode="danger-full-access"),
             event_bus=EventBus(),
-            tool_registry=tools.BUILTIN_TOOL_REGISTRY,
+            tool_registry=BUILTIN_TOOL_REGISTRY,
         )
         self.coordinator = AgentCoordinator(self.context, max_concurrent=3)
         self.context.agent_coordinator = self.coordinator

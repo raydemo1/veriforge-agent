@@ -10,7 +10,23 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from harness_code_agent.runtime.builtins.registry import (
+    BUILTIN_TOOL_REGISTRY,
+    TOOL_SCHEMAS,
+)
+from harness_code_agent.runtime.builtins.schemas import BROWSER_TOOL_SCHEMAS
+from harness_code_agent.runtime.builtins.shell import (
+    list_shell_jobs,
+    read_shell_output,
+    run_bash,
+    stop_shell_job,
+)
+from harness_code_agent.runtime.tool_registry import (
+    ToolRegistry,
+    tool_schemas_for_profile,
+)
 from harness_code_agent.runtime.tool_result import ToolResult
+from harness_code_agent.runtime.tool_runner import execute_tool
 
 
 def _result(text: str, *, status: str | None = None) -> ToolResult:
@@ -852,8 +868,21 @@ class ProductRuntimeTests(unittest.TestCase):
         from harness_code_agent.agent.conversation import Agent
         from harness_code_agent.agent.utils import _prompt_cache_key
 
-        first = _prompt_cache_key(Agent("test", "system\nHARNESS A", use_tools=False), None)
-        second = _prompt_cache_key(Agent("test", "system\nHARNESS B", use_tools=False), None)
+        first = _prompt_cache_key(
+            Agent("test", "system\nHARNESS A", use_tools=False), None, model="m"
+        )
+        second = _prompt_cache_key(
+            Agent("test", "system\nHARNESS B", use_tools=False), None, model="m"
+        )
+
+        self.assertNotEqual(first, second)
+
+    def test_prompt_cache_key_changes_when_model_changes(self):
+        from harness_code_agent.agent.conversation import Agent
+        from harness_code_agent.agent.utils import _prompt_cache_key
+
+        first = _prompt_cache_key(Agent("test", "system", use_tools=False), None, model="gpt-5.6")
+        second = _prompt_cache_key(Agent("test", "system", use_tools=False), None, model="gpt-6")
 
         self.assertNotEqual(first, second)
 
@@ -869,6 +898,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 prompt_cache_identity={"global_rules_hash": "a"},
             ),
             [{"type": "function", "function": {"name": "read_file"}}],
+            model="m",
         )
         second = _prompt_cache_key(
             Agent(
@@ -878,6 +908,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 prompt_cache_identity={"global_rules_hash": "b"},
             ),
             [{"type": "function", "function": {"name": "read_file"}}],
+            model="m",
         )
         third = _prompt_cache_key(
             Agent(
@@ -887,6 +918,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 prompt_cache_identity={"global_rules_hash": "a"},
             ),
             [{"type": "function", "function": {"name": "write_file"}}],
+            model="m",
         )
 
         self.assertNotEqual(first, second)
@@ -931,10 +963,212 @@ class ProductRuntimeTests(unittest.TestCase):
             },
         }
 
-        first = _prompt_cache_key(agent, [read_schema, write_schema])
-        second = _prompt_cache_key(agent, [write_schema, read_schema])
+        first = _prompt_cache_key(agent, [read_schema, write_schema], model="m")
+        second = _prompt_cache_key(agent, [write_schema, read_schema], model="m")
 
         self.assertEqual(first, second)
+
+    def test_full_system_prompt_keeps_stable_prefix_and_memory_index_separate(self):
+        from harness_code_agent.agent.conversation import Agent
+
+        without_memory = Agent("test", "stable", use_tools=False)
+        with_memory = Agent("test", "stable", use_tools=False, memory_index=" memory block \n")
+
+        self.assertEqual(without_memory.full_system_prompt, "stable")
+        self.assertIsNone(without_memory.memory_index)
+        self.assertEqual(with_memory.system_prompt, "stable")
+        self.assertEqual(with_memory.memory_index, "memory block")
+        self.assertEqual(with_memory.full_system_prompt, "stable\n\nmemory block")
+
+    def test_openai_cache_breakpoint_model_gate(self):
+        from harness_code_agent.agent.providers import (
+            ProviderAdapter,
+            openai_model_supports_cache_breakpoint,
+            supports_system_cache_breakpoint,
+        )
+
+        supported = {"gpt-5.6", "gpt-5.6-mini", "GPT-5.6", "gpt-6", "gpt-6.1"}
+        unsupported = {"gpt-5.5", "gpt-5", "gpt-4o", "gpt-4.1", "o3", "deepseek-v4-pro", ""}
+        for model in supported:
+            self.assertTrue(openai_model_supports_cache_breakpoint(model), model)
+        for model in unsupported:
+            self.assertFalse(openai_model_supports_cache_breakpoint(model), model)
+
+        openai = ProviderAdapter("openai")
+        deepseek = ProviderAdapter("deepseek")
+        compatible = ProviderAdapter("openai-compatible")
+        self.assertTrue(supports_system_cache_breakpoint(openai, "gpt-5.6"))
+        self.assertFalse(supports_system_cache_breakpoint(openai, "gpt-4o"))
+        self.assertFalse(supports_system_cache_breakpoint(deepseek, "gpt-5.6"))
+        self.assertFalse(supports_system_cache_breakpoint(compatible, "gpt-5.6"))
+        self.assertFalse(supports_system_cache_breakpoint(SimpleNamespace(), "gpt-5.6"))
+
+    def test_outbound_messages_split_memory_at_cache_breakpoint_only_for_supported_path(self):
+        from harness_code_agent.agent.conversation import Agent, AgentConversation
+        from harness_code_agent.agent.providers import ProviderAdapter
+
+        memory_block = "[HARNESS_MEMORY_INDEX]\n- [project:doc1 v1 active] topic"
+        agent = Agent("test", "stable-prefix", use_tools=False, memory_index=memory_block)
+        with patch("harness_code_agent.agent.conversation.get_client"):
+            conversation = AgentConversation(agent)
+
+        conversation.provider = ProviderAdapter("openai")
+        split = conversation._outbound_messages(conversation.messages, "gpt-5.6")
+        too_old = conversation._outbound_messages(conversation.messages, "gpt-4o")
+        conversation.provider = ProviderAdapter("deepseek")
+        deepseek_view = conversation._outbound_messages(conversation.messages, "gpt-5.6")
+
+        self.assertEqual(
+            split[0]["content"],
+            [
+                {
+                    "type": "text",
+                    "text": "stable-prefix",
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                },
+                {"type": "text", "text": memory_block},
+            ],
+        )
+        self.assertIs(too_old, conversation.messages)
+        self.assertIs(deepseek_view, conversation.messages)
+        # The durable log keeps the plain-string system message.
+        self.assertEqual(
+            conversation.messages[0]["content"],
+            f"stable-prefix\n\n{memory_block}",
+        )
+        self.assertIsInstance(conversation.messages[0]["content"], str)
+
+    def test_outbound_messages_without_memory_index_are_not_rendered(self):
+        from harness_code_agent.agent.conversation import Agent, AgentConversation
+        from harness_code_agent.agent.providers import ProviderAdapter
+
+        agent = Agent("test", "stable", use_tools=False)
+        with patch("harness_code_agent.agent.conversation.get_client"):
+            conversation = AgentConversation(agent)
+        conversation.provider = ProviderAdapter("openai")
+        self.assertIs(
+            conversation._outbound_messages(conversation.messages, "gpt-5.6"),
+            conversation.messages,
+        )
+
+    def test_agent_loop_sends_memory_breakpoint_parts_on_supported_openai_model(self):
+        from harness_code_agent import config
+        from harness_code_agent.agent.conversation import Agent, AgentConversation
+        from harness_code_agent.agent.providers import ProviderAdapter
+
+        memory_block = "[HARNESS_MEMORY_INDEX]\n- [project:doc1 v1 active] topic"
+
+        class FakeCompletions:
+            def __init__(self):
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content="done", tool_calls=None),
+                            finish_reason="stop",
+                        )
+                    ],
+                    usage=None,
+                )
+
+        class FakeClient:
+            def __init__(self):
+                self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        class CapturingProvider:
+            def __init__(self, name):
+                self.name = name
+                self.calls = []
+                self.delegate = ProviderAdapter(name)
+
+            @property
+            def supports_prompt_cache_key(self):
+                return self.delegate.supports_prompt_cache_key
+
+            def chat_kwargs(self, **kwargs):
+                self.calls.append(kwargs)
+                return self.delegate.chat_kwargs(**kwargs)
+
+            def assistant_message_from_response(self, msg):
+                return self.delegate.assistant_message_from_response(msg)
+
+        agent = Agent("test", "stable-prefix", use_tools=False, memory_index=memory_block)
+        with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
+            conversation = AgentConversation(agent)
+        conversation.provider = CapturingProvider("openai")
+
+        profile = config.ModelProfile(provider="openai", model="gpt-5.6")
+        with (
+            patch(
+                "harness_code_agent.agent.conversation.config.resolve_model_profile",
+                return_value=profile,
+            ),
+            patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 1),
+            patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+        ):
+            conversation.run_until_idle()
+
+        system_content = conversation.provider.calls[0]["messages"][0]["content"]
+        self.assertEqual(
+            system_content,
+            [
+                {
+                    "type": "text",
+                    "text": "stable-prefix",
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                },
+                {"type": "text", "text": memory_block},
+            ],
+        )
+        self.assertEqual(
+            conversation.messages[0]["content"],
+            f"stable-prefix\n\n{memory_block}",
+        )
+
+    def test_cache_shape_tracks_memory_index_change_separately(self):
+        from harness_code_agent.agent.conversation import Agent
+        from harness_code_agent.agent.utils import (
+            capture_prompt_cache_shape,
+            compare_prompt_cache_shapes,
+        )
+
+        v1 = Agent("test", "stable", use_tools=False, memory_index="mem v1")
+        v2 = Agent("test", "stable", use_tools=False, memory_index="mem v2")
+        changed_prefix = Agent("test", "stable v2", use_tools=False, memory_index="mem v2")
+
+        shape_v1 = capture_prompt_cache_shape(v1, None)
+        shape_v2 = capture_prompt_cache_shape(v2, None)
+        shape_prefix = capture_prompt_cache_shape(changed_prefix, None)
+
+        self.assertEqual(
+            compare_prompt_cache_shapes(shape_v1, shape_v2, None)["prefix_change_reasons"],
+            ["memory_index"],
+        )
+        self.assertEqual(
+            compare_prompt_cache_shapes(shape_v2, shape_prefix, None)["prefix_change_reasons"],
+            ["system"],
+        )
+
+    def test_apply_model_override_invalidates_conversation_cache_key(self):
+        from harness_code_agent import config
+        from harness_code_agent.core.interactive import InteractiveSession
+
+        self.addCleanup(config.set_model_override, None, None)
+        config.set_model_override(model=None, reasoning_effort=None)
+
+        session = InteractiveSession.__new__(InteractiveSession)
+        session.conversation = SimpleNamespace(_cached_prompt_cache_key="cache-key")
+        session.apply_model_override(model="deepseek-v4-pro")
+
+        self.assertEqual(config.get_model_override()["model"], "deepseek-v4-pro")
+        self.assertIsNone(session.conversation._cached_prompt_cache_key)
+
+        session.conversation = None
+        session.apply_model_override(reasoning_effort="low")
+        self.assertEqual(config.get_model_override()["reasoning_effort"], "low")
 
     def test_usage_to_dict_normalizes_deepseek_cache_hit_and_miss_tokens(self):
         from harness_code_agent.agent.utils import _usage_to_dict
@@ -1130,7 +1364,7 @@ class ProductRuntimeTests(unittest.TestCase):
                     with (
                         patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 3),
                         patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
-                        patch("harness_code_agent.runtime.tools.config.WORKSPACE", str(root)),
+                        patch("harness_code_agent.config.WORKSPACE", str(root)),
                     ):
                         conversation.run_until_idle()
 
@@ -1167,31 +1401,29 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertEqual(stderr.getvalue(), "")
 
     def test_builtin_tool_registry_exposes_schema_and_dispatch_exports(self):
-        from harness_code_agent.runtime import tools
 
         registry_names = {
             schema["function"]["name"]
-            for schema in tools.BUILTIN_TOOL_REGISTRY.schemas()
+            for schema in BUILTIN_TOOL_REGISTRY.schemas()
         }
         exported_schema_names = {
             schema["function"]["name"]
-            for schema in tools.TOOL_SCHEMAS + tools.BROWSER_TOOL_SCHEMAS
+            for schema in TOOL_SCHEMAS + BROWSER_TOOL_SCHEMAS
         }
 
         self.assertEqual(registry_names, exported_schema_names)
-        self.assertEqual(tools.BUILTIN_TOOL_REGISTRY.permission_for("web_search"), "network_read")
-        self.assertEqual(tools.BUILTIN_TOOL_REGISTRY.permission_for("list_shell_jobs"), "read")
-        self.assertEqual(tools.BUILTIN_TOOL_REGISTRY.permission_for("read_shell_output"), "read")
-        self.assertEqual(tools.BUILTIN_TOOL_REGISTRY.permission_for("stop_shell_job"), "control")
-        self.assertTrue(tools.BUILTIN_TOOL_REGISTRY.effect_for("list_shell_jobs", {}).barrier)
-        self.assertTrue(tools.BUILTIN_TOOL_REGISTRY.effect_for("read_shell_output", {}).barrier)
-        self.assertTrue(tools.BUILTIN_TOOL_REGISTRY.effect_for("stop_shell_job", {}).barrier)
-        self.assertTrue(all(spec.permission for spec in tools.BUILTIN_TOOL_REGISTRY.specs()))
-        self.assertTrue(all(spec.capabilities for spec in tools.BUILTIN_TOOL_REGISTRY.specs()))
-        self.assertIsNone(tools.BUILTIN_TOOL_REGISTRY.get("missing_tool"))
+        self.assertEqual(BUILTIN_TOOL_REGISTRY.permission_for("web_search"), "network_read")
+        self.assertEqual(BUILTIN_TOOL_REGISTRY.permission_for("list_shell_jobs"), "read")
+        self.assertEqual(BUILTIN_TOOL_REGISTRY.permission_for("read_shell_output"), "read")
+        self.assertEqual(BUILTIN_TOOL_REGISTRY.permission_for("stop_shell_job"), "control")
+        self.assertTrue(BUILTIN_TOOL_REGISTRY.effect_for("list_shell_jobs", {}).barrier)
+        self.assertTrue(BUILTIN_TOOL_REGISTRY.effect_for("read_shell_output", {}).barrier)
+        self.assertTrue(BUILTIN_TOOL_REGISTRY.effect_for("stop_shell_job", {}).barrier)
+        self.assertTrue(all(spec.permission for spec in BUILTIN_TOOL_REGISTRY.specs()))
+        self.assertTrue(all(spec.capabilities for spec in BUILTIN_TOOL_REGISTRY.specs()))
+        self.assertIsNone(BUILTIN_TOOL_REGISTRY.get("missing_tool"))
 
     def test_run_bash_long_running_uses_shell_job_manager(self):
-        from harness_code_agent.runtime import tools
 
         class FakeJobs:
             def start(self, command, *, early_exit_seconds=0.5):
@@ -1208,7 +1440,7 @@ class ProductRuntimeTests(unittest.TestCase):
         fake_jobs = FakeJobs()
         runtime_state = SimpleNamespace(shell_session=None, shell_job_manager=fake_jobs)
 
-        result = tools.run_bash(
+        result = run_bash(
             "npm run dev",
             timeout=300,
             runtime_state=runtime_state,
@@ -1220,7 +1452,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertEqual(result.metadata["job_id"], "shell-job-abc123")
 
     def test_run_bash_does_not_reuse_runtime_shell_session(self):
-        from harness_code_agent.runtime import tools
 
         class DeadShell:
             def __init__(self):
@@ -1242,13 +1473,12 @@ class ProductRuntimeTests(unittest.TestCase):
             close=lambda: None,
         )
         with patch("harness_code_agent.workspace.shell_session.PersistentShellSession", return_value=fresh_shell):
-            result = tools.run_bash("echo hi", runtime_state=runtime_state)
+            result = run_bash("echo hi", runtime_state=runtime_state)
 
         self.assertEqual(result.status, "success")
         self.assertFalse(dead_shell.closed)
 
     def test_run_bash_reports_nonzero_exit_as_success_with_exit_code_footer(self):
-        from harness_code_agent.runtime import tools
 
         class ExpectedFailureShell:
             def run(self, command, timeout=300, artifact_dir=None):
@@ -1263,7 +1493,7 @@ class ProductRuntimeTests(unittest.TestCase):
         shell = ExpectedFailureShell()
         shell.close = lambda: None
         with patch("harness_code_agent.workspace.shell_session.PersistentShellSession", return_value=shell):
-            result = tools.run_bash(
+            result = run_bash(
                 'python focusflow.py "Task" 0',
                 runtime_state=SimpleNamespace(shell_job_manager=None),
             )
@@ -1276,7 +1506,6 @@ class ProductRuntimeTests(unittest.TestCase):
     def test_run_bash_uses_one_shot_shell_for_powershell_exit(self):
         from unittest.mock import Mock
 
-        from harness_code_agent.runtime import tools
 
         persistent_shell = Mock()
         runtime_state = SimpleNamespace(shell_session=persistent_shell, shell_job_manager=None)
@@ -1298,7 +1527,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 return_value=shell_result,
             ) as one_shot,
         ):
-            result = tools.run_bash(
+            result = run_bash(
                 "Write-Output ready; exit 0",
                 runtime_state=runtime_state,
             )
@@ -1309,7 +1538,6 @@ class ProductRuntimeTests(unittest.TestCase):
         persistent_shell.run.assert_not_called()
 
     def test_shell_job_tools_handle_list_read_stop(self):
-        from harness_code_agent.runtime import tools
 
         class FakeJob:
             def __init__(self, job_id="shell-job-1", status="running"):
@@ -1339,9 +1567,9 @@ class ProductRuntimeTests(unittest.TestCase):
         fake_jobs = FakeJobs()
         runtime_state = SimpleNamespace(shell_job_manager=fake_jobs)
 
-        listed = tools.list_shell_jobs(runtime_state=runtime_state)
-        read = tools.read_shell_output("shell-job-1", max_chars=50, runtime_state=runtime_state)
-        stopped = tools.stop_shell_job("shell-job-1", runtime_state=runtime_state)
+        listed = list_shell_jobs(runtime_state=runtime_state)
+        read = read_shell_output("shell-job-1", max_chars=50, runtime_state=runtime_state)
+        stopped = stop_shell_job("shell-job-1", runtime_state=runtime_state)
 
         self.assertEqual(listed.status, "success")
         self.assertIn("shell-job-1", listed.output)
@@ -1399,9 +1627,8 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertTrue(middleware.closed)
 
     def test_tool_registry_requires_explicit_permission_classification(self):
-        from harness_code_agent.runtime import tools
 
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         schema = {
             "type": "function",
             "function": {
@@ -1490,7 +1717,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertEqual(decision.risk, "network_read")
 
     def test_ask_user_tool_appends_other_and_returns_structured_choice(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.questions import StaticQuestionProvider
         from harness_code_agent.runtime.tool_context import ToolContext
@@ -1506,7 +1732,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 question_provider=StaticQuestionProvider(index=1),
             )
 
-            result = tools.execute_tool(
+            result = execute_tool(
                 "ask_user",
                 {"question": "Pick a path", "options": ["Fast path"]},
                 tool_context=context,
@@ -1517,7 +1743,7 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertEqual(data["selected_index"], 1)
             self.assertEqual(data["label"], "其他")
             self.assertTrue(data["is_other"])
-            self.assertIn("ask_user", [schema["function"]["name"] for schema in tools.TOOL_SCHEMAS])
+            self.assertIn("ask_user", [schema["function"]["name"] for schema in TOOL_SCHEMAS])
 
     def test_structured_event_schema_covers_mvp_event_types(self):
         from harness_code_agent.sessions.events import (
@@ -1603,7 +1829,6 @@ class ProductRuntimeTests(unittest.TestCase):
                 self.assertEqual(classify_tool_failure(result), expected)
 
     def test_tool_result_serializes_and_tool_execution_records_structured_events(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.runtime.tool_result import ToolResult
@@ -1635,7 +1860,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 event_bus=EventBus(events_path),
             )
 
-            output = tools.execute_tool(
+            output = execute_tool(
                 "read_file",
                 {"path": "note.txt"},
                 tool_context=context,
@@ -1658,7 +1883,6 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertEqual(tool_result["payload"]["metadata"]["output_length"], 5)
 
     def test_read_file_supports_line_ranges_and_line_numbers(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
@@ -1673,7 +1897,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 event_bus=EventBus(root / ".harness" / "events.jsonl"),
             )
 
-            output = tools.execute_tool(
+            output = execute_tool(
                 "read_file",
                 {
                     "path": "note.txt",
@@ -1688,7 +1912,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertEqual(output, "2: two\n3: three")
 
     def test_read_file_rejects_invalid_range_arguments_without_exception(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
@@ -1703,13 +1926,13 @@ class ProductRuntimeTests(unittest.TestCase):
                 event_bus=EventBus(root / ".harness" / "events.jsonl"),
             )
 
-            start_output = tools.execute_tool(
+            start_output = execute_tool(
                 "read_file",
                 {"path": "note.txt", "start_line": "abc", "max_lines": 1},
                 tool_context=context,
                 agent_name="main_agent",
             )
-            max_output = tools.execute_tool(
+            max_output = execute_tool(
                 "read_file",
                 {"path": "note.txt", "start_line": 1, "max_lines": 0},
                 tool_context=context,
@@ -1722,7 +1945,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn("max_lines must be an integer", max_output)
 
     def test_read_file_requires_bounded_ranges_for_files_over_limit_lines(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.builtins.filesystem import READ_FILE_MAX_LINES
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
@@ -1741,7 +1963,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 event_bus=EventBus(root / ".harness" / "events.jsonl"),
             )
 
-            output = tools.execute_tool(
+            output = execute_tool(
                 "read_file",
                 {"path": "big.txt"},
                 tool_context=context,
@@ -1754,7 +1976,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn("max_lines", output)
 
     def test_read_file_rejects_ranges_over_limit_lines(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.builtins.filesystem import READ_FILE_MAX_LINES
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
@@ -1773,7 +1994,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 event_bus=EventBus(root / ".harness" / "events.jsonl"),
             )
 
-            output = tools.execute_tool(
+            output = execute_tool(
                 "read_file",
                 {"path": "big.txt", "start_line": 1, "max_lines": READ_FILE_MAX_LINES + 1},
                 tool_context=context,
@@ -1784,7 +2005,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn(f"max_lines must be <= {READ_FILE_MAX_LINES}", output)
 
     def test_read_file_rejects_windows_with_too_much_output(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.builtins.filesystem import (
             READ_FILE_MAX_OUTPUT_TOKENS,
         )
@@ -1807,7 +2027,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 event_bus=EventBus(root / ".harness" / "events.jsonl"),
             )
 
-            output = tools.execute_tool(
+            output = execute_tool(
                 "read_file",
                 {"path": "wide.txt", "start_line": 1, "max_lines": 1},
                 tool_context=context,
@@ -1822,7 +2042,6 @@ class ProductRuntimeTests(unittest.TestCase):
     def test_tool_result_does_not_infer_status_from_raw_tool_text(self):
         from unittest.mock import patch
 
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.approvals import StaticApprovalProvider
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
@@ -1840,11 +2059,11 @@ class ProductRuntimeTests(unittest.TestCase):
             )
 
             with patch.object(
-                tools.BUILTIN_TOOL_REGISTRY,
+                BUILTIN_TOOL_REGISTRY,
                 "get",
                 return_value=lambda **kwargs: "[error] this is domain output, not execution status",
             ):
-                output = tools.execute_tool(
+                output = execute_tool(
                     "custom_tool",
                     {},
                     tool_context=context,
@@ -1864,7 +2083,6 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertFalse(any(event["type"] == "failure" for event in events))
 
     def test_unknown_tool_records_structured_failure_events(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
@@ -1879,7 +2097,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 event_bus=EventBus(events_path),
             )
 
-            output = tools.execute_tool(
+            output = execute_tool(
                 "missing_tool",
                 {"secret": "nope"},
                 tool_context=context,
@@ -1903,7 +2121,6 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertEqual(failure["payload"]["tool"], "missing_tool")
 
     def test_tool_validation_failures_return_typed_failed_results(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
@@ -1918,19 +2135,19 @@ class ProductRuntimeTests(unittest.TestCase):
                 event_bus=EventBus(events_path),
             )
 
-            missing = tools.execute_tool(
+            missing = execute_tool(
                 "read_file",
                 {"path": "missing.txt"},
                 tool_context=context,
                 agent_name="main_agent",
             )
-            empty_write = tools.execute_tool(
+            empty_write = execute_tool(
                 "write_file",
                 {"path": "", "content": "x"},
                 tool_context=context,
                 agent_name="main_agent",
             )
-            empty_patch = tools.execute_tool(
+            empty_patch = execute_tool(
                 "apply_patch",
                 {"path": "", "search": "x", "replace": "y"},
                 tool_context=context,
@@ -2564,7 +2781,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn("network down", result.metadata["error"])
 
     def test_execute_tool_records_events_and_snapshots(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
@@ -2581,7 +2797,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 event_bus=EventBus(events_path),
             )
 
-            result = tools.execute_tool(
+            result = execute_tool(
                 "write_file",
                 {"path": "note.txt", "content": "new"},
                 tool_context=context,
@@ -2602,7 +2818,6 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertIn("file_change", event_types)
 
     def test_permission_middleware_denies_approval_and_emits_events(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permission_middleware import (
             PermissionMiddleware,
         )
@@ -2621,7 +2836,7 @@ class ProductRuntimeTests(unittest.TestCase):
             )
             middleware = PermissionMiddleware(
                 tool_context=context,
-                tool_registry=tools.BUILTIN_TOOL_REGISTRY,
+                tool_registry=BUILTIN_TOOL_REGISTRY,
             )
 
             blocked = middleware.before_tool(
@@ -2650,7 +2865,6 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_permission_middleware_denial_in_agent_loop_emits_tool_result_and_failure_events(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permission_middleware import (
             PermissionMiddleware,
         )
@@ -2704,9 +2918,9 @@ class ProductRuntimeTests(unittest.TestCase):
             )
             middleware = PermissionMiddleware(
                 tool_context=context,
-                tool_registry=tools.BUILTIN_TOOL_REGISTRY,
+                tool_registry=BUILTIN_TOOL_REGISTRY,
             )
-            shell_schemas = tools.tool_schemas_for_profile(allowed_permissions={"shell"})
+            shell_schemas = tool_schemas_for_profile(allowed_permissions={"shell"})
 
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
@@ -2734,7 +2948,6 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_agent_loop_blocks_tool_calls_not_advertised_in_schema(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
@@ -2783,7 +2996,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 permission_policy=PermissionPolicy(mode="workspace-write"),
                 event_bus=EventBus(),
             )
-            read_only_schemas = tools.tool_schemas_for_profile(allowed_permissions={"read"})
+            read_only_schemas = tool_schemas_for_profile(allowed_permissions={"read"})
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
                     Agent(
@@ -2805,7 +3018,6 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_agent_loop_token_budget_fallback_blocks_pending_tool_calls(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
@@ -2842,7 +3054,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 permission_policy=PermissionPolicy(mode="danger-full-access"),
                 event_bus=EventBus(),
             )
-            write_schemas = tools.tool_schemas_for_profile(allowed_permissions={"edit"})
+            write_schemas = tool_schemas_for_profile(allowed_permissions={"edit"})
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
                     Agent(
@@ -2872,7 +3084,6 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_agent_loop_tool_call_budget_blocks_unexecuted_pending_calls(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
@@ -2917,7 +3128,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 permission_policy=PermissionPolicy(mode="danger-full-access"),
                 event_bus=EventBus(),
             )
-            write_schemas = tools.tool_schemas_for_profile(allowed_permissions={"edit"})
+            write_schemas = tool_schemas_for_profile(allowed_permissions={"edit"})
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
                     Agent(
@@ -2948,7 +3159,6 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_agent_loop_max_iterations_emits_fallback_event(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
@@ -2986,7 +3196,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 permission_policy=PermissionPolicy(mode="workspace-write"),
                 event_bus=EventBus(),
             )
-            read_schemas = tools.tool_schemas_for_profile(allowed_permissions={"read"})
+            read_schemas = tool_schemas_for_profile(allowed_permissions={"read"})
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
                     Agent(
@@ -3012,7 +3222,6 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_agent_loop_time_budget_stops_run(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
@@ -3050,7 +3259,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 permission_policy=PermissionPolicy(mode="workspace-write"),
                 event_bus=EventBus(),
             )
-            read_schemas = tools.tool_schemas_for_profile(allowed_permissions={"read"})
+            read_schemas = tool_schemas_for_profile(allowed_permissions={"read"})
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
                     Agent(
@@ -3072,7 +3281,6 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_agent_loop_budget_warning_emits_once(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
@@ -3117,7 +3325,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 permission_policy=PermissionPolicy(mode="workspace-write"),
                 event_bus=EventBus(),
             )
-            read_schemas = tools.tool_schemas_for_profile(allowed_permissions={"read"})
+            read_schemas = tool_schemas_for_profile(allowed_permissions={"read"})
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
                     Agent(
@@ -3142,7 +3350,6 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertEqual(warnings[0].payload["limit_type"], "total_tokens")
 
     def test_permission_middleware_blocks_blacklisted_shell_without_approval(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permission_middleware import (
             PermissionMiddleware,
         )
@@ -3160,7 +3367,7 @@ class ProductRuntimeTests(unittest.TestCase):
             )
             middleware = PermissionMiddleware(
                 tool_context=context,
-                tool_registry=tools.BUILTIN_TOOL_REGISTRY,
+                tool_registry=BUILTIN_TOOL_REGISTRY,
             )
 
             blocked = middleware.before_tool(
@@ -3185,7 +3392,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertEqual(decision.risk, "shell_safe")
 
     def test_execute_tool_apply_patch_records_snapshot_and_rejects_ambiguous_patch(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
@@ -3201,13 +3407,13 @@ class ProductRuntimeTests(unittest.TestCase):
                 event_bus=EventBus(events_path),
             )
 
-            result = tools.execute_tool(
+            result = execute_tool(
                 "apply_patch",
                 {"path": "note.txt", "search": "old\n", "replace": "new\n"},
                 tool_context=context,
                 agent_name="main_agent",
             )
-            ambiguous = tools.execute_tool(
+            ambiguous = execute_tool(
                 "apply_patch",
                 {"path": "note.txt", "search": "", "replace": "x"},
                 tool_context=context,
@@ -3227,7 +3433,6 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertFalse(any(event["type"] == "file_changed" for event in events))
 
     def test_permission_middleware_allows_approved_tool_call(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.approvals import StaticApprovalProvider
         from harness_code_agent.runtime.permission_middleware import (
             PermissionMiddleware,
@@ -3248,7 +3453,7 @@ class ProductRuntimeTests(unittest.TestCase):
             )
             middleware = PermissionMiddleware(
                 tool_context=context,
-                tool_registry=tools.BUILTIN_TOOL_REGISTRY,
+                tool_registry=BUILTIN_TOOL_REGISTRY,
             )
 
             result = middleware.before_tool(
@@ -3271,7 +3476,6 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertTrue(decided["payload"]["approved"])
 
     def test_permission_middleware_records_llm_auto_approval_metadata(self):
-        from harness_code_agent.runtime import tools
         from harness_code_agent.runtime.approvals import StaticApprovalProvider
         from harness_code_agent.runtime.permission_middleware import (
             PermissionMiddleware,
@@ -3305,7 +3509,7 @@ class ProductRuntimeTests(unittest.TestCase):
             )
             middleware = PermissionMiddleware(
                 tool_context=context,
-                tool_registry=tools.BUILTIN_TOOL_REGISTRY,
+                tool_registry=BUILTIN_TOOL_REGISTRY,
             )
 
             result = middleware.before_tool(
@@ -3330,7 +3534,7 @@ class ProductRuntimeTests(unittest.TestCase):
     def test_static_verifier_passes_clean_python_file(self):
         import subprocess
 
-        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3346,7 +3550,7 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertIsNone(result)
 
     def test_static_verifier_ignores_preexisting_dirty_python_files(self):
-        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
         from harness_code_agent.workspace.service import WorkspaceService
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -3363,7 +3567,7 @@ class ProductRuntimeTests(unittest.TestCase):
     def test_static_verifier_git_baseline_ignores_preexisting_dirty_files(self):
         import subprocess
 
-        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3380,10 +3584,40 @@ class ProductRuntimeTests(unittest.TestCase):
 
             self.assertIsNone(result)
 
+    def test_static_verifier_catches_shell_edit_of_preexisting_dirty_file(self):
+        import subprocess
+
+        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, check=False)
+            (root / "good.py").write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, check=False)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, check=False)
+            # Already dirty (but valid) before the turn begins.
+            (root / "good.py").write_text("x = 2\n", encoding="utf-8")
+
+            mw = StaticVerifierMiddleware(workspace_root=str(root))
+            mw.begin_turn("task", messages=[])
+            # Shell-like out-of-band rewrite: the file stays inside the
+            # baseline dirty set, so only content fingerprints can see it.
+            (root / "good.py").write_text("def f(\n", encoding="utf-8")
+
+            with patch(
+                "harness_code_agent.runtime.middleware.verification._check_ruff",
+                return_value=[],
+            ):
+                result = mw.pre_exit(messages=[])
+
+            self.assertIsNotNone(result)
+            self.assertIn("LINT CHECK FAILED", result)
+            self.assertIn("good.py", result)
+
     def test_static_verifier_catches_shell_written_file_via_git_delta(self):
         import subprocess
 
-        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3409,7 +3643,7 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertIn("bad.py", result)
 
     def test_static_verifier_blocks_syntax_error_from_current_turn_workspace_change(self):
-        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
         from harness_code_agent.workspace.service import WorkspaceService
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -3430,7 +3664,7 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertIn("bad.py", result)
 
     def test_static_verifier_warns_only_once_then_allows_exit(self):
-        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
         from harness_code_agent.workspace.service import WorkspaceService
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -3455,7 +3689,7 @@ class ProductRuntimeTests(unittest.TestCase):
         import json
         from unittest.mock import MagicMock
 
-        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
         from harness_code_agent.workspace.service import WorkspaceService
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -3495,7 +3729,7 @@ class ProductRuntimeTests(unittest.TestCase):
     def test_static_verifier_ruff_unusable_output_does_not_block_exit(self):
         from unittest.mock import MagicMock
 
-        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
         from harness_code_agent.workspace.service import WorkspaceService
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -3517,7 +3751,7 @@ class ProductRuntimeTests(unittest.TestCase):
     def test_static_verifier_skips_non_python_files(self):
         import subprocess
 
-        from harness_code_agent.runtime.middlewares import StaticVerifierMiddleware
+        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3534,7 +3768,7 @@ class ProductRuntimeTests(unittest.TestCase):
     def test_check_ruff_not_installed_gracefully_skips(self):
         from unittest.mock import patch as _patch
 
-        from harness_code_agent.runtime.middlewares import _check_ruff
+        from harness_code_agent.runtime.middleware import _check_ruff
 
         def fake_run(*a, **kw):
             raise FileNotFoundError
@@ -3549,7 +3783,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
         from unittest.mock import patch as _patch
 
-        from harness_code_agent.runtime.middlewares import _check_ruff
+        from harness_code_agent.runtime.middleware import _check_ruff
 
         def fake_run(*a, **kw):
             raise subprocess.TimeoutExpired(cmd="ruff", timeout=30)
@@ -3619,6 +3853,117 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn('"jwt": "[redacted]"', result)
         self.assertIn('"token": "[redacted]"', result)
         self.assertNotIn("short-secret", result)
+
+
+class SessionResumeTests(unittest.TestCase):
+    """Resuming a history session forks it instead of replacing the live one."""
+
+    def setUp(self):
+        import shutil
+
+        self.shutil = shutil
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.env_patch = patch.dict(os.environ, {
+            "HARNESS_MEMORY_GENERATION_DISABLED": "1",
+        })
+        self.env_patch.start()
+        from harness_code_agent.core.interactive import InteractiveSession
+
+        self.interactive = InteractiveSession(
+            cwd=self.temp_dir,
+            enable_turn_summary=False,
+        )
+
+    def tearDown(self):
+        self.interactive.close()
+        self.env_patch.stop()
+        self.shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _seed_source_session(self):
+        from harness_code_agent.sessions.events import UserInputEvent
+        from harness_code_agent.sessions.journal import SessionJournal
+
+        source = self.interactive.session
+        journal = SessionJournal(source.journal_path)
+        journal.append_message({"role": "user", "content": "记住：提交前跑测试"})
+        journal.append_message({"role": "assistant", "content": "好的，我会跑测试。"})
+        self.interactive.event_bus.emit_event(
+            UserInputEvent(text="记住：提交前跑测试", turn=1).to_event()
+        )
+        return source
+
+    def test_resume_forks_without_duplicating_messages(self):
+        from harness_code_agent.sessions.journal import SessionJournal
+
+        source = self._seed_source_session()
+        source_journal_size = source.journal_path.stat().st_size
+        # The source must be a *history* session: branch off it first.
+        self.interactive.fork_current_session()
+        middle = self.interactive.session
+
+        self.interactive.resume_from_session(source.id)
+
+        active = self.interactive.session
+        self.assertNotEqual(active.id, source.id)
+        self.assertNotEqual(active.id, middle.id)
+        # Live messages: exactly one system + one user + one assistant.
+        roles = [m["role"] for m in self.interactive.conversation.messages]
+        self.assertEqual(roles, ["system", "user", "assistant"])
+        # The fork journal file keeps one copy of each message: the system
+        # message persisted at session start + user + assistant.
+        entries = [
+            entry for entry in SessionJournal(active.journal_path).read()
+            if entry.kind == "message"
+        ]
+        self.assertEqual(len(entries), 3)
+        # A fresh recovery from the fork journal matches the live messages.
+        recovered = SessionJournal(active.journal_path).recovery_messages(
+            self.interactive.agent.system_prompt
+        )
+        self.assertEqual(recovered, self.interactive.conversation.messages)
+        # The source session journal is untouched by the resume.
+        self.assertEqual(source.journal_path.stat().st_size, source_journal_size)
+
+    def test_repeated_resume_does_not_multiply_messages(self):
+        from harness_code_agent.sessions.journal import SessionJournal
+
+        source = self._seed_source_session()
+        self.interactive.fork_current_session()  # leave source behind
+        self.interactive.resume_from_session(source.id)
+        fork1 = self.interactive.session
+        self.interactive.resume_from_session(source.id)
+        fork2 = self.interactive.session
+        self.assertNotEqual(fork1.id, fork2.id)
+        roles = [m["role"] for m in self.interactive.conversation.messages]
+        self.assertEqual(roles, ["system", "user", "assistant"])
+        entries = [
+            entry for entry in SessionJournal(fork2.journal_path).read()
+            if entry.kind == "message"
+        ]
+        self.assertEqual(len(entries), 3)
+
+    def test_resuming_current_session_is_noop(self):
+        current = self.interactive.session
+        self.interactive.resume_from_session(current.id)
+        self.assertEqual(self.interactive.session.id, current.id)
+
+    def test_forked_session_starts_as_running(self):
+        source = self._seed_source_session()
+        forked = self.interactive.session_store.fork(source.id)
+        metadata = self.interactive.session_store.read_metadata(forked.id)
+        self.assertEqual(metadata["status"], "running")
+        self.assertEqual(metadata["forked_from"], source.id)
+
+    def test_sessions_panel_excludes_current_session(self):
+        from harness_code_agent.tui_bridge import BridgeServer
+
+        source = self._seed_source_session()
+        bridge = BridgeServer.__new__(BridgeServer)
+        bridge._session = self.interactive
+        bridge._session_error = None
+        panel = bridge._sessions_panel()
+        ids = {option["id"] for option in panel["options"]}
+        self.assertNotIn(source.id, ids)
 
 
 if __name__ == "__main__":

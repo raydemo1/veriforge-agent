@@ -1,6 +1,7 @@
 import json
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -211,6 +212,100 @@ class MemorySystemTests(unittest.TestCase):
         extract.assert_not_called()
         self.assertEqual(status, "suppressed")
 
+    def _wait_for_job_status(self, store, expected, timeout=5.0):
+        deadline = time.time() + timeout
+        while True:
+            with store.connect() as db:
+                statuses = [row["status"] for row in db.execute("SELECT status FROM extraction_jobs")]
+            if statuses and all(s == expected for s in statuses):
+                return
+            if time.time() >= deadline:
+                raise AssertionError(f"jobs did not reach status {expected!r}: {statuses}")
+            time.sleep(0.02)
+
+    def test_kicked_worker_processes_ready_job(self):
+        from harness_code_agent.memory.background import start_memory_worker
+
+        journal = self.temp_dir / "journal.jsonl"
+        journal.write_text("", encoding="utf-8")
+        with patch.dict("os.environ", {"HARNESS_MEMORY_ROOT": str(self.root)}):
+            service = MemoryService(self.workspace)
+            project = service.stores["project"]
+            project.enqueue_extraction("s1", 1, journal)
+            with patch(
+                "harness_code_agent.memory.background._extract_candidates",
+                return_value=[],
+            ):
+                start_memory_worker(self.workspace)
+                # The patch must stay active while the asynchronous worker
+                # reaches the (mocked) extraction call.
+                self._wait_for_job_status(project, "done")
+
+    def test_generate_switch_on_kicks_memory_worker(self):
+        from harness_code_agent.core.interactive import InteractiveSession
+
+        target = InteractiveSession.__new__(InteractiveSession)
+        target.cwd = self.workspace
+        target.memory_use_enabled = True
+        target.memory_auto_extract_enabled = False
+        target.tool_context = SimpleNamespace(memory_auto_extract_enabled=False)
+        with (
+            patch("harness_code_agent.core.interactive.MemoryService"),
+            patch("harness_code_agent.core.interactive.start_memory_worker") as kick,
+        ):
+            target.memory_command(["generate", "off"])
+            kick.assert_not_called()
+            target.memory_command(["generate", "on"])
+            kick.assert_called_once_with(self.workspace)
+        self.assertTrue(target.memory_auto_extract_enabled)
+        self.assertTrue(target.tool_context.memory_auto_extract_enabled)
+
+    def test_running_worker_does_not_block_other_workspaces(self):
+        from harness_code_agent.memory import background as bg
+
+        ws_a = self.temp_dir / "wa"
+        ws_b = self.temp_dir / "wb"
+        ws_a.mkdir()
+        ws_b.mkdir()
+        journal_a = ws_a / "journal.jsonl"
+        journal_b = ws_b / "journal.jsonl"
+        journal_a.write_text("", encoding="utf-8")
+        journal_b.write_text("", encoding="utf-8")
+        entered_a = threading.Event()
+        entered_b = threading.Event()
+        release = threading.Event()
+
+        def fake_extract(service, journal_path, session_id):
+            if Path(journal_path).parent == ws_a:
+                entered_a.set()
+            else:
+                entered_b.set()
+            release.wait(timeout=5)
+            return []
+
+        project = None
+        try:
+            with patch.dict("os.environ", {"HARNESS_MEMORY_ROOT": str(self.root)}):
+                service = MemoryService(self.workspace)
+                project = service.stores["project"]
+                project.enqueue_extraction("sa", 1, journal_a)
+                project.enqueue_extraction("sb", 1, journal_b)
+                with patch.object(bg, "_extract_candidates", fake_extract):
+                    bg.start_memory_worker(ws_a)
+                    self.assertTrue(entered_a.wait(5))
+                    bg.start_memory_worker(ws_b)
+                    self.assertTrue(
+                        entered_b.wait(5),
+                        "workspace B worker was blocked by workspace A",
+                    )
+        finally:
+            release.set()
+        self._wait_for_job_status(project, "done")
+        deadline = time.time() + 5
+        while bg._running_workspaces and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(bg._running_workspaces, set())
+
 
 class MemoryToolTests(unittest.TestCase):
     def setUp(self):
@@ -257,7 +352,7 @@ class MemoryToolTests(unittest.TestCase):
         )
 
         self.context.memory_use_enabled = False
-        self.context.memory_generate_enabled = False
+        self.context.memory_auto_extract_enabled = False
         with patch.dict("os.environ", {"HARNESS_MEMORY_ROOT": str(self.memory_root)}):
             searched = memory_search("anything", tool_context=self.context)
             written = memory_write("Topic", "Body", tool_context=self.context)

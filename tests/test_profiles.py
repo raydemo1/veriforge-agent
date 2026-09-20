@@ -190,7 +190,6 @@ class ProfilePromptTests(unittest.TestCase):
             schema["function"]["name"]
             for schema in tool_schemas_for_profile(
                 allowed_permissions=cfg.allowed_tool_permissions,
-                include_names=cfg.allowed_tool_names,
                 exclude_names=cfg.blocked_tool_names,
                 registry=BUILTIN_TOOL_REGISTRY,
             )
@@ -201,12 +200,11 @@ class ProfilePromptTests(unittest.TestCase):
         self.assertNotIn("parallel_agents", tool_names)
         self.assertNotIn("spawn_agent", tool_names)
 
-    def test_execution_profiles_have_no_intervention_middlewares_or_hard_timeout(self):
+    def test_execution_profiles_have_no_hard_timeout(self):
         for name in ("coding-agent", "app-builder"):
             with self.subTest(profile=name):
                 cfg = get_profile(name).main_agent()
 
-                self.assertEqual(cfg.middlewares, [])
                 self.assertIsNone(cfg.time_budget)
 
                 prompt = cfg.system_prompt
@@ -225,10 +223,9 @@ class ProfilePromptTests(unittest.TestCase):
         self.assertIsNone(plan_cfg.time_budget)
         self.assertIn("planning flow (plan.md)", plan_cfg.system_prompt)
 
-    def test_terminal_has_no_intervention_middleware_and_hard_timeout(self):
+    def test_terminal_has_hard_timeout(self):
         cfg = get_profile("terminal").main_agent()
 
-        self.assertEqual(cfg.middlewares, [])
         self.assertEqual(cfg.time_budget, 1800)
         self.assertNotIn("tracked", cfg.system_prompt)
         self.assertIn("non-trivial multi-step execution", cfg.system_prompt)

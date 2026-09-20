@@ -7,6 +7,7 @@ import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 
 def _install_fake_openai_module() -> None:
@@ -23,8 +24,18 @@ def _install_fake_openai_module() -> None:
 _install_fake_openai_module()
 
 from harness_code_agent.agent.cancellation import CancellationToken
-from harness_code_agent.runtime import tools
+from harness_code_agent.runtime.builtins.registry import (
+    BUILTIN_TOOL_REGISTRY,
+    TOOL_SCHEMAS,
+)
+from harness_code_agent.runtime.execution_planner import (
+    CallEffect,
+    ExecutionPlanner,
+    ResourceClaim,
+    ResourceCoordinator,
+)
 from harness_code_agent.runtime.mcp import McpClientManager, McpToolBinding
+from harness_code_agent.runtime.tool_registry import ToolRegistry
 from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.sessions.events import EventBus
@@ -49,42 +60,42 @@ class ParallelToolTests(unittest.TestCase):
     def test_planner_allows_independent_files_to_share_a_wave(self):
         root = self.context.workspace.root
         effects = [
-            tools.CallEffect((tools.ResourceClaim("workspace", str(root / "a.txt").casefold(), "exact", "write"),)),
-            tools.CallEffect((tools.ResourceClaim("workspace", str(root / "b.txt").casefold(), "exact", "write"),)),
+            CallEffect((ResourceClaim("workspace", str(root / "a.txt").casefold(), "exact", "write"),)),
+            CallEffect((ResourceClaim("workspace", str(root / "b.txt").casefold(), "exact", "write"),)),
         ]
-        planner = tools.ExecutionPlanner(enumerate(effects))
+        planner = ExecutionPlanner(enumerate(effects))
 
         self.assertEqual(planner.ready({0, 1}, set()), [0, 1])
 
     def test_planner_serializes_same_file_read_write(self):
         key = str(self.context.workspace.root / "sample.txt").casefold()
-        planner = tools.ExecutionPlanner([
-            (0, tools.CallEffect((tools.ResourceClaim("workspace", key, "exact", "read"),))),
-            (1, tools.CallEffect((tools.ResourceClaim("workspace", key, "exact", "write"),))),
+        planner = ExecutionPlanner([
+            (0, CallEffect((ResourceClaim("workspace", key, "exact", "read"),))),
+            (1, CallEffect((ResourceClaim("workspace", key, "exact", "write"),))),
         ])
 
         self.assertEqual(planner.ready({0, 1}, set()), [0])
         self.assertEqual(planner.ready({1}, {0}), [1])
 
     def test_network_read_can_overlap_local_write(self):
-        network = tools.BUILTIN_TOOL_REGISTRY.effect_for("web_search", {"query": "x"}, self.context)
-        local_write = tools.BUILTIN_TOOL_REGISTRY.effect_for("write_file", {"path": "a.txt"}, self.context)
-        planner = tools.ExecutionPlanner([(0, network), (1, local_write)])
+        network = BUILTIN_TOOL_REGISTRY.effect_for("web_search", {"query": "x"}, self.context)
+        local_write = BUILTIN_TOOL_REGISTRY.effect_for("write_file", {"path": "a.txt"}, self.context)
+        planner = ExecutionPlanner([(0, network), (1, local_write)])
 
         self.assertEqual(planner.ready({0, 1}, set()), [0, 1])
 
     def test_shell_inspections_parallel_but_verifications_serialize(self):
         inspections = [
-            tools.BUILTIN_TOOL_REGISTRY.effect_for("run_bash", {"command": command}, self.context)
+            BUILTIN_TOOL_REGISTRY.effect_for("run_bash", {"command": command}, self.context)
             for command in ("git status --short", "rg needle .")
         ]
         verifications = [
-            tools.BUILTIN_TOOL_REGISTRY.effect_for("run_bash", {"command": command}, self.context)
+            BUILTIN_TOOL_REGISTRY.effect_for("run_bash", {"command": command}, self.context)
             for command in ("pytest -q", "bun run check")
         ]
 
-        inspect_plan = tools.ExecutionPlanner(enumerate(inspections))
-        verify_plan = tools.ExecutionPlanner(enumerate(verifications))
+        inspect_plan = ExecutionPlanner(enumerate(inspections))
+        verify_plan = ExecutionPlanner(enumerate(verifications))
         self.assertEqual(inspect_plan.ready({0, 1}, set()), [0, 1])
         self.assertEqual(verify_plan.ready({0, 1}, set()), [0])
 
@@ -96,14 +107,14 @@ class ParallelToolTests(unittest.TestCase):
             McpToolBinding("mcp_write_a", "state", "a", "", {}, "dangerous", {}),
             McpToolBinding("mcp_write_b", "state", "b", "", {}, "dangerous", {}),
         ]
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         manager.register_tools(registry)
 
-        read_plan = tools.ExecutionPlanner([
+        read_plan = ExecutionPlanner([
             (0, registry.effect_for("mcp_read_a", {}, self.context)),
             (1, registry.effect_for("mcp_read_b", {}, self.context)),
         ])
-        write_plan = tools.ExecutionPlanner([
+        write_plan = ExecutionPlanner([
             (0, registry.effect_for("mcp_write_a", {}, self.context)),
             (1, registry.effect_for("mcp_write_b", {}, self.context)),
         ])
@@ -176,14 +187,106 @@ class ParallelToolTests(unittest.TestCase):
         finally:
             loop_thread.close()
 
+    def test_mcp_worker_cancel_propagates_to_session_call_tool(self):
+        from types import SimpleNamespace
+
+        import mcp
+        from mcp.client import stdio as mcp_stdio
+
+        from harness_code_agent.runtime.mcp import McpServerConfig
+
+        class FakeStdioClient:
+            async def __aenter__(self):
+                return (object(), object())
+
+            async def __aexit__(self, *args):
+                return False
+
+        class FakeClientSession:
+            # Events are installed per scenario (they must be created on the
+            # running loop); instances reach them through the class.
+            started: asyncio.Event | None = None
+            cancelled: asyncio.Event | None = None
+
+            def __init__(self, read_stream=None, write_stream=None):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def initialize(self):
+                return None
+
+            async def list_tools(self):
+                tool = SimpleNamespace(
+                    name="slow_tool",
+                    description="",
+                    inputSchema={"type": "object", "properties": {}},
+                    annotations=None,
+                )
+                return SimpleNamespace(tools=[tool])
+
+            async def call_tool(self, name, arguments):
+                type(self).started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    type(self).cancelled.set()
+
+        async def scenario():
+            started = asyncio.Event()
+            cancelled = asyncio.Event()
+            FakeClientSession.started = started
+            FakeClientSession.cancelled = cancelled
+
+            manager = McpClientManager(workspace=self.root)
+            server = McpServerConfig(
+                name="fake", transport="stdio", command="fake-cmd", args=[]
+            )
+            request_queue: asyncio.Queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+            ready = loop.create_future()
+            worker_task = asyncio.create_task(
+                manager._connection_worker(server, request_queue, ready)
+            )
+            bindings = await ready
+
+            response = loop.create_future()
+            await request_queue.put(("call", (bindings[0], {}), response))
+            await started.wait()
+            # Exactly what _call_tool does when its awaiter is cancelled.
+            response.cancel()
+            # The worker must propagate the response cancellation into the
+            # task blocked inside session.call_tool().
+            await asyncio.wait_for(cancelled.wait(), timeout=2)
+
+            # Close must return promptly rather than wait on the remote call.
+            close_response = loop.create_future()
+            await request_queue.put(("close", None, close_response))
+            await asyncio.wait_for(close_response, timeout=2)
+            await asyncio.wait_for(worker_task, timeout=2)
+
+        with (
+            patch.object(mcp, "ClientSession", FakeClientSession),
+            patch.object(
+                mcp_stdio,
+                "stdio_client",
+                lambda params: FakeStdioClient(),
+            ),
+        ):
+            asyncio.run(scenario())
+
     def test_coordinator_allows_different_file_writes_to_overlap(self):
-        coordinator = tools.ResourceCoordinator()
+        coordinator = ResourceCoordinator()
         both_entered = threading.Event()
         release = threading.Event()
         entered = []
 
         def worker(key):
-            claim = tools.ResourceClaim("workspace", key, "exact", "write")
+            claim = ResourceClaim("workspace", key, "exact", "write")
             with coordinator.acquire((claim,)):
                 entered.append(key)
                 if len(entered) == 2:
@@ -198,25 +301,25 @@ class ParallelToolTests(unittest.TestCase):
                 future.result()
 
     def test_coordinator_serializes_subtree_read_and_child_write(self):
-        coordinator = tools.ResourceCoordinator()
+        coordinator = ResourceCoordinator()
         reader_entered = threading.Event()
         release_reader = threading.Event()
         writer_entered = threading.Event()
-        subtree_key = tools.BUILTIN_TOOL_REGISTRY.effect_for(
+        subtree_key = BUILTIN_TOOL_REGISTRY.effect_for(
             "list_files", {"directory": "src"}, self.context
         ).resources[0].key
-        child_key = tools.BUILTIN_TOOL_REGISTRY.effect_for(
+        child_key = BUILTIN_TOOL_REGISTRY.effect_for(
             "write_file", {"path": "src/a.py"}, self.context
         ).resources[0].key
 
         def reader():
-            with coordinator.acquire((tools.ResourceClaim("workspace", subtree_key, "subtree", "read"),)):
+            with coordinator.acquire((ResourceClaim("workspace", subtree_key, "subtree", "read"),)):
                 reader_entered.set()
                 release_reader.wait(2)
 
         def writer():
             reader_entered.wait(1)
-            with coordinator.acquire((tools.ResourceClaim("workspace", child_key, "exact", "write"),)):
+            with coordinator.acquire((ResourceClaim("workspace", child_key, "exact", "write"),)):
                 writer_entered.set()
 
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -230,7 +333,7 @@ class ParallelToolTests(unittest.TestCase):
             write_future.result()
 
     def test_legacy_parallel_tools_are_removed(self):
-        schema_names = {schema["function"]["name"] for schema in tools.TOOL_SCHEMAS}
+        schema_names = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
 
         self.assertNotIn("parallel_commands", schema_names)
         self.assertNotIn("parallel_agents", schema_names)

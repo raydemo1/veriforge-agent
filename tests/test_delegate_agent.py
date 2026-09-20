@@ -13,7 +13,10 @@ from harness_code_agent.agent.coordinator import (
     AgentRecord,
     _path_allowed,
 )
-from harness_code_agent.runtime import tools
+from harness_code_agent.runtime.builtins.registry import (
+    BUILTIN_TOOL_REGISTRY,
+    TOOL_SCHEMAS,
+)
 from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.sessions.events import EventBus
@@ -101,7 +104,7 @@ class ChangeProposalTests(unittest.TestCase):
         self.assertTrue(self.store.sandbox_for("agent_worker").workspace.exists())
 
     def test_registry_exposes_lifecycle_tools_and_removes_legacy_batch_tools(self):
-        names = {schema["function"]["name"] for schema in tools.TOOL_SCHEMAS}
+        names = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
         self.assertIn("spawn_agent", names)
         self.assertIn("send_agent_message", names)
         self.assertIn("apply_agent_changes", names)
@@ -200,7 +203,7 @@ class AgentCoordinatorTests(unittest.TestCase):
             workspace=WorkspaceService(root=self.temp),
             permission_policy=PermissionPolicy(mode="danger-full-access"),
             event_bus=EventBus(),
-            tool_registry=tools.BUILTIN_TOOL_REGISTRY,
+            tool_registry=BUILTIN_TOOL_REGISTRY,
         )
         self.coordinator = AgentCoordinator(self.context, max_concurrent=3)
         self.context.agent_coordinator = self.coordinator
