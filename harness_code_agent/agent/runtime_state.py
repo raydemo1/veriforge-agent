@@ -166,7 +166,6 @@ class AgentRuntimeState:
     permission_mode: str = ""
     auto_compaction_turn_start_index: int = -1
     auto_compaction_suspended: bool = False
-    context_refill_streak: int = 0
     context_anxiety_turn_start_index: int = -1
     event_bus: Any = None
 

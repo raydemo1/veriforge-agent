@@ -30,7 +30,7 @@ _install_fake_openai_module()
 # ---------------------------------------------------------------------------
 
 class CompactionGateTests(unittest.TestCase):
-    """CompactionGate tracks active tool calls, dirty state, and message revision."""
+    """CompactionGate tracks active tool calls."""
 
     def _make_gate(self):
         from harness_code_agent.agent.compaction import CompactionGate
@@ -61,32 +61,6 @@ class CompactionGateTests(unittest.TestCase):
         gate.end_tool_call()
         self.assertFalse(gate.can_compact())
 
-    def test_message_revision_increments(self):
-        gate = self._make_gate()
-        r0 = gate.revision
-        gate.bump_revision()
-        r1 = gate.revision
-        self.assertEqual(r1, r0 + 1)
-
-    def test_coalescing_window_prevents_rapid_compaction(self):
-        gate = self._make_gate()
-        gate.mark_compacted()
-        # Within coalescing window, should not compact again
-        self.assertFalse(gate.can_compact(coalesce_seconds=30))
-
-    def test_coalescing_window_expires(self):
-        import time
-        gate = self._make_gate()
-        gate._last_compact_time = time.time() - 60
-        self.assertTrue(gate.can_compact(coalesce_seconds=30))
-
-    def test_dirty_flag_tracks_context_changes(self):
-        gate = self._make_gate()
-        self.assertFalse(gate.dirty)
-        gate.mark_dirty()
-        self.assertTrue(gate.dirty)
-        gate.mark_compacted()
-        self.assertFalse(gate.dirty)
 
 
 # ---------------------------------------------------------------------------
@@ -216,17 +190,6 @@ class CompactCommandTests(unittest.TestCase):
 
 
 class AgentConversationCompactionLifecycleTests(unittest.TestCase):
-    def test_message_revision_tracks_user_assistant_tool_and_middleware_appends(self):
-        from harness_code_agent.agent.conversation import Agent
-
-        agent = Agent("test_agent", "sys", use_tools=False)
-        conv = agent.start_conversation()
-        initial = conv.compaction_gate.revision
-
-        conv.add_user_turn("task")
-
-        self.assertGreater(conv.compaction_gate.revision, initial)
-
     def test_context_compacted_hook_replaces_dynamic_context_block(self):
         from harness_code_agent.agent.conversation import Agent
         from harness_code_agent.runtime.middleware import AgentMiddleware
@@ -389,7 +352,6 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
         thresholds = get_thresholds()
         agent = Agent("test_agent", "sys", use_tools=False)
         conv = agent.start_conversation("first")
-        conv.runtime_state.context_refill_streak = 1
         conv.runtime_state.fallback.request_stop(reason="loop_detected")
 
         with (
@@ -411,7 +373,6 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
             conv.run_until_idle()
 
         self.assertEqual(conv.messages[1]["content"], "first")
-        self.assertGreaterEqual(conv.runtime_state.context_refill_streak, 2)
         self.assertTrue(conv.runtime_state.auto_compaction_suspended)
 
     def test_context_anxiety_below_threshold_only_records_soft_signal(self):
@@ -615,17 +576,6 @@ class TuiStateCompactionTests(unittest.TestCase):
         }
         block = state.apply_event(event)
         self.assertIsNotNone(block)
-
-    def test_handoff_reset_shows_notice(self):
-        state = self._make_state()
-        event = MagicMock()
-        event.to_dict.return_value = {
-            "type": "context_compaction_started",
-            "payload": {"token_count": 180000, "phase": "handoff_reset"},
-        }
-        block = state.apply_event(event)
-        self.assertIsNone(block)
-        self.assertIn("compact", state.snapshot.status.lower())
 
     def test_context_anxiety_observed_shows_soft_notice(self):
         state = self._make_state()

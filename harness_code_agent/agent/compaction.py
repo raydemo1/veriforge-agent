@@ -1,12 +1,9 @@
 """Compaction gate helpers."""
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 
 from .. import config
-
-COALESCE_SECONDS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -41,33 +38,12 @@ class CompactionGate:
 
     def __init__(self) -> None:
         self._active_tool_calls: int = 0
-        self.revision: int = 0
-        self.dirty: bool = False
-        self._last_compact_time: float = 0.0
 
-    def can_compact(self, *, coalesce_seconds: int = COALESCE_SECONDS) -> bool:
-        if self._active_tool_calls > 0:
-            return False
-        if coalesce_seconds > 0:
-            elapsed = time.time() - self._last_compact_time
-            if elapsed < coalesce_seconds:
-                return False
-        return True
+    def can_compact(self) -> bool:
+        return self._active_tool_calls == 0
 
     def begin_tool_call(self) -> None:
         self._active_tool_calls += 1
-        self.dirty = True
 
     def end_tool_call(self) -> None:
         self._active_tool_calls = max(0, self._active_tool_calls - 1)
-
-    def bump_revision(self) -> None:
-        self.revision += 1
-        self.dirty = True
-
-    def mark_dirty(self) -> None:
-        self.dirty = True
-
-    def mark_compacted(self) -> None:
-        self.dirty = False
-        self._last_compact_time = time.time()
