@@ -159,6 +159,40 @@ class _ControlledAgent:
         return _ControlledConversation(self.name)
 
 
+class _RunFailingConversation:
+    def __init__(self, name):
+        self.name = name
+        self.messages = [{"role": "user", "content": "task"}]
+
+    def run_until_idle(self, cancellation_token=None):
+        raise RuntimeError("run exploded")
+
+    def has_queued_messages(self):
+        return False
+
+    def add_user_turn(self, task):
+        self.messages.append({"role": "user", "content": task})
+
+    def close(self):
+        pass
+
+
+class _RunFailingAgent:
+    def __init__(self, **kwargs):
+        self.name = kwargs["name"]
+
+    def start_conversation(self, task):
+        return _RunFailingConversation(self.name)
+
+
+class _SetupFailingAgent:
+    def __init__(self, **kwargs):
+        self.name = kwargs["name"]
+
+    def start_conversation(self, task):
+        raise ValueError("setup exploded")
+
+
 class AgentCoordinatorTests(unittest.TestCase):
     def setUp(self):
         self.temp = Path(tempfile.mkdtemp(prefix="hca-coordinator-test-"))
@@ -210,6 +244,20 @@ class AgentCoordinatorTests(unittest.TestCase):
             self.assertIs(_ControlledAgent.contexts["first"].resource_coordinator, self.context.resource_coordinator)
             second_conversation.release.set()
             self.assertEqual(self._wait_terminal(second["agent_id"])["status"], "completed")
+
+    def test_run_exception_is_caught_at_single_thread_boundary(self):
+        with patch("harness_code_agent.agent.conversation.Agent", _RunFailingAgent):
+            spawned = self.coordinator.spawn(name="boom", role="explorer", task="inspect")
+            terminal = self._wait_terminal(spawned["agent_id"])
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["error"], "RuntimeError: run exploded")
+
+    def test_setup_exception_is_caught_before_agent_ran(self):
+        with patch("harness_code_agent.agent.conversation.Agent", _SetupFailingAgent):
+            spawned = self.coordinator.spawn(name="setupboom", role="explorer", task="inspect")
+            terminal = self._wait_terminal(spawned["agent_id"])
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["error"], "ValueError: setup exploded")
 
     def test_wait_ignores_unrelated_agent_state_changes(self):
         selected = AgentRecord(

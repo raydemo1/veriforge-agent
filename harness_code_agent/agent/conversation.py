@@ -151,7 +151,6 @@ class AgentConversation:
         self.provider: ProviderAdapter = current_adapter()
         self.emitter = SessionEmitter(None, agent.name, self.provider.name)
         self.llm = LlmChannel(self)
-        self.consecutive_errors = 0
         self.last_text = ""
         self.last_run_streamed_text = False
         self._closed = False
@@ -883,39 +882,12 @@ class AgentConversation:
                 self.trace.finish("llm_timeout", iteration)
                 raise
             except Exception as e:
-                err_str = str(e)
-                self.trace.error("api_error", err_str)
-
-                # Rate limits get longer backoff and don't count toward abort threshold
-                if "rate_limit" in err_str.lower() or "429" in err_str:
-                    import random
-                    wait = min(2 ** (self.consecutive_errors + 2), 120) + random.uniform(0, 5)
-                    log.warning(f"[{agent.name}] Rate limited, waiting {wait:.1f}s...")
-                    time.sleep(wait)
-                    continue
-
-                log.error(f"[{agent.name}] API error: {e}")
-                self.consecutive_errors += 1
-                if self.consecutive_errors >= config.MAX_TOOL_ERRORS:
-                    log.error(f"[{agent.name}] Too many API errors, aborting.")
-                    self.trace.finish("api_errors", iteration)
-                    break
-                time.sleep(2 ** self.consecutive_errors)
-                continue
-
-            self.consecutive_errors = 0
-
-            # --- Guard against empty choices ---
-            if completion is None:
-                log.warning(f"[{agent.name}] API returned empty choices. Retrying...")
-                self.trace.error("empty_choices", "API returned no choices")
-                self.consecutive_errors += 1
-                if self.consecutive_errors >= config.MAX_TOOL_ERRORS:
-                    log.error(f"[{agent.name}] Too many empty responses, aborting.")
-                    self.trace.finish("empty_choices", iteration)
-                    break
-                time.sleep(2)
-                continue
+                # The channel owns the bounded retry budget; once it raises,
+                # the request has failed — record it and end the turn.
+                log.error(f"[{agent.name}] LLM request failed: {e}")
+                self.trace.error("api_error", str(e))
+                self.trace.finish("api_error", iteration)
+                break
 
             assistant_msg, finish_reason = completion
             content = assistant_msg.get("content")

@@ -35,6 +35,10 @@ class MultimodalRequestError(RuntimeError):
     """Configured endpoint rejected an image request."""
 
 
+class _EmptyChoicesError(RuntimeError):
+    """Provider returned a 200 response with no usable choices."""
+
+
 _RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 _RETRYABLE_ERROR_TOKENS = (
     "rate_limit",
@@ -219,7 +223,7 @@ class LlmChannel:
         # conversation it serves; it owns no state of its own.
         self.conversation = conversation
 
-    def request_assistant_message(self, kwargs: dict, cancellation_token=None) -> tuple[dict, str | None] | None:
+    def request_assistant_message(self, kwargs: dict, cancellation_token=None) -> tuple[dict, str | None]:
         conv = self.conversation
         attempts = max(1, int(config.LLM_MAX_RETRIES) + 1)
         if getattr(conv, "_client_needs_refresh", False):
@@ -342,13 +346,18 @@ class LlmChannel:
         remove_cancel_callback = self._interrupt_client_on_cancel(cancellation_token)
         try:
             def _nonstream_attempt():
-                return conv.client.chat.completions.create(**kwargs)
+                response = conv.client.chat.completions.create(**kwargs)
+                if not response.choices:
+                    raise _EmptyChoicesError("API returned no choices")
+                return response
 
             response = _call_with_retry(
                 _nonstream_attempt,
                 operation="chat completion",
                 attempts=attempts,
                 cancellation_token=cancellation_token,
+                is_retryable=lambda exc: isinstance(exc, _EmptyChoicesError)
+                or _is_retryable_llm_error(exc),
             )
         except Exception as exc:
             if cancellation_token is not None and cancellation_token.is_cancelled:
@@ -364,8 +373,6 @@ class LlmChannel:
         finally:
             remove_cancel_callback()
         conv._check_cancelled(cancellation_token)
-        if not response.choices:
-            return None
         choice = response.choices[0]
         conv.emitter.emit_llm_response_finished(
             call_id,

@@ -71,7 +71,6 @@ from .tool_registry import (
 from .tool_result import ToolResult
 from .tool_runner import (
     _registry_for_context,
-    _validate_and_fix,
     execute_tool,
     execute_tool_result,
     finalize_executed_tool_result,

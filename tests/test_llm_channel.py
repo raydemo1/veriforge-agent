@@ -121,5 +121,84 @@ class StreamFallbackPolicyTests(unittest.TestCase):
         self.assertTrue(conv.trace.errors)
 
 
+class _EmptyChoicesCompletions:
+    def __init__(self, empty_calls):
+        self.empty_calls = empty_calls
+        self.calls = 0
+
+    def create(self, **kwargs):
+        self.calls += 1
+        if self.calls <= self.empty_calls:
+            return SimpleNamespace(choices=[], usage=None)
+        choice = SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(content="non-stream ok"),
+        )
+        return SimpleNamespace(choices=[choice], usage=None)
+
+
+def _make_nonstream_conversation(completions):
+    client = _FakeClient(completions)
+    return SimpleNamespace(
+        provider=_FakeProvider(),
+        client=client,
+        agent=SimpleNamespace(stream_callback=None),
+        emitter=_FakeEmitter(),
+        trace=_FakeTrace(),
+        event_bus=None,
+        _client_needs_refresh=False,
+        last_run_streamed_text=False,
+        next_call_id=lambda: "call-1",
+        refresh_client=lambda: None,
+        record_llm_usage=lambda *a, **k: None,
+        _check_cancelled=lambda token=None: None,
+    )
+
+
+class EmptyChoicesRetryTests(unittest.TestCase):
+    def test_empty_choices_retried_within_budget_then_succeeds(self):
+        completions = _EmptyChoicesCompletions(empty_calls=2)
+        conv = _make_nonstream_conversation(completions)
+        channel = ch.LlmChannel(conv)
+        with patch.object(ch.config, "LLM_MAX_RETRIES", 2):
+            message, finish = channel.request_assistant_message(
+                {"model": "m", "messages": []}
+            )
+        self.assertEqual(completions.calls, 3)
+        self.assertEqual(finish, "stop")
+        self.assertEqual(message["content"], "non-stream ok")
+
+    def test_persistent_empty_choices_raises_and_never_returns_none(self):
+        completions = _EmptyChoicesCompletions(empty_calls=99)
+        conv = _make_nonstream_conversation(completions)
+        channel = ch.LlmChannel(conv)
+        with patch.object(ch.config, "LLM_MAX_RETRIES", 2):
+            with self.assertRaises(ch._EmptyChoicesError):
+                channel.request_assistant_message(
+                    {"model": "m", "messages": []}
+                )
+        self.assertEqual(completions.calls, 3)
+
+
+class ConversationErrorBoundaryTests(unittest.TestCase):
+    def test_channel_failure_ends_turn_with_a_single_request(self):
+        from harness_code_agent.agent.conversation import Agent
+
+        conv = Agent("test_agent", "sys", use_tools=False).start_conversation("task")
+        finishes = []
+        with (
+            patch.object(
+                conv.llm,
+                "request_assistant_message",
+                side_effect=ValueError("auth failed"),
+            ) as request,
+            patch.object(conv.trace, "finish", side_effect=lambda *a: finishes.append(a)),
+        ):
+            result = conv.run_until_idle()
+        request.assert_called_once()
+        self.assertEqual(result, "")
+        self.assertEqual(finishes[0][0], "api_error")
+
+
 if __name__ == "__main__":
     unittest.main()

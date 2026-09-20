@@ -300,14 +300,7 @@ class AgentCoordinator:
                         next_task = self._take_followup(record)
                         if next_task:
                             record.conversation.add_user_turn(next_task)
-                    try:
-                        result = record.conversation.run_until_idle(cancellation_token=token)
-                    except CancelledError as exc:
-                        self._finish(record, "interrupted", error=str(exc))
-                        return
-                    except Exception as exc:  # noqa: BLE001 - thread boundary records failures
-                        self._finish(record, "failed", error=f"{type(exc).__name__}: {exc}")
-                        return
+                    result = record.conversation.run_until_idle(cancellation_token=token)
                     record.summary = str(result or "")
                     with self._condition:
                         if record.conversation.has_queued_messages():
@@ -324,6 +317,8 @@ class AgentCoordinator:
                         continue
                     self._finish(record, "completed")
                     return
+            except CancelledError as exc:
+                self._finish(record, "interrupted", error=str(exc))
             except Exception as exc:  # noqa: BLE001 - thread boundary records failures
                 self._finish(record, "failed", error=f"{type(exc).__name__}: {exc}")
 

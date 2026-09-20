@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import inspect
-import os
 from collections.abc import Callable
 from typing import Any
 
@@ -18,81 +17,6 @@ from .tool_call_validation import validate_tool_arguments
 from .tool_context import ToolContext
 from .tool_registry import ToolRegistry
 from .tool_result import ToolResult, unstructured_tool_result_from_text
-
-
-def _validate_and_fix(name: str, arguments: dict) -> tuple[dict, str | None]:
-    """
-    Pre-validate tool arguments and auto-correct common mistakes.
-    Returns (fixed_arguments, warning_message_or_None).
-
-    This is a lightweight heuristic layer — no LLM calls.
-    Catches the most common tool-call errors from weaker models:
-      - Empty/missing required arguments
-      - Absolute paths that should be relative
-      - Obvious typos in common patterns
-    """
-    warning = None
-
-    if name == "write_file":
-        path = arguments.get("path", "")
-        content = arguments.get("content")
-
-        # Empty path
-        if not path or not path.strip():
-            return arguments, "[auto-fix] Empty file path. You must specify a path."
-
-        # Absolute path → make relative to workspace
-        if path.startswith("/"):
-            # Strip common workspace prefixes
-            for prefix in ["/app/", "/home/user/", "/workspace/"]:
-                if path.startswith(prefix):
-                    arguments["path"] = path[len(prefix):]
-                    warning = f"[auto-fix] Converted absolute path '{path}' to relative '{arguments['path']}'"
-                    break
-
-        # Missing content
-        if content is None:
-            arguments["content"] = ""
-            warning = "[auto-fix] Missing 'content' argument — writing empty file."
-
-    elif name == "read_file":
-        path = arguments.get("path", "")
-
-        # Absolute path → relative
-        if path.startswith("/"):
-            for prefix in ["/app/", "/home/user/", "/workspace/"]:
-                if path.startswith(prefix):
-                    arguments["path"] = path[len(prefix):]
-                    warning = f"[auto-fix] Converted absolute path '{path}' to relative '{arguments['path']}'"
-                    break
-
-    elif name == "run_bash":
-        command = arguments.get("command", "")
-
-        # Empty command
-        if not command or not command.strip():
-            return arguments, "[auto-fix] Empty command. You must specify a command to run."
-
-        # Detect interactive commands that will hang
-        interactive_cmds = ["vim", "nano", "vi", "less", "more", "top", "htop"]
-        first_word = command.strip().split()[0] if command.strip() else ""
-        if first_word in interactive_cmds:
-            return arguments, (
-                f"[auto-fix] '{first_word}' is an interactive command that will hang. "
-                f"Use non-interactive alternatives: "
-                f"for editing use write_file, for viewing use {'type/more' if os.name == 'nt' else 'cat/head/tail'}."
-            )
-
-    elif name == "list_files":
-        directory = arguments.get("directory", ".")
-        if directory.startswith("/"):
-            for prefix in ["/app/", "/home/user/", "/workspace/"]:
-                if directory.startswith(prefix):
-                    arguments["directory"] = directory[len(prefix):] or "."
-                    warning = f"[auto-fix] Converted absolute path '{directory}' to relative '{arguments['directory']}'"
-                    break
-
-    return arguments, warning
 
 
 TOOL_EVENT_OUTPUT_LIMIT = 2_000
@@ -151,7 +75,6 @@ def execute_tool_result(
             emit_events=emit_events,
         )
 
-    fix_warning = None
     if registry.schema_for(name) is not None:
         validation = validate_tool_arguments(name, arguments, registry, tool_context)
         if validation.error is not None:
@@ -163,28 +86,10 @@ def execute_tool_result(
             )
         arguments = validation.arguments
     else:
-        # Keep the legacy direct-call path usable for handlers injected by
-        # integrations that do not register a schema. Model tool calls never
-        # use this path: ToolExecutor requires a registered schema first.
+        # Direct-call path for handlers injected by integrations that do not
+        # register a schema. Model tool calls never use it: ToolExecutor
+        # requires a registered schema first.
         arguments = dict(arguments or {})
-        arguments, fix_warning = _validate_and_fix(name, arguments)
-
-    if fix_warning and (
-        fix_warning.startswith("[auto-fix] Empty")
-        or "interactive command" in fix_warning
-    ):
-        return _finalize_tool_result_object(
-            ToolResult(
-                tool=name,
-                status="failed",
-                output=fix_warning,
-                error=fix_warning,
-                metadata={"status_source": "validation"},
-            ),
-            tool_context=tool_context,
-            agent_name=agent_name,
-            emit_events=emit_events,
-        )
 
     try:
         result = _invoke_registered_tool(
@@ -208,10 +113,6 @@ def execute_tool_result(
         )
     else:
         tool_result = _coerce_tool_result(name, result)
-
-    # Prepend the auto-fix warning so the model knows what was corrected
-    if fix_warning:
-        tool_result = tool_result.with_output_prefix(fix_warning)
 
     return _finalize_tool_result_object(
         tool_result,
