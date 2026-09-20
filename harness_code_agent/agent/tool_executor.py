@@ -429,13 +429,17 @@ class ToolExecutor:
             blocked_text = blocked.to_text() if isinstance(blocked, ToolResult) else str(blocked)
             self.conversation.trace.middleware_inject(type(mw).__name__, "before_tool", blocked_text)
             if isinstance(blocked, ToolResult):
+                # First-party middleware carries machine semantics in metadata;
+                # never infer status_source from the human-facing text.
                 return blocked
+            # Legacy compatibility for external middlewares still returning a
+            # plain string: treat as a generic policy interception.
             return ToolResult(
                 tool=prepared.name,
                 status="failed",
                 output=blocked_text,
                 error=blocked_text,
-                metadata={"status_source": "approval" if blocked_text.startswith("[approval_denied]") else "permission"},
+                metadata={"status_source": "tool_policy"},
             )
         activity["duration_ms"] += (time.perf_counter() - started) * 1000
         return None

@@ -427,7 +427,7 @@ class _ProfilePresetPolicy(PermissionPolicy):
         ):
             return PermissionDecision(
                 PermissionAction.DENY.value,
-                "shell_blocked",
+                "shell_profile_restricted",
                 "profile does not allow shell commands that write workspace files",
             )
         return decision

@@ -231,6 +231,21 @@ class NormalizationTests(unittest.TestCase):
                 self.assertEqual(failure.visibility, visibility)
                 self.assertEqual(classify_tool_failure(failure.stamp_metadata(result)), event_category)
 
+    def test_from_result_never_infers_approval_from_text(self):
+        # Regression: a legacy plain-text block containing the old marker must
+        # not be classified as an approval denial without status_source metadata.
+        result = ToolResult(
+            tool="probe",
+            status="failed",
+            output="[approval_denied] legacy middleware said no",
+            error="[approval_denied] legacy middleware said no",
+            metadata={},
+        )
+        failure = ToolFailure.from_result(
+            tool_call_id="tc", tool_name="probe", result=result, intercepted=True
+        )
+        self.assertNotEqual(failure.kind, FailureKind.APPROVAL_DENIED)
+
     def test_from_result_classify_event_category_after_stamp(self):
         result = ToolResult(
             tool="probe",
@@ -831,11 +846,12 @@ class ExecutorFailureIntegrationTests(unittest.TestCase):
         self.assertTrue(any("Allowed arguments are exactly" in text for text in injected))
         self.assertTrue(any("3 consecutive validation failures" in text for text in injected))
 
-    def test_permission_interception_is_normalized_and_seen(self):
+    def test_legacy_string_interception_is_normalized_as_tool_policy(self):
         registry = self._registry()
         spy = FailureSpyMiddleware()
 
         class BlockMiddleware(AgentMiddleware):
+            # Legacy external middleware contract: a plain string block.
             def before_tool(self, tool_name, tool_args, messages, runtime_state=None, agent_name=None):
                 return "[blocked] not allowed"
 
@@ -853,7 +869,7 @@ class ExecutorFailureIntegrationTests(unittest.TestCase):
                 conversation.run_until_idle()
 
         self.assertEqual(len(spy.calls), 1)
-        self.assertEqual(spy.calls[0].kind, FailureKind.PERMISSION_DENIED)
+        self.assertEqual(spy.calls[0].kind, FailureKind.POLICY_VIOLATION)
         self.assertTrue(spy.calls[0].intercepted)
         event = next(event for event in context.event_bus.events if event.type == "failure")
         self.assertEqual(event.payload["metadata"]["failure_category"], "policy")
@@ -1028,7 +1044,7 @@ class FailureObservabilityTests(unittest.TestCase):
             if event.type == "tool_failure_decision"
         )
         self.assertEqual(decision["mode"], FailureMode.RETURN_TO_AGENT)
-        self.assertEqual(decision["kind"], FailureKind.PERMISSION_DENIED)
+        self.assertEqual(decision["kind"], FailureKind.POLICY_VIOLATION)
         self.assertEqual(decision["visibility"], "task")
         self.assertEqual(decision["turn_failure_count"], 1)
         self.assertEqual(turn_count, 1)
