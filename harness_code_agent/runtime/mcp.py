@@ -658,7 +658,24 @@ class McpClientManager:
 
         stack = contextlib.AsyncExitStack()
         close_response: asyncio.Future | None = None
-        active_calls: set[asyncio.Task] = set()
+        #: In-flight tool calls keyed by their response future, so cancelling
+        #: the response can be propagated to the task running
+        #: ``session.call_tool()``.
+        active_calls: dict[asyncio.Future, asyncio.Task] = {}
+
+        def _track_call(response: asyncio.Future, task: asyncio.Task) -> None:
+            active_calls[response] = task
+
+            def _discard(_):
+                active_calls.pop(response, None)
+
+            def _cancel_task(future):
+                if future.cancelled() and not task.done():
+                    task.cancel()
+
+            task.add_done_callback(_discard)
+            response.add_done_callback(_cancel_task)
+
         try:
             if server.transport == "stdio":
                 params = StdioServerParameters(
@@ -701,9 +718,9 @@ class McpClientManager:
             while True:
                 kind, payload, response = await request_queue.get()
                 if kind == "close":
+                    # Do not wait for remote calls to finish naturally; the
+                    # finally block cancels and reaps them.
                     close_response = response
-                    if active_calls:
-                        await asyncio.gather(*active_calls, return_exceptions=True)
                     break
                 if kind != "call":
                     if not response.done():
@@ -711,18 +728,17 @@ class McpClientManager:
                     continue
                 binding, arguments = payload
                 task = asyncio.create_task(execute_call(binding, arguments, response))
-                active_calls.add(task)
-                task.add_done_callback(active_calls.discard)
+                _track_call(response, task)
         except Exception as exc:
             if not ready.done():
                 ready.set_exception(exc)
             raise
         finally:
             close_error: Exception | None = None
-            for task in active_calls:
+            for task in active_calls.values():
                 task.cancel()
             if active_calls:
-                await asyncio.gather(*active_calls, return_exceptions=True)
+                await asyncio.gather(*active_calls.values(), return_exceptions=True)
             try:
                 await stack.aclose()
             except Exception as exc:

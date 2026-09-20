@@ -47,9 +47,15 @@ def execute_tool_result(
     agent_name: str | None = None,
     tool_context: ToolContext | None = None,
     emit_events: bool = True,
+    validate_arguments: bool = True,
     cancellation_token=None,
 ) -> ToolResult:
-    """Execute a registered tool only after the runtime validation boundary."""
+    """Execute a registered tool only after the runtime validation boundary.
+
+    Callers that have already validated model-produced arguments during call
+    preparation (the ToolExecutor) pass ``validate_arguments=False``; direct
+    and public execution keeps the default and validates here.
+    """
     registry = _registry_for_context(tool_context)
 
     if emit_events and tool_context is not None:
@@ -76,15 +82,16 @@ def execute_tool_result(
         )
 
     if registry.schema_for(name) is not None:
-        validation = validate_tool_arguments(name, arguments, registry, tool_context)
-        if validation.error is not None:
-            return _finalize_tool_result_object(
-                validation.error.to_result(name),
-                tool_context=tool_context,
-                agent_name=agent_name,
-                emit_events=emit_events,
-            )
-        arguments = validation.arguments
+        if validate_arguments:
+            validation = validate_tool_arguments(name, arguments, registry, tool_context)
+            if validation.error is not None:
+                return _finalize_tool_result_object(
+                    validation.error.to_result(name),
+                    tool_context=tool_context,
+                    agent_name=agent_name,
+                    emit_events=emit_events,
+                )
+            arguments = validation.arguments
     else:
         # Direct-call path for handlers injected by integrations that do not
         # register a schema. Model tool calls never use it: ToolExecutor

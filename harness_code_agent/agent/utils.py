@@ -6,8 +6,6 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from .. import config
-
 if TYPE_CHECKING:
     from .conversation import Agent
 
@@ -49,6 +47,7 @@ def _usage_to_dict(usage) -> dict | None:
 @dataclass(frozen=True)
 class PromptCacheShape:
     system_hash: str
+    memory_index_hash: str
     tools_hash: str
     prefix_hash: str
     log_rewrite_version: int
@@ -57,6 +56,7 @@ class PromptCacheShape:
     def to_dict(self) -> dict:
         return {
             "system_hash": self.system_hash,
+            "memory_index_hash": self.memory_index_hash,
             "tools_hash": self.tools_hash,
             "prefix_hash": self.prefix_hash,
             "log_rewrite_version": self.log_rewrite_version,
@@ -78,8 +78,10 @@ def capture_prompt_cache_shape(
         separators=(",", ":"),
     )
     system_prompt = getattr(agent, "system_prompt", "")
+    memory_index = getattr(agent, "memory_index", None) or ""
     return PromptCacheShape(
         system_hash=_short_hash(system_prompt),
+        memory_index_hash=_short_hash(memory_index),
         tools_hash=_short_hash(tool_text),
         prefix_hash=_short_hash(
             json.dumps(
@@ -103,6 +105,8 @@ def compare_prompt_cache_shapes(
     if previous is not None:
         if previous.system_hash != current.system_hash:
             reasons.append("system")
+        if previous.memory_index_hash != current.memory_index_hash:
+            reasons.append("memory_index")
         if previous.tools_hash != current.tools_hash:
             reasons.append("tools")
         if previous.log_rewrite_version != current.log_rewrite_version:
@@ -116,7 +120,12 @@ def compare_prompt_cache_shapes(
     }
 
 
-def _prompt_cache_key(agent: Agent, tool_schemas: list[dict] | None) -> str:
+def _prompt_cache_key(
+    agent: Agent,
+    tool_schemas: list[dict] | None,
+    *,
+    model: str,
+) -> str:
     tool_text = json.dumps(
         _canonical_tool_schemas(tool_schemas or []),
         ensure_ascii=False,
@@ -128,7 +137,7 @@ def _prompt_cache_key(agent: Agent, tool_schemas: list[dict] | None) -> str:
     }
     payload = {
         "agent": agent.name,
-        "model": config.MODEL,
+        "model": model,
         "stable_prefix": stable_prefix,
         "tools_hash": _short_hash(tool_text),
     }

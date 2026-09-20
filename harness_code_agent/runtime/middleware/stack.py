@@ -19,20 +19,20 @@ from .verification import StaticVerifierMiddleware
 
 def build_main_agent_middlewares(
     *,
-    agent_config: Any,
+    user_middlewares: list[AgentMiddleware],
     tool_context: Any,
     tool_registry: Any,
     workspace: Path,
 ) -> list[AgentMiddleware]:
     """Build the main-agent middleware stack.
 
-    Order mirrors the previous inline assembly in InteractiveSession:
-    profile-provided middlewares run first, then structural guards,
-    failure policy, permission enforcement, and finally static
-    verification. Memory is not middleware: its index is injected into
-    the system prompt by the interactive session.
+    Order: user middlewares from ``~/.harness/middlewares.json`` (loaded
+    once per session and shared across profile switches) first, then
+    structural guards, failure policy, permission enforcement, and finally
+    static verification. Memory is not middleware: its index is injected
+    into the system prompt by the interactive session.
     """
-    middlewares: list[AgentMiddleware] = list(agent_config.middlewares)
+    middlewares: list[AgentMiddleware] = list(user_middlewares)
     middlewares.append(ToolGuardMiddleware())
     middlewares.append(ToolFailurePolicyMiddleware(tool_registry=tool_registry))
     middlewares.append(

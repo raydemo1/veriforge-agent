@@ -106,7 +106,6 @@ class TerminalProfile(BaseProfile):
                     "file edit."
                 ),
             ),
-            middlewares=[],
             time_budget=self._get("task_budget"),
         )
 

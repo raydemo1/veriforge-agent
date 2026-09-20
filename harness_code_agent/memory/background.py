@@ -15,22 +15,27 @@ from .store import MemoryWriteCommand
 
 log = logging.getLogger("harness")
 _worker_lock = threading.Lock()
-_worker_running = False
+#: Workspaces whose kicked one-shot worker is still running in this process.
+_running_workspaces: set[Path] = set()
 
 
 def start_memory_worker(workspace: str | Path) -> None:
-    """Start at most one non-blocking extraction pass in this process."""
-    global _worker_running
+    """Kick one non-blocking extraction pass for one workspace.
+
+    The worker is one-shot, not a scheduler: it drains the jobs ready at the
+    time of the kick and exits. Failed jobs keep a future ``available_at`` and
+    are picked up by a later kick; no timer is involved.
+    """
+    resolved = Path(workspace).resolve()
     with _worker_lock:
-        if _worker_running:
+        if resolved in _running_workspaces:
             return
-        _worker_running = True
-    thread = threading.Thread(target=_run_once, args=(Path(workspace).resolve(),), daemon=True)
+        _running_workspaces.add(resolved)
+    thread = threading.Thread(target=_run_once, args=(resolved,), daemon=True)
     thread.start()
 
 
 def _run_once(workspace: Path) -> None:
-    global _worker_running
     try:
         service = MemoryService(workspace)
         store = service.stores["project"]
@@ -44,7 +49,7 @@ def _run_once(workspace: Path) -> None:
             _process_job(service, store, row)
     finally:
         with _worker_lock:
-            _worker_running = False
+            _running_workspaces.discard(workspace)
 
 
 def _claim_next_job(store):

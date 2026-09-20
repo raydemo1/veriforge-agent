@@ -646,9 +646,14 @@ class BridgeServer:
     def _sessions_panel(self) -> dict[str, Any]:
         session = self._require_session()
         options = []
+        current_session_id = session.session_id
         for metadata in session.session_store.list_sessions():
             session_id = str(metadata.get("id") or "").strip()
             if not session_id:
+                continue
+            if session_id == current_session_id:
+                # Resuming the active session would fork it onto itself; the
+                # current session has no place in the resume list.
                 continue
             preview = ""
             try:
@@ -822,9 +827,9 @@ class BridgeServer:
         elif panel == "permission":
             message = session.set_permission_mode(action)
         elif panel == "model":
-            config.set_model_override(model=action)
+            session.apply_model_override(model=action)
         elif panel == "effort":
-            config.set_model_override(reasoning_effort=action)
+            session.apply_model_override(reasoning_effort=action)
         elif panel == "checkpoint":
             if action == "create":
                 message = session.create_checkpoint(manual=True)

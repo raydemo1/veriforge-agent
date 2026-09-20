@@ -7,6 +7,7 @@ agent is allowed to finish the turn.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import subprocess
 from dataclasses import dataclass
@@ -31,6 +32,10 @@ class _TurnBaseline:
     #: untracked files), POSIX-relative. Pre-existing dirty work must never be
     #: counted as a current-turn change.
     git_files: frozenset[str]
+    #: SHA-256 of the ``.py`` files already dirty at baseline
+    #: (POSIX-relative path -> digest). Content changes to such a file during
+    #: the turn are detected even though it stays inside the baseline git set.
+    dirty_py_fingerprints: dict[str, str]
 
 
 class StaticVerifierMiddleware(AgentMiddleware):
@@ -112,9 +117,16 @@ class StaticVerifierMiddleware(AgentMiddleware):
     # ------------------------------------------------------------------
 
     def _capture_baseline(self) -> _TurnBaseline:
+        git_files = frozenset(_git_dirty_files(self._workspace_root))
+        root = Path(
+            self._workspace_root
+            or getattr(self._workspace, "root", ".")
+        ).resolve()
+        dirty_py = {path for path in git_files if path.endswith(".py")}
         return _TurnBaseline(
             journal_cursor=_workspace_change_cursor(self._workspace),
-            git_files=frozenset(_git_dirty_files(self._workspace_root)),
+            git_files=git_files,
+            dirty_py_fingerprints=_file_fingerprints(root, dirty_py),
         )
 
 
@@ -133,10 +145,12 @@ def _turn_changed_py_files(
        have no :class:`WorkspaceService` at all.
 
     A file that was already dirty at baseline and is merely kept dirty is not
-    reported (a shell-only re-edit of an already-dirty file is the one
-    unavoidable blind spot of the git-set-delta approach).
+    reported. If its *content* changed during the turn, the baseline
+    fingerprints catch it — including shell-only re-edits of an already-dirty
+    file, the previous blind spot of the git-set-delta approach.
     """
     candidates: set[str] = set()
+    root = Path(workspace_root or getattr(workspace, "root", ".")).resolve()
 
     if workspace is not None:
         journal = getattr(workspace, "change_journal", None)
@@ -154,13 +168,34 @@ def _turn_changed_py_files(
     if workspace_root:
         candidates.update(_git_dirty_files(workspace_root) - set(baseline.git_files))
 
-    root = Path(workspace_root or getattr(workspace, "root", ".")).resolve()
+    for rel, old_hash in baseline.dirty_py_fingerprints.items():
+        new_hash = _file_fingerprint(root / rel)
+        if new_hash is not None and new_hash != old_hash:
+            candidates.add(rel)
+
     files = {
         rel
         for rel in candidates
         if rel.endswith(".py") and (root / rel).exists()
     }
     return sorted(files)
+
+
+def _file_fingerprints(root: Path, rel_paths: set[str]) -> dict[str, str]:
+    """Hash the given files under ``root``; unreadable files are omitted."""
+    fingerprints: dict[str, str] = {}
+    for rel in rel_paths:
+        digest = _file_fingerprint(root / rel)
+        if digest is not None:
+            fingerprints[rel] = digest
+    return fingerprints
+
+
+def _file_fingerprint(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def _workspace_change_cursor(workspace) -> int:

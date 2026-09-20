@@ -67,7 +67,7 @@ def memory_write(
     tool_context: ToolContext | None = None,
 ) -> ToolResult:
     try:
-        if tool_context is not None and not getattr(tool_context, "memory_generate_enabled", True):
+        if tool_context is not None and not getattr(tool_context, "memory_auto_extract_enabled", True):
             raise ValueError("memory generation is disabled for this session")
         if scope not in {"project", "user"}:
             raise ValueError("scope must be project or user")
@@ -96,7 +96,7 @@ def memory_validate(
     tool_context: ToolContext | None = None,
 ) -> ToolResult:
     try:
-        if tool_context is not None and not getattr(tool_context, "memory_generate_enabled", True):
+        if tool_context is not None and not getattr(tool_context, "memory_auto_extract_enabled", True):
             raise ValueError("memory generation is disabled for this session")
         if scope not in {"project", "user"}:
             raise ValueError("scope must be project or user")
@@ -117,7 +117,7 @@ def memory_forget(
     tool_context: ToolContext | None = None,
 ) -> ToolResult:
     try:
-        if tool_context is not None and not getattr(tool_context, "memory_generate_enabled", True):
+        if tool_context is not None and not getattr(tool_context, "memory_auto_extract_enabled", True):
             raise ValueError("memory generation is disabled for this session")
         if scope not in {"project", "user"}:
             raise ValueError("scope must be project or user")

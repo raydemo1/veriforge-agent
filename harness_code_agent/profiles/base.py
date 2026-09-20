@@ -2,7 +2,7 @@
 
 A Profile encapsulates everything scenario-specific:
   - The main-agent prompt
-  - Extra tools and middleware for that agent
+  - Extra tools for that agent
   - Task-specific timeout metadata
 
 Configuration hierarchy (highest priority wins):
@@ -58,12 +58,8 @@ class AgentConfig:
     """Configuration for the main agent."""
     system_prompt: str
     allowed_tool_permissions: set[str] = field(default_factory=lambda: set(DEFAULT_PROFILE_TOOL_PERMISSIONS))
-    allowed_tool_names: set[str] = field(default_factory=set)
     blocked_tool_names: set[str] = field(default_factory=lambda: set(DEFAULT_PROFILE_BLOCKED_TOOLS))
-    enabled: bool = True
-    middlewares: list = field(default_factory=list)  # list[AgentMiddleware]
     time_budget: float | None = None  # seconds; None = no limit
-    memory_enabled: bool = True
     # Profile-scoped restriction layered on the session permission policy.
     # A preset can only tighten the user's session mode, never loosen it.
     permission_preset: PermissionPreset | None = None

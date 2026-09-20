@@ -78,5 +78,4 @@ class GeneralProfile(BaseProfile):
                 "browser_test",
                 "stop_dev_server",
             },
-            middlewares=[],
         )

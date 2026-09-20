@@ -1,6 +1,7 @@
 """Provider adapters for OpenAI-compatible chat completions."""
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -13,6 +14,50 @@ from .utils import _get, _usage_to_dict
 
 TextDeltaCallback = Callable[[str], None]
 ChunkCallback = Callable[[], None]
+
+# Explicit prompt-cache breakpoints ship on the OpenAI GPT-5.6 family and
+# later model families only.
+_OPENAI_BREAKPOINT_MODEL_RE = re.compile(r"^gpt-(\d+)(?:[.-](\d+))?(?:[.-].*)?$")
+
+
+def openai_model_supports_cache_breakpoint(model: str | None) -> bool:
+    """Return True for OpenAI models that accept prompt_cache_breakpoint."""
+    match = _OPENAI_BREAKPOINT_MODEL_RE.fullmatch((model or "").strip().lower())
+    if match is None:
+        return False
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    return (major, minor) >= (5, 6)
+
+
+def supports_system_cache_breakpoint(provider, model: str | None) -> bool:
+    """Capability gate: only the native OpenAI path on GPT-5.6+ models."""
+    return (
+        getattr(provider, "name", None) == "openai"
+        and openai_model_supports_cache_breakpoint(model)
+    )
+
+
+def build_system_cache_breakpoint_content(
+    stable_prefix: str,
+    dynamic_suffix: str,
+) -> list[dict]:
+    """Render the system message as two text parts split at the cache boundary.
+
+    The breakpoint marks the end of the reusable prefix; content after it
+    (the memory index) may change without invalidating the cached prefix.
+    """
+    return [
+        {
+            "type": "text",
+            "text": stable_prefix,
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+        },
+        {
+            "type": "text",
+            "text": dynamic_suffix,
+        },
+    ]
 
 
 def get_client() -> OpenAI:

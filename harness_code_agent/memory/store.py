@@ -301,7 +301,7 @@ class MemoryStore:
         with self.connect() as db:
             db.execute(
                 "INSERT OR IGNORE INTO extraction_jobs(session_id,boundary,journal_path,available_at) VALUES(?,?,?,?)",
-                (session_id, boundary, str(Path(journal_path).resolve()), time.time() + 60),
+                (session_id, boundary, str(Path(journal_path).resolve()), time.time()),
             )
 
     def sync_index(self, *, force: bool = False) -> None:

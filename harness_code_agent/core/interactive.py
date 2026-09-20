@@ -46,6 +46,7 @@ from ..runtime.approvals import (
 from ..runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
 from ..runtime.lifecycle import LifecycleScope
 from ..runtime.mcp import McpClientManager
+from ..runtime.middleware.loader import load_user_middlewares
 from ..runtime.middleware.stack import build_main_agent_middlewares
 from ..runtime.permissions import PermissionPolicy
 from ..runtime.questions import ConsoleQuestionProvider, QuestionProvider
@@ -144,7 +145,7 @@ class InteractiveSession:
         self.output_sink = output_sink or print
         self.enable_turn_summary = enable_turn_summary
         self.memory_use_enabled = os.environ.get("HARNESS_MEMORY_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
-        self.memory_generate_enabled = os.environ.get("HARNESS_MEMORY_GENERATION_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
+        self.memory_auto_extract_enabled = os.environ.get("HARNESS_MEMORY_GENERATION_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
         self.checkpoint = CheckpointConfig()
         self._allow_checkpoint_init_failure = allow_checkpoint_init_failure
         self.checkpoint_init_error: str = ""
@@ -183,9 +184,12 @@ class InteractiveSession:
         self._resolved_task_timeout: float | None = None
         self._closed = False
         self._close_lock = threading.Lock()
+        # User middlewares are loaded exactly once per session; profile
+        # switches reuse the same instances.
+        self.user_middlewares = load_user_middlewares()
         self._report_startup("connecting tools")
         self._bind_profile(self._pending_profile_name, source=self._profile_source)
-        if self.memory_generate_enabled:
+        if self.memory_auto_extract_enabled:
             start_memory_worker(self.cwd)
         self._report_startup("ready")
 
@@ -225,19 +229,22 @@ class InteractiveSession:
             skill_catalog=catalog,
         )
         middlewares = build_main_agent_middlewares(
-            agent_config=cfg,
+            user_middlewares=self.user_middlewares,
             tool_context=self.tool_context,
             tool_registry=self.tool_registry,
             workspace=self.cwd,
         )
-        system_prompt = prefix.content
-        if getattr(cfg, "memory_enabled", True) and getattr(self, "memory_use_enabled", True):
-            memory_index = MemoryService(self.cwd).index_block()
-            if "\n- [" in memory_index:
-                system_prompt = f"{system_prompt}\n\n{memory_index}"
+        # The memory index is dynamic reference material: it stays separate
+        # from the stable prefix so cache boundaries (and diagnostics) treat
+        # it as the variable suffix it is.
+        memory_index = None
+        if self.memory_use_enabled:
+            block = MemoryService(self.cwd).index_block()
+            if "\n- [" in block:
+                memory_index = block
         return Agent(
             "main_agent",
-            system_prompt,
+            prefix.content,
             use_tools=True,
             tool_schemas=self._tool_schemas_for_agent_config(cfg),
             middlewares=middlewares,
@@ -245,6 +252,7 @@ class InteractiveSession:
             tool_context=self.tool_context,
             stream_callback=self.stream_sink,
             prompt_cache_identity=prefix.cache_identity,
+            memory_index=memory_index,
         )
 
     def _load_mcp_tools(self) -> None:
@@ -279,7 +287,6 @@ class InteractiveSession:
     def _tool_schemas_for_agent_config(self, cfg, *, update_context: bool = True) -> list[dict]:
         core_schemas = tool_schemas_for_profile(
             allowed_permissions=cfg.allowed_tool_permissions,
-            include_names=cfg.allowed_tool_names,
             exclude_names=cfg.blocked_tool_names,
             registry=self.tool_registry,
         )
@@ -587,7 +594,7 @@ class InteractiveSession:
             event_bus=self.event_bus,
             session_id=self.session.id,
             memory_use_enabled=self.memory_use_enabled,
-            memory_generate_enabled=self.memory_generate_enabled,
+            memory_auto_extract_enabled=self.memory_auto_extract_enabled,
             approval_provider=self.approval_provider,
             question_provider=self.question_provider,
             tool_registry=self.tool_registry,
@@ -978,7 +985,7 @@ class InteractiveSession:
             counts = {scope: len(store.list_documents()) for scope, store in service.stores.items()}
             return (
                 f"memory use: {'on' if self.memory_use_enabled else 'off'}; "
-                f"generate: {'on' if self.memory_generate_enabled else 'off'}; "
+                f"generate: {'on' if self.memory_auto_extract_enabled else 'off'}; "
                 f"project={counts['project']}; user={counts['user']}"
             )
         if len(args) == 2 and args[0] in {"use", "generate"} and args[1] in {"on", "off"}:
@@ -988,9 +995,13 @@ class InteractiveSession:
                 if self.tool_context is not None:
                     self.tool_context.memory_use_enabled = enabled
             else:
-                self.memory_generate_enabled = enabled
+                self.memory_auto_extract_enabled = enabled
                 if self.tool_context is not None:
-                    self.tool_context.memory_generate_enabled = enabled
+                    self.tool_context.memory_auto_extract_enabled = enabled
+                if enabled:
+                    # Kick a one-shot pass so jobs queued while generate was
+                    # off are processed immediately.
+                    start_memory_worker(self.cwd)
             suffix = "；启动索引将在下次新会话刷新" if args[0] == "use" else ""
             return f"memory {args[0]}: {args[1]}{suffix}"
         if args[0] == "search" and len(args) > 1:
@@ -1082,6 +1093,22 @@ class InteractiveSession:
             )
         return f"permission mode switched: {previous} -> {permission_mode}"
 
+    def apply_model_override(
+        self,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        """Apply a TUI model/effort selection and drop the cached prompt key.
+
+        The cache key embeds the runtime-resolved model, so a model switch
+        must invalidate the conversation-level key; effort-only changes also
+        invalidate, and the key is simply rebuilt identically next turn.
+        """
+        config.set_model_override(model=model, reasoning_effort=reasoning_effort)
+        if self.conversation is not None:
+            self.conversation._cached_prompt_cache_key = None
+
     def toggle_permission_mode(self) -> str:
         modes = [
             PermissionPolicy.READ_ONLY,
@@ -1161,29 +1188,7 @@ class InteractiveSession:
             return "当前还没有可分支的会话"
         source = self.session
         branched = self.session_store.fork(source.id)
-        self.session = branched
-        self.attachment_manager = AttachmentManager(
-            self.cwd,
-            branched.root,
-            model_input_mode(),
-        )
-        self.event_bus = self.session_store.event_bus(
-            branched,
-            listener=self.event_listener,
-        )
-        self.conversation.event_bus = self.event_bus
-        self.conversation._event_bus = self.event_bus
-        self.conversation.journal = SessionJournal(branched.journal_path)
-        emitter = getattr(self.conversation, "emitter", None)
-        if emitter is not None:
-            emitter.event_bus = self.event_bus
-        runtime_state = getattr(self.conversation, "runtime_state", None)
-        if runtime_state is not None:
-            runtime_state.session_id = branched.id
-            runtime_state.event_bus = self.event_bus
-        if self.tool_context is not None:
-            self.tool_context.session_id = branched.id
-            self.tool_context.event_bus = self.event_bus
+        self._activate_session(branched)
         self.session_store.update_profile(
             branched.id,
             self.profile.name(),
@@ -1198,15 +1203,55 @@ class InteractiveSession:
         return f"已进入会话分支：{branched.id}"
 
     def resume_from_session(self, session_id: str) -> None:
-        """Load a selected history session into the active conversation."""
-        context_text = _build_resume_context(self.session_store, session_id)
-        self.resume_session_id = session_id
-        self.resume_context = context_text
-        if not self.is_bound:
+        """Fork a history session and activate the fork.
+
+        Resuming session X is exactly "fork X + make the new fork the active
+        session". The current conversation is never mutated in place: the fork
+        already carries a copy of the source journal, so recovered messages are
+        not appended a second time.
+        """
+        if self.session is not None and session_id == self.session.id:
             return
-        if self.session is not None:
-            self.session_store.update_resumed_from(self.session.id, session_id)
-        self._restore_session_messages(session_id)
+        branched = self.session_store.fork(session_id)
+        recovered = SessionJournal(branched.journal_path).recovery_messages(
+            self.agent.full_system_prompt
+        )
+        self._activate_session(branched)
+        self.conversation._replace_messages(recovered)
+        # The fork inherits the source session's profile in metadata; bring it
+        # in line with the profile the live runtime is actually using.
+        self.session_store.update_profile(
+            branched.id,
+            self.profile.name(),
+            profile_source=self._profile_source,
+        )
+        self.session_store.update_routing_mode(branched.id, self.routing_mode)
+
+    def _activate_session(self, session: Session) -> None:
+        """Rebind every live component onto an already-created session."""
+        self.session = session
+        self.attachment_manager = AttachmentManager(
+            self.cwd,
+            session.root,
+            model_input_mode(),
+        )
+        self.event_bus = self.session_store.event_bus(
+            session,
+            listener=self.event_listener,
+        )
+        self.conversation.event_bus = self.event_bus
+        self.conversation._event_bus = self.event_bus
+        self.conversation.journal = SessionJournal(session.journal_path)
+        emitter = getattr(self.conversation, "emitter", None)
+        if emitter is not None:
+            emitter.event_bus = self.event_bus
+        runtime_state = getattr(self.conversation, "runtime_state", None)
+        if runtime_state is not None:
+            runtime_state.session_id = session.id
+            runtime_state.event_bus = self.event_bus
+        if self.tool_context is not None:
+            self.tool_context.session_id = session.id
+            self.tool_context.event_bus = self.event_bus
 
     def _restore_session_messages(self, session_id: str) -> None:
         if self.conversation is None or self.agent is None:
@@ -1217,7 +1262,7 @@ class InteractiveSession:
                 "role": "user", "content": f"Resume context:\n{self.resume_context or ''}",
             })
             return
-        recovered = SessionJournal(journal_path).recovery_messages(self.agent.system_prompt)
+        recovered = SessionJournal(journal_path).recovery_messages(self.agent.full_system_prompt)
         self.conversation._replace_messages(recovered)
         if self.conversation.journal is not None:
             for message in recovered[1:]:
@@ -1459,7 +1504,7 @@ class InteractiveSession:
             self.session_store.write_summary(self.session.id)
         except Exception as exc:
             log.warning("Failed to write summary for session %s: %s", self.session.id, exc)
-        if self.memory_generate_enabled and self.session.journal_path.exists():
+        if self.memory_auto_extract_enabled and self.session.journal_path.exists():
             try:
                 service = MemoryService(self.cwd)
                 service.stores["project"].enqueue_extraction(
@@ -1467,6 +1512,9 @@ class InteractiveSession:
                     self.session.journal_path.stat().st_size,
                     self.session.journal_path,
                 )
+                # Enqueue happens on close; kick the one-shot worker so the
+                # job actually runs in this process.
+                start_memory_worker(self.cwd)
             except (OSError, ValueError) as exc:
                 log.debug("Failed to enqueue memory extraction: %s", exc)
 

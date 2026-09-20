@@ -55,5 +55,4 @@ class PlanProfile(BaseProfile):
                 TOOL_PERMISSION_CONTROL,
             },
             blocked_tool_names={"list_shell_jobs", "read_shell_output", "stop_shell_job"},
-            middlewares=[],
         )

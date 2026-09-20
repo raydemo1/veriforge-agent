@@ -99,7 +99,9 @@ class SessionStore:
         metadata = json.loads(session.metadata_path.read_text(encoding="utf-8"))
         metadata.update(
             {
-                "status": "forked",
+                # Lineage lives in forked_from; status follows the lifecycle,
+                # and a fresh branch starts as a running session.
+                "status": "running",
                 "forked_from": source_metadata.get("id", source_session_id),
                 "forked_from_event_count": len(source_events),
                 "forked_at": metadata["created_at"],
