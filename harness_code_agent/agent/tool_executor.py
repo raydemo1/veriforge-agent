@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import inspect
 import logging
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any
 
 from .. import config
@@ -47,17 +45,6 @@ class PreparedToolCall:
     permission_decision: Any = None
 
 
-@lru_cache(maxsize=None)
-def _middleware_accepts_decision(middleware_type) -> bool:
-    try:
-        params = inspect.signature(middleware_type.before_tool).parameters
-    except (TypeError, ValueError):
-        return True
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return True
-    return "permission_decision" in params
-
-
 @dataclass
 class ExecutedToolCall:
     prepared: PreparedToolCall
@@ -70,7 +57,6 @@ class ExecutedToolCall:
 @dataclass
 class ExecutionGroup:
     calls: list[PreparedToolCall]
-    parallel: bool = True
 
 
 class ToolExecutor:
@@ -89,9 +75,7 @@ class ToolExecutor:
         self._tool_calls = list(tool_calls or [])
         self.conversation.compaction_gate.begin_tool_call()
         try:
-            prepared, stop = self._prepare_calls(tool_calls)
-            if stop:
-                return True
+            prepared = self._prepare_calls(tool_calls)
             planner = ExecutionPlanner((call.index, call.effect) for call in prepared)
             by_index = {call.index: call for call in prepared}
             pending = set(by_index)
@@ -175,7 +159,7 @@ class ToolExecutor:
                 "content": "[cancelled] Execution cancelled before this tool produced a result.",
             })
 
-    def _prepare_calls(self, tool_calls: list) -> tuple[list[PreparedToolCall], bool]:
+    def _prepare_calls(self, tool_calls: list) -> list[PreparedToolCall]:
         prepared: list[PreparedToolCall] = []
         for index, tc in enumerate(tool_calls):
             call = ToolCall.from_raw(tc, index)
@@ -208,7 +192,8 @@ class ToolExecutor:
                 continue
 
             fn_args = validation.arguments
-            effect, blocked = self._classify_call(fn_name, fn_args)
+            effect = self._classify_call(fn_name, fn_args)
+            blocked = None
             if self.agent.allowed_tool_names is not None and fn_name not in self.agent.allowed_tool_names:
                 output = f"[blocked] Tool '{fn_name}' is not available to this agent profile."
                 blocked = ToolResult(
@@ -223,7 +208,7 @@ class ToolExecutor:
             prepared.append(
                 PreparedToolCall(
                     index=index,
-                    tool_call_id=tc["id"],
+                    tool_call_id=call.tool_call_id,
                     name=fn_name,
                     args=fn_args,
                     effect=effect,
@@ -232,11 +217,11 @@ class ToolExecutor:
                     permission_decision=self._permission_decision(fn_name, fn_args, registry),
                 )
             )
-        return prepared, False
+        return prepared
 
-    def _classify_call(self, name: str, args: dict) -> tuple[CallEffect, ToolResult | None]:
+    def _classify_call(self, name: str, args: dict) -> CallEffect:
         registry = _registry_for_context(self.agent.tool_context)
-        return registry.effect_for(name, args, self.agent.tool_context), None
+        return registry.effect_for(name, args, self.agent.tool_context)
 
     def _permission_decision(self, name: str, args: dict, registry):
         context = self.agent.tool_context
@@ -402,45 +387,30 @@ class ToolExecutor:
         started = time.perf_counter()
         for mw in self.agent.middlewares:
             activity["hooks"] += 1
-            if _middleware_accepts_decision(type(mw)):
-                blocked = mw.before_tool(
-                    prepared.name,
-                    prepared.args,
-                    self.conversation.messages,
-                    runtime_state=self.runtime_state,
-                    agent_name=self.agent.name,
-                    permission_decision=prepared.permission_decision,
-                )
-            else:
-                # Backward compatibility for custom middlewares written
-                # against the older before_tool signature.
-                blocked = mw.before_tool(
-                    prepared.name,
-                    prepared.args,
-                    self.conversation.messages,
-                    self.runtime_state,
-                    self.agent.name,
-                )
-            if not blocked:
+            blocked = mw.before_tool(
+                prepared.name,
+                prepared.args,
+                self.conversation.messages,
+                runtime_state=self.runtime_state,
+                agent_name=self.agent.name,
+                permission_decision=prepared.permission_decision,
+            )
+            if blocked is None:
                 continue
+            if not isinstance(blocked, ToolResult):
+                raise TypeError(
+                    f"{type(mw).__name__}.before_tool must return a ToolResult or None; "
+                    f"got {type(blocked).__name__}"
+                )
             activity["outcome"] = "blocked"
             activity["sources"].append(type(mw).__name__)
             activity["duration_ms"] += (time.perf_counter() - started) * 1000
-            blocked_text = blocked.to_text() if isinstance(blocked, ToolResult) else str(blocked)
-            self.conversation.trace.middleware_inject(type(mw).__name__, "before_tool", blocked_text)
-            if isinstance(blocked, ToolResult):
-                # First-party middleware carries machine semantics in metadata;
-                # never infer status_source from the human-facing text.
-                return blocked
-            # Legacy compatibility for external middlewares still returning a
-            # plain string: treat as a generic policy interception.
-            return ToolResult(
-                tool=prepared.name,
-                status="failed",
-                output=blocked_text,
-                error=blocked_text,
-                metadata={"status_source": "tool_policy"},
+            self.conversation.trace.middleware_inject(
+                type(mw).__name__, "before_tool", blocked.to_text()
             )
+            # Machine semantics live in the ToolResult metadata; the text is
+            # never parsed to infer a status_source.
+            return blocked
         activity["duration_ms"] += (time.perf_counter() - started) * 1000
         return None
 
@@ -460,6 +430,7 @@ class ToolExecutor:
             agent_name=self.agent.name,
             tool_context=self.agent.tool_context,
             emit_events=False,
+            validate_arguments=False,
             cancellation_token=cancellation_token,
         )
         return ExecutedToolCall(prepared, tool_result)

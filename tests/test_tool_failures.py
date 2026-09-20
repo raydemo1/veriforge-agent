@@ -23,12 +23,16 @@ _install_fake_openai_module()
 
 from harness_code_agent.agent.conversation import Agent, AgentConversation
 from harness_code_agent.agent.runtime_state import AgentRuntimeState
-from harness_code_agent.runtime import tools
-from harness_code_agent.runtime.middlewares import (
+from harness_code_agent.runtime.execution_planner import (
+    CallEffect,
+    ResourceClaim,
+)
+from harness_code_agent.runtime.middleware import (
     AgentMiddleware,
     ToolFailurePolicyMiddleware,
     ToolGuardMiddleware,
 )
+from harness_code_agent.runtime.tool_registry import ToolRegistry
 from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_call_validation import ToolError
 from harness_code_agent.runtime.tool_context import ToolContext
@@ -43,7 +47,7 @@ from harness_code_agent.runtime.tool_result import ToolResult
 from harness_code_agent.sessions.events import EventBus, classify_tool_failure
 from harness_code_agent.workspace.service import WorkspaceService
 
-_READ_EFFECT = tools.CallEffect((tools.ResourceClaim("workspace", "*", "global", "read"),))
+_READ_EFFECT = CallEffect((ResourceClaim("workspace", "*", "global", "read"),))
 
 _PROBE_SCHEMA = {
     "type": "function",
@@ -92,7 +96,7 @@ _RECURSIVE_LIST_ARGS = {"command": "Get-ChildItem -Recurse"}
 
 
 def _shell_guard_registry():
-    registry = tools.ToolRegistry()
+    registry = ToolRegistry()
 
     def _must_not_run(**kwargs):
         raise AssertionError(f"guarded command must not execute: {kwargs}")
@@ -137,7 +141,7 @@ class _RepeatCompletions:
         )
 
 
-def _conversation(root: Path, registry: tools.ToolRegistry, tool_calls, middlewares, repeat=1):
+def _conversation(root: Path, registry: ToolRegistry, tool_calls, middlewares, repeat=1):
     context = ToolContext(
         workspace=WorkspaceService(root=root, snapshots_dir=root / ".harness" / "snapshots"),
         permission_policy=PermissionPolicy(mode="danger-full-access"),
@@ -762,7 +766,7 @@ class PolicyDecisionTests(unittest.TestCase):
 
 class ExecutorFailureIntegrationTests(unittest.TestCase):
     def _registry(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         registry.register(
             _PROBE_SCHEMA,
             lambda value: ToolResult(tool="probe", status="success", output=value),
@@ -846,36 +850,28 @@ class ExecutorFailureIntegrationTests(unittest.TestCase):
         self.assertTrue(any("Allowed arguments are exactly" in text for text in injected))
         self.assertTrue(any("3 consecutive validation failures" in text for text in injected))
 
-    def test_legacy_string_interception_is_normalized_as_tool_policy(self):
+    def test_string_interception_is_invalid_middleware_behavior(self):
         registry = self._registry()
-        spy = FailureSpyMiddleware()
 
         class BlockMiddleware(AgentMiddleware):
-            # Legacy external middleware contract: a plain string block.
-            def before_tool(self, tool_name, tool_args, messages, runtime_state=None, agent_name=None):
+            # Invalid contract: before_tool must return ToolResult or None.
+            def before_tool(self, tool_name, tool_args, messages, runtime_state=None,
+                            agent_name=None, permission_decision=None):
                 return "[blocked] not allowed"
 
         with tempfile.TemporaryDirectory() as tmp:
-            conversation, context = _conversation(
+            conversation, _context = _conversation(
                 Path(tmp),
                 registry,
                 [_tool_call("tc_p", "reader", {"label": "a"})],
-                [BlockMiddleware(), spy, ToolFailurePolicyMiddleware(tool_registry=registry)],
+                [BlockMiddleware()],
             )
-            with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
-                patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
-            ):
+            with self.assertRaises(TypeError) as caught:
                 conversation.run_until_idle()
 
-        self.assertEqual(len(spy.calls), 1)
-        self.assertEqual(spy.calls[0].kind, FailureKind.POLICY_VIOLATION)
-        self.assertTrue(spy.calls[0].intercepted)
-        event = next(event for event in context.event_bus.events if event.type == "failure")
-        self.assertEqual(event.payload["metadata"]["failure_category"], "policy")
-        self.assertEqual(event.payload["category"], "tool_error")
-        # Single policy failure stays visible, no stop.
-        self.assertFalse(conversation.runtime_state.fallback.stop_requested)
+        message = str(caught.exception)
+        self.assertIn("BlockMiddleware.before_tool must return a ToolResult or None", message)
+        self.assertIn("got str", message)
 
     def test_mixed_parallel_batch_counts_failures_per_call(self):
         registry = self._registry()
@@ -910,7 +906,7 @@ class ExecutorFailureIntegrationTests(unittest.TestCase):
 
 def _run_schema_streak(root: Path):
     """Drive the bounded schema correction loop to its third-attempt stop."""
-    registry = tools.ToolRegistry()
+    registry = ToolRegistry()
     registry.register(
         _PROBE_SCHEMA,
         lambda value: ToolResult(tool="probe", status="success", output=value),
@@ -1006,7 +1002,7 @@ class FailureObservabilityTests(unittest.TestCase):
         self.assertTrue(any("Allowed arguments are exactly" in line["message"] for line in injections))
 
     def test_task_level_decision_emits_return_to_agent_and_counts_turn(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         registry.register(
             {
                 "type": "function",
@@ -1022,8 +1018,15 @@ class FailureObservabilityTests(unittest.TestCase):
         )
 
         class BlockMiddleware(AgentMiddleware):
-            def before_tool(self, tool_name, tool_args, messages, runtime_state=None, agent_name=None):
-                return "[blocked] not allowed"
+            def before_tool(self, tool_name, tool_args, messages, runtime_state=None,
+                            agent_name=None, permission_decision=None):
+                return ToolResult(
+                    tool=tool_name,
+                    status="failed",
+                    output="[blocked] not allowed",
+                    error="not allowed",
+                    metadata={"status_source": "tool_policy"},
+                )
 
         with tempfile.TemporaryDirectory() as tmp:
             conversation, context = _conversation(
@@ -1050,7 +1053,7 @@ class FailureObservabilityTests(unittest.TestCase):
         self.assertEqual(turn_count, 1)
 
     def test_no_decision_event_when_no_middleware_governs_the_failure(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         registry.register(
             {
                 "type": "function",
@@ -1066,8 +1069,15 @@ class FailureObservabilityTests(unittest.TestCase):
         )
 
         class BlockMiddleware(AgentMiddleware):
-            def before_tool(self, tool_name, tool_args, messages, runtime_state=None, agent_name=None):
-                return "[blocked] not allowed"
+            def before_tool(self, tool_name, tool_args, messages, runtime_state=None,
+                            agent_name=None, permission_decision=None):
+                return ToolResult(
+                    tool=tool_name,
+                    status="failed",
+                    output="[blocked] not allowed",
+                    error="not allowed",
+                    metadata={"status_source": "tool_policy"},
+                )
 
         # Only a no-op observing middleware: a failure exists, but nobody decides.
         with tempfile.TemporaryDirectory() as tmp:

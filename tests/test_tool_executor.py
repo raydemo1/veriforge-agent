@@ -24,20 +24,28 @@ def _install_fake_openai_module() -> None:
 _install_fake_openai_module()
 
 from harness_code_agent.agent.conversation import Agent, AgentConversation
-from harness_code_agent.runtime import shell_classification, tools
-from harness_code_agent.runtime.middlewares import (
-    AgentMiddleware,
+from harness_code_agent.runtime import shell_classification
+from harness_code_agent.runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
+from harness_code_agent.runtime.builtins.shell import run_bash
+from harness_code_agent.runtime.execution_planner import (
+    CallEffect,
+    ResourceClaim,
 )
+from harness_code_agent.runtime.middleware import AgentMiddleware
 from harness_code_agent.runtime.permissions import PermissionPolicy
+from harness_code_agent.runtime.tool_registry import (
+    ToolRegistry,
+    tool_schemas_for_profile,
+)
 from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.runtime.tool_result import ToolResult
 from harness_code_agent.sessions.events import EventBus
 from harness_code_agent.workspace.service import WorkspaceService
 
-_READ_EFFECT = tools.CallEffect((tools.ResourceClaim("workspace", "*", "global", "read"),))
-_VERIFY_EFFECT = tools.CallEffect((
-    tools.ResourceClaim("workspace", "*", "global", "read"),
-    tools.ResourceClaim("workspace:derived", "*", "global", "write"),
+_READ_EFFECT = CallEffect((ResourceClaim("workspace", "*", "global", "read"),))
+_VERIFY_EFFECT = CallEffect((
+    ResourceClaim("workspace", "*", "global", "read"),
+    ResourceClaim("workspace:derived", "*", "global", "write"),
 ))
 
 
@@ -93,7 +101,7 @@ class _FakeCompletions:
         )
 
 
-def _conversation_with_registry(root: Path, registry: tools.ToolRegistry, tool_calls, middlewares=None):
+def _conversation_with_registry(root: Path, registry: ToolRegistry, tool_calls, middlewares=None):
     context = ToolContext(
         workspace=WorkspaceService(root=root, snapshots_dir=root / ".harness" / "snapshots"),
         permission_policy=PermissionPolicy(mode="danger-full-access"),
@@ -123,7 +131,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("_executor", ToolExecutor.__dict__)
 
     def test_model_tool_call_schema_validation_precedes_permission_and_execution(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         executed = []
 
         def probe(value):
@@ -201,7 +209,7 @@ class ToolExecutorTests(unittest.TestCase):
             )
             for command, expected in cases.items():
                 with self.subTest(command=command):
-                    effect = tools.BUILTIN_TOOL_REGISTRY.effect_for(
+                    effect = BUILTIN_TOOL_REGISTRY.effect_for(
                         "run_bash", {"command": command}, context
                     )
                     self.assertEqual(effect.kind, expected)
@@ -213,7 +221,7 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             config.WORKSPACE = temp_dir
             try:
-                result = tools.run_bash(
+                result = run_bash(
                     "pwd",
                     timeout=10,
                 )
@@ -233,11 +241,11 @@ class ToolExecutorTests(unittest.TestCase):
                 event_bus=EventBus(),
             )
 
-            first = tools.run_bash(
+            first = run_bash(
                 "Set-Location nested; $env:VERIFORGE_SHELL_ISOLATION='leak'; Write-Output ready",
                 tool_context=context,
             )
-            second = tools.run_bash(
+            second = run_bash(
                 "Write-Output ((Get-Location).Path); Write-Output $env:VERIFORGE_SHELL_ISOLATION",
                 tool_context=context,
             )
@@ -257,7 +265,7 @@ class ToolExecutorTests(unittest.TestCase):
         shell_classification.analyze_shell_command.cache_clear()
 
     def test_parallel_read_tools_finish_faster_but_results_keep_original_order(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
 
         def slow_tool(label, delay=0.2):
             time.sleep(delay)
@@ -287,7 +295,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual([event.payload["tool"] for event in context.event_bus.events if event.type == "tool_call"], ["slow_read", "slow_read"])
 
     def test_different_file_writes_reach_the_same_execution_wave(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         entered = []
         entered_lock = threading.Lock()
         both_entered = threading.Event()
@@ -305,7 +313,7 @@ class ToolExecutorTests(unittest.TestCase):
             return ToolResult(tool="write_probe", status="success", output=path)
 
         def effect(args, _context):
-            return tools.CallEffect((tools.ResourceClaim("workspace", args["path"], "exact", "write"),))
+            return CallEffect((ResourceClaim("workspace", args["path"], "exact", "write"),))
 
         registry.register(_schema("write_probe"), write_probe, permission="edit", effect=effect)
         calls = [
@@ -324,7 +332,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(overlap_failed, [])
 
     def test_parallel_workers_do_not_emit_events_before_main_thread_ordering(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
 
         def timed_tool(label, delay):
             time.sleep(delay)
@@ -354,7 +362,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("fast", result_outputs[1])
 
     def test_post_tool_user_injection_waits_until_all_tool_results(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
 
         def read_tool(label):
             return ToolResult(tool="parallel_read", status="success", output=f"ok {label}")
@@ -401,7 +409,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(activity[0]["hooks"], 3)
 
     def test_all_post_tool_middlewares_observe_result_when_earlier_one_injects(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
 
         def read_tool():
             return ToolResult(tool="observed_read", status="success", output="ok")
@@ -448,7 +456,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("[SYSTEM] second guidance", injected)
 
     def test_tool_search_reveals_deferred_schema_for_next_iteration(self):
-        registry = tools.BUILTIN_TOOL_REGISTRY.copy()
+        registry = BUILTIN_TOOL_REGISTRY.copy()
         registry.register(
             {
                 "type": "function",
@@ -482,7 +490,7 @@ class ToolExecutorTests(unittest.TestCase):
                 blocked_tool_names={"browser_test", "stop_dev_server"},
                 revealed_tool_names=set(),
             )
-            initial_schemas = tools.tool_schemas_for_profile(
+            initial_schemas = tool_schemas_for_profile(
                 allowed_permissions=context.allowed_tool_permissions,
                 exclude_names=context.blocked_tool_names,
                 registry=registry,
@@ -515,7 +523,7 @@ class ToolExecutorTests(unittest.TestCase):
     def test_repeated_tool_search_reveal_preserves_prompt_cache_when_unchanged(self):
         from harness_code_agent.agent.tool_executor import ToolExecutor
 
-        registry = tools.BUILTIN_TOOL_REGISTRY.copy()
+        registry = BUILTIN_TOOL_REGISTRY.copy()
         registry.register(
             {
                 "type": "function",
@@ -545,10 +553,10 @@ class ToolExecutorTests(unittest.TestCase):
                 "main_agent",
                 "system",
                 use_tools=True,
-                tool_schemas=tools.tool_schemas_for_profile(
+                tool_schemas=tool_schemas_for_profile(
                     allowed_permissions={"read"},
                     registry=registry,
-                ) + tools.tool_schemas_for_profile(
+                ) + tool_schemas_for_profile(
                     allowed_permissions={"read"},
                     registry=registry,
                     disclosure={"deferred"},
@@ -571,7 +579,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(conversation._cached_prompt_cache_key, "old-cache-key")
 
     def test_write_barrier_prevents_later_read_from_running_before_write(self):
-        registry = tools.BUILTIN_TOOL_REGISTRY.copy()
+        registry = BUILTIN_TOOL_REGISTRY.copy()
         tool_calls = [
             _tool_call("tc_read_before", "read_file", {"path": "note.txt"}),
             _tool_call("tc_write", "write_file", {"path": "note.txt", "content": "after"}),
@@ -594,7 +602,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("after", tool_messages[2]["content"])
 
     def test_before_tool_block_only_blocks_current_tool_in_parallel_group(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
 
         def read_tool(label):
             return ToolResult(tool="parallel_read", status="success", output=f"ok {label}")
@@ -602,9 +610,16 @@ class ToolExecutorTests(unittest.TestCase):
         registry.register(_schema("parallel_read"), read_tool, permission="read", effect=_READ_EFFECT)
 
         class BlockMiddle(AgentMiddleware):
-            def before_tool(self, tool_name, tool_args, messages, runtime_state=None, agent_name=None):
+            def before_tool(self, tool_name, tool_args, messages, runtime_state=None,
+                            agent_name=None, permission_decision=None):
                 if tool_args.get("label") == "b":
-                    return "[blocked] blocked b"
+                    return ToolResult(
+                        tool=tool_name,
+                        status="failed",
+                        output="[blocked] blocked b",
+                        error="blocked b",
+                        metadata={"status_source": "tool_policy"},
+                    )
                 return None
 
         tool_calls = [
@@ -627,7 +642,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("ok c", tool_messages[2]["content"])
 
     def test_before_tool_fallback_blocks_later_unstarted_parallel_tools(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         executed_labels = []
 
         def read_tool(label):
@@ -637,10 +652,17 @@ class ToolExecutorTests(unittest.TestCase):
         registry.register(_schema("parallel_read"), read_tool, permission="read", effect=_READ_EFFECT)
 
         class FallbackMiddle(AgentMiddleware):
-            def before_tool(self, tool_name, tool_args, messages, runtime_state=None, agent_name=None):
+            def before_tool(self, tool_name, tool_args, messages, runtime_state=None,
+                            agent_name=None, permission_decision=None):
                 if tool_args.get("label") == "b":
                     runtime_state.fallback.request_stop(reason="test_fallback", last_tool=tool_name)
-                    return "[blocked] stopping at b"
+                    return ToolResult(
+                        tool=tool_name,
+                        status="failed",
+                        output="[blocked] stopping at b",
+                        error="stopping at b",
+                        metadata={"status_source": "tool_policy"},
+                    )
                 return None
 
         tool_calls = [
@@ -664,20 +686,27 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("Agent fallback triggered (test_fallback)", tool_messages[2]["content"])
 
     def test_fallback_answers_dependency_gap_before_later_ready_call(self):
-        registry = tools.ToolRegistry()
-        read_a = tools.CallEffect((tools.ResourceClaim("workspace", "a", "exact", "read"),))
-        write_a = tools.CallEffect((tools.ResourceClaim("workspace", "a", "exact", "write"),))
-        read_b = tools.CallEffect((tools.ResourceClaim("workspace", "b", "exact", "read"),))
+        registry = ToolRegistry()
+        read_a = CallEffect((ResourceClaim("workspace", "a", "exact", "read"),))
+        write_a = CallEffect((ResourceClaim("workspace", "a", "exact", "write"),))
+        read_b = CallEffect((ResourceClaim("workspace", "b", "exact", "read"),))
 
         registry.register(_schema("read_a"), lambda: ToolResult(tool="read_a", status="success", output="a"), permission="read", effect=read_a)
         registry.register(_schema("write_a"), lambda: ToolResult(tool="write_a", status="success", output="write"), permission="edit", effect=write_a)
         registry.register(_schema("read_b"), lambda: ToolResult(tool="read_b", status="success", output="b"), permission="read", effect=read_b)
 
         class StopOnB(AgentMiddleware):
-            def before_tool(self, tool_name, tool_args, messages, runtime_state=None, agent_name=None):
+            def before_tool(self, tool_name, tool_args, messages, runtime_state=None,
+                            agent_name=None, permission_decision=None):
                 if tool_name == "read_b":
                     runtime_state.fallback.request_stop(reason="gap_stop", last_tool=tool_name)
-                    return "[blocked] stop b"
+                    return ToolResult(
+                        tool=tool_name,
+                        status="failed",
+                        output="[blocked] stop b",
+                        error="stop b",
+                        metadata={"status_source": "tool_policy"},
+                    )
                 return None
 
         calls = [
@@ -699,7 +728,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("stop b", messages[2]["content"])
 
     def test_tool_call_budget_blocks_remaining_parallel_group_calls(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         executed_labels = []
 
         def read_tool(label):
@@ -737,7 +766,7 @@ class ToolExecutorTests(unittest.TestCase):
             PermissionMiddleware,
         )
 
-        registry = tools.BUILTIN_TOOL_REGISTRY.copy()
+        registry = BUILTIN_TOOL_REGISTRY.copy()
         tool_calls = [
             _tool_call("tc_write", "write_file", {"path": "note.txt", "content": "created"}),
             _tool_call("tc_risky", "run_bash", {"command": "git add ."}),
@@ -768,7 +797,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertLess(event_types.index("approval_requested"), event_types.index("approval_decided"))
 
     def test_parallel_group_waits_for_each_tool_own_timeout_not_shared_group_timeout(self):
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         seen_timeouts = []
 
         def timed_tool(label, timeout=0):
@@ -801,7 +830,7 @@ class ToolExecutorTests(unittest.TestCase):
             CancelledError,
         )
 
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         token = CancellationToken()
 
         def slow_tool(cancellation_token=None):
@@ -842,7 +871,7 @@ class ToolExecutorTests(unittest.TestCase):
             CancelledError,
         )
 
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         token = CancellationToken()
         settled = threading.Event()
 
@@ -890,7 +919,7 @@ class ToolExecutorTests(unittest.TestCase):
             CancelledError,
         )
 
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         token = CancellationToken()
         seen = []
 
@@ -934,7 +963,7 @@ class ToolExecutorTests(unittest.TestCase):
             CancelledError,
         )
 
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         token = CancellationToken()
         started = threading.Event()
         release = threading.Event()
@@ -977,7 +1006,7 @@ class ToolExecutorTests(unittest.TestCase):
             CancelledError,
         )
 
-        registry = tools.ToolRegistry()
+        registry = ToolRegistry()
         token = CancellationToken()
 
         def slow_tool(cancellation_token=None):
@@ -1026,7 +1055,7 @@ class ToolExecutorTests(unittest.TestCase):
             self.assertTrue(cancelled_contents, "orphaned calls must be answered with [cancelled]")
 
     def test_long_running_shell_is_serial_barrier_and_returns_job_id(self):
-        registry = tools.BUILTIN_TOOL_REGISTRY.copy()
+        registry = BUILTIN_TOOL_REGISTRY.copy()
         tool_calls = [
             _tool_call("tc_before", "read_file", {"path": "note.txt"}),
             _tool_call("tc_long", "run_bash", {"command": "npm run dev"}),
@@ -1072,6 +1101,81 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("before", tool_messages[0]["content"])
         self.assertIn("shell-job-test", tool_messages[1]["content"])
         self.assertIn("server ready", tool_messages[2]["content"])
+
+    def test_missing_provider_call_id_uses_index_fallback(self):
+        registry = ToolRegistry()
+
+        def read_one():
+            return ToolResult(tool="read_one", status="success", output="ok")
+
+        registry.register(
+            _schema("read_one"), read_one, permission="read", effect=_READ_EFFECT
+        )
+        tool_calls = [_tool_call(None, "read_one", {})]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation, _context = _conversation_with_registry(
+                Path(tmp), registry, tool_calls
+            )
+            with (
+                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
+                patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+            ):
+                conversation.run_until_idle()
+
+        tool_messages = [msg for msg in conversation.messages if msg.get("role") == "tool"]
+        self.assertEqual(
+            [msg["tool_call_id"] for msg in tool_messages], ["call_0"]
+        )
+
+    def test_blocked_fallback_path_uses_index_fallback_for_missing_ids(self):
+        registry = ToolRegistry()
+
+        def read_tool(label):
+            return ToolResult(tool="parallel_read", status="success", output=f"ok {label}")
+
+        registry.register(
+            _schema("parallel_read"), read_tool,
+            permission="read", effect=_READ_EFFECT,
+        )
+
+        class FallbackMiddle(AgentMiddleware):
+            def before_tool(self, tool_name, tool_args, messages, runtime_state=None,
+                            agent_name=None, permission_decision=None):
+                if tool_args.get("label") == "b":
+                    runtime_state.fallback.request_stop(
+                        reason="test_fallback", last_tool=tool_name
+                    )
+                    return ToolResult(
+                        tool=tool_name,
+                        status="failed",
+                        output="[blocked] stopping at b",
+                        error="stopping at b",
+                        metadata={"status_source": "tool_policy"},
+                    )
+                return None
+
+        tool_calls = [
+            _tool_call(None, "parallel_read", {"label": "a"}),
+            _tool_call(None, "parallel_read", {"label": "b"}),
+            _tool_call(None, "parallel_read", {"label": "c"}),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation, _context = _conversation_with_registry(
+                Path(tmp), registry, tool_calls, middlewares=[FallbackMiddle()]
+            )
+            with (
+                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
+                patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+            ):
+                conversation.run_until_idle()
+
+        tool_messages = [msg for msg in conversation.messages if msg.get("role") == "tool"]
+        self.assertEqual(
+            [msg["tool_call_id"] for msg in tool_messages],
+            ["call_0", "call_1", "call_2"],
+        )
 
 
 if __name__ == "__main__":
