@@ -5,8 +5,6 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from .commands import SlashCommandRegistry
-
 EXCLUDED_DIRS = {
     ".git",
     ".harness",
@@ -30,20 +28,6 @@ class MentionCandidate:
     display: str
     description: str
     kind: str
-
-
-def fuzzy_command_candidates(registry: SlashCommandRegistry, query: str):
-    """Return slash command specs matching the query, sorted by relevance."""
-    query = query.strip()
-    scored = [
-        (fuzzy_score(query, spec.name), index, spec)
-        for index, spec in enumerate(registry.candidates())
-    ]
-    return [
-        spec
-        for score, _index, spec in sorted(scored, key=lambda item: (-item[0], item[1]))
-        if score > 0
-    ]
 
 
 def current_mention_query(text_before_cursor: str) -> tuple[str, int] | None:

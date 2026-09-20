@@ -11,32 +11,6 @@ if TYPE_CHECKING:
 
 MAIN_AGENT_NAMES = {"main_agent"}
 
-# status_source values emitted when a call is intercepted before execution.
-_BLOCKED_SOURCES = {
-    "permission",
-    "approval",
-    "budget",
-    "tool_policy",
-    "delegate_policy",
-    "user_question",
-}
-
-
-def tool_blocked(result: ToolResult) -> bool:
-    """True when the call was intercepted by policy/permissions before running."""
-    source = str((result.metadata or {}).get("status_source") or "")
-    return result.status == "failed" and source in _BLOCKED_SOURCES
-
-
-def tool_failed(result: ToolResult) -> bool:
-    """True when the tool ran and reported a failure (not an interception)."""
-    return result.status == "failed" and not tool_blocked(result)
-
-
-def result_text(result: ToolResult) -> str:
-    """Human-facing text of a result (error first, full output as fallback)."""
-    return result.error or result.output or ""
-
 
 class AgentMiddleware(ABC):
     """Base class for agent middlewares."""

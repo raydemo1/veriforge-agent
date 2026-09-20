@@ -1519,11 +1519,6 @@ class InteractiveSession:
                 log.debug("Failed to enqueue memory extraction: %s", exc)
 
 
-def _require_arg(args: list[str], usage: str) -> None:
-    if len(args) != 1:
-        raise ValueError(usage)
-
-
 def _env_int(name: str, default: int) -> int:
     value = os.environ.get(name)
     if value is None or not value.strip():

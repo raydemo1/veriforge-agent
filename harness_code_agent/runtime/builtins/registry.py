@@ -285,15 +285,6 @@ def _path_effect(
     return resolve
 
 
-def _workspace_global(access: str):
-    def resolve(_args, context):
-        return CallEffect(
-            (workspace_claim(_root(context), ".", scope="global", access=access),)
-        )
-
-    return resolve
-
-
 def _agent_effect(argument: str, *, access: str, domain: str = "agent"):
     def resolve(args, _context):
         return CallEffect(

@@ -259,19 +259,6 @@ def observe_session(cwd: Path, args: list[str]) -> int:
     return 0
 
 
-def _submit_and_print(session: InteractiveSession, line: str) -> None:
-    from .attachments import AttachmentError
-    from .core.interactive import print_turn_result
-    from .core.mentions import MentionResolutionError
-
-    try:
-        result = session.submit(line)
-    except (AttachmentError, MentionResolutionError) as e:
-        _print_error(f"Error: {e}")
-        return
-    print_turn_result(result)
-
-
 def _latest_session_id(store: SessionStore) -> str:
     latest = store.latest_session()
     if latest is None:

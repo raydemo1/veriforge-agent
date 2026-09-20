@@ -622,13 +622,6 @@ def _file_change_counts(diff: str, additions: Any, deletions: Any) -> tuple[int,
     return added, deleted
 
 
-def _coerce_int(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def _format_elapsed(seconds: float) -> str:
     if seconds < 1.0:
         return f"{int(seconds * 1000)}ms"

@@ -90,11 +90,6 @@ def git_dirty_paths(workspace: Path) -> set[str]:
     return set(_parse_git_baseline(result.stdout).dirty_paths)
 
 
-def git_staged_paths(workspace: Path) -> set[str]:
-    baseline = capture_git_baseline(workspace)
-    return set(baseline.staged_paths) if baseline is not None else set()
-
-
 def capture_git_baseline(workspace: Path) -> GitBaseline | None:
     result = _run_git_status(workspace)
     if result is None:
