@@ -29,7 +29,13 @@ from .llm_channel import (
     llm_call_simple,
 )
 from .observations import FactTracker, ObservationStore
-from .providers import ProviderAdapter, current_adapter, get_client
+from .providers import (
+    ProviderAdapter,
+    build_system_cache_breakpoint_content,
+    current_adapter,
+    get_client,
+    supports_system_cache_breakpoint,
+)
 from .runtime_state import (
     AgentFallbackState,
     AgentRuntimeState,
@@ -67,7 +73,6 @@ class Agent:
     """
 
     def __init__(self, name: str, system_prompt: str, use_tools: bool = True,
-                 extra_tool_schemas: list[dict] | None = None,
                  middlewares: list | None = None,
                  time_budget: float | None = None,
                  tool_schemas: list[dict] | None = None,
@@ -75,11 +80,17 @@ class Agent:
                  stream_callback=None,
                  prompt_cache_identity: dict[str, str] | None = None,
                  model_intensity: str | None = None,
-                 max_iterations: int | None = None):
+                 max_iterations: int | None = None,
+                 memory_index: str | None = None):
         self.name = name
+        # Stable instructions only (identity/profile/rules/skills). The memory
+        # index is dynamic reference material and stays a separate suffix so
+        # it never pollutes the stable prompt-cache boundary.
         self.system_prompt = system_prompt
+        self.memory_index = (
+            memory_index.strip() if isinstance(memory_index, str) and memory_index.strip() else None
+        )
         self.use_tools = use_tools
-        self.extra_tool_schemas = extra_tool_schemas or []
         self.middlewares = middlewares or []  # list[AgentMiddleware]
         self.time_budget = time_budget
         self.tool_schemas = tool_schemas
@@ -91,6 +102,13 @@ class Agent:
         self.max_iterations = max_iterations
         self.current_task_metadata: dict = {}
         self._conversations: weakref.WeakSet[AgentConversation] = weakref.WeakSet()
+
+    @property
+    def full_system_prompt(self) -> str:
+        """Stable prefix plus the dynamic memory index, as one plain string."""
+        if self.memory_index:
+            return f"{self.system_prompt}\n\n{self.memory_index}"
+        return self.system_prompt
 
     def _create_runtime_state(self, task: str) -> AgentRuntimeState:
         workspace = self.tool_context.workspace.root if self.tool_context is not None else Path.cwd()
@@ -147,7 +165,7 @@ class AgentConversation:
             self.runtime_state.session_id = agent.tool_context.session_id
         if agent.tool_context is not None and agent.tool_context.permission_policy is not None:
             self.runtime_state.permission_mode = agent.tool_context.permission_policy.mode
-        self.messages: list[dict] = [{"role": "system", "content": agent.system_prompt}]
+        self.messages: list[dict] = [{"role": "system", "content": agent.full_system_prompt}]
         self.client = get_client()
         self._client_needs_refresh = False
         self.provider: ProviderAdapter = current_adapter()
@@ -207,6 +225,33 @@ class AgentConversation:
             return [*self.messages, {"role": "user", "content": reminder}]
         return self.messages
 
+    def _outbound_messages(self, messages: list[dict], model: str) -> list[dict]:
+        """Render provider-bound request messages without mutating history.
+
+        The durable log keeps one plain-string system message (stable prefix
+        + memory index). On OpenAI GPT-5.6+ requests the same content is split
+        into two text parts with an explicit cache breakpoint so memory-index
+        changes do not invalidate the cached stable prefix. Other providers
+        keep the plain-string form.
+        """
+        memory_index = self.agent.memory_index
+        if not memory_index or not messages:
+            return messages
+        if not supports_system_cache_breakpoint(self.provider, model):
+            return messages
+        system_message = messages[0]
+        if system_message.get("role") != "system" or not isinstance(system_message.get("content"), str):
+            return messages
+        outbound = list(messages)
+        outbound[0] = {
+            "role": "system",
+            "content": build_system_cache_breakpoint_content(
+                self.agent.system_prompt,
+                memory_index,
+            ),
+        }
+        return outbound
+
     def rebind_agent(self, agent: Agent) -> None:
         """Keep this conversation while changing the active profile runtime.
 
@@ -225,7 +270,7 @@ class AgentConversation:
             new_conversations.add(self)
         self.agent = agent
         if self.messages and self.messages[0].get("role") == "system":
-            self.messages[0] = {"role": "system", "content": agent.system_prompt}
+            self.messages[0] = {"role": "system", "content": agent.full_system_prompt}
         self._cached_prompt_cache_key = None
         self._last_prompt_cache_shape = None
         self._pending_prompt_cache_shape = None
@@ -255,7 +300,6 @@ class AgentConversation:
             return "当前对话暂时无需压缩"
         self._replace_messages(compacted.messages)
         self._journal_compaction(compacted.summary, compacted.first_kept_index, "manual", messages_before)
-        self.compaction_gate.mark_compacted()
         summary_text = compacted.summary
         self._emit_compaction_committed(
             messages_before=messages_before,
@@ -318,7 +362,6 @@ class AgentConversation:
         self.messages.append(message)
         if self.journal is not None:
             self.journal.append_message(message)
-        self.compaction_gate.bump_revision()
 
     def _journal_compaction(self, summary: str, first_kept_index: int, phase: str, messages_before: int) -> None:
         if self.journal is None:
@@ -353,7 +396,6 @@ class AgentConversation:
     def _replace_messages(self, messages: list[dict]) -> None:
         self.messages = list(messages)
         self._log_rewrite_version += 1
-        self.compaction_gate.bump_revision()
 
     def _strip_dynamic_context_messages(self) -> bool:
         kept: list[dict] = []
@@ -372,7 +414,6 @@ class AgentConversation:
             return False
         self.messages = kept
         self.runtime_state.current_turn_start_index = max(1, turn_start - removed_before_turn)
-        self.compaction_gate.bump_revision()
         return True
 
     def _inject_dynamic_context_after_system(self, injected: list[dict], *, source: str) -> None:
@@ -388,7 +429,6 @@ class AgentConversation:
             )
         if self.runtime_state.current_turn_start_index >= insert_at:
             self.runtime_state.current_turn_start_index += len(injected)
-        self.compaction_gate.bump_revision()
 
     def _refresh_dynamic_context_after_compaction(self, *, phase: str) -> None:
         self._strip_dynamic_context_messages()
@@ -458,7 +498,7 @@ class AgentConversation:
             state.auto_compaction_suspended = True
             self.trace.context_event("auto_compaction_suspended", "already attempted this turn")
             return
-        if not self.compaction_gate.can_compact(coalesce_seconds=0):
+        if not self.compaction_gate.can_compact():
             return
 
         state.auto_compaction_turn_start_index = state.current_turn_start_index
@@ -490,7 +530,6 @@ class AgentConversation:
                 "summarizing_history",
                 messages_before,
             )
-            self.compaction_gate.mark_compacted()
             self._emit_compaction_committed(
                 messages_before=messages_before,
                 token_count_before=token_count_before,
@@ -505,18 +544,16 @@ class AgentConversation:
             tool_schemas=_tool_schemas_for_agent(agent),
         )
         if tokens_after_summary < thresholds.compact:
-            state.context_refill_streak = 0
             return
 
         # A failed/insufficient summary never discards additional context.
-        state.context_refill_streak += 1
         state.auto_compaction_suspended = True
         self.emitter.emit_compaction_started(
             token_count=tokens_after_summary,
             threshold=thresholds.compact,
             phase="auto_compaction_suspended",
         )
-        self.trace.context_event("auto_compaction_suspended", f"streak={state.context_refill_streak}")
+        self.trace.context_event("auto_compaction_suspended", "summary still over threshold")
 
     def _working_context_state(self) -> dict:
         recent_errors, failed_commands = self._recent_error_state()
@@ -757,14 +794,22 @@ class AgentConversation:
         return " ".join(details)
 
     def _append_blocked_tool_results(self, tool_calls: list, reason: str) -> None:
+        from ..runtime.tool_call_validation import ToolCall
+
         status_source = "budget" if "budget" in reason else "fallback"
-        for tc in tool_calls:
-            fn_name = tc["function"]["name"]
-            fn_arguments = tc["function"].get("arguments") or "{}"
-            try:
-                fn_args = json.loads(fn_arguments)
-            except json.JSONDecodeError:
-                fn_args = {}
+        for index, tc in enumerate(tool_calls):
+            # Same normalization boundary as the regular execution path, so a
+            # provider-returned id of None still yields "call_<index>".
+            call = ToolCall.from_raw(tc, index)
+            fn_name = call.name
+            fn_arguments = call.raw_arguments
+            if isinstance(fn_arguments, dict):
+                fn_args = fn_arguments
+            else:
+                try:
+                    fn_args = json.loads(fn_arguments or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    fn_args = {}
             output = f"[blocked] Agent fallback triggered ({reason}); tool was not executed."
             tool_result = finalize_intercepted_tool_result(
                 ToolResult(
@@ -782,7 +827,7 @@ class AgentConversation:
             self.trace.tool_call(fn_name, fn_args, result)
             self._append_message({
                 "role": "tool",
-                "tool_call_id": tc["id"],
+                "tool_call_id": call.tool_call_id,
                 "content": result,
             })
 
@@ -859,9 +904,12 @@ class AgentConversation:
                 tool_schemas,
                 log_rewrite_version=self._log_rewrite_version,
             )
+            chat_args["messages"] = self._outbound_messages(prompt_messages, profile.model)
             if self.provider.supports_prompt_cache_key:
                 if self._cached_prompt_cache_key is None:
-                    self._cached_prompt_cache_key = _prompt_cache_key(agent, tool_schemas)
+                    self._cached_prompt_cache_key = _prompt_cache_key(
+                        agent, tool_schemas, model=profile.model
+                    )
                 chat_args["prompt_cache_key"] = self._cached_prompt_cache_key
             kwargs = self.provider.chat_kwargs(**chat_args)
 
@@ -975,19 +1023,7 @@ def _tool_schemas_for_agent(agent: Agent) -> list[dict] | None:
         return None
     if agent.tool_schemas is not None:
         return agent.tool_schemas
-    return TOOL_SCHEMAS + agent.extra_tool_schemas
-
-
-def _first_compacted_summary(messages: list[dict]) -> str:
-    for message in messages:
-        content = str(message.get("content") or "")
-        if not (
-            content.startswith("[COMPACTED CONTEXT")
-        ):
-            continue
-        _header, _sep, body = content.partition("\n")
-        return (body or content).strip()
-    return ""
+    return TOOL_SCHEMAS
 
 
 def _tool_names_from_schemas(tool_schemas: list[dict] | None) -> set[str]:
