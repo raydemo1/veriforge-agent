@@ -54,11 +54,6 @@ class ExecutedToolCall:
     intercepted: bool = False
 
 
-@dataclass
-class ExecutionGroup:
-    calls: list[PreparedToolCall]
-
-
 class ToolExecutor:
 
     def __init__(self, conversation, cancellation_token=None):
@@ -89,7 +84,7 @@ class ToolExecutor:
                     raise RuntimeError("Tool execution planner produced a dependency cycle")
                 safe_indexes = [index for index in ready_indexes if not self._requires_approval(by_index[index])]
                 selected = safe_indexes or [ready_indexes[0]]
-                executed = self._execute_group(ExecutionGroup([by_index[index] for index in selected]))
+                executed = self._execute_group([by_index[index] for index in selected])
                 stop_after_group = False
                 for item in executed:
                     buffered[item.prepared.index] = item
@@ -243,10 +238,10 @@ class ToolExecutor:
             return False
         return prepared.permission_decision.action == "ask"
 
-    def _execute_group(self, group: ExecutionGroup) -> list[ExecutedToolCall]:
+    def _execute_group(self, calls: list[PreparedToolCall]) -> list[ExecutedToolCall]:
         ready: list[PreparedToolCall] = []
         executed: list[ExecutedToolCall] = []
-        for prepared in group.calls:
+        for prepared in calls:
             self.conversation._check_cancelled(self.cancellation_token)
             if prepared.emit_events and not self.conversation._record_tool_call_budget(prepared.name, prepared.args):
                 output = (
