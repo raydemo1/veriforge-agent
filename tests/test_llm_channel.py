@@ -160,7 +160,12 @@ class EmptyChoicesRetryTests(unittest.TestCase):
         completions = _EmptyChoicesCompletions(empty_calls=2)
         conv = _make_nonstream_conversation(completions)
         channel = ch.LlmChannel(conv)
-        with patch.object(ch.config, "LLM_MAX_RETRIES", 2):
+        with (
+            patch.object(ch.config, "LLM_MAX_RETRIES", 2),
+            # Fast-forward the real exponential backoff waits; retry
+            # counts and outcomes are what these tests assert.
+            patch.object(ch.time, "sleep"),
+        ):
             message, finish = channel.request_assistant_message(
                 {"model": "m", "messages": []}
             )
@@ -172,7 +177,10 @@ class EmptyChoicesRetryTests(unittest.TestCase):
         completions = _EmptyChoicesCompletions(empty_calls=99)
         conv = _make_nonstream_conversation(completions)
         channel = ch.LlmChannel(conv)
-        with patch.object(ch.config, "LLM_MAX_RETRIES", 2):
+        with (
+            patch.object(ch.config, "LLM_MAX_RETRIES", 2),
+            patch.object(ch.time, "sleep"),
+        ):
             with self.assertRaises(ch._EmptyChoicesError):
                 channel.request_assistant_message(
                     {"model": "m", "messages": []}
@@ -184,7 +192,13 @@ class ConversationErrorBoundaryTests(unittest.TestCase):
     def test_channel_failure_ends_turn_with_a_single_request(self):
         from harness_code_agent.agent.conversation import Agent
 
-        conv = Agent("test_agent", "sys", use_tools=False).start_conversation("task")
+        # The LLM call is stubbed below, so constructing a real OpenAI
+        # client (multi-second httpx/proxy init on Windows) is pointless.
+        with patch(
+            "harness_code_agent.agent.conversation.get_client",
+            return_value=SimpleNamespace(),
+        ):
+            conv = Agent("test_agent", "sys", use_tools=False).start_conversation("task")
         finishes = []
         with (
             patch.object(
