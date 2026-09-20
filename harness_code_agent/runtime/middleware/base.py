@@ -76,8 +76,14 @@ class AgentMiddleware(ABC):
         runtime_state=None,
         agent_name: str | None = None,
         permission_decision=None,
-    ) -> str | None:
-        """Called before each tool execution. Return a blocking message, or None.
+    ) -> ToolResult | str | None:
+        """Called before each tool execution. Return a block result, or None.
+
+        First-party middlewares return a structured ``ToolResult``: machine
+        semantics live in ``metadata["status_source"]`` (permission / approval
+        / tool_policy / ...), human-facing text lives in ``output``. Legacy
+        external middlewares may still return a plain ``str``; the executor
+        maps it to ``status_source="tool_policy"`` and never parses the text.
 
         ``permission_decision`` is the single :class:`PermissionDecision`
         computed once during call preparation; middlewares must not re-run the

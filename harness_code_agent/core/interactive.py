@@ -44,13 +44,7 @@ from ..runtime.approvals import (
 from ..runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
 from ..runtime.lifecycle import LifecycleScope
 from ..runtime.mcp import McpClientManager
-from ..runtime.middleware import (
-    MemoryMiddleware,
-    StaticVerifierMiddleware,
-    ToolFailurePolicyMiddleware,
-    ToolGuardMiddleware,
-)
-from ..runtime.permission_middleware import PermissionMiddleware
+from ..runtime.middleware.stack import build_main_agent_middlewares
 from ..runtime.permissions import PermissionPolicy
 from ..runtime.questions import ConsoleQuestionProvider, QuestionProvider
 from ..runtime.tool_context import ToolContext
@@ -223,19 +217,11 @@ class InteractiveSession:
             global_rules_docs=[harness_rules] if harness_rules is not None else [],
             skill_catalog=catalog,
         )
-        middlewares = list(cfg.middlewares)
-        middlewares.append(ToolGuardMiddleware())
-        middlewares.append(ToolFailurePolicyMiddleware(tool_registry=self.tool_registry))
-        if getattr(cfg, "memory_enabled", True):
-            middlewares.append(MemoryMiddleware(workspace=self.cwd))
-        middlewares.append(
-            PermissionMiddleware(
-                tool_context=self.tool_context,
-                tool_registry=self.tool_registry,
-            )
-        )
-        middlewares.append(
-            StaticVerifierMiddleware(workspace_root=str(self.cwd), workspace=self.tool_context.workspace)
+        middlewares = build_main_agent_middlewares(
+            agent_config=cfg,
+            tool_context=self.tool_context,
+            tool_registry=self.tool_registry,
+            workspace=self.cwd,
         )
         return Agent(
             "main_agent",
@@ -585,7 +571,7 @@ class InteractiveSession:
                 root=self.cwd,
                 snapshots_dir=self.session.snapshots_dir,
             ),
-            permission_policy=PermissionPolicy(mode=self.permission_mode),
+            permission_policy=self._effective_permission_policy(),
             event_bus=self.event_bus,
             session_id=self.session.id,
             approval_provider=self.approval_provider,
@@ -626,6 +612,11 @@ class InteractiveSession:
                 "role": "user",
                 "content": f"Resume context:\n{self.resume_context}",
             })
+
+    def _effective_permission_policy(self) -> PermissionPolicy:
+        """Session permission mode tightened by the active profile preset."""
+        preset = self.profile.main_agent().permission_preset
+        return PermissionPolicy(mode=self.permission_mode).restricted_by(preset)
 
     def _activate_profile_runtime(
         self,
@@ -670,6 +661,9 @@ class InteractiveSession:
         self.profile = profile
         self.agent = slot.agent
         self.conversation = slot.conversation
+        # Profile presets (e.g. review's no-workspace-writes) live on the
+        # policy, so switching profiles must re-apply the preset immediately.
+        self.tool_context.permission_policy = self._effective_permission_policy()
         # Profile handoff messages used to split the conversation and hide
         # history. Approved plans are now carried by the execution turn itself.
         return created
@@ -986,7 +980,7 @@ class InteractiveSession:
         self.permission_mode = permission_mode
         self.approval_provider = self._approval_provider_for_mode(permission_mode)
         if self.tool_context is not None:
-            self.tool_context.permission_policy = PermissionPolicy(mode=permission_mode)
+            self.tool_context.permission_policy = self._effective_permission_policy()
             self.tool_context.approval_provider = self.approval_provider
         if self.conversation is not None and getattr(self.conversation, "runtime_state", None) is not None:
             self.conversation.runtime_state.permission_mode = permission_mode

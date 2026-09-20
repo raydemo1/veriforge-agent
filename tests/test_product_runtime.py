@@ -2636,7 +2636,9 @@ class ProductRuntimeTests(unittest.TestCase):
                 for line in events_path.read_text(encoding="utf-8").splitlines()
             ]
 
-            self.assertIn("[approval_denied]", blocked)
+            self.assertIsNotNone(blocked)
+            self.assertEqual(blocked.metadata["status_source"], "approval")
+            self.assertIn("[approval_denied]", blocked.output)
             event_types = [event["type"] for event in events]
             self.assertIn("approval_requested", event_types)
             self.assertIn("approval_decided", event_types)
@@ -3168,8 +3170,10 @@ class ProductRuntimeTests(unittest.TestCase):
                 agent_name="main_agent",
             )
 
-            self.assertIn("[blocked]", blocked)
-            self.assertIn("安全黑名单", blocked)
+            self.assertIsNotNone(blocked)
+            self.assertEqual(blocked.metadata["status_source"], "permission")
+            self.assertIn("[blocked]", blocked.output)
+            self.assertIn("安全黑名单", blocked.output)
 
     def test_env_shell_command_is_treated_as_read(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy

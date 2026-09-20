@@ -1,61 +1,14 @@
 """Review profile for non-mutating code review tasks."""
 from __future__ import annotations
 
-from typing import ClassVar
-
-from ..runtime.middleware import AgentMiddleware
 from ..runtime.permissions import (
     TOOL_PERMISSION_CONTROL,
     TOOL_PERMISSION_NETWORK_READ,
     TOOL_PERMISSION_READ,
     TOOL_PERMISSION_SHELL,
-    is_workspace_write_command,
+    PermissionPreset,
 )
-from ..runtime.tool_result import ToolResult
 from .base import AgentConfig, BaseProfile, build_profile_prompt
-
-
-class ReviewOnlyMiddleware(AgentMiddleware):
-    """Keep review mode from editing the real workspace or updating todo state."""
-
-    def __init__(self, *, profile_label: str = "review profile"):
-        self._profile_label = profile_label
-
-    _WRITE_OR_CONTROL_TOOLS: ClassVar[set] = {
-        "write_file",
-        "apply_patch",
-        "update_todo",
-        "ask_user",
-    }
-
-    def before_tool(
-        self,
-        tool_name: str,
-        tool_args: dict,
-        messages: list[dict],
-        runtime_state=None,
-        agent_name: str | None = None,
-        permission_decision=None,
-    ) -> ToolResult | None:
-        if tool_name in self._WRITE_OR_CONTROL_TOOLS:
-            return ToolResult(
-                tool=tool_name,
-                status="failed",
-                output=f"[blocked] {self._profile_label} cannot modify workspace files, update the todo list, or ask the user.",
-                error=f"{self._profile_label} cannot modify workspace files or update todo state",
-                metadata={"status_source": self._profile_label.replace(" ", "_")},
-            )
-        if tool_name == "run_bash":
-            command = str(tool_args.get("command", ""))
-            if is_workspace_write_command(command):
-                return ToolResult(
-                    tool=tool_name,
-                    status="failed",
-                    output=f"[blocked] {self._profile_label} cannot run shell commands that directly write workspace files.",
-                    error="direct workspace file writes are not allowed in review mode",
-                    metadata={"status_source": self._profile_label.replace(" ", "_")},
-                )
-        return None
 
 
 class ReviewProfile(BaseProfile):
@@ -104,5 +57,5 @@ class ReviewProfile(BaseProfile):
                 "update_todo",
                 "ask_user",
             },
-            middlewares=[ReviewOnlyMiddleware()],
+            permission_preset=PermissionPreset.NO_WORKSPACE_WRITES,
         )

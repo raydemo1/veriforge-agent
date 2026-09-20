@@ -23,6 +23,7 @@ from ..runtime.permissions import (
     TOOL_PERMISSION_NETWORK_READ,
     TOOL_PERMISSION_READ,
     TOOL_PERMISSION_SHELL,
+    PermissionPreset,
 )
 from ..tracking_policy import TASK_TRACKING_POLICY
 
@@ -63,6 +64,9 @@ class AgentConfig:
     middlewares: list = field(default_factory=list)  # list[AgentMiddleware]
     time_budget: float | None = None  # seconds; None = no limit
     memory_enabled: bool = True
+    # Profile-scoped restriction layered on the session permission policy.
+    # A preset can only tighten the user's session mode, never loosen it.
+    permission_preset: PermissionPreset | None = None
 
 
 @dataclass

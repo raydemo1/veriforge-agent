@@ -489,9 +489,7 @@ class ToolFailure:
                 fingerprint=failure_fingerprint(tool_name, kind, tool_args, text),
             )
 
-        if not source and "[approval_denied]" in lowered:
-            kind = FailureKind.APPROVAL_DENIED
-        elif metadata.get("timed_out"):
+        if metadata.get("timed_out"):
             kind = FailureKind.TIMEOUT
         elif source in {"resource", "quota"}:
             resource_kind = str(metadata.get("resource_kind", "") or "").strip().lower()
