@@ -1,164 +1,138 @@
 from __future__ import annotations
 
-import time
+import json
 
-from ...memory.dream import run_dream, should_dream
-from ...memory.recall import MemoryRecall
-from ...memory.store import (
-    MEMORY_CONTENT_FILES,
-    PROTECTED_FILES,
-    MemoryStore,
-    default_memory_root,
-)
+from ...memory import MemoryService, MemoryWriteCommand
 from ..tool_context import ToolContext
 from ..tool_result import ToolResult
 
 
-def memory_search(query: str, tool_context: ToolContext | None = None) -> ToolResult:
-    if not query or not query.strip():
-        return ToolResult(
-            tool="memory_search",
-            status="failed",
-            output="[error] query is required",
-            error="query is required",
-            metadata={"status_source": "validation"},
-        )
-    workspace = tool_context.workspace.root if tool_context is not None else None
-    if workspace is None:
-        return ToolResult(
-            tool="memory_search",
-            status="failed",
-            output="[error] memory_search requires a workspace tool context",
-            error="missing tool context",
-            metadata={"status_source": "validation"},
-        )
-    store = MemoryStore(default_memory_root(workspace), workspace=workspace)
-    if not store.exists():
-        return ToolResult(
-            tool="memory_search",
-            status="success",
-            output="No relevant memory found.",
-            metadata={"status_source": "native", "memory_root": str(store.root), "result_count": 0},
-        )
-    recall = MemoryRecall(store)
-    hits = recall.search(query)
-    if not hits:
-        return ToolResult(
-            tool="memory_search",
-            status="success",
-            output="No relevant memory found.",
-            metadata={"status_source": "native", "memory_root": str(store.root), "result_count": 0},
-        )
-    lines = [f"Found {len(hits)} memory entries:"]
-    lines.extend(recall.format_hit_lines(hits))
-    lines.append("")
-    lines.append("Use read_memory_file to read full details from the memory files.")
-    return ToolResult(
-        tool="memory_search",
-        status="success",
-        output="\n".join(lines),
-        metadata={"status_source": "native", "memory_root": str(store.root), "result_count": len(hits)},
-    )
+def _service(tool_context: ToolContext | None) -> MemoryService:
+    if tool_context is None or tool_context.workspace is None:
+        raise ValueError("memory tools require a workspace tool context")
+    return MemoryService(tool_context.workspace.root)
 
 
-def remember_memory(
-    summary: str,
-    title: str = "",
-    file: str = "",
-    tags: list[str] | None = None,
-    source_paths: list[str] | None = None,
-    confidence: float = 0.7,
+def memory_search(
+    query: str,
+    scope: str = "both",
+    paths: list[str] | None = None,
     tool_context: ToolContext | None = None,
 ) -> ToolResult:
-    if not summary or not summary.strip():
+    try:
+        if tool_context is not None and not getattr(tool_context, "memory_use_enabled", True):
+            raise ValueError("memory use is disabled for this session")
+        if scope not in {"project", "user", "both"}:
+            raise ValueError("scope must be project, user, or both")
+        hits = _service(tool_context).search(query, scope=scope, paths=paths or [])
+        output = MemoryService.format_hits(hits) or "No relevant memory found."
         return ToolResult(
-            tool="remember_memory",
-            status="failed",
-            output="[error] summary is required",
-            error="summary is required",
-            metadata={"status_source": "validation"},
+            tool="memory_search", status="success", output=output,
+            metadata={"status_source": "native", "result_count": len(hits)},
         )
-    if file in PROTECTED_FILES:
-        return ToolResult(
-            tool="remember_memory",
-            status="failed",
-            output=f"[error] {file} is managed by Dream and cannot be written directly",
-            error=f"protected memory file: {file}",
-            metadata={"status_source": "validation", "file": file},
-        )
-    if file and file not in MEMORY_CONTENT_FILES:
-        return ToolResult(
-            tool="remember_memory",
-            status="failed",
-            output=f"[error] Unknown memory file: {file}",
-            error=f"unknown memory file: {file}",
-            metadata={"status_source": "validation", "file": file},
-        )
-    workspace = tool_context.workspace.root if tool_context is not None else None
-    if workspace is None:
-        return ToolResult(
-            tool="remember_memory",
-            status="failed",
-            output="[error] remember_memory requires a workspace tool context",
-            error="missing tool context",
-            metadata={"status_source": "validation"},
-        )
-    store = MemoryStore(default_memory_root(workspace), workspace=workspace)
-    candidate = {
-        "title": title.strip() or summary.strip()[:80],
-        "summary": summary.strip(),
-        "file": file.strip(),
-        "tags": tags or [],
-        "source_paths": source_paths or [],
-        "source_sessions": [tool_context.session_id] if tool_context and tool_context.session_id else [],
-        "confidence": confidence,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    store.append_candidate(candidate)
-    dream_summary = ""
-    if should_dream(store):
-        dream_summary = run_dream(store)
-    output = "Queued memory candidate for Dream merge."
-    if dream_summary:
-        output += f"\n{dream_summary}"
-    return ToolResult(
-        tool="remember_memory",
-        status="success",
-        output=output,
-        metadata={"status_source": "native", "memory_root": str(store.root), "dream": dream_summary},
-    )
+    except (KeyError, OSError, ValueError) as exc:
+        return _failure("memory_search", exc)
 
 
-def read_memory_file(file: str = "MEMORY.md", tool_context: ToolContext | None = None) -> ToolResult:
-    if file not in ("MEMORY.md", *MEMORY_CONTENT_FILES, "dream-log.md"):
+def memory_read(
+    memory_id: str,
+    scope: str = "project",
+    tool_context: ToolContext | None = None,
+) -> ToolResult:
+    try:
+        if tool_context is not None and not getattr(tool_context, "memory_use_enabled", True):
+            raise ValueError("memory use is disabled for this session")
+        if scope not in {"project", "user"}:
+            raise ValueError("scope must be project or user")
+        doc = _service(tool_context).read(memory_id, scope=scope)
+        payload = {**doc.metadata(), "body": doc.body}
         return ToolResult(
-            tool="read_memory_file",
-            status="failed",
-            output=f"[error] Unknown readable memory file: {file}",
-            error=f"unknown memory file: {file}",
-            metadata={"status_source": "validation", "file": file},
+            tool="memory_read", status="success",
+            output=json.dumps(payload, ensure_ascii=False, indent=2),
+            metadata={"status_source": "native", "memory_id": doc.id, "version": doc.version},
         )
-    workspace = tool_context.workspace.root if tool_context is not None else None
-    if workspace is None:
+    except (KeyError, OSError, ValueError) as exc:
+        return _failure("memory_read", exc)
+
+
+def memory_write(
+    topic: str,
+    body: str,
+    scope: str = "project",
+    applicability: str = "",
+    source_paths: list[str] | None = None,
+    memory_id: str = "",
+    expected_version: int | None = None,
+    supersedes: str = "",
+    tool_context: ToolContext | None = None,
+) -> ToolResult:
+    try:
+        if tool_context is not None and not getattr(tool_context, "memory_generate_enabled", True):
+            raise ValueError("memory generation is disabled for this session")
+        if scope not in {"project", "user"}:
+            raise ValueError("scope must be project or user")
+        session_id = getattr(tool_context, "session_id", None)
+        doc = _service(tool_context).write(
+            MemoryWriteCommand(
+                topic=topic, body=body, scope=scope, applicability=applicability,
+                source_sessions=[session_id] if session_id else [],
+                source_paths=source_paths or [], memory_id=memory_id or None,
+                expected_version=expected_version, supersedes=supersedes or None,
+            )
+        )
         return ToolResult(
-            tool="read_memory_file",
-            status="failed",
-            output="[error] read_memory_file requires a workspace tool context",
-            error="missing tool context",
-            metadata={"status_source": "validation"},
+            tool="memory_write", status="success",
+            output=f"Saved memory {doc.id} v{doc.version} ({doc.scope}, {doc.status}).",
+            metadata={"status_source": "native", "memory_id": doc.id, "version": doc.version},
         )
-    store = MemoryStore(default_memory_root(workspace), workspace=workspace)
-    if not store.exists():
+    except (KeyError, OSError, ValueError) as exc:
+        return _failure("memory_write", exc)
+
+
+def memory_validate(
+    memory_id: str,
+    expected_version: int,
+    scope: str = "project",
+    tool_context: ToolContext | None = None,
+) -> ToolResult:
+    try:
+        if tool_context is not None and not getattr(tool_context, "memory_generate_enabled", True):
+            raise ValueError("memory generation is disabled for this session")
+        if scope not in {"project", "user"}:
+            raise ValueError("scope must be project or user")
+        doc = _service(tool_context).validate(memory_id, expected_version, scope=scope)
         return ToolResult(
-            tool="read_memory_file",
-            status="success",
-            output="(no memory files yet)",
-            metadata={"status_source": "native", "memory_root": str(store.root), "file": file},
+            tool="memory_validate", status="success",
+            output=f"Validated memory {doc.id}; now active at v{doc.version}.",
+            metadata={"status_source": "native", "memory_id": doc.id, "version": doc.version},
         )
-    content = store.read_memory_file(file)
+    except (KeyError, OSError, ValueError) as exc:
+        return _failure("memory_validate", exc)
+
+
+def memory_forget(
+    memory_id: str,
+    expected_version: int,
+    scope: str = "project",
+    tool_context: ToolContext | None = None,
+) -> ToolResult:
+    try:
+        if tool_context is not None and not getattr(tool_context, "memory_generate_enabled", True):
+            raise ValueError("memory generation is disabled for this session")
+        if scope not in {"project", "user"}:
+            raise ValueError("scope must be project or user")
+        _service(tool_context).forget(memory_id, expected_version, scope=scope)
+        return ToolResult(
+            tool="memory_forget", status="success",
+            output=f"Forgot memory {memory_id}; its content was removed.",
+            metadata={"status_source": "native", "memory_id": memory_id},
+        )
+    except (KeyError, OSError, ValueError) as exc:
+        return _failure("memory_forget", exc)
+
+
+def _failure(tool: str, exc: Exception) -> ToolResult:
     return ToolResult(
-        tool="read_memory_file",
-        status="success",
-        output=content or "(empty)",
-        metadata={"status_source": "native", "memory_root": str(store.root), "file": file},
+        tool=tool, status="failed", output=f"[error] {exc}", error=str(exc),
+        metadata={"status_source": "validation"},
     )

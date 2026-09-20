@@ -25,6 +25,8 @@ from ..attachments import (
     build_model_content,
     model_input_mode,
 )
+from ..memory import MemoryService, MemoryWriteCommand
+from ..memory.background import start_memory_worker
 from ..profiles import get_profile
 from ..profiles.base import BaseProfile
 from ..profiles.router import (
@@ -56,6 +58,7 @@ from ..sessions.events import (
     TurnSummaryEvent,
     UserInputEvent,
 )
+from ..sessions.journal import SessionJournal
 from ..sessions.report import build_final_report
 from ..sessions.store import Session, SessionStore
 from ..sessions.turn_summary import generate_turn_summary, should_summarize_turn
@@ -140,6 +143,8 @@ class InteractiveSession:
         self.question_provider = question_provider or ConsoleQuestionProvider()
         self.output_sink = output_sink or print
         self.enable_turn_summary = enable_turn_summary
+        self.memory_use_enabled = os.environ.get("HARNESS_MEMORY_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
+        self.memory_generate_enabled = os.environ.get("HARNESS_MEMORY_GENERATION_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
         self.checkpoint = CheckpointConfig()
         self._allow_checkpoint_init_failure = allow_checkpoint_init_failure
         self.checkpoint_init_error: str = ""
@@ -180,6 +185,8 @@ class InteractiveSession:
         self._close_lock = threading.Lock()
         self._report_startup("connecting tools")
         self._bind_profile(self._pending_profile_name, source=self._profile_source)
+        if self.memory_generate_enabled:
+            start_memory_worker(self.cwd)
         self._report_startup("ready")
 
     def _report_startup(self, stage: str) -> None:
@@ -223,9 +230,14 @@ class InteractiveSession:
             tool_registry=self.tool_registry,
             workspace=self.cwd,
         )
+        system_prompt = prefix.content
+        if getattr(cfg, "memory_enabled", True) and getattr(self, "memory_use_enabled", True):
+            memory_index = MemoryService(self.cwd).index_block()
+            if "\n- [" in memory_index:
+                system_prompt = f"{system_prompt}\n\n{memory_index}"
         return Agent(
             "main_agent",
-            prefix.content,
+            system_prompt,
             use_tools=True,
             tool_schemas=self._tool_schemas_for_agent_config(cfg),
             middlewares=middlewares,
@@ -574,6 +586,8 @@ class InteractiveSession:
             permission_policy=self._effective_permission_policy(),
             event_bus=self.event_bus,
             session_id=self.session.id,
+            memory_use_enabled=self.memory_use_enabled,
+            memory_generate_enabled=self.memory_generate_enabled,
             approval_provider=self.approval_provider,
             question_provider=self.question_provider,
             tool_registry=self.tool_registry,
@@ -607,10 +621,11 @@ class InteractiveSession:
                 "interactive": True,
             },
         )
-        if self.resume_context:
+        if self.resume_session_id:
+            self._restore_session_messages(self.resume_session_id)
+        elif self.resume_context:
             self._append_conversation_message({
-                "role": "user",
-                "content": f"Resume context:\n{self.resume_context}",
+                "role": "user", "content": f"Resume context:\n{self.resume_context}",
             })
 
     def _effective_permission_policy(self) -> PermissionPolicy:
@@ -943,6 +958,76 @@ class InteractiveSession:
             self.output_sink(result.text)
         return result.should_continue
 
+    def context_status(self) -> str:
+        if self.conversation is None or self.agent is None:
+            return "当前还没有活动会话"
+        from ..agent.context_manager import ContextManager
+
+        breakdown = ContextManager.breakdown(
+            self.conversation.messages,
+            tool_schemas_for_profile(self.agent),
+        )
+        labels = {"system": "系统指令", "summary": "工作摘要", "recent": "近期消息", "memory": "长期记忆", "tools": "工具定义"}
+        lines = [f"上下文估算：{sum(breakdown.values())} tokens"]
+        lines.extend(f"- {labels[key]}：{value}" for key, value in breakdown.items())
+        return "\n".join(lines)
+
+    def memory_command(self, args: list[str]) -> str:
+        service = MemoryService(self.cwd)
+        if not args or args == ["status"]:
+            counts = {scope: len(store.list_documents()) for scope, store in service.stores.items()}
+            return (
+                f"memory use: {'on' if self.memory_use_enabled else 'off'}; "
+                f"generate: {'on' if self.memory_generate_enabled else 'off'}; "
+                f"project={counts['project']}; user={counts['user']}"
+            )
+        if len(args) == 2 and args[0] in {"use", "generate"} and args[1] in {"on", "off"}:
+            enabled = args[1] == "on"
+            if args[0] == "use":
+                self.memory_use_enabled = enabled
+                if self.tool_context is not None:
+                    self.tool_context.memory_use_enabled = enabled
+            else:
+                self.memory_generate_enabled = enabled
+                if self.tool_context is not None:
+                    self.tool_context.memory_generate_enabled = enabled
+            suffix = "；启动索引将在下次新会话刷新" if args[0] == "use" else ""
+            return f"memory {args[0]}: {args[1]}{suffix}"
+        if args[0] == "search" and len(args) > 1:
+            return service.format_hits(service.search(" ".join(args[1:]))) or "没有找到相关记忆"
+        if args[0] in {"show", "forget", "validate"} and len(args) >= 2:
+            scope, memory_id = _parse_memory_ref(args[1])
+            if args[0] == "show":
+                doc = service.read(memory_id, scope=scope)
+                return json.dumps({**doc.metadata(), "body": doc.body}, ensure_ascii=False, indent=2)
+            if len(args) != 3:
+                raise ValueError(f"用法：/memory {args[0]} [project:|user:]<id> <version>")
+            version = int(args[2])
+            if args[0] == "forget":
+                service.forget(memory_id, version, scope=scope)
+                return f"已遗忘 {scope}:{memory_id}，正文已删除"
+            doc = service.validate(memory_id, version, scope=scope)
+            return f"已验证 {scope}:{doc.id} v{doc.version}"
+        if args[0] == "edit" and len(args) >= 4:
+            scope, memory_id = _parse_memory_ref(args[1])
+            version = int(args[2])
+            current = service.read(memory_id, scope=scope)
+            doc = service.write(MemoryWriteCommand(
+                topic=current.topic,
+                body=" ".join(args[3:]),
+                scope=scope,
+                applicability=current.applicability,
+                source_sessions=current.source_sessions,
+                source_paths=current.source_paths,
+                memory_id=current.id,
+                expected_version=version,
+            ))
+            return f"已编辑 {scope}:{doc.id} v{doc.version}"
+        raise ValueError(
+            "用法：/memory [status|search <query>|show <id>|edit <id> <version> <body>|forget <id> <version>|"
+            "validate <id> <version>|use on|off|generate on|off]"
+        )
+
     def submit_skill_command(self, line: str) -> TurnResult:
         if self.skill_registry.build_user_invocation(line) is None:
             raise ValueError(f"Unknown user skill command: {line}")
@@ -1088,6 +1173,7 @@ class InteractiveSession:
         )
         self.conversation.event_bus = self.event_bus
         self.conversation._event_bus = self.event_bus
+        self.conversation.journal = SessionJournal(branched.journal_path)
         emitter = getattr(self.conversation, "emitter", None)
         if emitter is not None:
             emitter.event_bus = self.event_bus
@@ -1120,10 +1206,22 @@ class InteractiveSession:
             return
         if self.session is not None:
             self.session_store.update_resumed_from(self.session.id, session_id)
-        self._append_conversation_message({
-            "role": "user",
-            "content": f"Resume context:\n{context_text}",
-        })
+        self._restore_session_messages(session_id)
+
+    def _restore_session_messages(self, session_id: str) -> None:
+        if self.conversation is None or self.agent is None:
+            return
+        journal_path = self.session_store.sessions_dir / session_id / "journal.jsonl"
+        if not journal_path.exists() or not journal_path.stat().st_size:
+            self._append_conversation_message({
+                "role": "user", "content": f"Resume context:\n{self.resume_context or ''}",
+            })
+            return
+        recovered = SessionJournal(journal_path).recovery_messages(self.agent.system_prompt)
+        self.conversation._replace_messages(recovered)
+        if self.conversation.journal is not None:
+            for message in recovered[1:]:
+                self.conversation.journal.append_message(message)
 
     def _externalize_large_turn_text(self, label: str, text: str, *, intro: str) -> str:
         limit = _env_int("HARNESS_TURN_INLINE_CHAR_LIMIT", TURN_INLINE_CHAR_LIMIT)
@@ -1192,26 +1290,10 @@ class InteractiveSession:
             self.conversation.messages.append(message)
 
     def _augment_user_prompt(self, user_prompt: str, *, mention_paths: list[str]) -> str:
-        if self.agent is None or self.conversation is None:
+        if self.agent is None or self.conversation is None or not getattr(self, "memory_use_enabled", True):
             return ""
-        blocks: list[str] = []
-        messages = getattr(self.conversation, "messages", [])
-        runtime_state = getattr(self.conversation, "runtime_state", None)
-        agent_name = getattr(self.agent, "name", None)
-        for mw in getattr(self.agent, "middlewares", []):
-            augment = getattr(mw, "augment_user_prompt", None)
-            if augment is None:
-                continue
-            block = augment(
-                user_prompt,
-                messages,
-                runtime_state=runtime_state,
-                agent_name=agent_name,
-                mention_paths=mention_paths,
-            )
-            if block and block.strip():
-                blocks.append(block.strip())
-        return "\n\n".join(blocks)
+        hits = MemoryService(self.cwd).search(user_prompt, scope="both", paths=mention_paths)
+        return MemoryService.format_hits(hits)
 
     def _handle_checkpoint_command(self, args: list[str]) -> str:
         if not args:
@@ -1377,6 +1459,16 @@ class InteractiveSession:
             self.session_store.write_summary(self.session.id)
         except Exception as exc:
             log.warning("Failed to write summary for session %s: %s", self.session.id, exc)
+        if self.memory_generate_enabled and self.session.journal_path.exists():
+            try:
+                service = MemoryService(self.cwd)
+                service.stores["project"].enqueue_extraction(
+                    self.session.id,
+                    self.session.journal_path.stat().st_size,
+                    self.session.journal_path,
+                )
+            except (OSError, ValueError) as exc:
+                log.debug("Failed to enqueue memory extraction: %s", exc)
 
 
 def _require_arg(args: list[str], usage: str) -> None:
@@ -1411,6 +1503,15 @@ def _memory_mention_paths(resolved: list[ResolvedMention]) -> list[str]:
         if value:
             paths.append(str(value))
     return paths
+
+
+def _parse_memory_ref(value: str) -> tuple[str, str]:
+    if ":" not in value:
+        return "project", value
+    scope, memory_id = value.split(":", 1)
+    if scope not in {"project", "user"} or not memory_id:
+        raise ValueError("记忆引用必须是 <id>、project:<id> 或 user:<id>")
+    return scope, memory_id
 
 
 def _format_turn_with_mentions_and_memory(

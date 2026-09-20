@@ -110,6 +110,8 @@ export const DEFAULT_COMMANDS: CommandItem[] = [
   { name: "/checkpoint", category: "工作流", description: "打开检查点管理" },
   { name: "/mcp", category: "工作流", description: "打开 MCP 服务与工具管理" },
   { name: "/compact", category: "工作流", description: "压缩当前对话上下文" },
+  { name: "/context", category: "会话", description: "查看上下文预算组成" },
+  { name: "/memory", category: "会话", description: "查看与管理长期记忆" },
   { name: "/fork", category: "会话", description: "从当前会话创建并进入分支" },
   { name: "/observe", category: "会话", description: "打开当前项目的运行观察" },
 ];

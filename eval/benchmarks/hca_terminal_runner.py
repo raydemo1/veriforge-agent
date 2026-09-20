@@ -244,7 +244,6 @@ def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("HCA_TERMINAL_EVAL_MODE", "1")
     os.environ.setdefault("HARNESS_STREAM", "0")
     os.environ.setdefault("HARNESS_MEMORY_DISABLED", "1")
-    os.environ.setdefault("HARNESS_MEMORY_DREAM_CHECK_INTERVAL_SECONDS", "3600")
 
     session: Any | None = None
     session_store: Any | None = None

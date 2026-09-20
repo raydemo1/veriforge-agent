@@ -34,7 +34,7 @@
 | 25 | 可靠性 | 大模型幻觉怎么 Harness？ | 如果验证也被模型带偏怎么办？ |
 | 26 | 质量保障 | Vibe coding 怎么确认代码质量？ | 怎么平衡速度和工程纪律？ |
 | 27 | Prompt Cache | Prompt Cache 怎么设计的？效果怎么量化？ | prefix 变了怎么办？compaction 会破坏 cache 吗？ |
-| 28 | Memory 系统 | 长期记忆怎么设计的？dream 整合是什么？ | 记忆冲突怎么解决？召回怎么做？ |
+| 28 | Memory 系统 | 长期记忆如何存储、召回和纠错？ | 为什么 Markdown 是事实源？如何避免过时结论？ |
 | 29 | 评估体系 | 8/24/full task set 怎么选？结果口径为什么用 ledger？ | 如何保证不是 cherry-picked？改进方向？ |
 | 30 | Profile 路由 | Profile 和 Agent 的职责边界？怎么选 profile？ | 路由出错怎么兜底？新增 profile 要改什么？ |
 | 31 | Shell / Sandbox | Windows Shell 和 Docker sandbox 怎么设计？ | 为什么不自动从 pwsh 降级到 WSL？Docker 是否等于绝对安全？ |
@@ -46,7 +46,7 @@
 
 > VeriForge 是一个面向真实本地仓库的可验证 Coding-Agent Runtime。模型负责理解任务和生成决策，Runtime 负责把这些决策放进可治理的执行环境：Profile 定义任务模式，Tool Registry 和 Permission Middleware 控制工具与风险，Workspace Service 约束路径，ToolExecutor 对安全读操作和 delegated agents 做保守并行，中间件处理循环检测、错误恢复、时间预算、任务跟踪和退出验证，Session/Event/Observation 系统负责复盘与旧事实失效。
 >
-> 它不是只做“LLM + Shell”。长运行命令会后台化；Windows 可以明确选择 PowerShell 7 或 WSL，且不会静默切换语义；不可信命令可进入 Docker sandbox；复杂任务可以委派给只读 Agent，或者让 Patch Agent 在临时副本中提出 Diff，但主工作区始终由单一 orchestrator 决策。上下文接近上限时会做 turn-safe compaction 和 handoff reset，跨会话事实则通过 BM25 Memory 按需召回。
+> 它不是只做“LLM + Shell”。长运行命令会后台化；Windows 可以明确选择 PowerShell 7 或 WSL，且不会静默切换语义；不可信命令可进入 Docker sandbox；复杂任务可以委派给只读 Agent，或者让 Patch Agent 在临时副本中提出 Diff，但主工作区始终由单一 orchestrator 决策。上下文接近上限时会在完整工具调用边界生成结构化工作摘要，原始逻辑消息保留在 JSONL 手账中；跨会话事实通过可验证的 Markdown Memory 按需召回。
 >
 > 评测上，我没有只挑一次成功 run，而是用 task-level ledger 从 raw Harbor/Terminal-Bench artifacts 重建结果。在 Terminal-Bench 2.1 的完整 89 任务分母下，`DeepSeek-V4-Flash-Preview` 经 VeriForge 运行后的本地 ledger 是 `56/89`、`62.9%`；这不是严格同场的 leaderboard 声明。官方 DeepSeek Harness 的同模型参考值是 `61.8%`，运行配置不同，只作为背景参照。这里要看的不是模型单项分数，而是 Profile、工具治理、恢复、验证和评测记录能否一起工作。
 
@@ -163,7 +163,7 @@ Agent 决策循环的核心流程还是串行的：发 LLM 请求 → 等响应 
 
 ## Q: 上下文压缩用的是什么策略？直接截断还是摘要？压缩后信息丢失怎么处理？
 
-> 用的是 **旧历史摘要 + handoff reset**。系统只在接近上限时介入：先摘要当前 turn 之前的旧 conversation；连续快速回填时生成 handoff 文档并清空上下文重建，不会做裸 reset。
+> 用的是 **结构化工作摘要 + append-only SessionJournal**。系统只在安全边界压缩当前 turn 之前的旧 conversation；摘要失败时保持原上下文，恢复与 fork 都能从原始逻辑消息重建。
 
 ### 压缩策略：LLM 摘要
 
@@ -197,11 +197,11 @@ Agent 决策循环的核心流程还是串行的：发 LLM 请求 → 等响应 
 2. **当前 turn 保护** — auto-compaction 只处理当前 turn 之前的内容，当前任务和最新工具输出完整保留。
 3. **摘要旧历史** — 旧 conversation 被替换成 `[COMPACTED CONTEXT]`，保留决策、约束、改动文件、错误和下一步。
 4. **每 turn 最多一次** — summary 后仍超过 85% 时，本 turn 暂停 auto-compaction，避免 thrashing。
-5. **handoff reset** — 连续两个 turn 都快速填满上下文时，生成 handoff Markdown，清空 conversation，并用 `[HANDOFF RESET]` 重新加载当前任务、状态、约束、重要文件、Suggested Skills 和 next action。
+5. **失败不提交** — 摘要调用失败或没有有效内容时，不写压缩边界，也不清空原上下文；本 turn 暂停再次自动压缩。
 
 ### 信息丢失是必然的，关键是怎么管理
 
-压缩必然丢失细节。我们的策略是：**当前 turn 不压缩，旧 conversation 摘要，极端情况下用 handoff reset 把可继承事实落地成文档再清空上下文**。这比裸 reset 更可控，也更少影响用户体验。
+压缩摘要必然有损，但原始历史没有被删除。`SessionJournal` 逐条记录逻辑消息、tool call/result 关联和压缩边界；恢复时使用最近有效摘要、边界后的原始消息和当前工作状态。摘要负责模型预算，手账负责审计和恢复，两者职责分开。
 
 ---
 
@@ -403,7 +403,7 @@ coding-agent profile 的核心执行中间件顺序：
 6. `PreExitVerificationMiddleware` — 退出前强制验证
 7. `TimeBudgetMiddleware` — 时间预算警告
 
-交互 session 随后还会追加 `ToolPolicyMiddleware`、可选 `MemoryMiddleware`、`PermissionMiddleware` 和 `StaticVerifierMiddleware`。所以面试时应区分 profile 构造的执行链与 session 最终装配后的完整链。
+交互 session 随后还会追加 `ToolPolicyMiddleware`、`PermissionMiddleware` 和 `StaticVerifierMiddleware`。Memory 不在 middleware 栈中：启动索引属于 system prompt 构建，按 turn 召回由 `MemoryService` 完成，生命周期操作通过独立工具暴露。
 
 这个顺序是有意设计的：
 
@@ -614,7 +614,7 @@ Aider 的核心是"编辑 chat"模式 — 用户和 agent 通过 git diff 对话
 1. **中间件链** — 多个中间件在运行时控制 agent 行为：循环检测防止原地打转，错误恢复引导正确方向，任务追踪维护验收项，时间预算控制节奏，退出验证确保质量。
 2. **权限沙箱** — 三档 runtime 权限 + profile 只读约束 + 命令风险分类 + 人工或 LLM 自动审批流，防止 agent 执行危险操作。
 3. **Profile 系统** — 不同任务用不同的运行契约：plan profile 只允许读，terminal profile 面向非交互评测，coding-agent profile 有完整的中间件保护。
-4. **上下文管理** — 85% auto-compaction + handoff reset，防止 agent 在上下文接近上限时反复压缩或丢失当前任务。
+4. **上下文管理** — 85% auto-compaction + 结构化工作摘要 + SessionJournal，防止 agent 在上下文接近上限时反复压缩，并保留可恢复的原始历史。
 5. **Observation Store** — 文件变更时自动失效旧的观察结果，防止 agent 基于过时信息做决策。
 
 ### 命名来源
@@ -639,7 +639,7 @@ Aider 的核心是"编辑 chat"模式 — 用户和 agent 通过 git diff 对话
 | --- | --- | --- |
 | Execution | 命令在哪跑、怎么停、会不会卡死 | host / docker sandbox、`PersistentShellSession`、后台 `ShellJobManager` |
 | Tooling | 模型能调用什么工具、工具能不能并发 | `ToolRegistry` 的 `schema / permission / effect / disclosure`，`ExecutionPlanner` 资源调度 |
-| Context | 模型依据的信息是不是最新、上下文满了怎么办 | 85% auto-compaction、handoff reset、Observation Store |
+| Context | 模型依据的信息是不是最新、上下文满了怎么办 | 85% auto-compaction、结构化摘要、SessionJournal、Observation Store |
 | Lifecycle | agent 怎么从任务开始走到退出 | bounded loop、中间件钩子、plan → coding-agent handoff、只读子 agent |
 | Observability | 出问题后能不能复盘 | `.harness/sessions`、`events.jsonl`、TraceWriter、observability metrics |
 | Verification | 不相信模型说"完成了" | `PreExitVerificationMiddleware`、`StaticVerifierMiddleware`、profile acceptance criteria |
@@ -723,16 +723,16 @@ OpenTUI 前端负责 transcript、composer、命令/文件补全、状态栏和�
 - 摘要：LLM 摘要本身消耗 token，且可能遗漏关键细节
 - 重置：丢失所有上下文，agent 必须从零开始理解项目
 
-### 解决方案：85% 轻量压缩 + handoff reset
+### 解决方案：85% 结构化压缩 + append-only 手账
 
 1. **单触发阈值**：85% 以下不自动压缩，85% 以上才介入。
 2. **摘要旧历史**：摘要当前 turn 之前的旧 conversation，不压缩当前 turn。
 3. **Thrash 保护**：同一 turn 最多自动压缩一次，summary 后仍超过 85% 就暂停本 turn 的 auto-compaction。
-4. **handoff reset**：连续两个 turn 快速填满上下文时，生成 handoff 文档并清空 conversation，从 handoff 继承任务状态，而不是硬截断或裸 reset。
+4. **可恢复边界**：压缩成功后才向 SessionJournal 写边界；恢复和 fork 使用最近摘要与边界后的原始消息，不依赖临时 reset 文档。
 
 ### 效果
 
-这个设计牺牲了一点提前准备能力，换来更少的用户打扰和更少的 prompt cache churn。大部分情况下，旧历史摘要就足够；只有连续快速回填时才把状态固化成 handoff 文档并重建上下文。
+这个设计让模型上下文保持紧凑，同时保留完整审计来源。`/context` 会分别展示系统指令、近期消息、工作摘要、长期记忆和工具定义的预算，便于解释一次压缩到底省在哪里。
 
 ---
 
@@ -1151,82 +1151,46 @@ compaction 确实重写了旧消息（把它们替换成摘要），但 **system
 
 ---
 
-## Q: 长期记忆怎么设计的？dream 整合是什么？
+## Q: 长期记忆如何存储、召回和纠错？
 
-> Memory 系统解决的问题是：Agent 在一次会话中学到的知识（用户偏好、项目架构、调试经验）如何跨会话持久化。核心思路是"inbox 缓冲 → 批量整合 → 按需召回"，类似人类的短期记忆到长期记忆的巩固过程。
+> Memory 不是一段自动拼进 prompt 的历史文本，而是一组有来源、有适用范围、有版本的可验证文档。Markdown 是正文的唯一事实源，SQLite 只承担可重建索引、后台任务、使用记录和抑制记录。
 
-### 整体架构
+### 四层职责
 
-```
-会话中 Agent 调用 remember_memory 工具
-         ↓
-    inbox.jsonl（短期缓冲）
-         ↓
-    dream 整合（批量触发）
-         ↓
-    records.jsonl（结构化记录）
-    + 6 个分类 .md 文件（人可读）
-         ↓
-    memory_search 工具（BM25 召回）
-         ↓
-    注入到下一次会话的上下文
+```text
+SessionJournal JSONL        原始逻辑消息、tool call/result、压缩边界
+Structured Working Summary 当前任务的压缩与恢复状态
+entries/<id>.md             人可读、可编辑的长期记忆正文与元数据
+memory.db                   BM25 索引、提炼队列、租约、usage、suppression
 ```
 
-### 写入：inbox 缓冲
+项目记忆按 Git common directory 生成稳定 key，因此多个 worktree 共享同一个项目记忆空间；个人偏好写入独立 user scope。`MEMORY.md` 只是简短导航，删除 SQLite 后可以从 entry Markdown 完整重建。
 
-Agent 在会话中通过 `remember_memory` 工具写入记忆候选，格式是结构化 JSON（title、summary、tags、source_paths、confidence）。候选项追加到 `inbox.jsonl`，不直接写入长期记忆。这个缓冲的设计理由是：Agent 一次会话中可能产生大量候选，质量参差，不应该每条都立刻持久化。
+### 显式写入与后台提炼
 
-### 整合：dream 过程
+- 用户明确说“记住”时，Agent 直接调用 `memory_write`，不等待后台任务。
+- 修改已有文档必须带 `expected_version`，旧版本写入会被拒绝，避免后台结果覆盖用户刚做的修改。
+- 已结束会话按 journal boundary 去重后进入提炼队列。每个进程只有一个 daemon worker，使用 `fast` 模型一次完成候选提取与已有记忆比较；失败有租约和有限重试，退出不等待。
+- 自动提炼只接受明确偏好、项目约定、决策背景和有证据的复用经验，排除一次性状态、临时日志、密钥、隐藏推理和易过期细节。
 
-`run_dream()` 是记忆巩固的核心函数，类比 REM 睡眠。触发条件：inbox 积累 ≥12 条，或距上次 dream ≥24 小时。
+### 召回与适用性检查
 
-整合流程：
+`MemoryService.search()` 使用 BM25、中文相邻二元词和路径 token 检索 project/user 两个 scope。它只对本次命中的记忆重新计算 `source_paths` 指纹：
 
-1. **读取 inbox**：加锁读取所有候选项
-2. **路由分类**：`_route_file()` 根据关键词把候选项分配到 6 个分类文件：
-   - `project.md` — 架构、模块
-   - `decisions.md` — 决策、取舍
-   - `commands.md` — 命令、shell
-   - `debugging.md` — 调试、错误
-   - `preferences.md` — 偏好、习惯
-   - `learnings.md` — 其他学习（兜底）
-3. **冲突检测与 supersede**：`_find_conflict()` 检查是否有同 file + 同 anchor 或同 source_paths 的已有记录。如果有冲突，旧记录被标记为 `superseded`，新记录的 `supersedes` 字段记录旧 ID。被 supersede 的记录不会被删除，而是标记 `status="superseded"` + `superseded_by`，保留审计轨迹。
-4. **原子写入**：`store.atomic_write()` 把更新后的 records、分类 markdown、导航文件 `MEMORY.md` 和 `dream-log.md` 一次性写入。
-5. **清空 inbox**：整合完成后清空 `inbox.jsonl`。
+1. 文件未变化：保持 `active`。
+2. 文件变化或消失：用版本锁改为 `review_required`，正文仍作为历史线索展示。
+3. Agent 阅读当前文件并确认结论仍成立：调用 `memory_validate` 更新指纹和版本，恢复 `active`。
+4. 结论已经失效：`memory_write(supersedes=<old id>, expected_version=<old version>)` 创建新文档；旧文档标记 `superseded` 并链接新文档，退出普通召回但保留审计。
 
-### 召回：BM25 检索
+记忆块始终带有 “reference only” 约束。记忆中的命令不会因为检索或后台提炼而执行；当前用户指令、项目规则和刚读取的代码事实始终优先。
 
-`MemoryRecall.search()` 在每个用户 turn 开始时触发：
+### 真正遗忘为什么和 supersede 不同
 
-1. `MemoryQueryComposer.compose()` 从用户消息中提取查询（判断 `should_recall` — 如果是闲聊或简单确认则跳过）
-2. `search_bm25()` 对 `records.jsonl` 中的 active 记录做 BM25 检索，取 top-6，阈值 0.3
-3. 命中的记录格式化为 `"Relevant long-term memory:"` 块，注入到上下文中
-4. 使用 `_cached_mtime` 做文件级缓存：只有 `records.jsonl` 修改时间变了才重建索引
+一般纠错保留旧正文并标记 `superseded`，因为它对审计和解释决策变化有价值。用户明确要求忘记时，`memory_forget` 会删除正文、索引和使用记录，只留下不含原内容的哈希抑制标记。后台提炼看到相同 session evidence 时会跳过，避免被删除内容又从旧会话中长回来。
 
-### 效果怎么量化
+### 为什么暂时不用向量数据库
 
-固定 Memory A/B suite 的结果是：tool calls **-50.0%**、elapsed **-18.8%**、tokens **-44.7%**。这不表示 Memory 会让所有任务减半，而是命中过往项目事实后减少了重复调查；泛化性仍需要更大任务集和多次运行验证。
-
-### 如果面试官追问"记忆冲突怎么解决？会不会新记忆覆盖了正确的旧记忆？"
-
-supersede 机制是基于 **file + anchor 匹配**和 **source_paths 交集**的。如果新记忆和旧记忆关于同一个文件的同一个主题，新的会取代旧的。这个设计假设是：关于同一个主题的最新记忆更准确。
-
-这确实有误伤风险 — 比如旧的偏好记忆其实是对的，新的是 Agent 误解了。缓解措施是：
-
-1. 被 supersede 的记录不删除，保留在 `records.jsonl` 中，只是 `status="superseded"`
-2. `dream-log.md` 记录了每次整合的具体操作（merged 哪些、superseded 哪些），可审计
-3. `confidence` 字段预留了置信度信息（目前默认 0.5，未来可以用来做更智能的冲突解决）
-
-### 如果面试官追问"为什么不用向量数据库做召回？"
-
-当前用 BM25 而不是向量检索，原因是：
-
-1. **零依赖**：不需要 embedding model 或向量数据库，纯本地 Python 实现
-2. **记忆规模小**：典型用户的活跃记录在几十到几百条，BM25 完全够用
-3. **可解释性**：BM25 的匹配可以看到具体是哪些关键词命中，比向量相似度更可调试
-4. **离线可用**：不需要调 embedding API，完全离线工作
-
-如果未来记忆规模增长到万级，可以考虑引入轻量级向量检索（如 `sentence-transformers` + FAISS），但当前阶段 BM25 是复杂度最低的正确选择。
+当前记忆规模适合 BM25；中文二元词和路径匹配已经覆盖代码仓库最常见的查询方式。它不需要 embedding 服务，结果可解释，索引可以从 Markdown 重建。评估采用三组双会话协议：关闭记忆、普通召回、带适用性检查召回，比较正确率、过时结论采用率、重复调查、token、延迟和提炼成本，而不是只报告一次静态 seed 的 A/B 数字。
 
 ---
 

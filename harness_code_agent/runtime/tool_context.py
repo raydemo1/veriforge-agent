@@ -22,6 +22,8 @@ class ToolContext:
     permission_policy: PermissionPolicy
     event_bus: EventBus
     session_id: str | None = None
+    memory_use_enabled: bool = True
+    memory_generate_enabled: bool = True
     approval_provider: ApprovalProvider = field(default_factory=NoApprovalProvider)
     question_provider: QuestionProvider = field(default_factory=NoQuestionProvider)
     tool_registry: ToolRegistry | None = None

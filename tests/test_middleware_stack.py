@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 from harness_code_agent.runtime.middleware import (
     AgentMiddleware,
-    MemoryMiddleware,
     StaticVerifierMiddleware,
     ToolFailurePolicyMiddleware,
     ToolGuardMiddleware,
@@ -29,12 +28,12 @@ class MiddlewareStackFactoryTests(unittest.TestCase):
         context = SimpleNamespace(workspace=workspace)
         return context, registry, workspace
 
-    def test_main_agent_stack_order_with_memory(self):
+    def test_main_agent_stack_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             context, registry, workspace = self._context(root)
             marker = _MarkerMiddleware()
-            agent_config = SimpleNamespace(middlewares=[marker], memory_enabled=True)
+            agent_config = SimpleNamespace(middlewares=[marker])
 
             stack = build_main_agent_middlewares(
                 agent_config=agent_config,
@@ -49,7 +48,6 @@ class MiddlewareStackFactoryTests(unittest.TestCase):
                     _MarkerMiddleware,
                     ToolGuardMiddleware,
                     ToolFailurePolicyMiddleware,
-                    MemoryMiddleware,
                     PermissionMiddleware,
                     StaticVerifierMiddleware,
                 ],
@@ -57,41 +55,37 @@ class MiddlewareStackFactoryTests(unittest.TestCase):
             # Profile-provided middleware is the same instance, not copied.
             self.assertIs(stack[0], marker)
             self.assertIs(stack[2].tool_registry, registry)
-            self.assertEqual(stack[3].workspace, root.resolve())
-            self.assertIs(stack[4]._ctx, context)
-            self.assertIs(stack[4]._registry, registry)
-            self.assertEqual(stack[5]._workspace_root, str(root))
-            self.assertIs(stack[5]._workspace, workspace)
+            self.assertIs(stack[3]._ctx, context)
+            self.assertIs(stack[3]._registry, registry)
+            self.assertEqual(stack[4]._workspace_root, str(root))
+            self.assertIs(stack[4]._workspace, workspace)
 
-    def test_main_agent_stack_omits_memory_when_disabled_and_defaults_on(self):
+    def test_main_agent_stack_has_no_memory_middleware(self):
+        # Memory lives outside the middleware stack (index injected into
+        # the system prompt), so memory_enabled must not alter the stack.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             context, registry, _ = self._context(root)
 
-            disabled = build_main_agent_middlewares(
-                agent_config=SimpleNamespace(middlewares=[], memory_enabled=False),
-                tool_context=context,
-                tool_registry=registry,
-                workspace=root,
-            )
-            self.assertEqual(
-                [type(mw) for mw in disabled],
-                [
-                    ToolGuardMiddleware,
-                    ToolFailurePolicyMiddleware,
-                    PermissionMiddleware,
-                    StaticVerifierMiddleware,
-                ],
-            )
-
-            # AgentConfig without an explicit memory_enabled keeps memory on.
-            default = build_main_agent_middlewares(
-                agent_config=SimpleNamespace(middlewares=[]),
-                tool_context=context,
-                tool_registry=registry,
-                workspace=root,
-            )
-            self.assertIn(MemoryMiddleware, [type(mw) for mw in default])
+            expected = [
+                ToolGuardMiddleware,
+                ToolFailurePolicyMiddleware,
+                PermissionMiddleware,
+                StaticVerifierMiddleware,
+            ]
+            for config in (
+                SimpleNamespace(middlewares=[], memory_enabled=True),
+                SimpleNamespace(middlewares=[], memory_enabled=False),
+                SimpleNamespace(middlewares=[]),
+            ):
+                with self.subTest(config=config):
+                    stack = build_main_agent_middlewares(
+                        agent_config=config,
+                        tool_context=context,
+                        tool_registry=registry,
+                        workspace=root,
+                    )
+                    self.assertEqual([type(mw) for mw in stack], expected)
 
     def test_subagent_stack_is_permission_only(self):
         context = SimpleNamespace(workspace=object())

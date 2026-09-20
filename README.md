@@ -15,7 +15,7 @@ VeriForge 是一个面向真实代码仓库的可验证 Coding-Agent Runtime。
 - 资源感知调度：无冲突调用可并行，冲突资源按顺序执行，结果按模型顺序回写
 - 安全修改：工作区路径保护、快照、审批、危险命令拦截和退出前验证
 - 子代理协作：只读 Agent 并行调查，worker 在隔离副本中生成可复查提案
-- 上下文与复盘：压缩、handoff、Memory、事件日志、checkpoint 和 eval ledger
+- 上下文与记忆：可恢复的 JSONL 会话手账、结构化压缩、Markdown 长期记忆和可重建索引
 - OpenTUI：命令与 `@` 补全、审批、会话、运行观察和模型设置
 
 ## 快速开始
@@ -60,6 +60,8 @@ veriforge -p "Review this repository"
 /checkpoint   管理检查点
 /mcp          管理 MCP 服务
 /compact      压缩上下文
+/context      查看上下文预算
+/memory       搜索、验证与管理长期记忆
 /fork         创建会话分支
 /observe      查看运行状态
 ```
@@ -87,10 +89,11 @@ veriforge --profile review "Review the current branch"
 
 | 模块 | 职责 |
 | --- | --- |
-| `agent/` | 对话循环、上下文、provider、取消和子代理 |
+| `agent/` | 对话循环、统一上下文生命周期、provider、取消和子代理 |
 | `runtime/` | 工具 registry、权限、调度、middleware 和 MCP |
 | `workspace/` | 文件保护、快照、Shell 和后台任务 |
-| `sessions/` | session metadata、事件和报告 |
+| `sessions/` | session metadata、事件、逻辑消息手账和报告 |
+| `memory/` | Markdown 记忆正文、BM25 检索、适用性验证和后台提炼 |
 | `profiles/` | 不同任务模式的 prompt、工具面和验收策略 |
 | `frontend/opentui/` | Bun + React + TypeScript 终端界面 |
 | `eval/` | 基准任务、运行器和结果账本 |

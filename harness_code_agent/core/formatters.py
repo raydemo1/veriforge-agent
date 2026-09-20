@@ -7,6 +7,7 @@ from pathlib import Path
 from .. import config
 from ..profiles import list_profiles
 from ..runtime.mcp import McpClientManager, McpConfigError, load_mcp_config
+from ..sessions.journal import SessionJournal
 from ..sessions.store import SessionStore
 from ..sessions.summary import load_session_summary
 from ..workspace.service import WorkspaceService
@@ -214,6 +215,20 @@ def _build_resume_context(
 ) -> str:
     lineage = store.read_lineage(session_id)
     current = lineage[-1]
+    journal_path = store.root / "sessions" / session_id / "journal.jsonl"
+    if journal_path.exists() and journal_path.stat().st_size:
+        recovered = SessionJournal(journal_path).recovery_messages("")
+        lines = [
+            f"Resuming session: {current.get('id', session_id)}",
+            "The following state was rebuilt from the append-only session journal.",
+            "Re-check current files before relying on old tool output.",
+            "",
+        ]
+        for message in recovered[1:]:
+            role = message.get("role", "unknown")
+            content = str(message.get("content") or "")
+            lines.append(f"[{role}] {content}")
+        return "\n\n".join(lines)
     lines = [
         f"Resuming session: {current.get('id', session_id)}",
         "Lineage: " + " -> ".join(item.get("id", "") for item in lineage),

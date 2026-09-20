@@ -16,10 +16,12 @@ from ..runtime.builtins.registry import TOOL_SCHEMAS
 from ..runtime.tool_context import ToolContext
 from ..runtime.tool_result import ToolResult
 from ..runtime.tool_runner import finalize_intercepted_tool_result
+from ..sessions.journal import SessionJournal
 from ..workspace.shell_jobs import ShellJobManager
 from . import context
 from .cancellation import CancelledError
 from .compaction import CompactionGate, compaction_action, get_thresholds
+from .context_manager import ContextManager
 from .llm_channel import (
     LlmChannel,
     LlmRequestTimeoutError,
@@ -56,7 +58,7 @@ class Agent:
     This is the 'managed agent loop' from the architecture:
     - while loop with llm.call(prompt)
     - tool execution
-    - context lifecycle (lightweight compaction / handoff reset)
+    - context lifecycle (structured compaction / journal recovery)
 
     Skills are handled via progressive disclosure:
     - Model-invoked descriptions are baked into the system prompt.
@@ -158,6 +160,7 @@ class AgentConversation:
         self._queued_messages_lock = threading.Lock()
         self._iteration_offset = 0
         self.compaction_gate = CompactionGate()
+        self.context_manager = ContextManager()
         self.event_bus = agent.tool_context.event_bus if agent.tool_context is not None else None
         self.runtime_state.event_bus = self.event_bus
         self.emitter.event_bus = self.event_bus
@@ -167,6 +170,14 @@ class AgentConversation:
         self._log_rewrite_version = 0
         self._last_prompt_cache_shape = None
         self._pending_prompt_cache_shape = None
+        session_id = getattr(self.runtime_state, "session_id", "default")
+        self.journal = None
+        if session_id and session_id != "default":
+            self.journal = SessionJournal(
+                self._workspace_root() / ".harness" / "sessions" / session_id / "journal.jsonl"
+            )
+            if not self.journal.read():
+                self.journal.append_message(self.messages[0])
         self._run_conversation_start_middlewares()
         if initial_task is not None:
             self.add_user_turn(initial_task)
@@ -233,16 +244,19 @@ class AgentConversation:
             tool_schemas=_tool_schemas_for_agent(self.agent),
         )
         self._strip_dynamic_context_messages()
-        summarized = context.summarize_older_conversation(
+        compacted = self.context_manager.compact(
             self.messages,
             llm_call_simple,
             current_turn_start_index=max(1, self.runtime_state.current_turn_start_index),
+            state=self._working_context_state(),
+            force=True,
         )
-        if summarized == self.messages:
+        if compacted is None:
             return "当前对话暂时无需压缩"
-        self._replace_messages(summarized)
+        self._replace_messages(compacted.messages)
+        self._journal_compaction(compacted.summary, compacted.first_kept_index, "manual", messages_before)
         self.compaction_gate.mark_compacted()
-        summary_text = _first_compacted_summary(summarized)
+        summary_text = compacted.summary
         self._emit_compaction_committed(
             messages_before=messages_before,
             token_count_before=token_count_before,
@@ -302,7 +316,21 @@ class AgentConversation:
 
     def _append_message(self, message: dict) -> None:
         self.messages.append(message)
+        if self.journal is not None:
+            self.journal.append_message(message)
         self.compaction_gate.bump_revision()
+
+    def _journal_compaction(self, summary: str, first_kept_index: int, phase: str, messages_before: int) -> None:
+        if self.journal is None:
+            return
+        kept_count = max(0, messages_before - first_kept_index)
+        boundary = self.journal.first_sequence_of_recent_messages(kept_count)
+        self.journal.append_compaction(
+            summary=summary,
+            first_kept_sequence=boundary,
+            phase=phase,
+            state=self._working_context_state(),
+        )
 
     def _run_conversation_start_middlewares(self) -> None:
         for mw in self.agent.middlewares:
@@ -444,17 +472,24 @@ class AgentConversation:
             threshold=thresholds.compact,
             phase="summarizing_history",
         )
-        summarized = context.summarize_older_conversation(
+        compacted = self.context_manager.compact(
             self.messages,
             llm_call_simple,
             current_turn_start_index=state.current_turn_start_index,
+            state=self._working_context_state(),
         )
         summary_chars = 0
         summary_text = ""
-        if summarized != self.messages:
-            summary_text = _first_compacted_summary(summarized)
+        if compacted is not None:
+            summary_text = compacted.summary
             summary_chars = len(summary_text)
-            self._replace_messages(summarized)
+            self._replace_messages(compacted.messages)
+            self._journal_compaction(
+                compacted.summary,
+                compacted.first_kept_index,
+                "summarizing_history",
+                messages_before,
+            )
             self.compaction_gate.mark_compacted()
             self._emit_compaction_committed(
                 messages_before=messages_before,
@@ -473,7 +508,7 @@ class AgentConversation:
             state.context_refill_streak = 0
             return
 
-        # Layer 2 — reset context from a persisted handoff document
+        # A failed/insufficient summary never discards additional context.
         state.context_refill_streak += 1
         state.auto_compaction_suspended = True
         self.emitter.emit_compaction_started(
@@ -482,49 +517,6 @@ class AgentConversation:
             phase="auto_compaction_suspended",
         )
         self.trace.context_event("auto_compaction_suspended", f"streak={state.context_refill_streak}")
-        if state.context_refill_streak >= 2:
-            self._handoff_reset_context(agent, token_count=tokens_after_summary, thresholds=thresholds)
-
-    def _handoff_reset_context(self, agent: Agent, *, token_count: int, thresholds) -> None:
-        self.emitter.emit_compaction_started(
-            token_count=token_count,
-            threshold=thresholds.compact,
-            phase="handoff_reset",
-        )
-        messages_before = len(self.messages)
-        system_prompt = (
-            self.messages[0].get("content", "")
-            if self.messages and self.messages[0].get("role") == "system"
-            else agent.system_prompt
-        )
-        workspace = str(self._workspace_root())
-        handoff, handoff_path = context.create_handoff_reset(
-            self.messages,
-            self._working_context_state(),
-            llm_call_simple,
-            session_id=self.runtime_state.session_id,
-            profile=agent.name,
-            workspace=workspace,
-            max_turns=5,
-        )
-        reset_messages = context.restore_from_handoff_reset(handoff, system_prompt, handoff_path)
-        self._replace_messages(reset_messages)
-        self.runtime_state.current_turn_start_index = max(1, len(self.messages) - 1)
-        self.compaction_gate.mark_compacted()
-        self.runtime_state.context_refill_streak = 0
-        self.runtime_state.auto_compaction_suspended = True
-        self.runtime_state.auto_compaction_turn_start_index = -1
-        self.runtime_state.context_anxiety_turn_start_index = -1
-        self.runtime_state.fallback = AgentFallbackState()
-        summary_text = _first_compacted_summary(self.messages)
-        self._emit_compaction_committed(
-            messages_before=messages_before,
-            token_count_before=token_count,
-            summary_chars=len(summary_text),
-            summary_text=summary_text,
-            phase="handoff_reset",
-        )
-        self._refresh_dynamic_context_after_compaction(phase="handoff_reset")
 
     def _working_context_state(self) -> dict:
         recent_errors, failed_commands = self._recent_error_state()
@@ -990,7 +982,7 @@ def _first_compacted_summary(messages: list[dict]) -> str:
     for message in messages:
         content = str(message.get("content") or "")
         if not (
-            content.startswith(("[COMPACTED CONTEXT", "[HANDOFF RESET]"))
+            content.startswith("[COMPACTED CONTEXT")
         ):
             continue
         _header, _sep, body = content.partition("\n")

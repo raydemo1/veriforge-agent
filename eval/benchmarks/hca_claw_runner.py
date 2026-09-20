@@ -17,7 +17,6 @@ def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("HARNESS_STREAM", "0")
     os.environ.setdefault("HARNESS_MEMORY_DISABLED", "1")
     os.environ.setdefault("HARNESS_MENTION_MODE", "off")
-    os.environ.setdefault("HARNESS_MEMORY_DREAM_CHECK_INTERVAL_SECONDS", "3600")
 
     try:
         from harness_code_agent.core.interactive import (

@@ -24,6 +24,7 @@ from typing_extensions import Self
 
 from harness_code_agent import config
 from harness_code_agent.agent import context
+from harness_code_agent.agent.context_manager import ContextManager
 from harness_code_agent.agent.conversation import Agent
 from harness_code_agent.agent.providers import current_adapter, get_client
 from harness_code_agent.agent.utils import (
@@ -335,12 +336,14 @@ class DeepSeekContextEvaluator:
             return str(summary_assistant.get("content") or "")
 
         current_turn_start = max(1, len(messages) - 2)
-        rewritten = context.summarize_older_conversation(
+        compacted = ContextManager().compact(
             messages,
             summarize_with_deepseek,
             current_turn_start_index=current_turn_start,
+            state={},
+            force=True,
         )
-        messages = rewritten
+        messages = compacted.messages if compacted is not None else messages
         for post_turn in range(1, max(1, self.args.post_rewrite_turns) + 1):
             messages.append({
                 "role": "user",

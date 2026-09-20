@@ -1,6 +1,6 @@
 {
   "suite": "memory_ab",
-  "description": "Fixed A/B tasks for measuring long-term memory impact. Baseline disables memory; treatment seeds these records.",
+  "description": "Two-session lifecycle tasks comparing disabled memory, unchecked recall, and recall with source applicability checks.",
   "tasks": [
     {
       "id": "context_tail_budget",
@@ -63,17 +63,18 @@
       ]
     },
     {
-      "id": "memory_middleware",
+      "id": "memory_service_lifecycle",
       "profile": "general",
-      "prompt": "Find how long-term memory is injected into the agent prompt.",
-      "success_markers": ["MemoryMiddleware", "MEMORY.md", "memory_search"],
+      "prompt": "Find how long-term memory is stored, recalled, and invalidated when source files change.",
+      "success_markers": ["MemoryService", "review_required", "expected_version"],
       "memory_records": [
         {
-          "file": "project.md",
-          "title": "Memory middleware injection points",
-          "summary": "MemoryMiddleware injects a compact MEMORY.md index at conversation start and after compaction, and augments user turns with MemoryRecall search results surfaced through memory_search/read_memory_file tooling.",
-          "tags": ["memory", "middleware", "recall"],
-          "source_paths": ["harness_code_agent/runtime/middleware/memory.py"]
+          "title": "Long-term memory lifecycle",
+          "summary": "MemoryService stores authoritative Markdown entries, uses a rebuildable SQLite BM25 index, requires expected_version for updates, and marks a recalled memory review_required when its source fingerprints changed.",
+          "stale_summary": "MemoryMiddleware injects records.jsonl results and read_memory_file exposes the selected record after Dream consolidation.",
+          "stale_markers": ["MemoryMiddleware", "read_memory_file", "Dream"],
+          "applicability": "When explaining long-term memory storage, recall, revisions, or stale evidence handling.",
+          "source_paths": ["harness_code_agent/memory/service.py", "harness_code_agent/memory/store.py"]
         }
       ]
     }

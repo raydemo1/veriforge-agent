@@ -28,6 +28,12 @@ eval = [
 [project.scripts]
 veriforge = "harness_code_agent.cli:main"
 
+[tool.pytest.ini_options]
+# Keep bare `pytest` scoped to the test suite: eval/results holds historical
+# run artifacts (including stale symlink trees on Windows) that are not
+# tests and break collection when pytest recurses the whole repository.
+testpaths = ["tests"]
+
 [tool.setuptools.packages.find]
 include = ["harness_code_agent*"]
 
@@ -50,7 +56,6 @@ include = ["harness_code_agent*"]
 "harness_code_agent/runtime/builtins/shell.py" = ["BLE001"]
 "harness_code_agent/runtime/builtins/web.py" = ["BLE001"]
 "harness_code_agent/runtime/mcp.py" = ["BLE001"]
-"harness_code_agent/runtime/middleware/memory.py" = ["BLE001"]
 "harness_code_agent/runtime/middleware/verification.py" = ["BLE001"]
 "harness_code_agent/runtime/tool_runner.py" = ["BLE001"]
 "harness_code_agent/sessions/events.py" = ["BLE001"]

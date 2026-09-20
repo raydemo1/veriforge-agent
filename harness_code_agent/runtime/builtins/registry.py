@@ -49,7 +49,13 @@ from .filesystem import (
     write_file,
 )
 from .interaction import ask_user
-from .memory_tools import memory_search, read_memory_file, remember_memory
+from .memory_tools import (
+    memory_forget,
+    memory_read,
+    memory_search,
+    memory_validate,
+    memory_write,
+)
 from .schemas import BROWSER_TOOL_SCHEMAS, CORE_TOOL_SCHEMAS
 from .shell import list_shell_jobs, read_shell_output, run_bash, stop_shell_job
 from .todo import update_todo
@@ -103,12 +109,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         capabilities=all_agents,
     )
     add("memory_search", memory_search, TOOL_PERMISSION_READ, capabilities=all_agents)
-    add(
-        "read_memory_file",
-        read_memory_file,
-        TOOL_PERMISSION_READ,
-        capabilities=all_agents,
-    )
+    add("memory_read", memory_read, TOOL_PERMISSION_READ, capabilities=all_agents)
     add(
         "web_search",
         web_search,
@@ -231,7 +232,9 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         TOOL_PERMISSION_READ,
         CallEffect.global_exclusive(kind="interaction"),
     )
-    add("remember_memory", remember_memory, TOOL_PERMISSION_EDIT)
+    add("memory_write", memory_write, TOOL_PERMISSION_EDIT)
+    add("memory_validate", memory_validate, TOOL_PERMISSION_EDIT)
+    add("memory_forget", memory_forget, TOOL_PERMISSION_EDIT)
     add(
         "update_todo",
         update_todo,

@@ -1,19 +1,11 @@
-"""Context lifecycle helpers for lightweight auto-compaction.
-
-Auto-compaction starts near the context limit by summarizing older conversation.
-If the context rapidly refills across turns, the session is reset from a
-persisted handoff document. It never rewrites the system prompt or tools schema.
-"""
+"""Context lifecycle helpers for token-safe structured compaction."""
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
 import re
-import tempfile
-import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from .. import config
 
@@ -164,163 +156,8 @@ def detect_anxiety(messages: list[dict]) -> ContextAnxietySignal:
     return ContextAnxietySignal()
 
 
-# ---------------------------------------------------------------------------
-# Compaction
-# ---------------------------------------------------------------------------
-
-def summarize_older_conversation(
-    messages: list[dict],
-    llm_call,
-    *,
-    current_turn_start_index: int,
-) -> list[dict]:
-    """Summarize conversation before the current turn and keep current turn raw."""
-    if not messages:
-        return messages
-
-    system = [messages[0]] if messages[0].get("role") == "system" else []
-    system_len = len(system)
-    split = max(system_len, min(current_turn_start_index, len(messages)))
-    older = messages[system_len:split]
-    current = messages[split:]
-    if not older:
-        return messages
-    if not _compaction_economics(older):
-        return messages
-
-    old_text = _messages_to_text(older)
-    summary = llm_call([
-        {"role": "system", "content": (
-            "You are summarizing older conversation history for a coding agent. "
-            "Preserve decisions, active constraints, changed files, files touched, "
-            "failed commands, recent errors, current status, and next action. "
-            "Discard old full tool output, repeated logs, and resolved branches."
-        )},
-        {"role": "user", "content": old_text},
-    ])
-    summary_msg = {
-        "role": "user",
-        "content": f"[COMPACTED CONTEXT — summary of older conversation]\n{summary}",
-    }
-    return system + [summary_msg] + current
-
-
-def create_handoff_reset(
-    messages: list[dict],
-    state: dict,
-    llm_call,
-    *,
-    session_id: str = "default",
-    profile: str = "",
-    workspace: str = "",
-    max_turns: int = 5,
-) -> tuple[str, Path]:
-    """Create a handoff document for a fresh context reset and persist it to temp."""
-    if not messages:
-        handoff = _fallback_handoff_text(state, session_id=session_id, profile=profile, workspace=workspace)
-        return _persist_handoff_reset(handoff, session_id=session_id)
-
-    recent = _last_turn_messages(messages, max_turns=max_turns)
-    recent_text = _messages_to_text([
-        _sanitize_message_for_rebuild(msg)
-        for msg in recent
-        if msg.get("role") != "system"
-    ])
-    reset_input = (
-        "Create a handoff document for a fresh coding-agent session after an automatic context reset.\n\n"
-        "Requirements:\n"
-        "- Save-worthy content only; the next model context will be empty except for this handoff.\n"
-        "- Include a Suggested Skills section.\n"
-        "- Reference existing artifacts by path instead of duplicating them.\n"
-        "- Redact secrets, credentials, tokens, and personal data.\n"
-        "- Preserve current task, status, constraints, changed files, errors, and exact next action.\n"
-        "- Mention that shell state may persist but cwd/env should be verified before relying on it.\n\n"
-        f"Session: {session_id or 'default'}\n"
-        f"Profile: {profile or 'unknown'}\n"
-        f"Workspace: {workspace or config.WORKSPACE}\n\n"
-        f"## Current User Task\n{_state_value(state, 'current_user_task')}\n\n"
-        f"## Current Todo\n{_state_value(state, 'current_todo')}\n\n"
-        f"## Changed Files\n{_state_list(state, 'changed_files')}\n\n"
-        f"## Files Touched\n{_state_list(state, 'files_touched')}\n\n"
-        f"## Recent Errors\n{_state_list(state, 'recent_errors')}\n\n"
-        f"## Failed Commands\n{_state_list(state, 'failed_commands')}\n\n"
-        f"## Active Constraints\n{_state_list(state, 'active_constraints')}\n\n"
-        f"## Latest Checkpoint Summary\n{_state_value(state, 'latest_checkpoint_summary')}\n\n"
-        f"## Last {max_turns} Turns\n{recent_text or 'none'}\n\n"
-        f"## Next Recommended Action\n{_state_value(state, 'next_recommended_action')}\n\n"
-        "Avoid duplicating old full tool output, read_file content, repeated logs, and resolved branches."
-    )
-    handoff = llm_call([
-        {"role": "system", "content": (
-            "You are writing a concise but complete handoff document for a fresh agent context. "
-            "Use Markdown headings. Include: Summary, Current State, Suggested Skills, "
-            "Important Files/Artifacts, Known Issues, and Next Steps."
-        )},
-        {"role": "user", "content": reset_input},
-    ])
-    if not isinstance(handoff, str) or not handoff.strip():
-        handoff = _fallback_handoff_text(state, session_id=session_id, profile=profile, workspace=workspace)
-    return _persist_handoff_reset(handoff.strip(), session_id=session_id)
-
-
-def restore_from_handoff_reset(handoff: str, system_prompt: str, handoff_path: str | Path) -> list[dict]:
-    """Build a fresh message list from a persisted handoff reset document."""
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": (
-            "[HANDOFF RESET]\n"
-            "The previous context was intentionally cleared after an automatic context reset. "
-            "Continue this same session using the handoff document below as the source of continuity.\n\n"
-            f"Handoff document path: {handoff_path}\n\n"
-            "## Handoff Document\n"
-            + handoff.strip()
-            + "\n\nDo not assume old tool outputs are current facts. Re-read files or rerun commands before relying on exact current state."
-        )},
-    ]
-
-
 def _compaction_economics(messages: list[dict]) -> bool:
     return count_tokens(messages) >= MIN_COMPACT_REGION_TOKENS
-
-
-def _persist_handoff_reset(handoff: str, *, session_id: str) -> tuple[str, Path]:
-    safe_session = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in (session_id or "default"))
-    root = Path(tempfile.gettempdir()) / "harness-code-agent" / "handoffs" / safe_session
-    root.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    path = root / f"handoff-{stamp}-{int(time.time() * 1000) % 1000:03d}.md"
-    path.write_text(handoff.rstrip() + "\n", encoding="utf-8")
-    return handoff.rstrip(), path
-
-
-def _fallback_handoff_text(state: dict, *, session_id: str, profile: str, workspace: str) -> str:
-    return (
-        "# Handoff Reset\n\n"
-        "## Summary\n"
-        "The previous context was cleared after repeated auto-compaction pressure. "
-        "Continue the same session from the state below.\n\n"
-        "## Current State\n"
-        f"- Session: {session_id or 'default'}\n"
-        f"- Profile: {profile or 'unknown'}\n"
-        f"- Workspace: {workspace or config.WORKSPACE}\n"
-        f"- Current task: {_state_value(state, 'current_user_task')}\n"
-        f"- Current todo: {_state_value(state, 'current_todo')}\n"
-        f"- Changed files: {_state_list(state, 'changed_files')}\n"
-        f"- Files touched: {_state_list(state, 'files_touched')}\n\n"
-        "## Suggested Skills\n"
-        "- Use repo-specific skills only if the next task mentions them or requires their workflow.\n\n"
-        "## Known Issues\n"
-        f"{_state_list(state, 'recent_errors')}\n\n"
-        "## Failed Commands\n"
-        f"{_state_list(state, 'failed_commands')}\n\n"
-        "## Active Constraints\n"
-        f"{_state_list(state, 'active_constraints')}\n\n"
-        "## Next Steps\n"
-        f"{_state_value(state, 'next_recommended_action')}\n\n"
-        "## Notes\n"
-        "Shell state may persist across this reset, but verify cwd/env before relying on it. "
-        "Re-read files or rerun commands before relying on exact current facts."
-    )
 
 
 # ---------------------------------------------------------------------------

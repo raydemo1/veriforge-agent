@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from ..runtime.permissions import (
+    TOOL_PERMISSION_EDIT,
     TOOL_PERMISSION_NETWORK_READ,
     TOOL_PERMISSION_READ,
 )
@@ -37,7 +38,9 @@ class GeneralProfile(BaseProfile):
                 boundaries=(
                     "This profile is read-only. Do not modify files, run direct shell commands, manage jobs, "
                     "start browser sessions, maintain execution todo state, use delegated agents, or turn a "
-                    "discussion into an implementation interview. Specialized implementation, planning, "
+                    "discussion into an implementation interview. You may write, validate, or forget long-term "
+                    "memory only when the user explicitly asks or the durable fact is unambiguous. "
+                    "Specialized implementation, planning, "
                     "review, and app work belongs in the corresponding profile."
                 ),
                 completion=(
@@ -50,11 +53,11 @@ class GeneralProfile(BaseProfile):
             allowed_tool_permissions={
                 TOOL_PERMISSION_READ,
                 TOOL_PERMISSION_NETWORK_READ,
+                TOOL_PERMISSION_EDIT,
             },
             blocked_tool_names={
                 "write_file",
                 "apply_patch",
-                "remember_memory",
                 "update_todo",
                 "ask_user",
                 "run_bash",

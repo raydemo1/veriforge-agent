@@ -85,6 +85,8 @@ def default_command_registry(skill_registry=None) -> SlashCommandRegistry:
         CommandSpec("/checkpoint", "工作流", "/checkpoint", "打开检查点管理", _checkpoint_picker),
         CommandSpec("/mcp", "工作流", "/mcp", "打开 MCP 服务与工具管理", _mcp_picker),
         CommandSpec("/compact", "工作流", "/compact", "压缩当前对话上下文", _compact_now),
+        CommandSpec("/context", "会话", "/context", "查看上下文预算组成", _context_status),
+        CommandSpec("/memory", "会话", "/memory", "查看与管理长期记忆", _memory_command),
         CommandSpec("/fork", "会话", "/fork", "从当前会话创建并进入分支", _fork_current),
         CommandSpec("/observe", "会话", "/observe", "打开当前项目的运行观察", _observe_panel),
     ]
@@ -149,6 +151,15 @@ def _compact_now(session: Any, args: list[str], registry: SlashCommandRegistry) 
     _no_args(args, "用法：/compact")
     _require_bound(session)
     return CommandResult(action="compact")
+
+
+def _context_status(session: Any, args: list[str], registry: SlashCommandRegistry) -> CommandResult:
+    _no_args(args, "用法：/context")
+    return CommandResult(session.context_status())
+
+
+def _memory_command(session: Any, args: list[str], registry: SlashCommandRegistry) -> CommandResult:
+    return CommandResult(session.memory_command(args))
 
 
 def _fork_current(session: Any, args: list[str], registry: SlashCommandRegistry) -> CommandResult:

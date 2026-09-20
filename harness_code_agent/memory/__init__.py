@@ -1,5 +1,13 @@
-"""File-system long-term memory for VeriForge."""
+"""Auditable long-term memory for VeriForge."""
 
-from .store import MemoryRecord, MemoryStore, default_memory_root
+from .service import MemoryHit, MemoryService
+from .store import MemoryDocument, MemoryStore, MemoryWriteCommand, default_memory_root
 
-__all__ = ["MemoryRecord", "MemoryStore", "default_memory_root"]
+__all__ = [
+    "MemoryDocument",
+    "MemoryHit",
+    "MemoryService",
+    "MemoryStore",
+    "MemoryWriteCommand",
+    "default_memory_root",
+]

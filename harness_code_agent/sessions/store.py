@@ -20,6 +20,7 @@ class Session:
     snapshots_dir: Path
     summary_path: Path
     compacted_dir: Path = Path(".")
+    journal_path: Path = Path(".")
 
 
 class SessionStore:
@@ -56,6 +57,7 @@ class SessionStore:
             snapshots_dir=snapshots_dir,
             summary_path=session_root / "summary.md",
             compacted_dir=compacted_dir,
+            journal_path=session_root / "journal.jsonl",
         )
         metadata = {
             "id": session.id,
@@ -75,6 +77,7 @@ class SessionStore:
             encoding="utf-8",
         )
         session.events_path.write_text("", encoding="utf-8")
+        session.journal_path.write_text("", encoding="utf-8")
         return session
 
     def fork(self, source_session_id: str) -> Session:
@@ -86,6 +89,12 @@ class SessionStore:
             model=source_metadata["model"],
             permission_mode=source_metadata["permission_mode"],
         )
+        source_journal = self._session_root(source_session_id) / "journal.jsonl"
+        if source_journal.exists():
+            session.journal_path.write_text(
+                source_journal.read_text(encoding="utf-8", errors="replace"),
+                encoding="utf-8",
+            )
 
         metadata = json.loads(session.metadata_path.read_text(encoding="utf-8"))
         metadata.update(

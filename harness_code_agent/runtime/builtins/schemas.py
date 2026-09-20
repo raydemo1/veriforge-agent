@@ -326,9 +326,8 @@ CORE_TOOL_SCHEMAS = [
         "function": {
             "name": "memory_search",
             "description": (
-                "Search long-term project memory for relevant past decisions, "
-                "debugging notes, commands, preferences, and learnings. Returns summaries; "
-                "use read_memory_file for full details."
+                "Search project and user long-term memory. Results include status, version, "
+                "applicability, sources, and a concise body preview."
             ),
             "parameters": {
                 "type": "object",
@@ -338,6 +337,8 @@ CORE_TOOL_SCHEMAS = [
                         "type": "string",
                         "description": "Natural language search query.",
                     },
+                    "scope": {"type": "string", "enum": ["project", "user", "both"], "default": "both"},
+                    "paths": {"type": "array", "items": {"type": "string"}, "default": []},
                 },
             },
         },
@@ -345,52 +346,27 @@ CORE_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "remember_memory",
+            "name": "memory_write",
             "description": (
-                "Queue a long-term memory candidate. This tool never writes MEMORY.md, "
-                "manifest.json, dream-log.md, records.jsonl, or Markdown memory files directly; "
-                "Dream merges candidates later."
+                "Create or edit a durable Markdown memory immediately. Use supersedes plus "
+                "expected_version for a correction that must preserve the old memory as audit history."
             ),
             "parameters": {
                 "type": "object",
-                "required": ["summary"],
+                "required": ["topic", "body"],
                 "properties": {
-                    "summary": {
-                        "type": "string",
-                        "description": "Concise durable memory to preserve.",
-                    },
-                    "title": {
-                        "type": "string",
-                        "description": "Short title for the memory candidate.",
-                        "default": "",
-                    },
-                    "file": {
-                        "type": "string",
-                        "description": (
-                            "Optional Dream routing hint: project.md, decisions.md, commands.md, "
-                            "debugging.md, preferences.md, or learnings.md."
-                        ),
-                        "default": "",
-                    },
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional tags for later recall.",
-                        "default": [],
-                    },
+                    "topic": {"type": "string"},
+                    "body": {"type": "string"},
+                    "scope": {"type": "string", "enum": ["project", "user"], "default": "project"},
+                    "applicability": {"type": "string", "default": ""},
                     "source_paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Workspace paths related to this memory.",
                         "default": [],
                     },
-                    "confidence": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 1,
-                        "description": "Confidence that the memory is durable and useful.",
-                        "default": 0.7,
-                    },
+                    "memory_id": {"type": "string", "default": ""},
+                    "expected_version": {"type": ["integer", "null"], "minimum": 1, "default": None},
+                    "supersedes": {"type": "string", "default": ""},
                 },
             },
         },
@@ -398,26 +374,44 @@ CORE_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "read_memory_file",
-            "description": "Read a generated long-term memory file for details after MEMORY.md navigation or recall points to it.",
+            "name": "memory_read",
+            "description": "Read one memory by stable id, including its metadata and full body.",
             "parameters": {
                 "type": "object",
+                "required": ["memory_id"],
                 "properties": {
-                    "file": {
-                        "type": "string",
-                        "description": "Readable memory file.",
-                        "enum": [
-                            "MEMORY.md",
-                            "project.md",
-                            "decisions.md",
-                            "commands.md",
-                            "debugging.md",
-                            "preferences.md",
-                            "learnings.md",
-                            "dream-log.md",
-                        ],
-                        "default": "MEMORY.md",
-                    },
+                    "memory_id": {"type": "string"},
+                    "scope": {"type": "string", "enum": ["project", "user"], "default": "project"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_validate",
+            "description": "Confirm a memory after checking its current evidence and refresh its fingerprints.",
+            "parameters": {
+                "type": "object", "required": ["memory_id", "expected_version"],
+                "properties": {
+                    "memory_id": {"type": "string"},
+                    "expected_version": {"type": "integer", "minimum": 1},
+                    "scope": {"type": "string", "enum": ["project", "user"], "default": "project"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_forget",
+            "description": "Permanently remove a memory body after an explicit user request to forget it.",
+            "parameters": {
+                "type": "object", "required": ["memory_id", "expected_version"],
+                "properties": {
+                    "memory_id": {"type": "string"},
+                    "expected_version": {"type": "integer", "minimum": 1},
+                    "scope": {"type": "string", "enum": ["project", "user"], "default": "project"},
                 },
             },
         },

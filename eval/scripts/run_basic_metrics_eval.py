@@ -33,8 +33,7 @@ from eval.scripts.eval_common import (
     write_eval_reports,
     write_suite_summary,
 )
-from harness_code_agent.memory.dream import run_dream
-from harness_code_agent.memory.store import MemoryStore
+from harness_code_agent.memory.store import MemoryStore, MemoryWriteCommand
 from harness_code_agent.sessions.observability import build_session_observability
 from harness_code_agent.sessions.store import SessionStore
 
@@ -113,21 +112,44 @@ def run_memory_suite(args: argparse.Namespace) -> Path:
     run_dir = make_run_dir(args, "memory_ab")
     raw_path = run_dir / "raw_cases.jsonl"
     results: list[CaseResult] = []
+    learning_results: list[CaseResult] = []
+    evidence_root = PROJECT_ROOT / ".harness" / "memory-eval-evidence" / run_dir.name
+    evidence_root.mkdir(parents=True, exist_ok=True)
     for task in tasks:
-        for variant in ("baseline", "treatment"):
+        for variant in ("disabled", "recall", "checked"):
             env = base_env()
             memory_root = run_dir / "memory_roots" / str(task["id"]) / variant
             env["HARNESS_MEMORY_ROOT"] = str(memory_root)
             env["HARNESS_PERMISSION_MODE"] = "danger-full-access"
             env["HARNESS_STREAM"] = "0"
             _apply_metrics_eval_limits(env, suite="memory")
-            if variant == "baseline":
+            if variant == "disabled":
                 env["HARNESS_MEMORY_DISABLED"] = "1"
             else:
                 env.pop("HARNESS_MEMORY_DISABLED", None)
-                _seed_memory(memory_root, task)
+            env["HARNESS_MEMORY_APPLICABILITY_CHECK"] = "0" if variant == "recall" else "1"
+            learning = _run_hca_case(
+                suite="memory_lifecycle",
+                case_id=str(task["id"]),
+                variant=f"{variant}:learn",
+                prompt=_metrics_eval_prompt(
+                    str(task.get("learn_prompt") or task["prompt"]), suite="memory",
+                ),
+                profile=str(task.get("profile") or "general"),
+                env=env,
+                run_dir=run_dir,
+                timeout=args.task_timeout,
+                success_markers=[],
+            )
+            learning_results.append(learning)
+            append_jsonl(raw_path, learning.to_dict())
+            if variant != "disabled":
+                evidence_path = evidence_root / f"{task['id']}-{variant}.txt"
+                evidence_path.write_text("first-session evidence\n", encoding="utf-8")
+                _seed_memory(memory_root, task, extra_source_path=evidence_path)
+                evidence_path.write_text("changed between sessions\n", encoding="utf-8")
             result = _run_hca_case(
-                suite="memory_ab",
+                suite="memory_lifecycle",
                 case_id=str(task["id"]),
                 variant=variant,
                 prompt=_metrics_eval_prompt(str(task["prompt"]), suite="memory"),
@@ -140,7 +162,7 @@ def run_memory_suite(args: argparse.Namespace) -> Path:
             results.append(result)
             append_jsonl(raw_path, result.to_dict())
 
-    summary = _memory_summary(results)
+    summary = _memory_summary(results, learning_results)
     write_suite_summary(run_dir, summary, results)
     return run_dir
 
@@ -297,14 +319,26 @@ def _apply_metrics_eval_limits(env: dict[str, str], *, suite: str) -> None:
         env["MAX_AGENT_TOTAL_TOKENS"] = "100000"
 
 
-def _seed_memory(memory_root: Path, task: dict[str, Any]) -> None:
+def _seed_memory(
+    memory_root: Path,
+    task: dict[str, Any],
+    *,
+    extra_source_path: Path | None = None,
+) -> None:
     store = MemoryStore(memory_root, workspace=PROJECT_ROOT)
     for candidate in task.get("memory_records") or []:
-        payload = dict(candidate)
-        payload.setdefault("confidence", 0.95)
-        payload.setdefault("source_sessions", ["eval_seed"])
-        store.append_candidate(payload)
-    run_dream(store)
+        store.write(
+            MemoryWriteCommand(
+                topic=str(candidate.get("topic") or candidate.get("title") or "Eval memory"),
+                body=str(candidate.get("stale_summary") or candidate.get("body") or candidate.get("summary") or ""),
+                applicability=str(candidate.get("applicability") or ""),
+                source_sessions=["eval_seed"],
+                source_paths=[
+                    *[str(path) for path in candidate.get("source_paths") or []],
+                    *([str(extra_source_path)] if extra_source_path is not None else []),
+                ],
+            )
+        )
 
 
 def _session_metrics(session_id: str) -> dict[str, Any]:
@@ -318,23 +352,54 @@ def _session_metrics(session_id: str) -> dict[str, Any]:
     return snapshot.to_dict()
 
 
-def _memory_summary(results: list[CaseResult]) -> dict[str, Any]:
-    baseline = [item for item in results if item.variant == "baseline"]
-    treatment = [item for item in results if item.variant == "treatment"]
-    base = _aggregate_case_results(baseline)
-    treat = _aggregate_case_results(treatment)
+def _memory_summary(
+    results: list[CaseResult],
+    learning_results: list[CaseResult] | None = None,
+) -> dict[str, Any]:
+    disabled = _aggregate_case_results([item for item in results if item.variant == "disabled"])
+    recall = _aggregate_case_results([item for item in results if item.variant == "recall"])
+    checked = _aggregate_case_results([item for item in results if item.variant == "checked"])
+    stale_markers = [
+        str(marker)
+        for task in load_task_list("memory_ab.json")["tasks"]
+        for record in task.get("memory_records") or []
+        for marker in record.get("stale_markers") or []
+    ]
     return {
-        "suite": "memory_ab",
+        "suite": "memory_lifecycle",
         "task_count": len({item.case_id for item in results}),
-        "baseline": base,
-        "treatment": treat,
-        "uplift": {
-            "tool_calls_reduction_ratio": reduction(base["tool_calls"], treat["tool_calls"]),
-            "elapsed_seconds_reduction_ratio": reduction(base["elapsed_seconds"], treat["elapsed_seconds"]),
-            "total_tokens_reduction_ratio": reduction(base["total_tokens"], treat["total_tokens"]),
-            "success_delta": treat["success_rate"] - base["success_rate"],
+        "protocol": "two-session: learn, then reuse after evidence changes",
+        "disabled": disabled,
+        "recall": recall,
+        "checked": checked,
+        "stale_adoption_rate": {
+            "disabled": _output_marker_rate(results, "disabled", stale_markers),
+            "recall": _output_marker_rate(results, "recall", stale_markers),
+            "checked": _output_marker_rate(results, "checked", stale_markers),
+        },
+        "learning_cost": _aggregate_case_results(learning_results or []),
+        "checked_vs_disabled": {
+            "tool_calls_reduction_ratio": reduction(disabled["tool_calls"], checked["tool_calls"]),
+            "elapsed_seconds_reduction_ratio": reduction(disabled["elapsed_seconds"], checked["elapsed_seconds"]),
+            "total_tokens_reduction_ratio": reduction(disabled["total_tokens"], checked["total_tokens"]),
+            "success_delta": checked["success_rate"] - disabled["success_rate"],
         },
     }
+
+
+def _output_marker_rate(results: list[CaseResult], variant: str, markers: list[str]) -> float:
+    selected = [item for item in results if item.variant == variant]
+    if not selected or not markers:
+        return 0.0
+    adopted = 0
+    for item in selected:
+        try:
+            output = Path(item.stdout_path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            output = ""
+        if any(marker.lower() in output.lower() for marker in markers):
+            adopted += 1
+    return adopted / len(selected)
 
 
 def _latency_summary(results: list[CaseResult]) -> dict[str, Any]:

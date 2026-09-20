@@ -345,6 +345,8 @@ class AgentCoordinator:
             permission_policy=policy,
             event_bus=self.context.event_bus,
             session_id=self.context.session_id,
+            memory_use_enabled=self.context.memory_use_enabled,
+            memory_generate_enabled=self.context.memory_generate_enabled,
             tool_registry=registry,
             allowed_tool_permissions={"read", "network_read", "edit", "shell"},
         )
