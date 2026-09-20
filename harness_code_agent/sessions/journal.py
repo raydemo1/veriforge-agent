@@ -26,8 +26,8 @@ class SessionJournal:
         self._lock = threading.Lock()
         self._sequence = self._last_sequence()
 
-    def append_message(self, message: dict, *, transient: bool = False) -> JournalEntry:
-        return self.append("message", {"message": _json_safe(message), "transient": transient})
+    def append_message(self, message: dict) -> JournalEntry:
+        return self.append("message", {"message": _json_safe(message)})
 
     def append_compaction(
         self,
@@ -80,7 +80,6 @@ class SessionJournal:
                 for entry in entries
                 if entry.kind == "message"
                 and entry.sequence >= boundary
-                and not entry.payload.get("transient")
                 and entry.payload.get("message", {}).get("role") != "system"
             )
             return messages
@@ -90,7 +89,6 @@ class SessionJournal:
                 entry.payload["message"]
                 for entry in entries
                 if entry.kind == "message"
-                and not entry.payload.get("transient")
                 and entry.payload.get("message", {}).get("role") != "system"
             ],
         ]
