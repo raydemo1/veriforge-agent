@@ -951,18 +951,21 @@ class AgentConversation:
                 self.last_text = content
                 log.info(f"[{agent.name}] assistant: {content[:200]}...")
 
-            # --- If no tool calls, check pre-exit middlewares ---
-            if not tool_calls:
-                decision = turn_controller.after_no_tool_calls(iteration=iteration)
-                if decision.continue_loop:
-                    continue
-                break
-
+            # --- Token budget stop runs before the no-tool branch so that
+            # response-only turns (e.g. pre-exit middleware injections)
+            # cannot bypass MAX_AGENT_TOTAL_TOKENS ---
             if self._request_token_budget_stop_if_needed():
                 self.emitter.emit_agent_fallback(self.runtime_state.fallback)
                 self.last_text = self._fallback_text()
                 self._append_blocked_tool_results(tool_calls, self.runtime_state.fallback.stop_reason)
                 self.trace.finish("agent_fallback", iteration)
+                break
+
+            # --- If no tool calls, check pre-exit middlewares ---
+            if not tool_calls:
+                decision = turn_controller.after_no_tool_calls(iteration=iteration)
+                if decision.continue_loop:
+                    continue
                 break
 
             # --- Execute tool calls ---

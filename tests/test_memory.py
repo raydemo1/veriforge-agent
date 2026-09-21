@@ -241,6 +241,44 @@ class MemorySystemTests(unittest.TestCase):
                 # reaches the (mocked) extraction call.
                 self._wait_for_job_status(project, "done")
 
+    def test_kick_after_empty_drain_triggers_rerun_pass(self):
+        from harness_code_agent.memory import background as bg
+
+        journal1 = self.temp_dir / "journal1.jsonl"
+        journal2 = self.temp_dir / "journal2.jsonl"
+        journal1.write_text("", encoding="utf-8")
+        journal2.write_text("", encoding="utf-8")
+        real_claim = bg._claim_next_job
+        rerun_kicked = threading.Event()
+
+        def claim_then_kick(store):
+            row = real_claim(store)
+            if row is None and not rerun_kicked.is_set():
+                # Reproduces the missed-wake-up window: the drain found no
+                # work, but before the worker removes itself a new job is
+                # enqueued and another kick arrives.
+                rerun_kicked.set()
+                project.enqueue_extraction("s2", 1, journal2)
+                bg.start_memory_worker(self.workspace)
+            return row
+
+        with patch.dict("os.environ", {"HARNESS_MEMORY_ROOT": str(self.root)}):
+            service = MemoryService(self.workspace)
+            project = service.stores["project"]
+            project.enqueue_extraction("s1", 1, journal1)
+            # All waits must stay inside both patches: the worker imports
+            # providers lazily, so it may reach the mocked calls late.
+            with (
+                patch.object(bg, "_claim_next_job", claim_then_kick),
+                patch.object(bg, "_extract_candidates", return_value=[]),
+            ):
+                bg.start_memory_worker(self.workspace)
+                self._wait_for_job_status(project, "done")
+                deadline = time.time() + 5
+                while bg._running_workspaces and time.time() < deadline:
+                    time.sleep(0.02)
+                self.assertEqual(bg._running_workspaces, {})
+
     def test_generate_switch_on_kicks_memory_worker(self):
         from harness_code_agent.core.interactive import InteractiveSession
 
@@ -304,7 +342,7 @@ class MemorySystemTests(unittest.TestCase):
         deadline = time.time() + 5
         while bg._running_workspaces and time.time() < deadline:
             time.sleep(0.02)
-        self.assertEqual(bg._running_workspaces, set())
+        self.assertEqual(bg._running_workspaces, {})
 
 
 class MemoryToolTests(unittest.TestCase):

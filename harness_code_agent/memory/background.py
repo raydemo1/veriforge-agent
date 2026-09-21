@@ -15,8 +15,10 @@ from .store import MemoryWriteCommand
 
 log = logging.getLogger("harness")
 _worker_lock = threading.Lock()
-#: Workspaces whose kicked one-shot worker is still running in this process.
-_running_workspaces: set[Path] = set()
+#: Maps a workspace to a rerun flag while its kicked one-shot worker runs.
+#: A kick arriving while the worker is running sets the flag so the worker
+#: drains one more pass instead of the kick being lost.
+_running_workspaces: dict[Path, bool] = {}
 
 
 def start_memory_worker(workspace: str | Path) -> None:
@@ -29,8 +31,11 @@ def start_memory_worker(workspace: str | Path) -> None:
     resolved = Path(workspace).resolve()
     with _worker_lock:
         if resolved in _running_workspaces:
+            # Missed-wake-up guard: remember the kick; the running worker
+            # re-checks the flag before removing itself.
+            _running_workspaces[resolved] = True
             return
-        _running_workspaces.add(resolved)
+        _running_workspaces[resolved] = False
     thread = threading.Thread(target=_run_once, args=(resolved,), daemon=True)
     thread.start()
 
@@ -41,15 +46,26 @@ def _run_once(workspace: Path) -> None:
         store = service.stores["project"]
         store.ensure_initialized()
         while True:
-            row = _claim_next_job(store)
-            if row is False:
-                continue
-            if row is None:
-                return
-            _process_job(service, store, row)
+            while True:
+                row = _claim_next_job(store)
+                if row is False:
+                    continue
+                if row is None:
+                    break
+                _process_job(service, store, row)
+            with _worker_lock:
+                if _running_workspaces.get(workspace):
+                    # A kick landed during the drain; run another pass.
+                    _running_workspaces[workspace] = False
+                else:
+                    # Removal and the exit decision share the lock, closing
+                    # the window where a kick could see a running worker that
+                    # is about to exit.
+                    _running_workspaces.pop(workspace, None)
+                    return
     finally:
         with _worker_lock:
-            _running_workspaces.discard(workspace)
+            _running_workspaces.pop(workspace, None)
 
 
 def _claim_next_job(store):

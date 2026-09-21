@@ -50,6 +50,17 @@ class TerminalUiTests(unittest.TestCase):
         self.assertEqual(change.kind, "file")
         self.assertEqual(state.snapshot.dirty_count, 1)
 
+    def test_transcript_shows_child_parent_report(self):
+        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        block = state.apply_event(SessionEvent(
+            1, 0, "agent_parent_message", "reviewer",
+            {"name": "reviewer", "message": "evidence contradicts the plan"},
+        ))
+
+        self.assertEqual(block.kind, "agent")
+        self.assertIn("reviewer", block.title)
+        self.assertEqual(block.body, "evidence contradicts the plan")
+
     def test_transcript_hides_internal_route_fallbacks_and_only_shows_real_switches(self):
         state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
         stayed = state.apply_event(SessionEvent(

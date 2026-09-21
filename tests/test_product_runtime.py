@@ -3072,6 +3072,50 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertEqual(tool_result.payload["status"], "failed")
             self.assertEqual(tool_result.payload["metadata"]["status_source"], "budget")
 
+    def test_agent_loop_token_budget_covers_response_only_pre_exit_turns(self):
+        from harness_code_agent.agent.conversation import Agent, AgentConversation
+
+        class AlwaysInject:
+            def per_iteration(self, iteration, messages, runtime_state=None, agent_name=None):
+                return None
+
+            def pre_exit(self, messages, runtime_state=None, agent_name=None):
+                return "keep going"
+
+        class FakeCompletions:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                self.calls += 1
+                if self.calls > 20:
+                    # Safety net if the budget stop regresses: fail instead
+                    # of hanging the suite forever (there is no iteration cap).
+                    raise AssertionError("response-only turn was not stopped by token budget")
+                message = SimpleNamespace(content="still thinking", tool_calls=None)
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=message, finish_reason="stop")],
+                    usage=SimpleNamespace(prompt_tokens=5, completion_tokens=5, total_tokens=10),
+                )
+
+        class FakeClient:
+            def __init__(self):
+                self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
+            conversation = AgentConversation(Agent("main_agent", "system", use_tools=True))
+        conversation.agent.middlewares = [AlwaysInject()]
+        with (
+            patch("harness_code_agent.agent.conversation.config.MAX_AGENT_TOTAL_TOKENS", 15),
+            patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+        ):
+            text = conversation.run_until_idle()
+
+        fallback = conversation.runtime_state.fallback
+        self.assertEqual(fallback.stop_reason, "token_budget_exceeded")
+        self.assertEqual(fallback.stop_limit_type, "total_tokens")
+        self.assertIn("Agent fallback triggered", text)
+
     def test_agent_loop_tool_call_budget_blocks_unexecuted_pending_calls(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
         from harness_code_agent.runtime.permissions import PermissionPolicy
@@ -3946,6 +3990,36 @@ class SessionResumeTests(unittest.TestCase):
         panel = bridge._sessions_panel()
         ids = {option["id"] for option in panel["options"]}
         self.assertNotIn(source.id, ids)
+
+
+class ContextCommandTests(unittest.TestCase):
+    def setUp(self):
+        import shutil
+
+        self.shutil = shutil
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.env_patch = patch.dict(os.environ, {
+            "HARNESS_MEMORY_GENERATION_DISABLED": "1",
+        })
+        self.env_patch.start()
+        from harness_code_agent.core.interactive import InteractiveSession
+
+        self.interactive = InteractiveSession(
+            cwd=self.temp_dir,
+            enable_turn_summary=False,
+            output_sink=lambda _text: None,
+        )
+
+    def tearDown(self):
+        self.interactive.close()
+        self.env_patch.stop()
+        self.shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_context_status_returns_token_breakdown(self):
+        result = self.interactive.context_status()
+
+        self.assertIn("上下文估算", result)
+        self.assertIn("系统指令", result)
 
 
 if __name__ == "__main__":

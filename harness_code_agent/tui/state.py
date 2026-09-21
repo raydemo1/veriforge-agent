@@ -91,6 +91,10 @@ class TuiState:
         if event_type == "agent_message":
             name = str(payload.get("name") or payload.get("agent_id") or "子代理")
             return TranscriptBlock("agent", f"已补充消息  {name}", "", "running", turn=self.snapshot.turn)
+        if event_type == "agent_parent_message":
+            name = str(payload.get("name") or payload.get("agent_id") or "子代理")
+            message = str(payload.get("message") or "")
+            return TranscriptBlock("agent", f"← 子代理上报  {name}", message, "running", turn=self.snapshot.turn)
         if event_type == "agent_status":
             name = str(payload.get("name") or payload.get("agent_id") or "子代理")
             status = str(payload.get("status") or "unknown")
