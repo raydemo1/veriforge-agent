@@ -1,9 +1,12 @@
 """Completion logic for slash commands and @mentions (UI-agnostic)."""
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+
+MENTION_CACHE_TTL_SECONDS = 30.0
 
 EXCLUDED_DIRS = {
     ".git",
@@ -73,17 +76,26 @@ def mention_candidates(
 
 
 def _file_candidates(root: Path, prefix: str, *, limit: int) -> list[MentionCandidate]:
-    candidates = _scored_file_candidates(root, prefix)
+    file_rels = [
+        rel for rel, is_dir in iter_workspace_paths(root, limit=2000) if not is_dir
+    ]
+    return _file_candidates_from_rels(file_rels, prefix, limit=limit)
+
+
+def _file_candidates_from_rels(
+    file_rels: list[str], prefix: str, *, limit: int
+) -> list[MentionCandidate]:
+    candidates = _scored_file_candidates(file_rels, prefix)
     candidates.sort(key=lambda item: (-item[0], item[1].display.lower()))
     return [candidate for _score, candidate in candidates[:limit]]
 
 
-def _scored_file_candidates(root: Path, prefix: str) -> list[tuple[int, MentionCandidate]]:
+def _scored_file_candidates(
+    file_rels: list[str], prefix: str
+) -> list[tuple[int, MentionCandidate]]:
     prefix = prefix.strip().strip('"')
     file_candidates: list[tuple[int, MentionCandidate]] = []
-    for rel, is_dir in iter_workspace_paths(root, limit=2000):
-        if is_dir:
-            continue
+    for rel in file_rels:
         score = fuzzy_score(prefix, rel)
         if score <= 0 and prefix:
             continue
@@ -101,18 +113,27 @@ def _scored_file_candidates(root: Path, prefix: str) -> list[tuple[int, MentionC
 
 
 def _session_candidates(session_store, prefix: str, *, limit: int) -> list[MentionCandidate]:
-    candidates = _scored_session_candidates(session_store, prefix)
+    session_items = [
+        (item.get("id", ""), _session_preview(session_store, item.get("id", "")))
+        for item in session_store.list_sessions()[:100]
+    ]
+    session_items = [(sid, preview) for sid, preview in session_items if preview]
+    return _session_candidates_from_items(session_items, prefix, limit=limit)
+
+
+def _session_candidates_from_items(
+    session_items: list[tuple[str, str]], prefix: str, *, limit: int
+) -> list[MentionCandidate]:
+    candidates = _scored_session_candidates(session_items, prefix)
     candidates.sort(key=lambda item: -item[0])
     return [candidate for _score, candidate in candidates[:limit]]
 
 
-def _scored_session_candidates(session_store, prefix: str) -> list[tuple[int, MentionCandidate]]:
+def _scored_session_candidates(
+    session_items: list[tuple[str, str]], prefix: str
+) -> list[tuple[int, MentionCandidate]]:
     candidates: list[tuple[int, MentionCandidate]] = []
-    for item in session_store.list_sessions()[:100]:
-        session_id = item.get("id", "")
-        preview = _session_preview(session_store, session_id)
-        if not preview:
-            continue
+    for session_id, preview in session_items:
         score = max(fuzzy_score(prefix, session_id), fuzzy_score(prefix, preview))
         if score <= 0 and prefix:
             continue
@@ -127,6 +148,79 @@ def _scored_session_candidates(session_store, prefix: str) -> list[tuple[int, Me
             ),
         ))
     return candidates
+
+
+class MentionIndex:
+    """Small session-level cache for @mention candidates.
+
+    Holds only a file-list cache and a session-preview cache, both refreshed
+    purely by a short TTL. Picking a candidate still goes through the normal
+    attachment/resolve validation, so a briefly stale entry cannot cause a
+    wrong result.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        session_store,
+        *,
+        ttl_seconds: float = MENTION_CACHE_TTL_SECONDS,
+    ) -> None:
+        self._root = Path(root)
+        self._session_store = session_store
+        self._ttl = ttl_seconds
+        self._file_rels: list[str] | None = None
+        self._files_expire = 0.0
+        self._session_items: list[tuple[str, str]] | None = None
+        self._sessions_expire = 0.0
+
+    def _cached_file_rels(self) -> list[str]:
+        now = time.monotonic()
+        if self._file_rels is None or now >= self._files_expire:
+            self._file_rels = [
+                rel
+                for rel, is_dir in iter_workspace_paths(self._root, limit=2000)
+                if not is_dir
+            ]
+            self._files_expire = now + self._ttl
+        return self._file_rels
+
+    def _cached_session_items(self) -> list[tuple[str, str]]:
+        now = time.monotonic()
+        if self._session_items is None or now >= self._sessions_expire:
+            items: list[tuple[str, str]] = []
+            for meta in self._session_store.list_sessions()[:100]:
+                session_id = str(meta.get("id") or "")
+                preview = _session_preview(self._session_store, session_id)
+                if preview:
+                    items.append((session_id, preview))
+            self._session_items = items
+            self._sessions_expire = now + self._ttl
+        return self._session_items
+
+    def candidates(self, prefix: str, *, limit: int = 50) -> list[MentionCandidate]:
+        """Return file/session candidates matching the @mention prefix."""
+        prefix = prefix.strip()
+        if prefix.startswith("session:"):
+            session_prefix = prefix.removeprefix("session:")
+            return _session_candidates_from_items(
+                self._cached_session_items(), session_prefix, limit=limit
+            )
+        if prefix.startswith("file:"):
+            file_prefix = prefix.removeprefix("file:")
+            return _file_candidates_from_rels(
+                self._cached_file_rels(), file_prefix, limit=limit
+            )
+
+        # Keep recent conversations visible before workspace files. A global score
+        # sort lets a large file tree crowd the history section out entirely.
+        sessions = _session_candidates_from_items(
+            self._cached_session_items(), prefix, limit=min(8, limit)
+        )
+        files = _file_candidates_from_rels(
+            self._cached_file_rels(), prefix, limit=max(0, limit - len(sessions))
+        )
+        return sessions + files
 
 
 def _session_preview(session_store, session_id: str) -> str:

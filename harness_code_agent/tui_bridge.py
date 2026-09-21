@@ -48,7 +48,7 @@ from .sessions.observability import (
 )
 from .tui.approval import ApprovalAllowlist, _persistent_prefix_for_request
 from .tui.commands import default_command_registry
-from .tui.completion import mention_candidates
+from .tui.completion import MentionIndex, mention_candidates
 from .tui.protocol import UI_PROTOCOL_VERSION, validate_ui_event
 from .tui.state import SessionStatusSnapshot, TranscriptBlock, TuiState, _localize_error
 
@@ -63,9 +63,9 @@ _PROFILE_COPY = {
 }
 
 _PERMISSION_COPY = {
-    PermissionPolicy.WORKSPACE_WRITE: ("请求批准", "工作区内修改与执行未知程序时询问，工作区外写入直接拒绝"),
+    PermissionPolicy.WORKSPACE_WRITE: ("请求批准", "工作区内写入允许，风险操作询问，工作区外写入拒绝"),
     PermissionPolicy.LLM_AUTO: ("替我审批", "由模型判断风险并自动批准具体、范围明确的安全操作"),
-    PermissionPolicy.DANGER_FULL_ACCESS: ("完全访问权限", "工作区内外修改均不询问；灾难性命令（如 rm -rf /、git reset --hard）仍会被拦截"),
+    PermissionPolicy.DANGER_FULL_ACCESS: ("完全访问", "工作区内外修改均不询问；灾难性命令（如 rm -rf /、git reset --hard）仍会被拦截"),
     PermissionPolicy.READ_ONLY: ("只读", "禁止一切修改与未知程序执行"),
 }
 
@@ -267,6 +267,7 @@ class BridgeServer:
             )
         )
         self._interactions = BridgeInteractionProvider(self._send_event, project_root=self.cwd)
+        self._mention_index: MentionIndex | None = None
         self._send_event({"type": "progress", "status": "starting", "detail": "正在准备 Python 会话…"})
         self._start_session_construction()
         self._worker = threading.Thread(target=self._worker_loop, name="opentui-submit", daemon=True)
@@ -325,6 +326,7 @@ class BridgeServer:
             if reset_ui:
                 self._send_event({"type": "session_reset", "snapshot": self._snapshot_payload(), "items": []})
             self._send_event({"type": "progress", "status": "ready", "detail": "Python 会话已就绪。"})
+            self._start_mcp_warm(session)
         except Exception as exc:  # pragma: no cover - exercised by real startup failures
             error = _localize_error(exc, "会话启动失败，请稍后重试")
             with self._session_lock:
@@ -338,6 +340,17 @@ class BridgeServer:
 
     def _startup_progress(self, stage: str) -> None:
         self._send_event({"type": "progress", "status": stage, "detail": stage})
+
+    def _start_mcp_warm(self, session: InteractiveSession) -> None:
+        """Connect configured MCP servers in the background after ready."""
+
+        def _warm() -> None:
+            try:
+                session.warm_mcp_tools()
+            except Exception:  # warm failures are invisible to the user path
+                log.debug("Background MCP warm failed", exc_info=True)
+
+        threading.Thread(target=_warm, name="opentui-mcp-warm", daemon=True).start()
 
     def _emit_commands(self) -> None:
         if self._session is None:
@@ -498,6 +511,7 @@ class BridgeServer:
             "file": "file",
             "thought": "thought",
             "profile": "profile",
+            "agent": "agent",
         }
         kind = kind_map.get(block.kind, "status")
         state = {
@@ -515,6 +529,8 @@ class BridgeServer:
             "body": block.body,
             "state": state,
         }
+        if block.direction:
+            item["direction"] = block.direction
         if self._assistant_group_id:
             item["parentId"] = self._assistant_group_id
         return item
@@ -538,6 +554,8 @@ class BridgeServer:
             "reasoningEffort": profile.reasoning_effort,
             "provider": snapshot.provider,
             "contextPercent": context_percent,
+            "contextTokens": snapshot.context_tokens,
+            "contextWindowTokens": snapshot.context_window_tokens,
             "status": snapshot.status,
             "cwd": str(snapshot.cwd),
             "sessionId": snapshot.session_id,
@@ -705,7 +723,11 @@ class BridgeServer:
                 "tone": "success" if current == item["name"] else "default",
                 "selected": current == item["name"],
             } for item in list_profiles())
-            return {"kind": "profile", "title": "工作模式", "options": options}
+            body = ""
+            if session.display_routing_mode == "auto":
+                active_label = _PROFILE_COPY.get(session.display_profile, (session.display_profile, ""))[0]
+                body = f"自动路由 ✓ · 当前：{active_label}"
+            return {"kind": "profile", "title": "工作模式", "options": options, "body": body}
         if kind == "permission":
             current = session.permission_mode
             options = []
@@ -814,7 +836,7 @@ class BridgeServer:
             session.resume_from_session(action)
             items = self._history_items(action)
             self._send_event({"type": "session_reset", "snapshot": self._snapshot_payload(), "items": items})
-            return {"ok": True, "message": "历史会话已加载"}
+            return {"ok": True, "message": "已从历史会话创建分支"}
         if panel == "command":
             if action == "compact":
                 message = session.compact_current_context()
@@ -941,7 +963,11 @@ class BridgeServer:
             return {"ok": True}
         if name == "complete_mention":
             session = self._require_session()
-            candidates = mention_candidates(self.cwd, str(params.get("prefix") or ""), session.session_store, limit=30)
+            if self._mention_index is None:
+                self._mention_index = MentionIndex(self.cwd, session.session_store)
+            candidates = self._mention_index.candidates(
+                str(params.get("prefix") or ""), limit=30
+            )
             mode = model_input_mode()
             filtered = []
             for item in candidates:

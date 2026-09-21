@@ -31,6 +31,7 @@ class TranscriptBlock:
     status: str = ""
     turn: int | None = None
     id: str | None = None
+    direction: str = ""
 
 
 @dataclass(frozen=True)
@@ -80,27 +81,42 @@ class TuiState:
             self.snapshot.status = "idle"
             turn = _payload_turn(payload, self.snapshot.turn)
             return TranscriptBlock("assistant", "助手", str(payload.get("text", "")), turn=turn)
+        if event_type == "llm_usage":
+            prompt_tokens = payload.get("prompt_tokens")
+            if isinstance(prompt_tokens, int) and prompt_tokens > 0:
+                self.snapshot.context_tokens = prompt_tokens
+                self.snapshot.context_window_tokens = _context_window_tokens()
+            return None
         if event_type == "tool_call":
             return self._apply_tool_call(payload)
         if event_type == "tool_result":
             return self._apply_tool_result(payload)
         if event_type == "agent_spawned":
             name = str(payload.get("name") or payload.get("agent_id") or "子代理")
-            role = str(payload.get("role") or "")
-            return TranscriptBlock("agent", f"子代理已启动  {name}", role, "running", turn=self.snapshot.turn)
+            return TranscriptBlock("agent", f"{name} 已启动", "", "running", turn=self.snapshot.turn)
         if event_type == "agent_message":
             name = str(payload.get("name") or payload.get("agent_id") or "子代理")
-            return TranscriptBlock("agent", f"已补充消息  {name}", "", "running", turn=self.snapshot.turn)
+            message = str(payload.get("message") or "")
+            return TranscriptBlock("agent", f"{name} 已补充", message, "running", turn=self.snapshot.turn, direction="out")
         if event_type == "agent_parent_message":
             name = str(payload.get("name") or payload.get("agent_id") or "子代理")
             message = str(payload.get("message") or "")
-            return TranscriptBlock("agent", f"← 子代理上报  {name}", message, "running", turn=self.snapshot.turn)
+            return TranscriptBlock("agent", f"{name} 上报", message, "running", turn=self.snapshot.turn, direction="in")
         if event_type == "agent_status":
             name = str(payload.get("name") or payload.get("agent_id") or "子代理")
             status = str(payload.get("status") or "unknown")
-            labels = {"running": "运行中", "completed": "已完成", "failed": "失败", "blocked": "受阻", "interrupted": "已中断", "closed": "已关闭"}
-            body = str(payload.get("error") or payload.get("proposal_id") or "")
-            return TranscriptBlock("agent", f"子代理{name}：{labels.get(status, status)}", body, status, turn=self.snapshot.turn)
+            # spawned already expressed the start, and closing an agent adds no
+            # outcome information; only outcome-bearing states reach the UI.
+            if status in {"running", "closed"}:
+                return None
+            labels = {"completed": "已完成", "failed": "失败", "blocked": "受阻", "interrupted": "已中断"}
+            body = ""
+            if status == "completed":
+                if payload.get("proposal_id"):
+                    body = "有改动待应用"
+            else:
+                body = str(payload.get("error") or "")
+            return TranscriptBlock("agent", f"{name} {labels.get(status, status)}", body, status, turn=self.snapshot.turn)
         if event_type == "middleware_activity":
             return self._apply_middleware_activity(payload)
         if event_type == "file_change":
@@ -260,6 +276,12 @@ class TuiState:
         self.snapshot.status = "running"
         error = str(payload.get("error") or "")
         return_code = payload.get("return_code")
+        # run_bash reports status="success" even on non-zero exit; treat a bad
+        # exit as failure so the title/color match reality, and keep the raw
+        # output tail (pytest failures, ModuleNotFoundError, ...).
+        bash_failed = tool == "run_bash" and return_code not in (None, 0)
+        if bash_failed:
+            status = "failed"
         parts = []
         if return_code not in (None, 0):
             parts.append(f"退出码 {return_code}")
@@ -267,6 +289,13 @@ class TuiState:
         if error:
             localized_error = _localize_error(error)
             body += f"\n{localized_error}" if body else localized_error
+            raw_tail = _bounded_tail(error, 600)
+            if raw_tail and raw_tail not in body:
+                body += f"\n{raw_tail}"
+        if bash_failed:
+            output_tail = _bounded_tail(str(payload.get("output") or ""), 1200)
+            if output_tail and output_tail not in body:
+                body += f"\n{output_tail}" if body else output_tail
         block = self._take_active_tool_block(tool)
         if block is not None:
             block.title = _tool_result_title_with_detail(tool, status, block.title)
@@ -548,6 +577,8 @@ def _tool_result_title(tool: str, status: str) -> str:
         if result_label:
             return result_label
         return f"{_tool_display_label(tool)}已完成"
+    if tool == "run_bash":
+        return "命令执行失败"
     return f"{_tool_display_label(tool)}失败"
 
 
@@ -630,3 +661,19 @@ def _format_elapsed(seconds: float) -> str:
     if seconds < 1.0:
         return f"{int(seconds * 1000)}ms"
     return f"{seconds:.1f}s"
+
+
+def _context_window_tokens() -> int:
+    try:
+        from ..config import CONTEXT_WINDOW_TOKENS
+
+        return int(CONTEXT_WINDOW_TOKENS)
+    except Exception:
+        return 200_000
+
+
+def _bounded_tail(text: str, limit: int) -> str:
+    text = text.strip("\n")
+    if len(text) <= limit:
+        return text
+    return "…" + text[-limit:]

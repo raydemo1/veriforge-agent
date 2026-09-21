@@ -13,6 +13,7 @@ from harness_code_agent.tui.approval import (
 )
 from harness_code_agent.tui.commands import default_command_registry
 from harness_code_agent.tui.completion import (
+    MentionIndex,
     current_mention_query,
     mention_candidates,
     replace_mention_fragment,
@@ -116,6 +117,80 @@ class TerminalUiTests(unittest.TestCase):
 
         self.assertEqual(live_ids, replay_ids)
         self.assertEqual(len(set(live_ids)), 2)
+
+    def test_agent_status_dedup_and_completed_wording(self):
+        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        running = state.apply_event(SessionEvent(1, 0, "agent_status", "main", {"name": "worker", "status": "running"}))
+        closed = state.apply_event(SessionEvent(2, 0, "agent_status", "main", {"name": "worker", "status": "closed"}))
+        completed = state.apply_event(SessionEvent(3, 0, "agent_status", "main", {
+            "name": "worker",
+            "status": "completed",
+            "proposal_id": "proposal_abc123",
+        }))
+        failed = state.apply_event(SessionEvent(4, 0, "agent_status", "main", {
+            "name": "verifier",
+            "status": "failed",
+            "error": "pytest failed",
+        }))
+
+        self.assertIsNone(running)
+        self.assertIsNone(closed)
+        self.assertEqual(completed.title, "worker 已完成")
+        self.assertEqual(completed.body, "有改动待应用")
+        self.assertNotIn("proposal_abc123", completed.body)
+        self.assertEqual(failed.title, "verifier 失败")
+        self.assertEqual(failed.body, "pytest failed")
+
+    def test_llm_usage_updates_context_tokens(self):
+        from harness_code_agent.config import CONTEXT_WINDOW_TOKENS
+
+        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        result = state.apply_event(SessionEvent(1, 0, "llm_usage", "main", {"prompt_tokens": 16000}))
+
+        self.assertIsNone(result)
+        self.assertEqual(state.snapshot.context_tokens, 16000)
+        self.assertEqual(state.snapshot.context_window_tokens, int(CONTEXT_WINDOW_TOKENS))
+
+    def test_run_bash_failure_keeps_raw_output(self):
+        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        call = state.apply_event(SessionEvent(1, 0, "tool_call", "main", {
+            "tool": "run_bash",
+            "args": {"command": "pytest tests/test_thing.py"},
+        }))
+        result = state.apply_event(SessionEvent(2, 0, "tool_result", "main", {
+            "tool": "run_bash",
+            "status": "success",
+            "return_code": 1,
+            "output": "3 failed\nModuleNotFoundError: No module named 'xxx'",
+        }))
+
+        self.assertIs(result, call)
+        self.assertEqual(result.status, "failed")
+        self.assertIn("命令执行失败", result.title)
+        self.assertIn("ModuleNotFoundError", result.body)
+        self.assertIn("退出码 1", result.body)
+
+    def test_mention_index_caches_file_and_session_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "readme.md").write_text("x", encoding="utf-8")
+
+            class Store:
+                def list_sessions(self):
+                    return [{"id": "s1"}]
+
+                def read_events(self, session_id):
+                    return [{"type": "user_input", "payload": {"text": "hello review"}}]
+
+            index = MentionIndex(root, Store())
+            first = index.candidates("review")
+            (root / "review-new.md").write_text("x", encoding="utf-8")
+            cached = index.candidates("review")
+
+            self.assertEqual([c.display for c in cached], [c.display for c in first])
+
+            fresh = MentionIndex(root, Store(), ttl_seconds=0).candidates("review")
+            self.assertIn("review-new.md", [c.display for c in fresh])
 
 
 if __name__ == "__main__":

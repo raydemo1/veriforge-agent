@@ -85,8 +85,10 @@ class AttachmentBridgeTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
 
     def test_text_model_mention_keeps_pdf_and_docx_but_filters_images(self):
-        server = self._server(SimpleNamespace(session_store=object()))
+        session = SimpleNamespace(session_store=object())
+        server = self._server(session)
         server.cwd = r"C:\workspace"
+        server._mention_index = None
         candidates = [
             SimpleNamespace(
                 insert_text="file:manual.pdf",
@@ -108,9 +110,16 @@ class AttachmentBridgeTests(unittest.TestCase):
             ),
         ]
 
+        class FakeMentionIndex:
+            def __init__(self, root, store) -> None:
+                pass
+
+            def candidates(self, prefix, *, limit):
+                return candidates
+
         with (
             patch("harness_code_agent.tui_bridge.model_input_mode", return_value="text"),
-            patch("harness_code_agent.tui_bridge.mention_candidates", return_value=candidates),
+            patch("harness_code_agent.tui_bridge.MentionIndex", FakeMentionIndex),
         ):
             result = BridgeServer._action(server, "complete_mention", {"prefix": ""})
 

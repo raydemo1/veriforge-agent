@@ -10,6 +10,8 @@ export type Snapshot = {
   reasoningEffort?: string | null;
   provider: string;
   contextPercent: number;
+  contextTokens?: number;
+  contextWindowTokens?: number;
   status: string;
   cwd: string;
   sessionId?: string;
@@ -40,12 +42,13 @@ export type SubmitResult = {
 export type CommandItem = { name: string; description: string; category?: string };
 export type TranscriptItem = {
   id: string;
-  kind: "user" | "assistant" | "tool" | "status" | "plan" | "todo" | "error" | "file" | "thought" | "profile";
+  kind: "user" | "assistant" | "tool" | "status" | "plan" | "todo" | "error" | "file" | "thought" | "profile" | "agent";
   title: string;
   body: string;
   state?: "running" | "success" | "failed" | "pending" | "changed";
   role?: "group" | "message";
   parentId?: string;
+  direction?: "in" | "out";
 };
 
 export type ApprovalInteraction = {
