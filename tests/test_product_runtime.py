@@ -3220,6 +3220,63 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertEqual(fallback.payload["reason"], "max_iterations")
             self.assertEqual(fallback.payload["limit_type"], "iterations")
 
+    def test_subagent_message_injected_at_next_safe_boundary(self):
+        from harness_code_agent.agent.conversation import Agent, AgentConversation
+
+        class FakeCompletions:
+            def __init__(self):
+                self.calls = 0
+
+            def create(self, **kwargs):
+                self.calls += 1
+                text = "waiting for the child" if self.calls == 1 else "incorporating the report"
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        message=SimpleNamespace(content=text, tool_calls=None),
+                        finish_reason="stop",
+                    )],
+                    usage=None,
+                )
+
+        class FakeClient:
+            def __init__(self):
+                self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        class QueueOnceMiddleware:
+            # Stands in for the coordinator sink: the child's report is
+            # queued while the main turn is already in flight.
+            def __init__(self, conversation):
+                self.conversation = conversation
+                self.done = False
+
+            def per_iteration(self, iteration, messages, runtime_state=None, agent_name=None):
+                if not self.done:
+                    self.done = True
+                    self.conversation.queue_message(
+                        "evidence contradicts the current plan",
+                        tag="SUBAGENT MESSAGE from explorer",
+                    )
+                return None
+
+            def pre_exit(self, messages, runtime_state=None, agent_name=None):
+                return None
+
+        with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
+            conversation = AgentConversation(Agent("main_agent", "system", use_tools=True))
+        conversation.agent.middlewares = [QueueOnceMiddleware(conversation)]
+
+        with patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1):
+            text = conversation.run_until_idle()
+
+        self.assertEqual(text, "incorporating the report")
+        self.assertEqual(
+            conversation.messages[-2],
+            {
+                "role": "user",
+                "content": "[SUBAGENT MESSAGE from explorer]\nevidence contradicts the current plan",
+            },
+        )
+
     def test_agent_loop_time_budget_stops_run(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
         from harness_code_agent.runtime.permissions import PermissionPolicy

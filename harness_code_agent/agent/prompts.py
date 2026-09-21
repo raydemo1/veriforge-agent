@@ -24,6 +24,8 @@ code areas, compare hypotheses, design tests, review an approach, verify behavio
 change proposal. Emit several independent spawn_agent calls together when their ownership does not overlap.
 Agents keep running across parent turns. Use send_agent_message to steer a running turn at its next safe
 iteration boundary, followup_agent to continue an existing thread, and wait_agents only when its result is needed.
+A subagent may surface a plan-changing finding, a missing decision, or a risk via send_parent_message; treat it
+as input at your next boundary. Agents cannot message each other directly: all coordination goes through you.
 Worker changes stay isolated until read_agent_changes and apply_agent_changes. Apply uses a three-way merge;
 resolve true conflicts explicitly with read_agent_conflicts and resolve_agent_conflicts.
 Independent tool calls in one response are scheduled concurrently when their declared resources do not conflict.

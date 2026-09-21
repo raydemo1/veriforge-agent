@@ -35,6 +35,7 @@ from .agents import (
     read_agent_conflicts,
     resolve_agent_conflicts,
     send_agent_message,
+    send_parent_message,
     spawn_agent,
     wait_agents,
 )
@@ -71,6 +72,9 @@ def _build_builtin_tool_registry() -> ToolRegistry:
     main = {TOOL_CAPABILITY_MAIN}
     all_agents = main | {TOOL_CAPABILITY_READONLY_AGENT, TOOL_CAPABILITY_WORKER_AGENT}
     worker_agents = main | {TOOL_CAPABILITY_WORKER_AGENT}
+    # Child-only: the main agent has no parent, so the upward channel is
+    # absent from its registry. This is the fixed Main <-> Child topology.
+    child_agents = {TOOL_CAPABILITY_READONLY_AGENT, TOOL_CAPABILITY_WORKER_AGENT}
 
     def add(name, handler, permission, effect=None, *, capabilities=main):
         registry.register(
@@ -167,6 +171,13 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         send_agent_message,
         TOOL_PERMISSION_READ,
         _agent_effect("agent_id", access="write"),
+    )
+    add(
+        "send_parent_message",
+        send_parent_message,
+        TOOL_PERMISSION_READ,
+        CallEffect((ResourceClaim("agent", "main_agent", "exact", "write"),)),
+        capabilities=child_agents,
     )
     add(
         "followup_agent",

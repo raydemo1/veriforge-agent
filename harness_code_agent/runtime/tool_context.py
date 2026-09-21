@@ -33,3 +33,5 @@ class ToolContext:
     resource_coordinator: ResourceCoordinator = field(default_factory=ResourceCoordinator)
     tool_tasks: ToolTaskSupervisor = field(default_factory=ToolTaskSupervisor)
     agent_coordinator: AgentCoordinator | None = None
+    #: Set only on child-agent contexts; identifies the calling subagent.
+    agent_id: str | None = None

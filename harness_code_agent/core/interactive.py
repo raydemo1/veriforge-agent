@@ -609,6 +609,7 @@ class InteractiveSession:
             parent_messages=lambda: (
                 list(self.conversation.messages) if self.conversation is not None else []
             ),
+            parent_message_sink=self._queue_parent_message,
         )
         self.lifecycle.register(
             "agent_coordinator",
@@ -639,6 +640,14 @@ class InteractiveSession:
         """Session permission mode tightened by the active profile preset."""
         preset = self.profile.main_agent().permission_preset
         return PermissionPolicy(mode=self.permission_mode).restricted_by(preset)
+
+    def _queue_parent_message(self, text: str, tag: str) -> None:
+        # Child -> Main upward channel. The message is queued on the main
+        # conversation and injected at the next safe boundary of its loop.
+        conversation = getattr(self, "conversation", None)
+        if conversation is None:
+            raise RuntimeError("main conversation is unavailable")
+        conversation.queue_message(text, tag=tag)
 
     def _activate_profile_runtime(
         self,

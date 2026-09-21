@@ -513,6 +513,19 @@ CORE_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "send_parent_message",
+            "description": (
+                "Report to the parent main agent one of: a finding that changes the parent plan, "
+                "a missing decision or constraint, or a conflict/high-value risk. The parent sees "
+                "it at the next safe boundary. Do not use for routine progress; the final task "
+                "result is returned through completion."
+            ),
+            "parameters": {"type": "object", "required": ["message"], "properties": {"message": {"type": "string"}}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "followup_agent",
             "description": "Give an agent another task. Running agents receive it at the next safe boundary; idle agents start a new turn.",
             "parameters": {"type": "object", "required": ["agent_id", "task"], "properties": {"agent_id": {"type": "string"}, "task": {"type": "string"}}},

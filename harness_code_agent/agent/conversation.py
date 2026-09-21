@@ -174,7 +174,7 @@ class AgentConversation:
         self.last_text = ""
         self.last_run_streamed_text = False
         self._closed = False
-        self._queued_messages: list[str] = []
+        self._queued_messages: list[tuple[str, str]] = []
         self._queued_messages_lock = threading.Lock()
         self._iteration_offset = 0
         self.compaction_gate = CompactionGate()
@@ -334,13 +334,13 @@ class AgentConversation:
             )
         self._append_message({"role": "user", "content": task})
 
-    def queue_message(self, message: str) -> None:
+    def queue_message(self, message: str, *, tag: str = "PARENT STEERING MESSAGE") -> None:
         """Queue steering text for the next valid model-request boundary."""
         text = str(message or "").strip()
         if not text:
             raise ValueError("queued message must not be empty")
         with self._queued_messages_lock:
-            self._queued_messages.append(text)
+            self._queued_messages.append((tag, text))
 
     def has_queued_messages(self) -> bool:
         with self._queued_messages_lock:
@@ -350,10 +350,10 @@ class AgentConversation:
         with self._queued_messages_lock:
             pending = self._queued_messages
             self._queued_messages = []
-        for message in pending:
+        for tag, message in pending:
             self._append_message({
                 "role": "user",
-                "content": f"[PARENT STEERING MESSAGE]\n{message}",
+                "content": f"[{tag}]\n{message}",
             })
             self.trace.middleware_inject("AgentInbox", "safe_boundary", message)
         return bool(pending)

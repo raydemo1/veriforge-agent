@@ -68,6 +68,22 @@ def send_agent_message(agent_id: str, message: str, tool_context: ToolContext | 
     return _result("send_agent_message", _coordinator(tool_context).send(agent_id, message))
 
 
+def send_parent_message(message: str, tool_context: ToolContext | None = None) -> ToolResult:
+    # Child -> Main only. The tool is absent from the main registry, and the
+    # context carries an id only for child-agent contexts.
+    agent_id = None if tool_context is None else tool_context.agent_id
+    if not agent_id:
+        return _policy_error(
+            "send_parent_message",
+            "send_parent_message is only available to spawned agents",
+        )
+    try:
+        payload = _coordinator(tool_context).send_to_parent(agent_id, message)
+    except ValueError as exc:
+        return _policy_error("send_parent_message", str(exc))
+    return _result("send_parent_message", payload)
+
+
 def followup_agent(agent_id: str, task: str, tool_context: ToolContext | None = None) -> ToolResult:
     return _result("followup_agent", _coordinator(tool_context).followup(agent_id, task))
 

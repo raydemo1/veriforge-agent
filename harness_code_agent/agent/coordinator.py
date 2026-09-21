@@ -75,10 +75,12 @@ class AgentCoordinator:
         tool_context: ToolContext,
         *,
         parent_messages: Callable[[], list[dict]] | None = None,
+        parent_message_sink: Callable[[str, str], None] | None = None,
         max_concurrent: int = MAX_CONCURRENT_AGENTS,
     ) -> None:
         self.context = tool_context
         self._parent_messages = parent_messages or list
+        self._parent_message_sink = parent_message_sink
         self._executor = ThreadPoolExecutor(max_workers=max(1, int(max_concurrent)), thread_name_prefix="hca-agent")
         self._condition = threading.Condition(threading.RLock())
         self._records: dict[str, AgentRecord] = {}
@@ -165,6 +167,20 @@ class AgentCoordinator:
             else:
                 raise ValueError("agent is not running; use followup_agent to start another turn")
         self._emit(record, "agent_message", message=text, mode="steer")
+        return self._snapshot(record)
+
+    def send_to_parent(self, agent_id: str, message: str) -> dict:
+        record = self._record(agent_id)
+        text = str(message or "").strip()
+        if not text:
+            raise ValueError("message is required")
+        sink = self._parent_message_sink
+        if sink is None:
+            raise ValueError("no parent agent is available")
+        # Queue into the main conversation; injection happens at the main
+        # agent's next safe boundary. No event is delivered to any sibling.
+        sink(text, f"SUBAGENT MESSAGE from {record.name}")
+        self._emit(record, "agent_parent_message", message=text)
         return self._snapshot(record)
 
     def followup(self, agent_id: str, task: str) -> dict:
@@ -341,6 +357,7 @@ class AgentCoordinator:
             sandbox_mode="host",
         )
         sub_context = ToolContext(
+            agent_id=record.id,
             workspace=workspace,
             permission_policy=policy,
             event_bus=self.context.event_bus,
@@ -476,6 +493,9 @@ def _role_prompt(record: AgentRecord, parent_messages: list[dict]) -> str:
     return (
         f"You are the {record.name} subagent with role {record.role}. {role_text}\n"
         "Stay within the assigned task. The parent owns integration and final completion.\n"
+        "Use send_parent_message only for: a finding that changes the parent's plan, a missing "
+        "decision or constraint you cannot resolve, or a conflict / high-value risk. Do not send "
+        "routine progress such as status percentages; return the final result through task completion.\n"
         f"Project instructions inherited from the parent:\n{system}\n"
         f"Inherited recent context:\n{inherited}"
     )

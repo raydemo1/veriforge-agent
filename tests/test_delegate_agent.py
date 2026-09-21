@@ -397,6 +397,71 @@ class AgentCoordinatorTests(unittest.TestCase):
         self.assertIsNotNone(worker.get("write_file"))
         self.assertIsNone(worker.get("spawn_agent"))
 
+    def test_child_registries_hold_upward_channel_only(self):
+        # Fixed Main <-> Child topology: children may report upward but hold
+        # no downward or sibling addressing, and cannot spawn agents.
+        explorer = self.coordinator._role_registry("explorer")
+        worker = self.coordinator._role_registry("worker")
+
+        self.assertIsNotNone(explorer.get("send_parent_message"))
+        self.assertIsNotNone(worker.get("send_parent_message"))
+        self.assertIsNone(explorer.get("send_agent_message"))
+        self.assertIsNone(worker.get("send_agent_message"))
+
+    def test_send_to_parent_queues_tagged_message_for_main(self):
+        queued = []
+        self.coordinator._parent_message_sink = lambda text, tag: queued.append((text, tag))
+        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
+            spawned = self.coordinator.spawn(name="reporter", role="explorer", task="inspect")
+            self._wait_conversation("reporter")
+
+        snapshot = self.coordinator.send_to_parent(
+            spawned["agent_id"], "evidence contradicts the current plan"
+        )
+
+        self.assertEqual(
+            queued,
+            [("evidence contradicts the current plan", "SUBAGENT MESSAGE from reporter")],
+        )
+        self.assertEqual(snapshot["status"], "running")
+
+    def test_send_to_parent_without_sink_raises(self):
+        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
+            spawned = self.coordinator.spawn(name="adrift", role="explorer", task="inspect")
+            self._wait_conversation("adrift")
+
+        with self.assertRaisesRegex(ValueError, "no parent agent is available"):
+            self.coordinator.send_to_parent(spawned["agent_id"], "hello")
+
+    def test_send_to_parent_rejects_empty_message(self):
+        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
+            spawned = self.coordinator.spawn(name="quiet", role="explorer", task="inspect")
+            self._wait_conversation("quiet")
+
+        with self.assertRaisesRegex(ValueError, "message is required"):
+            self.coordinator.send_to_parent(spawned["agent_id"], "   ")
+
+    def test_send_parent_message_tool_blocks_without_child_identity(self):
+        from harness_code_agent.runtime.builtins.agents import send_parent_message
+
+        result = send_parent_message("hello", tool_context=self.context)
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("only available to spawned agents", result.output)
+
+    def test_send_parent_message_tool_routes_through_coordinator(self):
+        from harness_code_agent.runtime.builtins.agents import send_parent_message
+
+        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
+            spawned = self.coordinator.spawn(name="routed", role="explorer", task="inspect")
+            self._wait_conversation("routed")
+        self.context.agent_id = spawned["agent_id"]
+        self.coordinator._parent_message_sink = lambda text, tag: None
+
+        result = send_parent_message("plan must change", tool_context=self.context)
+
+        self.assertEqual(result.status, "success")
+
     def _wait_conversation(self, name):
         for _ in range(1000):
             conversation = _ControlledConversation.instances.get(name)
