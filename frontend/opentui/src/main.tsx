@@ -95,6 +95,7 @@ function createBridgeClient(): BridgeClient {
   });
   let requestCounter = 0;
   let ended = false;
+  let graceful = false;
   let buffer = "";
   const pending = new Map<string, { resolve: (value: unknown) => void; reject: (reason: unknown) => void }>();
   const eventQueue: UiEvent[] = [];
@@ -169,6 +170,16 @@ function createBridgeClient(): BridgeClient {
     } finally {
       ended = true;
       markReadyFailed(new Error("OpenTUI bridge exited before the session became ready"));
+      // Surface the bridge exit inside the UI instead of only tearing down.
+      if (!graceful) {
+        enqueue({
+          type: "notice",
+          level: "error",
+          text: readySettled
+            ? "与 Python 桥接的连接已断开，当前暂时无法提交任务。"
+            : "会话启动失败，请检查 Python 环境与依赖后重试。",
+        });
+      }
       for (const waiter of pending.values()) waiter.reject(new Error("OpenTUI bridge exited"));
       pending.clear();
       while (eventWaiters.length) eventWaiters.shift()?.(null);
@@ -191,7 +202,7 @@ function createBridgeClient(): BridgeClient {
     if (status === "ready") markReady();
   }).catch((error) => {
     markReadyFailed(error);
-    console.error(`桥接初始化失败：${formatUserError(error)}`);
+    enqueue({ type: "notice", level: "error", text: `会话启动失败：${formatUserError(error)}` });
   });
 
   const events: AsyncIterable<UiEvent> = {
@@ -213,7 +224,10 @@ function createBridgeClient(): BridgeClient {
     void request(method, params).catch((error) => console.error(`操作失败：${formatUserError(error)}`));
   };
   const shutdown = () => {
-    if (!ended) fire("shutdown");
+    if (!ended) {
+      graceful = true;
+      fire("shutdown");
+    }
   };
   process.once("exit", () => {
     if (!ended) terminateBridgeTree(child);

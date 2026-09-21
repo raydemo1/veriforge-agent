@@ -19,4 +19,21 @@ describe("OpenTUI state", () => {
     expect(resolveIcons("auto")).toBe(unicodeIcons);
     expect(resolveIcons("nerd")).toBe(nerdIcons);
   });
+  test("progress failed stops the loading state and shows the failure in the welcome row", () => {
+    const failed = reduceEvent(initialState, { type: "progress", status: "failed", detail: "缺少运行依赖" });
+    expect(failed.snapshot.status).toBe("failed");
+    const welcome = failed.items.find((item) => item.id === "welcome");
+    expect(welcome?.state).toBe("failed");
+    expect(welcome?.title).toBe("会话启动失败");
+    expect(welcome?.body).toBe("缺少运行依赖");
+  });
+  test("startup stages are localized and ready shows the input hint", () => {
+    const connecting = reduceEvent(initialState, { type: "progress", status: "connecting tools", detail: "connecting tools" });
+    expect(connecting.items[0].body).toBe("正在连接工具…");
+    expect(connecting.items[0].state).toBe("running");
+
+    const ready = reduceEvent(initialState, { type: "progress", status: "ready", detail: "Python 会话已就绪。" });
+    expect(ready.items[0].state).toBe("success");
+    expect(ready.items[0].body).toBe("输入任务开始，/ 查看命令，@ 添加上下文");
+  });
 });

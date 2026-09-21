@@ -16,14 +16,39 @@ export const initialState: AppState = {
   commands: DEFAULT_COMMANDS, turnState: "idle", queueDepth: 0, interaction: null,
 };
 
+const STARTUP_COPY: Record<string, string> = {
+  starting: "正在准备 Python 会话…",
+  "checking workspace": "正在检查工作区…",
+  "loading skills": "正在加载技能…",
+  "connecting tools": "正在连接工具…",
+};
+const READY_HINT = "输入任务开始，/ 查看命令，@ 添加上下文";
+
 export function reduceEvent(state: AppState, event: UiEvent): AppState {
   if (event.type === "snapshot") return { ...state, snapshot: event.snapshot };
   if (event.type === "session_reset") return { ...state, snapshot: event.snapshot, items: event.items ?? [], turnState: "idle", queueDepth: 0, interaction: null };
   if (event.type === "commands") return { ...state, commands: event.commands };
-  if (event.type === "progress") return {
-    ...state, snapshot: { ...state.snapshot, status: event.status },
-    items: state.items.map((item) => item.id === "welcome" ? { ...item, body: event.detail || event.status, state: event.status === "ready" ? "success" : "running" } : item),
-  };
+  if (event.type === "progress") {
+    const welcomeState = event.status === "ready"
+      ? "success"
+      : event.status === "failed"
+        ? "failed"
+        : "running";
+    const welcomeBody = event.status === "ready"
+      ? READY_HINT
+      : event.status === "failed"
+        ? (event.detail || "会话启动失败")
+        : STARTUP_COPY[event.status] || event.detail || event.status;
+    return {
+      ...state, snapshot: { ...state.snapshot, status: event.status },
+      items: state.items.map((item) => item.id === "welcome" ? {
+        ...item,
+        title: event.status === "failed" ? "会话启动失败" : item.title,
+        body: welcomeBody,
+        state: welcomeState,
+      } : item),
+    };
+  }
   if (event.type === "turn_state") return { ...state, turnState: event.state, queueDepth: event.queueDepth ?? (event.state === "queued" ? state.queueDepth + 1 : 0) };
   if (event.type === "transcript") {
     const existingIndex = state.items.findIndex((item) => item.id === event.item.id);
