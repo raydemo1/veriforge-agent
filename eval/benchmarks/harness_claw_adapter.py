@@ -104,7 +104,7 @@ class HarnessCodeAgentAdapter(BaseClawAdapter):
             f"HARNESS_MODEL_HARD={self.model}",
             "-e",
             f"HARNESS_MODEL_MAX={self.model}",
-            "-e",f"-e",
+            "-e",
             f"HARNESS_MODEL_INTENSITY={os.environ.get('HARNESS_MODEL_INTENSITY', 'normal')}",
         ])
         # max_turns stays accepted for upstream CLI compatibility but is
