@@ -20,7 +20,10 @@ from harness_code_agent.profiles.router import (
 )
 from harness_code_agent.profiles.terminal import TerminalProfile
 from harness_code_agent.runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
-from harness_code_agent.runtime.tool_registry import tool_schemas_for_profile
+from harness_code_agent.runtime.tool_registry import (
+    TOOL_CAPABILITY_READONLY_AGENT,
+    tool_schemas_for_profile,
+)
 
 
 class ProfilePromptTests(unittest.TestCase):
@@ -199,6 +202,28 @@ class ProfilePromptTests(unittest.TestCase):
         self.assertNotIn("delegate_agent", tool_names)
         self.assertNotIn("parallel_agents", tool_names)
         self.assertNotIn("spawn_agent", tool_names)
+
+    def test_main_schemas_hide_child_only_tools_by_capability(self):
+        from harness_code_agent.runtime.permissions import VALID_TOOL_PERMISSIONS
+
+        main_names = {
+            schema["function"]["name"]
+            for schema in tool_schemas_for_profile(
+                allowed_permissions=VALID_TOOL_PERMISSIONS,
+                registry=BUILTIN_TOOL_REGISTRY,
+            )
+        }
+        child_names = {
+            schema["function"]["name"]
+            for schema in tool_schemas_for_profile(
+                allowed_permissions=VALID_TOOL_PERMISSIONS,
+                registry=BUILTIN_TOOL_REGISTRY,
+                capabilities={TOOL_CAPABILITY_READONLY_AGENT},
+            )
+        }
+
+        self.assertNotIn("send_parent_message", main_names)
+        self.assertIn("send_parent_message", child_names)
 
     def test_execution_profiles_have_no_hard_timeout(self):
         for name in ("coding-agent", "app-builder"):

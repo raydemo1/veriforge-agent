@@ -443,18 +443,29 @@ class AgentCoordinatorTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertIn("only available to spawned agents", result.output)
 
-    def test_send_parent_message_tool_routes_through_coordinator(self):
+    def test_send_parent_message_tool_routes_through_real_child_context(self):
         from harness_code_agent.runtime.builtins.agents import send_parent_message
 
         with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
             spawned = self.coordinator.spawn(name="routed", role="explorer", task="inspect")
             self._wait_conversation("routed")
-        self.context.agent_id = spawned["agent_id"]
-        self.coordinator._parent_message_sink = lambda text, tag: None
 
-        result = send_parent_message("plan must change", tool_context=self.context)
+        # Use the production child context, not the main context: it must
+        # carry both the child identity and a reference to the coordinator.
+        child_context = _ControlledAgent.contexts["routed"]
+        self.assertEqual(child_context.agent_id, spawned["agent_id"])
+        self.assertIs(child_context.agent_coordinator, self.coordinator)
+
+        reported = []
+        self.coordinator._parent_message_sink = lambda text, tag: reported.append((text, tag))
+
+        result = send_parent_message("plan must change", tool_context=child_context)
 
         self.assertEqual(result.status, "success")
+        self.assertEqual(
+            reported,
+            [("plan must change", "SUBAGENT MESSAGE from routed")],
+        )
 
     def _wait_conversation(self, name):
         for _ in range(1000):

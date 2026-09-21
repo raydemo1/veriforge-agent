@@ -981,7 +981,7 @@ class InteractiveSession:
 
         breakdown = ContextManager.breakdown(
             self.conversation.messages,
-            tool_schemas_for_profile(self.agent),
+            self.agent.tool_schemas if self.agent.use_tools else None,
         )
         labels = {"system": "系统指令", "summary": "工作摘要", "recent": "近期消息", "memory": "长期记忆", "tools": "工具定义"}
         lines = [f"上下文估算：{sum(breakdown.values())} tokens"]

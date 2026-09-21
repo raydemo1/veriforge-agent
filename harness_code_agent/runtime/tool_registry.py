@@ -154,6 +154,7 @@ def tool_schemas_for_profile(
     exclude_names: set[str] | None = None,
     registry: ToolRegistry | None = None,
     disclosure: set[str] | None = None,
+    capabilities: set[str] | frozenset[str] | None = None,
 ) -> list[dict]:
     if registry is None:
         from .builtins.registry import BUILTIN_TOOL_REGISTRY
@@ -165,6 +166,11 @@ def tool_schemas_for_profile(
     include_names = set(include_names or set())
     exclude_names = set(exclude_names or set())
     disclosures = {"core"} if disclosure is None else set(disclosure)
+    required_capabilities = frozenset(capabilities or {TOOL_CAPABILITY_MAIN})
+    unknown_capabilities = required_capabilities - VALID_TOOL_CAPABILITIES
+    if unknown_capabilities:
+        names = ", ".join(sorted(unknown_capabilities))
+        raise ValueError(f"Unknown tool capability classification for profile: {names}")
     if allowed_permissions is not None:
         unknown_permissions = allowed_permissions - VALID_TOOL_PERMISSIONS
         if unknown_permissions:
@@ -179,6 +185,8 @@ def tool_schemas_for_profile(
 
     schemas: list[dict] = []
     for spec in registry.specs():
+        if not (spec.capabilities & required_capabilities):
+            continue
         if spec.name in exclude_names:
             continue
         if spec.disclosure not in disclosures:

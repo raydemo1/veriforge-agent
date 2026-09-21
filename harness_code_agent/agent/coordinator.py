@@ -363,6 +363,7 @@ class AgentCoordinator:
             tool_registry=registry,
             allowed_tool_permissions={"read", "network_read", "edit", "shell"},
             agent_id=record.id,
+            agent_coordinator=self,
         )
         sub_context.resource_coordinator = self.context.resource_coordinator
         sub_context.tool_tasks = self.context.tool_tasks
