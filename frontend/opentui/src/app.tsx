@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { stringWidth } from "bun";
 import { CliRenderEvents, SyntaxStyle } from "@opentui/core";
-import type { BoxRenderable, ClipboardReadResult, ScrollBoxRenderable, TextareaRenderable } from "@opentui/core";
+import type { BoxRenderable, ClipboardReadResult, InputRenderable, ScrollBoxRenderable, TextareaRenderable } from "@opentui/core";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import { resolveIcons } from "./icons.ts";
 import type { IconSet } from "./icons.ts";
@@ -47,8 +47,16 @@ function commandMatches(command: CommandItem, query: string): boolean {
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-function markerFor(item: TranscriptItem, icons: IconSet, spinnerFrame = 0): string {
-  if (item.state === "running" && (item.kind === "tool" || item.kind === "thought")) return SPINNER_FRAMES[spinnerFrame];
+function Spinner({ color }: { color: string }) {
+  const [frame, setFrame] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setFrame((value) => (value + 1) % SPINNER_FRAMES.length), 180);
+    return () => clearInterval(timer);
+  }, []);
+  return <text fg={color}>{SPINNER_FRAMES[frame]}</text>;
+}
+
+function markerFor(item: TranscriptItem, icons: IconSet): string {
   if (item.state === "success") return icons.success;
   if (item.state === "failed") return icons.failure;
   if (item.state === "pending") return icons.pending;
@@ -93,12 +101,14 @@ function MarkdownText({ text, color, streaming = false }: { text: string; color:
 }
 
 const MAX_DIFF_LINES = 50;
-type FileDiffLine = { kind: "add" | "delete" | "context"; content: string };
+type FileDiffLine = { kind: "add" | "delete" | "context" | "hunk"; content: string };
 
 function parseFileDiff(diff: string): FileDiffLine[] {
   return diff.split(/\r?\n/).reduce<FileDiffLine[]>((lines, rawLine, index, allLines) => {
     if (index === allLines.length - 1 && rawLine === "") return lines;
-    if (rawLine.startsWith("@@") || rawLine.startsWith("--- ") || rawLine.startsWith("+++ ")) return lines;
+    // Keep hunk headers (they locate the change); drop only file headers.
+    if (rawLine.startsWith("@@")) return [...lines, { kind: "hunk", content: rawLine }];
+    if (rawLine.startsWith("--- ") || rawLine.startsWith("+++ ")) return lines;
     if (rawLine.startsWith("… ") && rawLine.endsWith(" more diff lines")) return lines;
     if (rawLine.startsWith("+")) return [...lines, { kind: "add", content: rawLine.slice(1) }];
     if (rawLine.startsWith("-")) return [...lines, { kind: "delete", content: rawLine.slice(1) }];
@@ -121,6 +131,7 @@ function FileDiffTitle({ title, theme, icons }: { title: string; theme: Theme; i
 
 function FileDiffBlock({ item, theme, icons }: { item: TranscriptItem; theme: Theme; icons: IconSet }) {
   const [expanded, setExpanded] = useState(false);
+  const toggleFocus = useKeyboardFocusVisible<BoxRenderable>();
   const lines = useMemo(() => parseFileDiff(item.body), [item.body]);
   const visibleLines = expanded ? lines : lines.slice(0, MAX_DIFF_LINES);
   const remaining = Math.max(0, lines.length - visibleLines.length);
@@ -131,6 +142,13 @@ function FileDiffBlock({ item, theme, icons }: { item: TranscriptItem; theme: Th
       {visibleLines.length ? (
         <box style={{ flexDirection: "column", marginTop: 1, backgroundColor: theme.surface }}>
           {visibleLines.map((line, index) => {
+            if (line.kind === "hunk") {
+              return (
+                <box key={`${index}-hunk`} style={{ flexDirection: "row", width: "100%", backgroundColor: theme.surface }}>
+                  <text fg={theme.subtle}>{line.content}</text>
+                </box>
+              );
+            }
             const added = line.kind === "add";
             const deleted = line.kind === "delete";
             const backgroundColor = added ? theme.diffAddBackground : deleted ? theme.diffDeleteBackground : theme.surface;
@@ -147,10 +165,11 @@ function FileDiffBlock({ item, theme, icons }: { item: TranscriptItem; theme: Th
       ) : null}
       {lines.length > MAX_DIFF_LINES ? (
         <box
+          ref={toggleFocus.ref}
           focusable
           onMouseDown={toggle}
           onKeyDown={(key) => { if (isEnterKey(key.name) || key.name === "space") { key.preventDefault(); toggle(); } }}
-          style={{ flexDirection: "row", justifyContent: "space-between", marginTop: 1, paddingLeft: 1, paddingRight: 1, backgroundColor: theme.surfaceRaised }}
+          style={{ flexDirection: "row", justifyContent: "space-between", marginTop: 1, paddingLeft: 1, paddingRight: 1, backgroundColor: toggleFocus.focused ? theme.surfaceSelected : theme.surfaceRaised }}
         >
           <text fg={theme.muted}>{expanded ? "收起" : `余 ${remaining} 行`}</text>
           <text fg={theme.accent}>{expanded ? "⌃" : "▸"}</text>
@@ -160,20 +179,9 @@ function FileDiffBlock({ item, theme, icons }: { item: TranscriptItem; theme: Th
   );
 }
 
-function Transcript({ items, theme, icons }: { items: TranscriptItem[]; theme: Theme; icons: IconSet }) {
-  const hasRunningTool = items.some((item) => item.kind === "tool" && item.state === "running");
-  const hasRunningThought = items.some((item) => item.kind === "thought" && item.state === "running");
-  const hasRunningAgent = items.some((item) => item.kind === "agent" && item.state === "running");
-  const [spinnerFrame, setSpinnerFrame] = useState(0);
-  useEffect(() => {
-    setSpinnerFrame(0);
-    if (!hasRunningTool && !hasRunningThought && !hasRunningAgent) return;
-    const timer = setInterval(() => setSpinnerFrame((value) => (value + 1) % SPINNER_FRAMES.length), 180);
-    return () => clearInterval(timer);
-  }, [hasRunningTool, hasRunningThought, hasRunningAgent]);
-
+function Transcript({ items, theme, icons, narrow }: { items: TranscriptItem[]; theme: Theme; icons: IconSet; narrow: boolean }) {
   return (
-    <scrollbox stickyScroll focused style={{ height: 1, flexGrow: 1, flexShrink: 1, minHeight: 0, paddingLeft: 2, paddingRight: 2 }}>
+    <scrollbox stickyScroll focused style={{ height: 1, flexGrow: 1, flexShrink: 1, minHeight: 0, paddingLeft: narrow ? 1 : 2, paddingRight: narrow ? 1 : 2 }}>
       <box style={{ flexDirection: "column", gap: 1, paddingTop: 1, paddingBottom: 1 }}>
         {items.map((item) => {
           if (item.kind === "assistant" && item.role === "group") {
@@ -204,21 +212,35 @@ function Transcript({ items, theme, icons }: { items: TranscriptItem[]; theme: T
           if (item.kind === "file") return <FileDiffBlock key={item.id} item={item} theme={theme} icons={icons} />;
           if (item.kind === "agent") {
             const directed = item.direction !== undefined;
-            const marker = directed
-              ? (item.direction === "in" ? "←" : "→")
-              : markerFor(item, icons, spinnerFrame);
+            const running = item.state === "running";
             const markerColor = directed ? theme.accent : toneFor(item, theme);
-            const bodyNextLine = directed || item.state === "failed";
+            const stackBody = directed || item.state === "failed" || item.body.includes("\n");
             return (
               <box key={item.id} style={{ flexDirection: "column", maxWidth: 110 }}>
-                <text fg={markerColor}>{`${marker} ${item.title}${!bodyNextLine && item.body ? `  · ${item.body}` : ""}`}</text>
-                {bodyNextLine && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
+                <box style={{ flexDirection: "row" }}>
+                  {directed
+                    ? <text fg={markerColor}>{item.direction === "in" ? "←" : "→"}</text>
+                    : running
+                      ? <Spinner color={markerColor} />
+                      : <text fg={markerColor}>{markerFor(item, icons)}</text>}
+                  <text fg={markerColor}>{` ${item.title}${!stackBody && item.body ? `  · ${item.body}` : ""}`}</text>
+                </box>
+                {stackBody && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
               </box>
             );
           }
+          const genericTone = toneFor(item, theme);
+          const genericRunning = item.state === "running";
+          const stackGenericBody = item.state === "failed" || item.body.includes("\n");
           return (
             <box key={item.id} style={{ flexDirection: "column", maxWidth: 110, marginLeft: item.parentId ? 2 : 0 }}>
-              <text fg={toneFor(item, theme)}>{`  ${markerFor(item, icons, spinnerFrame)} ${item.title}${item.body ? `  ${item.body}` : ""}`}</text>
+              <box style={{ flexDirection: "row" }}>
+                {genericRunning
+                  ? <Spinner color={genericTone} />
+                  : <text fg={genericTone}>{markerFor(item, icons)}</text>}
+                <text fg={genericTone}>{` ${item.title}${!stackGenericBody && item.body ? `  ${item.body}` : ""}`}</text>
+              </box>
+              {stackGenericBody && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
             </box>
           );
         })}
@@ -227,32 +249,64 @@ function Transcript({ items, theme, icons }: { items: TranscriptItem[]; theme: T
   );
 }
 
-function HeaderAction({ icon, label, theme, onInvoke }: { icon: string; label: string; theme: Theme; onInvoke: () => void }) {
+function useKeyboardFocusVisible<T extends BoxRenderable>() {
+  const [focused, setFocused] = useState(false);
+  const ref = useRef<T | null>(null);
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    const on = () => setFocused(true);
+    const off = () => setFocused(false);
+    node.on("focused", on);
+    node.on("blurred", off);
+    return () => { node.off("focused", on); node.off("blurred", off); };
+  }, []);
+  return { ref, focused };
+}
+
+function ActionButton({ icon, label, theme, color, activeColor, bold = false, defaultBg, onInvoke }: {
+  icon?: string;
+  label?: string;
+  theme: Theme;
+  color: string;
+  activeColor?: string;
+  bold?: boolean;
+  defaultBg: string;
+  onInvoke: () => void;
+}) {
   const [hovered, setHovered] = useState(false);
-  const color = hovered ? theme.text : theme.subtle;
+  const { ref, focused } = useKeyboardFocusVisible<BoxRenderable>();
+  const active = hovered || focused;
+  const content = icon && label ? `${icon} ${label}` : (icon ?? label ?? "");
   return (
     <box
+      ref={ref}
       focusable
       onMouseOver={() => setHovered(true)}
       onMouseOut={() => setHovered(false)}
       onMouseDown={onInvoke}
       onKeyDown={(key) => { if (isEnterKey(key.name) || key.name === "space") onInvoke(); }}
-      style={{ flexDirection: "row", paddingLeft: 1, paddingRight: 1, backgroundColor: hovered ? theme.surfaceSelected : theme.background }}
+      style={{ flexDirection: "row", paddingLeft: 1, paddingRight: 1, backgroundColor: active ? theme.surfaceSelected : defaultBg }}
     >
-      <text fg={color}>{icon}</text>
-      <text fg={color}>{` ${label}`}</text>
+      <text fg={active ? (activeColor ?? color) : color}>
+        {bold ? <strong>{content}</strong> : content}
+      </text>
     </box>
   );
 }
 
-function Header({ cwd, theme, icons, compact, onHistory, onNew }: { cwd: string; theme: Theme; icons: IconSet; compact: boolean; onHistory: () => void; onNew: () => void }) {
+function HeaderAction({ icon, label, theme, onInvoke }: { icon: string; label: string; theme: Theme; onInvoke: () => void }) {
+  return <ActionButton icon={icon} label={label} theme={theme} color={theme.subtle} activeColor={theme.text} defaultBg={theme.background} onInvoke={onInvoke} />;
+}
+
+function Header({ cwd, theme, icons, compact, narrow, onHistory, onNew }: { cwd: string; theme: Theme; icons: IconSet; compact: boolean; narrow: boolean; onHistory: () => void; onNew: () => void }) {
   const label = compact ? (cwd.replace(/\\/g, "/").split("/").filter(Boolean).at(-1) ?? cwd) : cwd;
   return (
     <box style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", height: 1, flexShrink: 0, paddingLeft: 2, paddingRight: 1 }}>
       <text fg={theme.subtle}>{label}</text>
       <box style={{ flexDirection: "row", gap: 1 }}>
-        <HeaderAction icon={icons.session} label="历史" theme={theme} onInvoke={onHistory} />
-        <HeaderAction icon={icons.newSession} label="新会话" theme={theme} onInvoke={onNew} />
+        <HeaderAction icon={icons.session} label={narrow ? "" : "历史"} theme={theme} onInvoke={onHistory} />
+        <HeaderAction icon={icons.newSession} label={narrow ? "" : "新会话"} theme={theme} onInvoke={onNew} />
       </box>
     </box>
   );
@@ -315,13 +369,21 @@ function PanelView({ panel, theme, icons, onSelect, busyId }: { panel: PanelSpec
             const tone = busy ? theme.warning : option.tone === "danger" ? theme.error : option.tone === "warning" ? theme.warning : option.tone === "success" ? theme.success : active ? theme.focus : theme.text;
             return (
               <box id={`panel-option-${index}`} key={option.id} onMouseDown={() => { if (!busyId) onSelect(option.id); }} style={{ flexDirection: "column", paddingLeft: 1, paddingRight: 1, backgroundColor: active ? theme.surfaceSelected : theme.surface }}>
-                <text fg={tone}>{`${busy ? SPINNER_FRAMES[0] : active ? icons.prompt : " "} ${option.label}${busy ? "  处理中…" : ""}`}</text>
+                {busy ? (
+                  <box style={{ flexDirection: "row" }}>
+                    <Spinner color={tone} />
+                    <text fg={tone}>{` ${option.label}  处理中…`}</text>
+                  </box>
+                ) : (
+                  <text fg={tone}>{`${active ? icons.prompt : " "} ${option.label}`}</text>
+                )}
                 {option.description && !busy ? <text fg={theme.subtle}>{`    ${option.description}`}</text> : null}
               </box>
             );
           })}
         </scrollbox>
       ) : null}
+      <text fg={theme.subtle} style={{ paddingLeft: 1 }}>↑↓ 选择 · Enter 确认 · Esc 关闭</text>
     </box>
   );
 }
@@ -380,7 +442,7 @@ function PanelOverlay({ panel, anchor, theme, icons, terminalWidth, terminalHeig
 function InteractionView({ interaction, theme, icons, onResolve }: { interaction: Interaction; theme: Theme; icons: IconSet; onResolve: (result: Record<string, unknown>) => void }) {
   const [selected, setSelected] = useState(0);
   const selectedRef = useRef(0);
-  const [customText, setCustomText] = useState("");
+  const otherRef = useRef<InputRenderable | null>(null);
   const approvalOptions = interaction.kind === "approval"
     ? [{ label: "仅本次允许", value: "approve" }, ...(interaction.payload.persistAvailable ? [{ label: "以后允许这类命令", value: "persist" }] : []), { label: "拒绝", value: "deny" }]
     : [];
@@ -391,39 +453,77 @@ function InteractionView({ interaction, theme, icons, onResolve }: { interaction
     selectedRef.current = index;
     setSelected(index);
   };
+  const resolveCurrent = () => {
+    if (interaction.kind === "approval") onResolve({ decision: approvalOptions[selectedRef.current].value });
+    else onResolve({ selectedIndex: selectedRef.current, customText: otherRef.current?.value ?? "" });
+  };
   useKeyboard((key) => {
-    if (otherSelected) {
-      if (key.name === "escape") onResolve({ cancelled: true });
-      else if (isEnterKey(key.name)) onResolve({ selectedIndex: selectedRef.current, customText });
+    // Up/down always move selection, including while the "other" input is open,
+    // so the custom branch can never become a navigation trap.
+    if (key.name === "up" || (!otherSelected && key.name === "left")) {
+      key.preventDefault();
+      select((selectedRef.current - 1 + options.length) % options.length);
       return;
     }
-    if (key.name === "escape") onResolve(interaction.kind === "approval" ? { decision: "deny" } : { cancelled: true });
-    else if (key.name === "left" || key.name === "up") select((selectedRef.current - 1 + options.length) % options.length);
-    else if (key.name === "right" || key.name === "down") select((selectedRef.current + 1) % options.length);
+    if (key.name === "down" || (!otherSelected && key.name === "right")) {
+      key.preventDefault();
+      select((selectedRef.current + 1) % options.length);
+      return;
+    }
+    if (key.name === "escape") {
+      key.preventDefault();
+      onResolve(interaction.kind === "approval" ? { decision: "deny" } : { cancelled: true });
+    }
     else if (isEnterKey(key.name)) {
-      if (interaction.kind === "approval") onResolve({ decision: approvalOptions[selectedRef.current].value });
-      else onResolve({ selectedIndex: selectedRef.current, customText });
+      key.preventDefault();
+      resolveCurrent();
     }
     else if (/^[1-9]$/.test(key.name)) {
       const index = Number(key.name) - 1;
       if (index < options.length) {
-        if (index === selectedRef.current) {
-          if (interaction.kind === "approval") onResolve({ decision: approvalOptions[selectedRef.current].value });
-          else onResolve({ selectedIndex: selectedRef.current, customText });
-        } else {
-          select(index);
-        }
+        key.preventDefault();
+        if (index === selectedRef.current) resolveCurrent();
+        else select(index);
       }
     }
   });
+  const argsText = interaction.kind === "approval" ? JSON.stringify(interaction.payload.args, null, 2) : "";
+  const argsHeight = Math.min(Math.max(2, argsText.split("\n").length), 6);
   return (
     <box border borderStyle="rounded" borderColor={interaction.kind === "approval" ? theme.warning : theme.accent} style={{ flexDirection: "column", flexShrink: 0, marginLeft: 2, marginRight: 2, paddingLeft: 1, paddingRight: 1, paddingTop: 1, paddingBottom: 1, backgroundColor: theme.surfaceRaised }}>
       <text fg={interaction.kind === "approval" ? theme.warning : theme.accent}><strong>{interaction.kind === "approval" ? "需要确认" : interaction.payload.question}</strong></text>
-      {interaction.kind === "approval" ? <text fg={theme.muted}>{`${interaction.payload.toolName}  ${interaction.payload.risk}\n${interaction.payload.reason}\n${JSON.stringify(interaction.payload.args, null, 2)}`}</text> : null}
+      {interaction.kind === "approval" ? (
+        <box style={{ flexDirection: "column", flexShrink: 0 }}>
+          <text>
+            <span fg={theme.warning}>{`${interaction.payload.toolName} · ${interaction.payload.risk}`}</span>
+          </text>
+          <text fg={theme.muted}>{`原因：${interaction.payload.reason}`}</text>
+          <text fg={theme.subtle}>参数</text>
+          <scrollbox style={{ height: argsHeight, backgroundColor: theme.surface }}>
+            <text fg={theme.muted}>{argsText}</text>
+          </scrollbox>
+        </box>
+      ) : null}
       <box style={{ flexDirection: "column", paddingTop: 1 }}>
-        {options.map((option, index) => <text key={`${option.value}-${index}`} fg={index === selected ? theme.focus : (interaction.kind === "approval" && option.value === "deny" ? theme.error : theme.text)}>{`${index === selected ? icons.prompt : " "} [${index + 1}] ${option.label}${interaction.kind === "question" && questionOptions[index]?.description ? ` — ${questionOptions[index].description}` : ""}`}</text>)}
+        {options.map((option, index) => {
+          const active = index === selected;
+          const tone = active ? theme.focus : interaction.kind === "approval" && option.value === "deny" ? theme.error : theme.text;
+          const description = interaction.kind === "question" ? questionOptions[index]?.description : "";
+          return (
+            <box
+              key={`${option.value}-${index}`}
+              focusable
+              onMouseDown={() => { if (index === selectedRef.current) resolveCurrent(); else select(index); }}
+              style={{ flexDirection: "column", backgroundColor: active ? theme.surfaceSelected : theme.surfaceRaised, paddingLeft: 1, paddingRight: 1 }}
+            >
+              <text fg={tone}>{`${active ? icons.prompt : " "} [${index + 1}] ${option.label}`}</text>
+              {description ? <text fg={theme.subtle}>{`    ${description}`}</text> : null}
+            </box>
+          );
+        })}
       </box>
-      {otherSelected ? <input value={customText} placeholder="其他说明…" focused onInput={setCustomText} style={{ backgroundColor: theme.surface, textColor: theme.text, cursorColor: theme.accent, placeholderColor: theme.muted }} /> : null}
+      {otherSelected ? <input ref={otherRef} placeholder="其他说明…" focused style={{ backgroundColor: theme.surface, textColor: theme.text, cursorColor: theme.accent, placeholderColor: theme.muted }} /> : null}
+      <text fg={theme.subtle}>{`↑↓/点击 选择 · Enter 确认 · Esc ${interaction.kind === "approval" ? "拒绝" : "取消"}`}</text>
     </box>
   );
 }
@@ -450,19 +550,7 @@ function truncateText(text: string, maxWidth: number): string {
 }
 
 function StopAction({ icon, theme, onStop }: { icon: string; theme: Theme; onStop: () => void }) {
-  const [hovered, setHovered] = useState(false);
-  return (
-    <box
-      focusable
-      onMouseOver={() => setHovered(true)}
-      onMouseOut={() => setHovered(false)}
-      onMouseDown={onStop}
-      onKeyDown={(key) => { if (isEnterKey(key.name) || key.name === "space") onStop(); }}
-      style={{ paddingLeft: 1, paddingRight: 1, backgroundColor: hovered ? theme.surfaceSelected : theme.surface }}
-    >
-      <text fg={theme.error}><strong>{icon}</strong></text>
-    </box>
-  );
+  return <ActionButton icon={icon} theme={theme} color={theme.error} bold defaultBg={theme.surface} onInvoke={onStop} />;
 }
 
 const BRAILLE_ROW_BITS = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
@@ -543,22 +631,10 @@ function ContextGauge({ percent, tokens, windowTokens, theme }: { percent: numbe
 }
 
 function AttachAction({ theme, onAddFiles }: { theme: Theme; onAddFiles: () => void }) {
-  const [hovered, setHovered] = useState(false);
-  return (
-    <box
-      focusable
-      onMouseOver={() => setHovered(true)}
-      onMouseOut={() => setHovered(false)}
-      onMouseDown={onAddFiles}
-      onKeyDown={(key) => { if (isEnterKey(key.name) || key.name === "space") onAddFiles(); }}
-      style={{ flexDirection: "row", paddingLeft: 1, paddingRight: 1, backgroundColor: hovered ? theme.surfaceSelected : theme.surface }}
-    >
-      <text fg={theme.accent}><strong>＋</strong></text>
-    </box>
-  );
+  return <ActionButton icon="＋" theme={theme} color={theme.accent} bold defaultBg={theme.surface} onInvoke={onAddFiles} />;
 }
 
-function CompletionOverlay({ theme, title, footer, onClose, children }: { theme: Theme; title: string; footer: string; onClose: () => void; children: React.ReactNode }) {
+function CompletionOverlay({ theme, title, footer, bottomOffset, maxHeight, onClose, children }: { theme: Theme; title: string; footer: string; bottomOffset: number; maxHeight: number; onClose: () => void; children: React.ReactNode }) {
   return (
     <box
       position="absolute"
@@ -570,18 +646,17 @@ function CompletionOverlay({ theme, title, footer, onClose, children }: { theme:
       onMouseDown={onClose}
       style={{ width: "100%", height: "100%" }}
     >
-      <box position="absolute" top={0} left={0} width="100%" height="100%" style={{ backgroundColor: theme.background, opacity: 0.35 }} />
       <box
         position="absolute"
         left={2}
         right={2}
-        bottom={2}
+        bottom={bottomOffset}
         zIndex={31}
         border
         borderStyle="rounded"
         borderColor={theme.border}
         onMouseDown={(event) => event.stopPropagation()}
-        style={{ flexDirection: "column", maxHeight: 14, backgroundColor: theme.surfaceRaised, paddingLeft: 1, paddingRight: 1 }}
+        style={{ flexDirection: "column", maxHeight, backgroundColor: theme.surfaceRaised, paddingLeft: 1, paddingRight: 1 }}
       >
         <text fg={theme.accent}><strong>{title}</strong></text>
         {children}
@@ -591,7 +666,7 @@ function CompletionOverlay({ theme, title, footer, onClose, children }: { theme:
   );
 }
 
-function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queueDepth, commands, theme, icons, compact, terminalWidth, disabled, sessionReady, onAction, attachments, onAddFiles, onStagePaths, onPaste, onRemoveAttachment, snapshot, onOpenPanel }: { value: string; onChange: (value: string) => void; onSubmit: () => void; onCancel: () => void; running: boolean; stopping: boolean; queueDepth: number; commands: CommandItem[]; theme: Theme; icons: IconSet; compact: boolean; terminalWidth: number; disabled: boolean; sessionReady: boolean; onAction?: AppProps["onAction"]; attachments: AttachmentItem[]; onAddFiles: () => void; onStagePaths: (paths: string[], source: "mention" | "clipboard") => Promise<boolean>; onPaste: (editor: TextareaRenderable | null) => void; onRemoveAttachment: (id: string) => void; snapshot: typeof initialState.snapshot; onOpenPanel: (panel: "profile" | "permission" | "model" | "effort") => void }) {
+function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queueDepth, commands, theme, icons, compact, narrow, terminalWidth, terminalHeight, disabled, sessionReady, onAction, attachments, onAddFiles, onStagePaths, onPaste, onRemoveAttachment, snapshot, onOpenPanel }: { value: string; onChange: (value: string) => void; onSubmit: () => void; onCancel: () => void; running: boolean; stopping: boolean; queueDepth: number; commands: CommandItem[]; theme: Theme; icons: IconSet; compact: boolean; narrow: boolean; terminalWidth: number; terminalHeight: number; disabled: boolean; sessionReady: boolean; onAction?: AppProps["onAction"]; attachments: AttachmentItem[]; onAddFiles: () => void; onStagePaths: (paths: string[], source: "mention" | "clipboard") => Promise<boolean>; onPaste: (editor: TextareaRenderable | null) => void; onRemoveAttachment: (id: string) => void; snapshot: typeof initialState.snapshot; onOpenPanel: (panel: "profile" | "permission" | "model" | "effort") => void }) {
   const [selected, setSelected] = useState(0);
   const [mentions, setMentions] = useState<Completion[]>([]);
   const [dismissedCompletionValue, setDismissedCompletionValue] = useState<string | null>(null);
@@ -686,16 +761,24 @@ function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queu
       )}
     </box>
   );
+  const composerBottomOffset = narrow ? 11 : 8;
+  const paletteMaxHeight = Math.max(5, Math.min(14, terminalHeight - composerBottomOffset - 1));
+  const paletteBodyRows = Math.min(
+    candidates.length + (commandMode ? 0 : mentionSections.length),
+    Math.max(2, paletteMaxHeight - 3)
+  );
   return (
-    <box style={{ flexDirection: "column", flexShrink: 0, paddingLeft: 2, paddingRight: 2 }}>
+    <box style={{ flexDirection: "column", flexShrink: 0, paddingLeft: narrow ? 1 : 2, paddingRight: narrow ? 1 : 2 }}>
       {paletteOpen ? (
         <CompletionOverlay
           theme={theme}
           title={commandMode ? "命令" : "添加上下文"}
           footer={` ${selected + 1}/${candidates.length}  ↑↓ 选择  Enter/Tab 使用  点击外层关闭`}
+          bottomOffset={composerBottomOffset}
+          maxHeight={paletteMaxHeight}
           onClose={() => setDismissedCompletionValue(value)}
         >
-          <scrollbox ref={paletteRef} style={{ height: Math.min(candidates.length + (commandMode ? 0 : mentionSections.length), 10), backgroundColor: theme.surfaceRaised }}>
+          <scrollbox ref={paletteRef} style={{ height: paletteBodyRows, backgroundColor: theme.surfaceRaised }}>
             {commandMode
               ? candidates.map(renderCandidate)
               : mentionSections.map((section) => (
@@ -728,13 +811,13 @@ function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queu
             style={{ flexGrow: 1, minHeight: 2, maxHeight: 6, backgroundColor: theme.surface, textColor: theme.text, cursorColor: theme.accent, placeholderColor: theme.muted }}
           />
         </box>
-        <box style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingLeft: 1, paddingRight: 1 }}>
+        <box style={{ flexDirection: narrow ? "column" : "row", alignItems: "center", justifyContent: "space-between", paddingLeft: 1, paddingRight: 1 }}>
           <box style={{ flexDirection: "row", alignItems: "center", flexShrink: 1, minWidth: 0 }}>
             <AttachAction theme={theme} onAddFiles={onAddFiles} />
             <ToolbarAction label={`${snapshot.routingMode === "auto" ? "自动" : profileLabel(snapshot.profile)} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("profile")} />
             <ToolbarAction label={`${compact ? "审批" : permissionLabel(snapshot.permissionMode)} ▾`} theme={theme} tone={snapshot.permissionMode === "danger-full-access" ? theme.error : theme.text} onInvoke={() => onOpenPanel("permission")} />
           </box>
-          <box style={{ flexDirection: "row", alignItems: "center", flexShrink: 0, marginLeft: 2 }}>
+          <box style={{ flexDirection: "row", alignItems: "center", flexShrink: narrow ? 1 : 0, minWidth: 0, marginLeft: narrow ? 0 : 2 }}>
             <ContextGauge percent={snapshot.contextPercent} tokens={snapshot.contextTokens ?? 0} windowTokens={snapshot.contextWindowTokens ?? 0} theme={theme} />
             <ToolbarAction label={`${icons.assistant} ${compact ? shortModelLabel(snapshot.model) : truncateText(snapshot.model, 26)} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("model")} />
             <ToolbarAction label={`${effortLabel(snapshot.reasoningEffort)} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("effort")} />
@@ -748,9 +831,7 @@ function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queu
           {attachments.map((attachment) => (
             <box key={attachment.id} style={{ flexDirection: "row", paddingLeft: 1, gap: 1 }}>
               <text fg={theme.subtle}>{`${icons.file} ${attachment.name}  ${formatBytes(attachment.size)}`}</text>
-              <box focusable onMouseDown={() => onRemoveAttachment(attachment.id)} onKeyDown={(key) => { if (isEnterKey(key.name) || key.name === "space") onRemoveAttachment(attachment.id); }}>
-                <text fg={theme.error}>×</text>
-              </box>
+              <ActionButton icon="×" theme={theme} color={theme.error} defaultBg={theme.surface} onInvoke={() => onRemoveAttachment(attachment.id)} />
             </box>
           ))}
         </box>
@@ -785,19 +866,7 @@ function effortLabel(effort: string | null | undefined): string {
 }
 
 function ToolbarAction({ label, theme, tone, onInvoke }: { label: string; theme: Theme; tone: string; onInvoke: () => void }) {
-  const [hovered, setHovered] = useState(false);
-  return (
-    <box
-      focusable
-      onMouseOver={() => setHovered(true)}
-      onMouseOut={() => setHovered(false)}
-      onMouseDown={onInvoke}
-      onKeyDown={(key) => { if (isEnterKey(key.name) || key.name === "space") onInvoke(); }}
-      style={{ paddingLeft: 1, paddingRight: 1, backgroundColor: hovered ? theme.surfaceSelected : theme.surface }}
-    >
-      <text fg={tone}><strong>{label}</strong></text>
-    </box>
-  );
+  return <ActionButton label={label} theme={theme} color={tone} defaultBg={theme.surface} onInvoke={onInvoke} />;
 }
 
 export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInteraction, onPickFiles, onReadClipboard, onCopyText, initialTask, themePreference = "auto", iconPreference = "auto" }: AppProps) {
@@ -815,6 +884,7 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
   const theme = resolveTheme(themePreference, detectedTheme);
   const icons = resolveIcons(iconPreference);
   const compact = width < 96;
+  const narrow = width < 70;
   const stopping = state.turnState === "cancelling";
   const running = state.turnState === "running" || state.turnState === "queued" || stopping;
 
@@ -953,6 +1023,10 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
   const submitWithAuthorization = async (authorizedPaths: string[] = []) => {
     const text = draft.trim();
     if (!text && !attachments.length) return;
+    if (state.snapshot.status === "failed") {
+      dispatch({ type: "notice", level: "error", text: "会话未就绪，暂时无法提交。" });
+      return;
+    }
     const panelCommands: Record<string, string> = { "/checkpoint": "checkpoint", "/mcp": "mcp", "/observe": "observe" };
     if (!attachments.length && panelCommands[text]) { setDraft(""); void invoke("open_panel", { panel: panelCommands[text] }); return; }
     if (!attachments.length && (text === "/compact" || text === "/fork")) { setDraft(""); void invoke("panel_action", { panel: "command", action: text.slice(1) }); return; }
@@ -1002,18 +1076,18 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
 
   return (
     <box style={{ flexDirection: "column", width: "100%", height: "100%", backgroundColor: theme.background }}>
-      <Header cwd={state.snapshot.cwd} theme={theme} icons={icons} compact={compact} onHistory={() => void invoke("open_sessions", undefined, "history")} onNew={() => void invoke("new_session")} />
-      <Transcript items={state.items} theme={theme} icons={icons} />
+      <Header cwd={state.snapshot.cwd} theme={theme} icons={icons} compact={compact} narrow={narrow} onHistory={() => void invoke("open_sessions", undefined, "history")} onNew={() => void invoke("new_session")} />
+      <Transcript items={state.items} theme={theme} icons={icons} narrow={narrow} />
       {state.interaction ? <InteractionView interaction={state.interaction} theme={theme} icons={icons} onResolve={resolveInteraction} /> : panel ? null : externalPaths ? (
         <box border borderStyle="rounded" borderColor={theme.warning} style={{ flexDirection: "column", marginLeft: 2, marginRight: 2, paddingLeft: 1, paddingRight: 1 }}>
           <text fg={theme.warning}><strong>允许读取工作区外文件？</strong></text>
           {externalPaths.map((path) => <text key={path} fg={theme.text}>{path}</text>)}
-          <box style={{ flexDirection: "row", gap: 2 }}>
-            <box focusable onMouseDown={() => void submitWithAuthorization(externalPaths)} onKeyDown={(key) => { if (isEnterKey(key.name)) void submitWithAuthorization(externalPaths); }}><text fg={theme.success}>允许本次读取</text></box>
-            <box focusable onMouseDown={() => setExternalPaths(null)} onKeyDown={(key) => { if (isEnterKey(key.name)) setExternalPaths(null); }}><text fg={theme.error}>拒绝</text></box>
+          <box style={{ flexDirection: "row", gap: 1 }}>
+            <ActionButton label="允许本次读取" theme={theme} color={theme.success} defaultBg={theme.surfaceRaised} onInvoke={() => void submitWithAuthorization(externalPaths)} />
+            <ActionButton label="拒绝" theme={theme} color={theme.error} defaultBg={theme.surfaceRaised} onInvoke={() => setExternalPaths(null)} />
           </box>
         </box>
-      ) : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} commands={state.commands} theme={theme} icons={icons} compact={compact} terminalWidth={width} disabled={stopping} sessionReady={state.snapshot.status === "ready"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
+      ) : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping} sessionReady={state.snapshot.status === "ready"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
       {panel && !state.interaction ? <PanelOverlay panel={panel} anchor={panelAnchor} theme={theme} icons={icons} terminalWidth={width} terminalHeight={height} onClose={() => setPanel(null)} onSelect={selectPanel} busyId={panelBusyId} /> : null}
     </box>
   );
