@@ -125,7 +125,7 @@ class TerminalBenchLauncherTests(unittest.TestCase):
             self.assertEqual(env["TMP"], expected_temp)
             self.assertEqual(env["OPENAI_API_KEY"], "test-key")
             self.assertEqual(env["HARNESS_MODEL"], "existing-model")
-            self.assertEqual(env["MAX_AGENT_ITERATIONS"], "100")
+            self.assertNotIn("MAX_AGENT_ITERATIONS", env)
             self.assertEqual(env["MAX_AGENT_TOOL_CALLS"], "400")
             self.assertEqual(env["PYTHONIOENCODING"], "utf-8")
             self.assertEqual(env["PYTHONUTF8"], "1")
@@ -142,12 +142,10 @@ class TerminalBenchLauncherTests(unittest.TestCase):
                 repo_root,
                 base_env={
                     "PATH": "base-path",
-                    "MAX_AGENT_ITERATIONS": "120",
                     "MAX_AGENT_TOOL_CALLS": "500",
                 },
             )
 
-            self.assertEqual(env["MAX_AGENT_ITERATIONS"], "120")
             self.assertEqual(env["MAX_AGENT_TOOL_CALLS"], "500")
         finally:
             shutil.rmtree(repo_root, ignore_errors=True)
@@ -159,7 +157,6 @@ class TerminalBenchLauncherTests(unittest.TestCase):
                 "OPENAI_API_KEY": "secret",
                 "OPENAI_BASE_URL": "https://api.deepseek.com",
                 "HARNESS_MODEL": "deepseek-v4-flash",
-                "MAX_AGENT_ITERATIONS": "100",
                 "MAX_AGENT_TOTAL_TOKENS": "900000",
                 "MAX_AGENT_TOOL_CALLS": "400",
                 "AGENT_BUDGET_WARN_FRACTION": "0.9",
@@ -168,7 +165,7 @@ class TerminalBenchLauncherTests(unittest.TestCase):
         ):
             env = runner_env_vars()
 
-        self.assertEqual(env["MAX_AGENT_ITERATIONS"], "100")
+        self.assertNotIn("MAX_AGENT_ITERATIONS", env)
         self.assertEqual(env["MAX_AGENT_TOTAL_TOKENS"], "900000")
         self.assertEqual(env["MAX_AGENT_TOOL_CALLS"], "400")
         self.assertEqual(env["AGENT_BUDGET_WARN_FRACTION"], "0.9")

@@ -104,11 +104,13 @@ class HarnessCodeAgentAdapter(BaseClawAdapter):
             f"HARNESS_MODEL_HARD={self.model}",
             "-e",
             f"HARNESS_MODEL_MAX={self.model}",
-            "-e",
+            "-e",f"-e",
             f"HARNESS_MODEL_INTENSITY={os.environ.get('HARNESS_MODEL_INTENSITY', 'normal')}",
         ])
-        if self.max_turns:
-            args.extend(["-e", f"MAX_AGENT_ITERATIONS={self.max_turns}"])
+        # max_turns stays accepted for upstream CLI compatibility but is
+        # intentionally not applied: runs are bounded by the profile task
+        # budget (PROFILE_CODING_AGENT_TASK_BUDGET) plus the hard process
+        # timeout, not by a step guess.
         return args
 
     def post_container_start(self, workspace) -> None:
@@ -153,7 +155,7 @@ class HarnessCodeAgentAdapter(BaseClawAdapter):
                 stderr_path=stderr_path,
             )
 
-        command = _agent_command(timeout=self.timeout, max_turns=self.max_turns)
+        command = _agent_command(timeout=self.timeout)
         started = time.perf_counter()
         timed_out = False
         try:
@@ -216,7 +218,7 @@ class HarnessCodeAgentAdapter(BaseClawAdapter):
         return usage
 
 
-def _agent_command(*, timeout: int, max_turns: int | None) -> str:
+def _agent_command(*, timeout: int) -> str:
     env = {
         "PYTHONPATH": CONTAINER_REPO,
         "HARNESS_WORKSPACE": "/testbed",
@@ -227,8 +229,6 @@ def _agent_command(*, timeout: int, max_turns: int | None) -> str:
         "MAX_AGENT_TOTAL_TOKENS": "900000",
         "PROFILE_CODING_AGENT_TASK_BUDGET": str(timeout),
     }
-    if max_turns:
-        env["MAX_AGENT_ITERATIONS"] = str(max_turns)
     prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
     return f"cd /testbed && {prefix} python3 {shlex.quote(RUNNER)} {shlex.quote(CONTAINER_PROMPT)}"
 

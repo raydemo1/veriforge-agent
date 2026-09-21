@@ -243,7 +243,6 @@ def _run_hca_case(
     marker_success = all(str(marker).lower() in combined for marker in success_markers)
     fallback_reason = str((metrics.get("audit") or {}).get("latest_fallback") or "").strip()
     bad_fallbacks = {
-        "max_iterations",
         "token_budget_exceeded",
         "tool_call_budget_exceeded",
         "repeated_tool_failure",
@@ -311,11 +310,11 @@ def _coerce_output(value: Any) -> str:
 
 
 def _apply_metrics_eval_limits(env: dict[str, str], *, suite: str) -> None:
+    # Only resource budgets are set; the runtime no longer accepts an
+    # iteration cap. Wall-clock stays bounded by the launch timeout.
     if suite == "latency":
-        env["MAX_AGENT_ITERATIONS"] = "8"
         env["MAX_AGENT_TOTAL_TOKENS"] = "80000"
     else:
-        env["MAX_AGENT_ITERATIONS"] = "12"
         env["MAX_AGENT_TOTAL_TOKENS"] = "100000"
 
 

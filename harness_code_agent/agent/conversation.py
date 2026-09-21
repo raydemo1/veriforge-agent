@@ -80,7 +80,6 @@ class Agent:
                  stream_callback=None,
                  prompt_cache_identity: dict[str, str] | None = None,
                  model_intensity: str | None = None,
-                 max_iterations: int | None = None,
                  memory_index: str | None = None):
         self.name = name
         # Stable instructions only (identity/profile/rules/skills). The memory
@@ -99,7 +98,6 @@ class Agent:
         self.stream_callback = stream_callback
         self.prompt_cache_identity = prompt_cache_identity
         self.model_intensity = model_intensity
-        self.max_iterations = max_iterations
         self.current_task_metadata: dict = {}
         self._conversations: weakref.WeakSet[AgentConversation] = weakref.WeakSet()
 
@@ -119,8 +117,7 @@ class Agent:
 
     def run(self, task: str) -> str:
         """
-        Execute the agent loop until the model stops calling tools
-        or we hit the iteration limit.
+        Execute the agent loop until the model stops calling tools.
 
         Returns the final assistant text response.
         Writes a JSONL trace file to {WORKSPACE}/.harness/traces/trace_{name}.jsonl
@@ -335,7 +332,12 @@ class AgentConversation:
         self._append_message({"role": "user", "content": task})
 
     def queue_message(self, message: str, *, tag: str = "PARENT STEERING MESSAGE") -> None:
-        """Queue steering text for the next valid model-request boundary."""
+        """Queue text for the next valid model-request boundary.
+
+        The tag labels the injected user message; steering keeps the
+        default parent-message tag, child-to-parent reports supply their
+        own subagent tag.
+        """
         text = str(message or "").strip()
         if not text:
             raise ValueError("queued message must not be empty")
@@ -837,8 +839,11 @@ class AgentConversation:
         run_started = time.monotonic()
         turn_controller = TurnController(self)
 
-        iteration_limit = agent.max_iterations or config.MAX_AGENT_ITERATIONS
-        for local_iteration in range(1, iteration_limit + 1):
+        # No iteration cap: resources, side effects and runaway behavior are
+        # bounded elsewhere (tool/token budgets, time budget, cancellation).
+        local_iteration = 0
+        while True:
+            local_iteration += 1
             iteration = self._iteration_offset + local_iteration
 
             # --- Cancellation check ---
@@ -975,9 +980,6 @@ class AgentConversation:
             )
             if not decision.continue_loop:
                 break
-
-        else:
-            turn_controller.finish_max_iterations(iteration_limit=iteration_limit)
 
         self._iteration_offset += local_iteration
         return self.last_text

@@ -99,19 +99,3 @@ class TurnController:
             })
             return TurnDecision(True, "length_truncated")
         return TurnDecision(True, "tools_executed")
-
-    def finish_max_iterations(self, *, iteration_limit: int) -> TurnDecision:
-        conversation = self.conversation
-        agent = conversation.agent
-        log.warning("[%s] Hit max iterations (%s).", agent.name, iteration_limit)
-        conversation.runtime_state.fallback.request_stop(
-            reason="max_iterations",
-            limit_type="iterations",
-            used=iteration_limit,
-            limit=iteration_limit,
-            recent_action_summary=conversation.runtime_state.fallback.recent_action_summary,
-        )
-        conversation.emitter.emit_agent_fallback(conversation.runtime_state.fallback)
-        conversation.last_text = conversation._fallback_text()
-        conversation.trace.finish("max_iterations", iteration_limit)
-        return TurnDecision(False, "max_iterations")

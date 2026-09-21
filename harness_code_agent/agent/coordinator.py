@@ -51,8 +51,6 @@ class AgentRecord:
     allowed_paths: list[str]
     fork_turns: str | int
     model_intensity: str | None
-    max_turns: int
-    max_seconds: int
     state: str = "queued"
     summary: str = ""
     error: str | None = None
@@ -80,6 +78,9 @@ class AgentCoordinator:
     ) -> None:
         self.context = tool_context
         self._parent_messages = parent_messages or list
+        # Delivers (text, tag) into the main agent conversation queue. The
+        # topology is fixed Main <-> Child: this is the only upward path,
+        # there is no child-to-child addressing.
         self._parent_message_sink = parent_message_sink
         self._executor = ThreadPoolExecutor(max_workers=max(1, int(max_concurrent)), thread_name_prefix="hca-agent")
         self._condition = threading.Condition(threading.RLock())
@@ -99,8 +100,6 @@ class AgentCoordinator:
         allowed_paths: list[str] | None = None,
         fork_turns: str | int = "none",
         model_intensity: str | None = None,
-        max_turns: int = 6,
-        max_seconds: int = 300,
         parent_cancellation_token: CancellationToken | None = None,
     ) -> dict:
         role = str(role or "").strip().lower()
@@ -141,8 +140,6 @@ class AgentCoordinator:
                 allowed_paths=paths,
                 fork_turns=normalized_fork,
                 model_intensity=model_intensity,
-                max_turns=max(1, min(20, int(max_turns))),
-                max_seconds=max(30, min(1800, int(max_seconds))),
                 parent_token=parent_cancellation_token,
             )
             self._records[agent_id] = record
@@ -357,7 +354,6 @@ class AgentCoordinator:
             sandbox_mode="host",
         )
         sub_context = ToolContext(
-            agent_id=record.id,
             workspace=workspace,
             permission_policy=policy,
             event_bus=self.context.event_bus,
@@ -366,6 +362,7 @@ class AgentCoordinator:
             memory_auto_extract_enabled=self.context.memory_auto_extract_enabled,
             tool_registry=registry,
             allowed_tool_permissions={"read", "network_read", "edit", "shell"},
+            agent_id=record.id,
         )
         sub_context.resource_coordinator = self.context.resource_coordinator
         sub_context.tool_tasks = self.context.tool_tasks
@@ -378,10 +375,8 @@ class AgentCoordinator:
                 tool_context=sub_context,
                 tool_registry=registry,
             ),
-            time_budget=float(record.max_seconds),
             tool_context=sub_context,
             model_intensity=record.model_intensity,
-            max_iterations=record.max_turns,
         )
         record.conversation = agent.start_conversation(_task_prompt(record))
         with self._condition:

@@ -99,8 +99,6 @@ CORE_TOOL_SCHEMAS = [
                     "allowed_paths": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Required writable ownership paths for worker; optional for read-only roles."},
                     "fork_turns": {"oneOf": [{"type": "string", "enum": ["none", "all"]}, {"type": "integer", "minimum": 1, "maximum": 5}], "default": "none"},
                     "model_intensity": {"type": "string", "enum": ["fast", "normal", "hard", "max"]},
-                    "max_turns": {"type": "integer", "minimum": 1, "maximum": 20, "default": 6},
-                    "max_seconds": {"type": "integer", "minimum": 30, "maximum": 1800, "default": 300},
                 },
             },
         },

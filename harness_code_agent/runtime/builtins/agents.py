@@ -18,8 +18,6 @@ def spawn_agent(
     allowed_paths: list[str] | None = None,
     fork_turns: str | int = "none",
     model_intensity: str | None = None,
-    max_turns: int = 6,
-    max_seconds: int = 300,
     tool_context: ToolContext | None = None,
     cancellation_token=None,
 ) -> ToolResult:
@@ -33,8 +31,6 @@ def spawn_agent(
             allowed_paths=allowed_paths,
             fork_turns=fork_turns,
             model_intensity=model_intensity,
-            max_turns=max_turns,
-            max_seconds=max_seconds,
             parent_cancellation_token=cancellation_token,
         )
     except SubagentCapacityError as exc:

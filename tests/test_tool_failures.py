@@ -805,7 +805,6 @@ class ExecutorFailureIntegrationTests(unittest.TestCase):
                 [spy, ToolFailurePolicyMiddleware(tool_registry=registry)],
             )
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -832,7 +831,6 @@ class ExecutorFailureIntegrationTests(unittest.TestCase):
                 repeat=5,
             )
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 6),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -888,7 +886,6 @@ class ExecutorFailureIntegrationTests(unittest.TestCase):
                 [spy, ToolFailurePolicyMiddleware(tool_registry=registry)],
             )
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -920,9 +917,8 @@ def _run_schema_streak(root: Path):
         [spy, ToolFailurePolicyMiddleware(tool_registry=registry)],
         repeat=5,
     )
-    with (
-        patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 6),
-        patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+    with patch(
+        "harness_code_agent.agent.conversation.context.count_tokens", return_value=1
     ):
         conversation.run_until_idle()
     return conversation, context, registry
@@ -1036,7 +1032,6 @@ class FailureObservabilityTests(unittest.TestCase):
                 [BlockMiddleware(), ToolFailurePolicyMiddleware(tool_registry=registry)],
             )
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -1088,7 +1083,6 @@ class FailureObservabilityTests(unittest.TestCase):
                 [BlockMiddleware(), FailureSpyMiddleware()],
             )
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -1108,7 +1102,6 @@ class FailureObservabilityTests(unittest.TestCase):
                 repeat=3,
             )
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 4),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -1154,7 +1147,6 @@ class FailureObservabilityTests(unittest.TestCase):
                 [ToolGuardMiddleware(), spy, ToolFailurePolicyMiddleware()],
             )
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()

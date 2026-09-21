@@ -173,8 +173,7 @@ class ToolExecutorTests(unittest.TestCase):
             )
             policy = SpyPermissionPolicy()
             context.permission_policy = policy
-            with patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2):
-                conversation.run_until_idle()
+            conversation.run_until_idle()
 
         self.assertEqual(executed, [])
         self.assertEqual(policy.calls, 0)
@@ -281,7 +280,6 @@ class ToolExecutorTests(unittest.TestCase):
             conversation, context = _conversation_with_registry(Path(tmp), registry, tool_calls)
             start = time.perf_counter()
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -323,7 +321,6 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, _ = _conversation_with_registry(Path(tmp), registry, calls)
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -347,7 +344,6 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, context = _conversation_with_registry(Path(tmp), registry, tool_calls)
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -383,7 +379,6 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, context = _conversation_with_registry(Path(tmp), registry, tool_calls, middlewares=[NudgeMiddle()])
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -439,7 +434,6 @@ class ToolExecutorTests(unittest.TestCase):
                 middlewares=[FirstMiddleware(), observer],
             )
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -508,7 +502,6 @@ class ToolExecutorTests(unittest.TestCase):
                 agent._conversations.add(conversation)
                 conversation._cached_prompt_cache_key = "old-cache-key"
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -591,7 +584,6 @@ class ToolExecutorTests(unittest.TestCase):
             (root / "note.txt").write_text("before", encoding="utf-8")
             conversation, _context = _conversation_with_registry(root, registry, tool_calls)
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -631,7 +623,6 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, _context = _conversation_with_registry(Path(tmp), registry, tool_calls, middlewares=[BlockMiddle()])
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -674,7 +665,6 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, _context = _conversation_with_registry(Path(tmp), registry, tool_calls, middlewares=[FallbackMiddle()])
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -717,7 +707,6 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, _ = _conversation_with_registry(Path(tmp), registry, calls, middlewares=[StopOnB()])
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -745,7 +734,6 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, _context = _conversation_with_registry(Path(tmp), registry, tool_calls)
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.config.MAX_AGENT_TOTAL_TOKENS", 100),
                 patch("harness_code_agent.agent.conversation.config.MAX_AGENT_TOOL_CALLS", 1),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
@@ -786,7 +774,6 @@ class ToolExecutorTests(unittest.TestCase):
             context.approval_provider = ApprovalProvider()
             conversation.agent.middlewares.append(PermissionMiddleware(context, registry))
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -814,7 +801,6 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, _context = _conversation_with_registry(Path(tmp), registry, tool_calls)
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -856,7 +842,6 @@ class ToolExecutorTests(unittest.TestCase):
             conversation, _context = _conversation_with_registry(Path(tmp), registry, tool_calls)
             start = time.perf_counter()
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
                 self.assertRaises(CancelledError),
             ):
@@ -898,7 +883,6 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, _context = _conversation_with_registry(Path(tmp), registry, tool_calls)
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
                 self.assertRaises(CancelledError),
             ):
@@ -944,7 +928,6 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, _context = _conversation_with_registry(Path(tmp), registry, tool_calls)
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
                 self.assertRaises(CancelledError),
             ):
@@ -988,7 +971,6 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, context = _conversation_with_registry(Path(tmp), registry, tool_calls)
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
                 self.assertRaises(CancelledError),
             ):
@@ -1033,7 +1015,6 @@ class ToolExecutorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, _context = _conversation_with_registry(Path(tmp), registry, tool_calls)
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
                 self.assertRaises(CancelledError),
             ):
@@ -1091,7 +1072,6 @@ class ToolExecutorTests(unittest.TestCase):
             fake_jobs = FakeJobs()
             conversation.runtime_state.shell_job_manager = fake_jobs
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -1118,7 +1098,6 @@ class ToolExecutorTests(unittest.TestCase):
                 Path(tmp), registry, tool_calls
             )
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
@@ -1166,7 +1145,6 @@ class ToolExecutorTests(unittest.TestCase):
                 Path(tmp), registry, tool_calls, middlewares=[FallbackMiddle()]
             )
             with (
-                patch("harness_code_agent.agent.conversation.config.MAX_AGENT_ITERATIONS", 2),
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()

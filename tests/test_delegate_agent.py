@@ -272,8 +272,6 @@ class AgentCoordinatorTests(unittest.TestCase):
             allowed_paths=[],
             fork_turns="none",
             model_intensity=None,
-            max_turns=1,
-            max_seconds=30,
             state="running",
         )
         unrelated = AgentRecord(
@@ -285,8 +283,6 @@ class AgentCoordinatorTests(unittest.TestCase):
             allowed_paths=[],
             fork_turns="none",
             model_intensity=None,
-            max_turns=1,
-            max_seconds=30,
             state="running",
         )
         with self.coordinator._condition:
@@ -327,8 +323,6 @@ class AgentCoordinatorTests(unittest.TestCase):
             allowed_paths=[],
             fork_turns="none",
             model_intensity=None,
-            max_turns=1,
-            max_seconds=30,
             state="completed",
             conversation=conversation,
         )

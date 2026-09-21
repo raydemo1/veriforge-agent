@@ -433,9 +433,9 @@ class EvalSuiteTests(unittest.TestCase):
         self.assertIn("HARNESS_MODEL=deepseek-v4-flash", joined)
         self.assertIn("HARNESS_MODEL_HARD=deepseek-v4-flash", joined)
         self.assertIn("HARNESS_MODEL_INTENSITY=normal", joined)
-        self.assertIn("MAX_AGENT_ITERATIONS=12", joined)
+        self.assertNotIn("MAX_AGENT_ITERATIONS", joined)
 
-        command = _agent_command(timeout=120, max_turns=12)
+        command = _agent_command(timeout=120)
         self.assertIn("PROFILE_CODING_AGENT_TASK_BUDGET=120", command)
         self.assertIn("hca_claw_runner.py", command)
 
