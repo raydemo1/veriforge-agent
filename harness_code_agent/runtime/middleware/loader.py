@@ -16,6 +16,7 @@ running without a policy the user explicitly configured.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -89,9 +90,10 @@ def _load_middleware(raw_path: str, class_name: str) -> AgentMiddleware:
             f"Failed to load middleware {class_name}:\nfile not found: {Path(raw_path).expanduser()}"
         ) from exc
 
-    module_name = "_harness_user_middleware_" + "".join(
-        ch if ch.isalnum() else "_" for ch in str(path)
-    )
+    # Fixed-length, collision-resistant module name derived from the resolved
+    # path, instead of embedding the whole path in the identifier.
+    path_digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
+    module_name = f"_harness_user_middleware_{path_digest}"
     try:
         spec = importlib.util.spec_from_file_location(module_name, path)
         if spec is None or spec.loader is None:

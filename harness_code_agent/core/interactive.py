@@ -155,8 +155,6 @@ class InteractiveSession:
         self.last_command_result = None
         self.session_store = SessionStore(self.cwd / ".harness")
         self.session_store.root.mkdir(parents=True, exist_ok=True)
-        self.resume_session_id: str | None = None
-        self.resume_context: str | None = None
         inferred_explicit = profile_name != PRODUCT_DEFAULT_PROFILE
         self.profile_explicit = inferred_explicit if profile_explicit is None else profile_explicit
         self.routing_mode = ROUTING_MODE_PINNED if self.profile_explicit else ROUTING_MODE_AUTO
@@ -553,7 +551,6 @@ class InteractiveSession:
             cwd=self.cwd,
             model=config.MODEL,
             permission_mode=self.permission_mode,
-            resumed_from=self.resume_session_id,
             profile_source=source,
         )
         self.attachment_manager = AttachmentManager(
@@ -625,16 +622,9 @@ class InteractiveSession:
                 "profile": self.profile.name(),
                 "profile_source": source,
                 "workspace": str(self.cwd),
-                "resumed_from": self.resume_session_id,
                 "interactive": True,
             },
         )
-        if self.resume_session_id:
-            self._restore_session_messages(self.resume_session_id)
-        elif self.resume_context:
-            self._append_conversation_message({
-                "role": "user", "content": f"Resume context:\n{self.resume_context}",
-            })
 
     def _effective_permission_policy(self) -> PermissionPolicy:
         """Session permission mode tightened by the active profile preset."""
@@ -1262,21 +1252,6 @@ class InteractiveSession:
             self.tool_context.session_id = session.id
             self.tool_context.event_bus = self.event_bus
 
-    def _restore_session_messages(self, session_id: str) -> None:
-        if self.conversation is None or self.agent is None:
-            return
-        journal_path = self.session_store.sessions_dir / session_id / "journal.jsonl"
-        if not journal_path.exists() or not journal_path.stat().st_size:
-            self._append_conversation_message({
-                "role": "user", "content": f"Resume context:\n{self.resume_context or ''}",
-            })
-            return
-        recovered = SessionJournal(journal_path).recovery_messages(self.agent.full_system_prompt)
-        self.conversation._replace_messages(recovered)
-        if self.conversation.journal is not None:
-            for message in recovered[1:]:
-                self.conversation.journal.append_message(message)
-
     def _externalize_large_turn_text(self, label: str, text: str, *, intro: str) -> str:
         limit = _env_int("HARNESS_TURN_INLINE_CHAR_LIMIT", TURN_INLINE_CHAR_LIMIT)
         if limit <= 0 or len(text) <= limit:
@@ -1631,7 +1606,6 @@ def print_turn_result(result: TurnResult) -> None:
     if result.checkpoint:
         print(result.checkpoint)
 
-from .formatters import _build_resume_context
 from .git_helpers import (
     GitBaseline,
     _ensure_git_repository,

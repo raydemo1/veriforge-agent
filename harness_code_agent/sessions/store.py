@@ -201,16 +201,6 @@ class SessionStore:
         )
         return metadata
 
-    def update_resumed_from(self, session_id: str, resumed_from: str) -> dict[str, Any]:
-        metadata = self.read_metadata(session_id)
-        metadata["resumed_from"] = resumed_from
-        metadata_path = self._session_root(session_id) / "session.json"
-        metadata_path.write_text(
-            json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        return metadata
-
     def read_events(self, session_id: str) -> list[dict[str, Any]]:
         session_root = self._session_root(session_id)
         events_path = session_root / "events.jsonl"
