@@ -1,9 +1,21 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import type { TestRendererSetup } from "@opentui/core/testing";
+import type { Renderable } from "@opentui/core";
 import { App } from "./app.tsx";
 import type { ActionName, UiEvent } from "./protocol.ts";
 import { initialState } from "./state.ts";
+
+type AnyNode = Renderable & { _childrenInLayoutOrder?: AnyNode[] };
+
+function findFocused(node: AnyNode): AnyNode | null {
+  if (node.focused) return node;
+  for (const child of node._childrenInLayoutOrder ?? []) {
+    const found = findFocused(child);
+    if (found) return found;
+  }
+  return null;
+}
 
 function eventStream() {
   const queued: UiEvent[] = [];
@@ -277,5 +289,89 @@ describe("OpenTUI app interactions", () => {
     expect(frame).not.toContain("历史");
     expect(frame).not.toContain("新会话");
     expect(frame).toContain("◷");
+  });
+
+  test("welcome empty state is removed after the first real message", async () => {
+    const stream = eventStream();
+    setup = await testRender(
+      <App
+        events={stream.events}
+        onSubmit={async () => ({ accepted: true } as never)}
+        onAction={async () => ({ ok: true })}
+      />,
+      { width: 100, height: 30 }
+    );
+    stream.push({ type: "progress", status: "ready", detail: "" });
+    await setup.waitForFrame((frame) => frame.includes("输入任务开始"));
+
+    await setup.mockInput.typeText("修复这个问题");
+    await sleep(200);
+    setup.mockInput.pressEnter();
+    await sleep(400);
+    const submitted = setup.captureCharFrame();
+    expect(submitted).toContain("修复这个问题");
+    expect(submitted).not.toContain("VeriForge");
+  });
+
+  test("panel marks the current option with a check and adapts its footer", async () => {
+    const stream = eventStream();
+    setup = await testRender(
+      <App
+        events={stream.events}
+        onSubmit={async () => ({ accepted: true } as never)}
+        onAction={async () => ({ ok: true })}
+      />,
+      { width: 100, height: 30 }
+    );
+    stream.push({
+      type: "panel",
+      panel: {
+        kind: "profile",
+        title: "工作模式",
+        options: [
+          { id: "auto", label: "自动路由", selected: true },
+          { id: "coding", label: "编码" },
+        ],
+      },
+    });
+    const frame = await setup.waitForFrame((frame) => frame.includes("✓ 自动路由"));
+    expect(frame).toContain("↑↓ 选择");
+
+    stream.push({ type: "panel", panel: { kind: "help", title: "帮助", body: "一些说明" } });
+    await setup.waitForFrame((frame) => frame.includes("一些说明") && frame.includes("Esc 关闭") && !frame.includes("↑↓ 选择"));
+  });
+
+  test("running rows use the dot marker once idle", async () => {
+    // Marker semantics are covered via state/frame; here we only assert the
+    // icon set no longer collides the prompt glyph with the running glyph.
+    const { unicodeIcons } = await import("./icons.ts");
+    expect(unicodeIcons.running).not.toBe(unicodeIcons.prompt);
+    expect(unicodeIcons.running).toBe("·");
+    expect(unicodeIcons.checkpoint).not.toBe(unicodeIcons.assistant);
+    expect(unicodeIcons.checkpoint).toBe("◈");
+  });
+
+  test("mouse click on a header button does not leave focus on it", async () => {
+    setup = await testRender(
+      <App
+        events={{ [Symbol.asyncIterator]: async function* () {} }}
+        onSubmit={async () => ({ accepted: true } as never)}
+        onAction={async () => ({ ok: true })}
+      />,
+      { width: 100, height: 30 }
+    );
+    await sleep(300);
+    const headerLine = setup.captureCharFrame().split("\n")[0] ?? "";
+    const labelX = headerLine.indexOf("新会话");
+    expect(labelX).toBeGreaterThan(-1);
+
+    await setup.mockMouse.click(labelX + 1, 0);
+    await sleep(150);
+
+    const focused = findFocused((setup.renderer as unknown as { root: AnyNode }).root);
+    const focusedKind = focused?.constructor?.name ?? "none";
+    // Focus returns to the composer textarea instead of lingering on the
+    // button; otherwise the hover highlight would stay after mouse-out.
+    expect(focusedKind === "TextareaRenderable" || focusedKind === "none").toBe(true);
   });
 });

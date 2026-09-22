@@ -52,7 +52,13 @@ export function reduceEvent(state: AppState, event: UiEvent): AppState {
   if (event.type === "turn_state") return { ...state, turnState: event.state, queueDepth: event.queueDepth ?? (event.state === "queued" ? state.queueDepth + 1 : 0) };
   if (event.type === "transcript") {
     const existingIndex = state.items.findIndex((item) => item.id === event.item.id);
-    if (existingIndex < 0) return { ...state, items: [...state.items, event.item] };
+    if (existingIndex < 0) {
+      // The welcome row is an empty-state placeholder: drop it as soon as
+      // real content (anything other than notices) enters the transcript.
+      const realContent = event.item.kind !== "status" && event.item.kind !== "error";
+      const items = realContent ? state.items.filter((item) => item.id !== "welcome") : state.items;
+      return { ...state, items: [...items, event.item] };
+    }
     return {
       ...state,
       items: state.items.map((item, index) => index === existingIndex ? event.item : item),

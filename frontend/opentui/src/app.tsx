@@ -7,7 +7,7 @@ import { resolveIcons } from "./icons.ts";
 import type { IconSet } from "./icons.ts";
 import { formatUserError } from "./errors.ts";
 import { clipboardFilePaths, formatBytes } from "./attachment-utils.ts";
-import type { ActionName, ActionResult, AttachmentItem, CommandItem, IconPreference, Interaction, PanelSpec, SubmitResult, ThemePreference, TranscriptItem, TurnSubmission, UiEvent } from "./protocol.ts";
+import type { ActionName, ActionResult, AttachmentItem, CommandItem, IconPreference, Interaction, PanelOption, PanelSpec, SubmitResult, ThemePreference, TranscriptItem, TurnSubmission, UiEvent } from "./protocol.ts";
 import { initialState, reduceEvent, withOptimisticUserMessage } from "./state.ts";
 import { resolveTheme } from "./theme.ts";
 import type { Theme, ThemeMode } from "./theme.ts";
@@ -122,7 +122,8 @@ function FileDiffTitle({ title, theme, icons }: { title: string; theme: Theme; i
   const label = match?.[1] ?? title;
   return (
     <text>
-      <span fg={theme.diffAdd}>{`${icons.file} ${label}`}</span>
+      <span fg={theme.accent}>{icons.file}</span>
+      <span fg={theme.text}>{` ${label}`}</span>
       {match ? <span fg={theme.diffAdd}>{`  +${match[2]}`}</span> : null}
       {match ? <span fg={theme.diffDelete}>{`  -${match[3]}`}</span> : null}
     </text>
@@ -167,7 +168,7 @@ function FileDiffBlock({ item, theme, icons }: { item: TranscriptItem; theme: Th
         <box
           ref={toggleFocus.ref}
           focusable
-          onMouseDown={toggle}
+          onMouseDown={() => { toggle(); setTimeout(() => toggleFocus.ref.current?.blur(), 0); }}
           onKeyDown={(key) => { if (isEnterKey(key.name) || key.name === "space") { key.preventDefault(); toggle(); } }}
           style={{ flexDirection: "row", justifyContent: "space-between", marginTop: 1, paddingLeft: 1, paddingRight: 1, backgroundColor: toggleFocus.focused ? theme.surfaceSelected : theme.surfaceRaised }}
         >
@@ -187,7 +188,7 @@ function Transcript({ items, theme, icons, narrow }: { items: TranscriptItem[]; 
           if (item.kind === "assistant" && item.role === "group") {
             return (
               <box key={item.id} style={{ flexDirection: "column", maxWidth: 96 }}>
-                <text fg={theme.success}><strong>{`${icons.assistant} 助手`}</strong></text>
+                <text><span fg={theme.accent}><strong>{icons.assistant}</strong></span><span fg={theme.text}><strong> 助手</strong></span></text>
               </box>
             );
           }
@@ -202,8 +203,9 @@ function Transcript({ items, theme, icons, narrow }: { items: TranscriptItem[]; 
             const assistant = item.kind === "assistant";
             return (
               <box key={item.id} style={{ flexDirection: "column", maxWidth: 96 }}>
-                <text fg={assistant ? theme.success : theme.accent}>
-                  <strong>{`${assistant ? icons.assistant : icons.prompt} ${assistant ? "助手" : "你"}`}</strong>
+                <text>
+                  <span fg={theme.accent}><strong>{assistant ? icons.assistant : icons.prompt}</strong></span>
+                  <span fg={theme.text}><strong>{` ${assistant ? "助手" : "你"}`}</strong></span>
                 </text>
                 {assistant ? <MarkdownText text={item.body} color={theme.text} streaming={item.state === "running"} /> : <text fg={theme.text}>{item.body}</text>}
               </box>
@@ -284,7 +286,13 @@ function ActionButton({ icon, label, theme, color, activeColor, bold = false, de
       focusable
       onMouseOver={() => setHovered(true)}
       onMouseOut={() => setHovered(false)}
-      onMouseDown={onInvoke}
+      onMouseDown={() => {
+        onInvoke();
+        // OpenTUI focuses the box only after this handler returns, so the
+        // blur has to run on the next tick. Mouse activation must not leave
+        // keyboard focus behind; keyboard activation keeps focus as expected.
+        setTimeout(() => ref.current?.blur(), 0);
+      }}
       onKeyDown={(key) => { if (isEnterKey(key.name) || key.name === "space") onInvoke(); }}
       style={{ flexDirection: "row", paddingLeft: 1, paddingRight: 1, backgroundColor: active ? theme.surfaceSelected : defaultBg }}
     >
@@ -302,7 +310,7 @@ function HeaderAction({ icon, label, theme, onInvoke }: { icon: string; label: s
 function Header({ cwd, theme, icons, compact, narrow, onHistory, onNew }: { cwd: string; theme: Theme; icons: IconSet; compact: boolean; narrow: boolean; onHistory: () => void; onNew: () => void }) {
   const label = compact ? (cwd.replace(/\\/g, "/").split("/").filter(Boolean).at(-1) ?? cwd) : cwd;
   return (
-    <box style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", height: 1, flexShrink: 0, paddingLeft: 2, paddingRight: 1 }}>
+    <box style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", height: 1, flexShrink: 0, paddingLeft: narrow ? 1 : 2, paddingRight: 1 }}>
       <text fg={theme.subtle}>{label}</text>
       <box style={{ flexDirection: "row", gap: 1 }}>
         <HeaderAction icon={icons.session} label={narrow ? "" : "历史"} theme={theme} onInvoke={onHistory} />
@@ -334,6 +342,42 @@ function defaultPanelAnchor(panel: PanelSpec): PanelAnchor {
   return "top-right";
 }
 
+function PanelOptionRow({ option, active, busy, theme, icons, onSelect }: { option: PanelOption; active: boolean; busy: boolean; theme: Theme; icons: IconSet; onSelect: () => void }) {
+  const [hovered, setHovered] = useState(false);
+  const tone = busy
+    ? theme.warning
+    : option.tone === "danger"
+      ? theme.error
+      : option.tone === "warning"
+        ? theme.warning
+        : active
+          ? theme.focus
+          : theme.text;
+  const backgroundColor = active ? theme.accentSoft : hovered ? theme.surfaceSelected : theme.surface;
+  return (
+    <box
+      onMouseOver={() => setHovered(true)}
+      onMouseOut={() => setHovered(false)}
+      onMouseDown={onSelect}
+      style={{ flexDirection: "column", paddingLeft: 1, paddingRight: 1, backgroundColor }}
+    >
+      {busy ? (
+        <box style={{ flexDirection: "row" }}>
+          <Spinner color={tone} />
+          <text fg={tone}>{` ${option.label}  处理中…`}</text>
+        </box>
+      ) : (
+        <text>
+          <span fg={active ? theme.focus : theme.subtle}>{active ? icons.prompt : " "}</span>
+          <span fg={option.selected ? theme.success : theme.subtle}>{` ${option.selected ? icons.success : " "}`}</span>
+          <span fg={tone}>{` ${option.label}`}</span>
+        </text>
+      )}
+      {option.description && !busy ? <text fg={theme.subtle}>{`     ${option.description}`}</text> : null}
+    </box>
+  );
+}
+
 function PanelView({ panel, theme, icons, onSelect, busyId }: { panel: PanelSpec; theme: Theme; icons: IconSet; onSelect: (id: string) => void; busyId: string | null }) {
   const [query, setQuery] = useState("");
   const scrollRef = useRef<ScrollBoxRenderable | null>(null);
@@ -354,36 +398,35 @@ function PanelView({ panel, theme, icons, onSelect, busyId }: { panel: PanelSpec
     else if (key.name === "pagedown") setSelected((value) => Math.min(options.length - 1, value + 8));
     else if (isEnterKey(key.name) && options[selected] && !busyId) onSelect(options[selected].id);
   });
+  const footer = options.length
+    ? "↑↓ 选择 · Enter 确认 · Esc 关闭"
+    : panel.searchable
+      ? "输入搜索 · Esc 关闭"
+      : "Esc 关闭";
   return (
     <box style={{ flexDirection: "column", width: "100%", maxHeight: "100%", minHeight: 3, backgroundColor: theme.surface }}>
       <box style={{ flexDirection: "row", height: 1, paddingLeft: 1, paddingRight: 1, backgroundColor: theme.surfaceRaised }}>
         <text fg={theme.accent}><strong>{`${panelIcon(panel.kind, icons)} ${panel.title}`}</strong></text>
       </box>
-      {panel.searchable ? <input value={query} placeholder={`${icons.search} 搜索会话…`} focused onInput={setQuery} style={{ paddingLeft: 1, paddingRight: 1, backgroundColor: theme.surface, textColor: theme.text, cursorColor: theme.accent, placeholderColor: theme.muted }} /> : null}
+      {panel.searchable ? <input value={query} placeholder={`${icons.search} 搜索会话…`} focused onInput={setQuery} style={{ paddingLeft: 1, paddingRight: 1, backgroundColor: theme.surface, textColor: theme.text, cursorColor: theme.accent, placeholderColor:theme.muted }} /> : null}
       {panel.body ? <scrollbox style={{ maxHeight: options.length ? 5 : 8, flexShrink: 1, paddingLeft: 1, paddingRight: 1 }}><text fg={theme.muted}>{panel.body}</text></scrollbox> : null}
       {options.length ? (
         <scrollbox ref={scrollRef} style={{ maxHeight: panel.searchable ? 10 : 12, flexShrink: 1, minHeight: 1, paddingTop: 1, paddingBottom: 1 }}>
-          {options.map((option, index) => {
-            const active = index === selected;
-            const busy = option.id === busyId;
-            const tone = busy ? theme.warning : option.tone === "danger" ? theme.error : option.tone === "warning" ? theme.warning : option.tone === "success" ? theme.success : active ? theme.focus : theme.text;
-            return (
-              <box id={`panel-option-${index}`} key={option.id} onMouseDown={() => { if (!busyId) onSelect(option.id); }} style={{ flexDirection: "column", paddingLeft: 1, paddingRight: 1, backgroundColor: active ? theme.surfaceSelected : theme.surface }}>
-                {busy ? (
-                  <box style={{ flexDirection: "row" }}>
-                    <Spinner color={tone} />
-                    <text fg={tone}>{` ${option.label}  处理中…`}</text>
-                  </box>
-                ) : (
-                  <text fg={tone}>{`${active ? icons.prompt : " "} ${option.label}`}</text>
-                )}
-                {option.description && !busy ? <text fg={theme.subtle}>{`    ${option.description}`}</text> : null}
-              </box>
-            );
-          })}
+          {options.map((option, index) => (
+            <box id={`panel-option-${index}`} key={option.id} style={{ flexDirection: "column" }}>
+              <PanelOptionRow
+                option={option}
+                active={index === selected}
+                busy={option.id === busyId}
+                theme={theme}
+                icons={icons}
+                onSelect={() => { if (!busyId) onSelect(option.id); }}
+              />
+            </box>
+          ))}
         </scrollbox>
       ) : null}
-      <text fg={theme.subtle} style={{ paddingLeft: 1 }}>↑↓ 选择 · Enter 确认 · Esc 关闭</text>
+      <text fg={theme.subtle} style={{ paddingLeft: 1 }}>{footer}</text>
     </box>
   );
 }
@@ -439,7 +482,34 @@ function PanelOverlay({ panel, anchor, theme, icons, terminalWidth, terminalHeig
   );
 }
 
-function InteractionView({ interaction, theme, icons, onResolve }: { interaction: Interaction; theme: Theme; icons: IconSet; onResolve: (result: Record<string, unknown>) => void }) {
+function InteractionOptionRow({ index, label, description, active, deny, theme, icons, onPick }: {
+  index: number;
+  label: string;
+  description: string;
+  active: boolean;
+  deny: boolean;
+  theme: Theme;
+  icons: IconSet;
+  onPick: () => void;
+}) {
+  const [hovered, setHovered] = useState(false);
+  const tone = active ? theme.focus : deny ? theme.error : theme.text;
+  const backgroundColor = active ? theme.accentSoft : hovered ? theme.surfaceSelected : theme.surfaceRaised;
+  return (
+    <box
+      focusable
+      onMouseOver={() => setHovered(true)}
+      onMouseOut={() => setHovered(false)}
+      onMouseDown={onPick}
+      style={{ flexDirection: "column", backgroundColor, paddingLeft: 1, paddingRight: 1 }}
+    >
+      <text fg={tone}>{`${active ? icons.prompt : " "} [${index + 1}] ${label}`}</text>
+      {description ? <text fg={theme.subtle}>{`    ${description}`}</text> : null}
+    </box>
+  );
+}
+
+function InteractionView({ interaction, theme, icons, narrow, onResolve }: { interaction: Interaction; theme: Theme; icons: IconSet; narrow: boolean; onResolve: (result: Record<string, unknown>) => void }) {
   const [selected, setSelected] = useState(0);
   const selectedRef = useRef(0);
   const otherRef = useRef<InputRenderable | null>(null);
@@ -490,7 +560,7 @@ function InteractionView({ interaction, theme, icons, onResolve }: { interaction
   const argsText = interaction.kind === "approval" ? JSON.stringify(interaction.payload.args, null, 2) : "";
   const argsHeight = Math.min(Math.max(2, argsText.split("\n").length), 6);
   return (
-    <box border borderStyle="rounded" borderColor={interaction.kind === "approval" ? theme.warning : theme.accent} style={{ flexDirection: "column", flexShrink: 0, marginLeft: 2, marginRight: 2, paddingLeft: 1, paddingRight: 1, paddingTop: 1, paddingBottom: 1, backgroundColor: theme.surfaceRaised }}>
+    <box border borderStyle="rounded" borderColor={interaction.kind === "approval" ? theme.warning : theme.accent} style={{ flexDirection: "column", flexShrink: 0, marginLeft: narrow ? 1 : 2, marginRight: narrow ? 1 : 2, paddingLeft: 1, paddingRight: 1, paddingTop: 1, paddingBottom: 1, backgroundColor: theme.surfaceRaised }}>
       <text fg={interaction.kind === "approval" ? theme.warning : theme.accent}><strong>{interaction.kind === "approval" ? "需要确认" : interaction.payload.question}</strong></text>
       {interaction.kind === "approval" ? (
         <box style={{ flexDirection: "column", flexShrink: 0 }}>
@@ -505,22 +575,19 @@ function InteractionView({ interaction, theme, icons, onResolve }: { interaction
         </box>
       ) : null}
       <box style={{ flexDirection: "column", paddingTop: 1 }}>
-        {options.map((option, index) => {
-          const active = index === selected;
-          const tone = active ? theme.focus : interaction.kind === "approval" && option.value === "deny" ? theme.error : theme.text;
-          const description = interaction.kind === "question" ? questionOptions[index]?.description : "";
-          return (
-            <box
-              key={`${option.value}-${index}`}
-              focusable
-              onMouseDown={() => { if (index === selectedRef.current) resolveCurrent(); else select(index); }}
-              style={{ flexDirection: "column", backgroundColor: active ? theme.surfaceSelected : theme.surfaceRaised, paddingLeft: 1, paddingRight: 1 }}
-            >
-              <text fg={tone}>{`${active ? icons.prompt : " "} [${index + 1}] ${option.label}`}</text>
-              {description ? <text fg={theme.subtle}>{`    ${description}`}</text> : null}
-            </box>
-          );
-        })}
+        {options.map((option, index) => (
+          <InteractionOptionRow
+            key={`${option.value}-${index}`}
+            index={index}
+            label={option.label}
+            description={interaction.kind === "question" ? (questionOptions[index]?.description ?? "") : ""}
+            active={index === selected}
+            deny={interaction.kind === "approval" && option.value === "deny"}
+            theme={theme}
+            icons={icons}
+            onPick={() => { if (index === selectedRef.current) resolveCurrent(); else select(index); }}
+          />
+        ))}
       </box>
       {otherSelected ? <input ref={otherRef} placeholder="其他说明…" focused style={{ backgroundColor: theme.surface, textColor: theme.text, cursorColor: theme.accent, placeholderColor: theme.muted }} /> : null}
       <text fg={theme.subtle}>{`↑↓/点击 选择 · Enter 确认 · Esc ${interaction.kind === "approval" ? "拒绝" : "取消"}`}</text>
@@ -532,11 +599,6 @@ type Completion = { id: string; label: string; description: string; insert: stri
 type CompletionSection = { title: string; items: Completion[] };
 
 const COMMAND_LABEL_WIDTH = 30;
-
-function truncateLabel(label: string, maxWidth: number): string {
-  if (label.length <= maxWidth) return label;
-  return `${label.slice(0, Math.max(0, maxWidth - 1))}…`;
-}
 
 function truncateText(text: string, maxWidth: number): string {
   if (stringWidth(text) <= maxWidth) return text;
@@ -634,7 +696,40 @@ function AttachAction({ theme, onAddFiles }: { theme: Theme; onAddFiles: () => v
   return <ActionButton icon="＋" theme={theme} color={theme.accent} bold defaultBg={theme.surface} onInvoke={onAddFiles} />;
 }
 
-function CompletionOverlay({ theme, title, footer, bottomOffset, maxHeight, onClose, children }: { theme: Theme; title: string; footer: string; bottomOffset: number; maxHeight: number; onClose: () => void; children: React.ReactNode }) {
+function CandidateRow({ rowId, item, active, compact, labelWidth, descriptionWidth, theme, onPick }: {
+  rowId: string;
+  item: Completion;
+  active: boolean;
+  compact: boolean;
+  labelWidth: number;
+  descriptionWidth: number;
+  theme: Theme;
+  onPick: () => void;
+}) {
+  const [hovered, setHovered] = useState(false);
+  const backgroundColor = active ? theme.accentSoft : hovered ? theme.surfaceSelected : theme.surfaceRaised;
+  return (
+    <box
+      id={rowId}
+      onMouseOver={() => setHovered(true)}
+      onMouseOut={() => setHovered(false)}
+      onMouseDown={onPick}
+      style={{ flexDirection: "row", backgroundColor }}
+    >
+      <box style={{ width: labelWidth, flexDirection: "row", flexShrink: 0, justifyContent: "flex-start", paddingLeft: 1, paddingRight: 1 }}>
+        <text fg={active ? theme.focus : theme.accent}>{truncateText(item.label, labelWidth - 2)}</text>
+      </box>
+      {compact ? null : (
+        <text fg={active ? theme.text : theme.subtle} wrapMode="none" truncate>
+          {truncateText(item.description, descriptionWidth)}
+        </text>
+      )}
+    </box>
+  );
+}
+
+function CompletionOverlay({ theme, title, footer, bottomOffset, maxHeight, narrow, onClose, children }: { theme: Theme; title: string; footer: string; bottomOffset: number; maxHeight: number; narrow: boolean; onClose: () => void; children: React.ReactNode }) {
+  const gutter = narrow ? 1 : 2;
   return (
     <box
       position="absolute"
@@ -648,8 +743,8 @@ function CompletionOverlay({ theme, title, footer, bottomOffset, maxHeight, onCl
     >
       <box
         position="absolute"
-        left={2}
-        right={2}
+        left={gutter}
+        right={gutter}
         bottom={bottomOffset}
         zIndex={31}
         border
@@ -750,16 +845,17 @@ function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queu
     }
   });
   const renderCandidate = (item: Completion, index: number) => (
-    <box id={`completion-${index}`} key={item.id} onMouseDown={() => applyCompletion(item)} style={{ flexDirection: "row", backgroundColor: index === selected ? theme.surfaceSelected : theme.surfaceRaised }}>
-      <box style={{ width: candidateLabelWidth, flexDirection: "row", flexShrink: 0, justifyContent: "flex-start", paddingLeft: 1, paddingRight: 1 }}>
-        <text fg={index === selected ? theme.focus : theme.accent}>{truncateLabel(item.label, candidateLabelWidth - 2)}</text>
-      </box>
-      {compact ? null : (
-        <text fg={index === selected ? theme.text : theme.subtle} wrapMode="none" truncate>
-          {truncateText(item.description, descriptionWidth)}
-        </text>
-      )}
-    </box>
+    <CandidateRow
+      key={item.id}
+      rowId={`completion-${index}`}
+      item={item}
+      active={index === selected}
+      compact={compact}
+      labelWidth={candidateLabelWidth}
+      descriptionWidth={descriptionWidth}
+      theme={theme}
+      onPick={() => applyCompletion(item)}
+    />
   );
   const composerBottomOffset = narrow ? 11 : 8;
   const paletteMaxHeight = Math.max(5, Math.min(14, terminalHeight - composerBottomOffset - 1));
@@ -776,6 +872,7 @@ function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queu
           footer={` ${selected + 1}/${candidates.length}  ↑↓ 选择  Enter/Tab 使用  点击外层关闭`}
           bottomOffset={composerBottomOffset}
           maxHeight={paletteMaxHeight}
+          narrow={narrow}
           onClose={() => setDismissedCompletionValue(value)}
         >
           <scrollbox ref={paletteRef} style={{ height: paletteBodyRows, backgroundColor: theme.surfaceRaised }}>
@@ -811,13 +908,13 @@ function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queu
             style={{ flexGrow: 1, minHeight: 2, maxHeight: 6, backgroundColor: theme.surface, textColor: theme.text, cursorColor: theme.accent, placeholderColor: theme.muted }}
           />
         </box>
-        <box style={{ flexDirection: narrow ? "column" : "row", alignItems: "center", justifyContent: "space-between", paddingLeft: 1, paddingRight: 1 }}>
+        <box style={{ flexDirection: narrow ? "column" : "row", alignItems: narrow ? "flex-start" : "center", justifyContent: "space-between", paddingLeft: 1, paddingRight: 1 }}>
           <box style={{ flexDirection: "row", alignItems: "center", flexShrink: 1, minWidth: 0 }}>
             <AttachAction theme={theme} onAddFiles={onAddFiles} />
             <ToolbarAction label={`${snapshot.routingMode === "auto" ? "自动" : profileLabel(snapshot.profile)} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("profile")} />
             <ToolbarAction label={`${compact ? "审批" : permissionLabel(snapshot.permissionMode)} ▾`} theme={theme} tone={snapshot.permissionMode === "danger-full-access" ? theme.error : theme.text} onInvoke={() => onOpenPanel("permission")} />
           </box>
-          <box style={{ flexDirection: "row", alignItems: "center", flexShrink: narrow ? 1 : 0, minWidth: 0, marginLeft: narrow ? 0 : 2 }}>
+          <box style={{ flexDirection: "row", alignItems: "center", flexGrow: narrow ? 1 : 0, flexShrink: 1, minWidth: 0, justifyContent: narrow ? "space-between" : "flex-start", width: narrow ? "100%" : undefined, marginLeft: narrow ? 0 : 2 }}>
             <ContextGauge percent={snapshot.contextPercent} tokens={snapshot.contextTokens ?? 0} windowTokens={snapshot.contextWindowTokens ?? 0} theme={theme} />
             <ToolbarAction label={`${icons.assistant} ${compact ? shortModelLabel(snapshot.model) : truncateText(snapshot.model, 26)} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("model")} />
             <ToolbarAction label={`${effortLabel(snapshot.reasoningEffort)} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("effort")} />
@@ -1078,8 +1175,8 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
     <box style={{ flexDirection: "column", width: "100%", height: "100%", backgroundColor: theme.background }}>
       <Header cwd={state.snapshot.cwd} theme={theme} icons={icons} compact={compact} narrow={narrow} onHistory={() => void invoke("open_sessions", undefined, "history")} onNew={() => void invoke("new_session")} />
       <Transcript items={state.items} theme={theme} icons={icons} narrow={narrow} />
-      {state.interaction ? <InteractionView interaction={state.interaction} theme={theme} icons={icons} onResolve={resolveInteraction} /> : panel ? null : externalPaths ? (
-        <box border borderStyle="rounded" borderColor={theme.warning} style={{ flexDirection: "column", marginLeft: 2, marginRight: 2, paddingLeft: 1, paddingRight: 1 }}>
+      {state.interaction ? <InteractionView interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : panel ? null : externalPaths ? (
+        <box border borderStyle="rounded" borderColor={theme.warning} style={{ flexDirection: "column", marginLeft: narrow ? 1 : 2, marginRight: narrow ? 1 : 2, paddingLeft: 1, paddingRight: 1 }}>
           <text fg={theme.warning}><strong>允许读取工作区外文件？</strong></text>
           {externalPaths.map((path) => <text key={path} fg={theme.text}>{path}</text>)}
           <box style={{ flexDirection: "row", gap: 1 }}>

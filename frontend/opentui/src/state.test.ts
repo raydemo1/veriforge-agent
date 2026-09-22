@@ -36,4 +36,13 @@ describe("OpenTUI state", () => {
     expect(ready.items[0].state).toBe("success");
     expect(ready.items[0].body).toBe("输入任务开始，/ 查看命令，@ 添加上下文");
   });
+  test("first real transcript item replaces the welcome empty state", () => {
+    const withContent = reduceEvent(initialState, { type: "transcript", item: { id: "user-1", kind: "user", title: "你", body: "开始干活" } });
+    expect(withContent.items.some((item) => item.id === "welcome")).toBe(false);
+    expect(withContent.items.map((item) => item.id)).toEqual(["user-1"]);
+  });
+  test("notices keep the welcome empty state until real content arrives", () => {
+    const noticed = reduceEvent(initialState, { type: "notice", level: "info", text: "工具已同步" });
+    expect(noticed.items.some((item) => item.id === "welcome")).toBe(true);
+  });
 });
