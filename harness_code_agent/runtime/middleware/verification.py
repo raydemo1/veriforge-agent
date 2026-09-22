@@ -9,7 +9,9 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -207,33 +209,76 @@ def _workspace_change_cursor(workspace) -> int:
     return len(getattr(workspace, "changed_files", []))
 
 
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Kill the whole process tree so inherited pipe handles are released."""
+    if sys.platform == "win32":
+        # Git for Windows spawns sh/real-git grandchildren that inherit our
+        # capture pipes; killing only the git.exe wrapper leaves the pipes
+        # open and a follow-up communicate() blocks forever.
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5, check=False,
+        )
+    else:
+        try:
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+    try:
+        proc.communicate(timeout=3)
+    except (subprocess.TimeoutExpired, ValueError):
+        pass
+
+
+def _run_git(args: list[str], cwd: str | None, timeout: float = 8) -> str | None:
+    """Run a read-only git command; never blocks past timeout, never raises."""
+    if not cwd:
+        return None
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+    proc: subprocess.Popen | None = None
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+            env=env,
+            creationflags=creationflags,
+        )
+        stdout, _stderr = proc.communicate(timeout=timeout)
+    except (FileNotFoundError, OSError):
+        return None
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            _kill_process_tree(proc)
+        return None
+    return stdout if proc is not None and proc.returncode == 0 else None
+
+
 def _git_dirty_files(workspace_root: str | None) -> set[str]:
     """Return files dirty vs HEAD (tracked changes + untracked), POSIX-relative."""
-    if not workspace_root:
-        return set()
     files: set[str] = set()
-    try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "--diff-filter=ACMR", "HEAD"],
-            capture_output=True, text=True, timeout=10,
-            cwd=workspace_root,
-            check=False,
-        )
-        if result.returncode == 0:
-            files.update(result.stdout.splitlines())
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return set()
-    try:
-        result = subprocess.run(
-            ["git", "ls-files", "--others", "--exclude-standard"],
-            capture_output=True, text=True, timeout=10,
-            check=False,
-            cwd=workspace_root,
-        )
-        if result.returncode == 0:
-            files.update(result.stdout.splitlines())
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+    tracked = _run_git(
+        ["git", "diff", "--name-only", "--diff-filter=ACMR", "HEAD"],
+        workspace_root,
+    )
+    if tracked is not None:
+        files.update(tracked.splitlines())
+    untracked = _run_git(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        workspace_root,
+    )
+    if untracked is not None:
+        files.update(untracked.splitlines())
     return {line.strip().replace("\\", "/") for line in files if line.strip()}
 
 
