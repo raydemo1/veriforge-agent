@@ -100,6 +100,34 @@ class ShellPolicyTests(unittest.TestCase):
         self.assertIn("[blocked]", second.output)
         self.assertFalse(state.fallback.stop_requested)
 
+    def test_unbounded_recursive_targets_stay_blocked(self) -> None:
+        middleware = ToolGuardMiddleware()
+        for command in (
+            "Get-ChildItem . -Recurse",
+            "Get-ChildItem .. -Recurse",
+            "Get-ChildItem C:\\ -Recurse",
+            "Get-ChildItem $HOME -Recurse",
+            "Get-ChildItem $env:USERPROFILE -Recurse",
+        ):
+            with self.subTest(command=command):
+                blocked = middleware.before_tool(
+                    "run_bash", {"command": command}, [], runtime_state=AgentRuntimeState()
+                )
+                self.assertIsNotNone(blocked)
+
+    def test_bounded_recursive_targets_are_allowed(self) -> None:
+        middleware = ToolGuardMiddleware()
+        for command in (
+            'Get-ChildItem "$env:USERPROFILE\\AppData\\Local\\ms-playwright" -Recurse',
+            "Get-ChildItem C:\\cache\\playwright -Recurse",
+            "Get-ChildItem -Path .\\src\\pkg -Recurse",
+        ):
+            with self.subTest(command=command):
+                blocked = middleware.before_tool(
+                    "run_bash", {"command": command}, [], runtime_state=AgentRuntimeState()
+                )
+                self.assertIsNone(blocked)
+
     def test_recursive_grep_over_explicit_file_globs_is_allowed(self) -> None:
         middleware = ToolGuardMiddleware()
         state = AgentRuntimeState()

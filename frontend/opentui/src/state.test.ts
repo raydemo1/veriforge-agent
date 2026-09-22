@@ -32,9 +32,18 @@ describe("OpenTUI state", () => {
     expect(connecting.items[0].body).toBe("正在连接工具…");
     expect(connecting.items[0].state).toBe("running");
 
+    const connectingExternal = reduceEvent(initialState, { type: "progress", status: "connecting external tools", detail: "" });
+    expect(connectingExternal.items[0].body).toBe("正在连接外部工具…");
+    expect(connectingExternal.items[0].state).toBe("running");
+
     const ready = reduceEvent(initialState, { type: "progress", status: "ready", detail: "Python 会话已就绪。" });
     expect(ready.items[0].state).toBe("success");
-    expect(ready.items[0].body).toBe("输入任务开始，/ 查看命令，@ 添加上下文");
+    expect(ready.items[0].body).toBe("今天想造点什么？");
+
+    // external tools ready completes the whole startup: spinner must stop.
+    const externalReady = reduceEvent(initialState, { type: "progress", status: "external tools ready", detail: "external tools ready" });
+    expect(externalReady.items[0].state).toBe("success");
+    expect(externalReady.items[0].body).toBe("今天想造点什么？");
   });
   test("first real transcript item replaces the welcome empty state", () => {
     const withContent = reduceEvent(initialState, { type: "transcript", item: { id: "user-1", kind: "user", title: "你", body: "开始干活" } });

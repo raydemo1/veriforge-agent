@@ -65,7 +65,7 @@ _PROFILE_COPY = {
 _PERMISSION_COPY = {
     PermissionPolicy.WORKSPACE_WRITE: ("请求批准", "工作区内写入允许，风险操作询问，工作区外写入拒绝"),
     PermissionPolicy.LLM_AUTO: ("替我审批", "由模型判断风险并自动批准具体、范围明确的安全操作"),
-    PermissionPolicy.DANGER_FULL_ACCESS: ("完全访问", "工作区内外修改均不询问；灾难性命令（如 rm -rf /、git reset --hard）仍会被拦截"),
+    PermissionPolicy.DANGER_FULL_ACCESS: ("完全访问", "工作区内外修改均不询问；灾难性命令仍会被拦截"),
     PermissionPolicy.READ_ONLY: ("只读", "禁止一切修改与未知程序执行"),
 }
 
@@ -334,7 +334,8 @@ class BridgeServer:
                 if current:
                     self._session_error = error
             if current:
-                self._notice("error", error)
+                # Startup failure surfaces through progress/failed (the
+                # welcome row); an extra error notice would say it twice.
                 self._send_event({"type": "progress", "status": "failed", "detail": error})
             log.debug("OpenTUI bridge session construction failed\n%s", traceback.format_exc())
 
@@ -437,6 +438,10 @@ class BridgeServer:
             self._send_event({"type": "transcript", "item": item})
 
     def _begin_assistant_group(self, turn: int) -> None:
+        if self._assistant_group_id is not None:
+            # Already opened (e.g. pre-opened by _run_task before routing);
+            # turn_started must not duplicate it.
+            return
         self._assistant_group_counter += 1
         self._assistant_group_id = f"assistant-group-{turn}-{self._assistant_group_counter}"
         self._reset_assistant_segment()
@@ -606,6 +611,10 @@ class BridgeServer:
                 self._active_token = token
             self._assistant_id = None
             self._assistant_text = ""
+            if self._assistant_group_id is not None:
+                # A previous task crashed before turn_finished; close the
+                # stale group so this turn's group can open cleanly.
+                self._close_assistant_group("success")
             self._send_event({"type": "turn_state", "state": "running"})
             try:
                 self._run_task(task, token)
@@ -650,6 +659,9 @@ class BridgeServer:
             if not should_continue:
                 self._closing.set()
             return
+        # Open the assistant group before routing/preparation so the transcript
+        # shows "助手" immediately; turn_started later finds it already open.
+        self._begin_assistant_group(0)
         result = session.submit_prepared(task, cancellation_token=token)
         if getattr(result, "notice", ""):
             self._notice("info", str(result.notice))
@@ -707,15 +719,17 @@ class BridgeServer:
             from .profiles import list_profiles
 
             current = "auto" if session.display_routing_mode == "auto" else session.display_profile
-            options = [
-                {
-                    "id": "auto",
-                    "label": "自动路由",
-                    "description": "根据当前任务选择工作模式",
-                    "tone": "success" if current == "auto" else "default",
-                    "selected": current == "auto",
-                }
-            ]
+            auto_option: dict[str, Any] = {
+                "id": "auto",
+                "label": "自动路由",
+                "description": "根据当前任务选择工作模式",
+                "tone": "success" if current == "auto" else "default",
+                "selected": current == "auto",
+            }
+            if session.display_routing_mode == "auto":
+                active_label = _PROFILE_COPY.get(session.display_profile, (session.display_profile, ""))[0]
+                auto_option["badge"] = f"当前：{active_label}"
+            options = [auto_option]
             options.extend({
                 "id": item["name"],
                 "label": _PROFILE_COPY.get(item["name"], (item["name"], item["description"]))[0],
@@ -723,11 +737,7 @@ class BridgeServer:
                 "tone": "success" if current == item["name"] else "default",
                 "selected": current == item["name"],
             } for item in list_profiles())
-            body = ""
-            if session.display_routing_mode == "auto":
-                active_label = _PROFILE_COPY.get(session.display_profile, (session.display_profile, ""))[0]
-                body = f"自动路由 ✓ · 当前：{active_label}"
-            return {"kind": "profile", "title": "工作模式", "options": options, "body": body}
+            return {"kind": "profile", "title": "工作模式", "options": options}
         if kind == "permission":
             current = session.permission_mode
             options = []

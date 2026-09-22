@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { stringWidth } from "bun";
 import { CliRenderEvents, SyntaxStyle } from "@opentui/core";
 import type { BoxRenderable, ClipboardReadResult, InputRenderable, ScrollBoxRenderable, TextareaRenderable } from "@opentui/core";
@@ -180,25 +181,159 @@ function FileDiffBlock({ item, theme, icons }: { item: TranscriptItem; theme: Th
   );
 }
 
+function GroupChildRow({ item, theme, icons }: { item: TranscriptItem; theme: Theme; icons: IconSet }) {
+  if (item.kind === "assistant") {
+    return (
+      <box style={{ flexDirection: "column", maxWidth: 110, marginLeft: 2 }}>
+        <MarkdownText text={item.body} color={theme.text} streaming={item.state === "running"} />
+      </box>
+    );
+  }
+  if (item.kind === "file") return <FileDiffBlock item={item} theme={theme} icons={icons} />;
+  if (item.kind === "agent") {
+    const directed = item.direction !== undefined;
+    const running = item.state === "running";
+    const markerColor = directed ? theme.accent : toneFor(item, theme);
+    const stackBody = directed || item.state === "failed" || item.body.includes("\n");
+    return (
+      <box style={{ flexDirection: "column", maxWidth: 110, marginLeft: 2 }}>
+        <box style={{ flexDirection: "row" }}>
+          {directed
+            ? <text fg={markerColor}>{item.direction === "in" ? "←" : "→"}</text>
+            : running
+              ? <Spinner color={markerColor} />
+              : <text fg={markerColor}>{markerFor(item, icons)}</text>}
+          <text fg={markerColor}>{` ${item.title}${!stackBody && item.body ? `  · ${item.body}` : ""}`}</text>
+        </box>
+        {stackBody && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
+      </box>
+    );
+  }
+  const tone = toneFor(item, theme);
+  const running = item.state === "running";
+  const stackBody = item.state === "failed" || item.body.includes("\n");
+  return (
+    <box style={{ flexDirection: "column", maxWidth: 110, marginLeft: 2 }}>
+      <box style={{ flexDirection: "row" }}>
+        {running
+          ? <Spinner color={tone} />
+          : <text fg={tone}>{markerFor(item, icons)}</text>}
+        <text fg={tone}>{` ${item.title}${!stackBody && item.body ? `  ${item.body}` : ""}`}</text>
+      </box>
+      {stackBody && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
+    </box>
+  );
+}
+
+function isCollapsibleRow(item: TranscriptItem): boolean {
+  return (item.kind === "tool" || item.kind === "thought") && item.state === "success";
+}
+
+// Collapsed summaries read as natural sentences ("已阅读 2 个文件") instead of
+// raw counts; thoughts are deliberately left out of the summary.
+const TOOL_SUMMARY_PHRASES: Record<string, (count: number) => string> = {
+  "文件已阅读": (n) => `已阅读 ${n} 个文件`,
+  "文件已写入": (n) => `已写入 ${n} 个文件`,
+  "文件已修改": (n) => `已修改 ${n} 个文件`,
+  "文件已删除": (n) => `已删除 ${n} 个文件`,
+  "文件已重命名": (n) => `已重命名 ${n} 个文件`,
+  "目录已查看": (n) => `已查看目录 ${n} 次`,
+  "文件已搜索": (n) => `已搜索文件 ${n} 次`,
+  "代码已搜索": (n) => `已搜索代码 ${n} 次`,
+  "命令已执行": (n) => `已执行命令 ${n} 次`,
+  "网页已搜索": (n) => `已搜索网页 ${n} 次`,
+  "网页已阅读": (n) => `已阅读网页 ${n} 个`,
+  "子代理已启动": (n) => `已启动子代理 ${n} 个`,
+};
+
+function summarizeToolRows(rows: TranscriptItem[]): string {
+  const counts = new Map<string, number>();
+  let unmapped = 0;
+  const keys = Object.keys(TOOL_SUMMARY_PHRASES);
+  for (const row of rows) {
+    if (row.kind === "thought") continue;
+    // Result titles carry a detail suffix ("文件已阅读  README.md"), so
+    // match the label as a prefix instead of an exact key.
+    const key = keys.find((k) => row.title === k || row.title.startsWith(`${k}  `));
+    if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
+    else unmapped += 1;
+  }
+  const parts = [...counts.entries()].map(([title, count]) => TOOL_SUMMARY_PHRASES[title](count));
+  // Unknown tools are aggregated without naming them.
+  if (unmapped > 0) parts.push(`执行了工具 ${unmapped} 次`);
+  return parts.join("，");
+}
+
+function ToolGroupSummary({ rows, theme, icons }: { rows: TranscriptItem[]; theme: Theme; icons: IconSet }) {
+  const [expanded, setExpanded] = useState(false);
+  const toggleFocus = useKeyboardFocusVisible<BoxRenderable>();
+  if (!rows.length) return null;
+  return (
+    <box style={{ flexDirection: "column", maxWidth: 110, marginLeft: 2 }}>
+      <box
+        ref={toggleFocus.ref}
+        focusable
+        onMouseDown={() => { setExpanded((value) => !value); setTimeout(() => toggleFocus.ref.current?.blur(), 0); }}
+        onKeyDown={(key) => { if (isEnterKey(key.name) || key.name === "space") { key.preventDefault(); setExpanded((value) => !value); } }}
+        style={{ flexDirection: "row", paddingLeft: 1, paddingRight: 1, backgroundColor: toggleFocus.focused ? theme.surfaceSelected : undefined }}
+      >
+        <text fg={theme.accent}>{expanded ? "▾" : "▸"}</text>
+        <text fg={theme.muted}>{` ${summarizeToolRows(rows)}`}</text>
+      </box>
+      {expanded ? rows.map((row) => <GroupChildRow key={row.id} item={row} theme={theme} icons={icons} />) : null}
+    </box>
+  );
+}
+
+function AssistantGroupBlock({ item, rows, theme, icons }: { item: TranscriptItem; rows: TranscriptItem[]; theme: Theme; icons: IconSet }) {
+  // Collapse only *consecutive* runs of successful tool/thought rows; a
+  // failure or text block ends a run, preserving the real execution order.
+  const rendered: ReactNode[] = [];
+  let cursor = 0;
+  while (cursor < rows.length) {
+    if (isCollapsibleRow(rows[cursor])) {
+      const start = cursor;
+      while (cursor < rows.length && isCollapsibleRow(rows[cursor])) cursor += 1;
+      rendered.push(
+        <ToolGroupSummary key={`collapsed-${rows[start].id}`} rows={rows.slice(start, cursor)} theme={theme} icons={icons} />
+      );
+    } else {
+      rendered.push(<GroupChildRow key={rows[cursor].id} item={rows[cursor]} theme={theme} icons={icons} />);
+      cursor += 1;
+    }
+  }
+  return (
+    <box style={{ flexDirection: "column", maxWidth: 96, gap: 1 }}>
+      {/* Thinking indicator: spinner under the title while the group is
+          running, so the turn opens with visible motion instead of a bare
+          heading that sits silent until the first token. */}
+      <box style={{ flexDirection: "row", gap: 1 }}>
+        <text><span fg={theme.accent}><strong>{icons.assistant}</strong></span><span fg={theme.text}><strong> 助手</strong></span></text>
+        {item.state === "running" ? <Spinner color={theme.accent} /> : null}
+        {item.state === "running" ? <text fg={theme.muted}>思考中</text> : null}
+      </box>
+      {rendered}
+    </box>
+  );
+}
+
 function Transcript({ items, theme, icons, narrow }: { items: TranscriptItem[]; theme: Theme; icons: IconSet; narrow: boolean }) {
+  const childrenByGroup = new Map<string, TranscriptItem[]>();
+  for (const item of items) {
+    if (item.parentId) {
+      const list = childrenByGroup.get(item.parentId);
+      if (list) list.push(item);
+      else childrenByGroup.set(item.parentId, [item]);
+    }
+  }
   return (
     <scrollbox stickyScroll focused style={{ height: 1, flexGrow: 1, flexShrink: 1, minHeight: 0, paddingLeft: narrow ? 1 : 2, paddingRight: narrow ? 1 : 2 }}>
       <box style={{ flexDirection: "column", gap: 1, paddingTop: 1, paddingBottom: 1 }}>
         {items.map((item) => {
           if (item.kind === "assistant" && item.role === "group") {
-            return (
-              <box key={item.id} style={{ flexDirection: "column", maxWidth: 96 }}>
-                <text><span fg={theme.accent}><strong>{icons.assistant}</strong></span><span fg={theme.text}><strong> 助手</strong></span></text>
-              </box>
-            );
+            return <AssistantGroupBlock key={item.id} item={item} rows={childrenByGroup.get(item.id) ?? []} theme={theme} icons={icons} />;
           }
-          if (item.kind === "assistant" && item.parentId) {
-            return (
-              <box key={item.id} style={{ flexDirection: "column", maxWidth: 110, marginLeft: 2 }}>
-                <MarkdownText text={item.body} color={theme.text} streaming={item.state === "running"} />
-              </box>
-            );
-          }
+          if (item.parentId && childrenByGroup.has(item.parentId)) return null;
           if (item.kind === "user" || item.kind === "assistant") {
             const assistant = item.kind === "assistant";
             return (
@@ -228,6 +363,23 @@ function Transcript({ items, theme, icons, narrow }: { items: TranscriptItem[]; 
                   <text fg={markerColor}>{` ${item.title}${!stackBody && item.body ? `  · ${item.body}` : ""}`}</text>
                 </box>
                 {stackBody && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
+              </box>
+            );
+          }
+          if (item.id === "welcome" && item.kind === "status") {
+            // Startup/welcome row: bare copy when ready, spinner while loading,
+            // failure marker only when it actually failed. Scoped to the
+            // welcome row — other status blocks carry meaningful titles.
+            const failed = item.state === "failed";
+            const ready = item.state === "success";
+            const tone = failed ? theme.error : ready ? theme.success : theme.accent;
+            return (
+              <box key={item.id} style={{ flexDirection: "column", maxWidth: 110 }}>
+                <box style={{ flexDirection: "row" }}>
+                  {item.state === "running" ? <Spinner color={tone} /> : failed ? <text fg={tone}>{icons.failure}</text> : null}
+                  <text fg={tone}>{ready ? item.body : ` ${failed ? item.title : item.body}`}</text>
+                </box>
+                {failed && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
               </box>
             );
           }
@@ -331,7 +483,13 @@ function panelIcon(kind: PanelSpec["kind"], icons: IconSet): string {
 
 type PanelAnchor = "history" | "profile" | "permission" | "model" | "effort" | "top-right";
 
-const BOTTOM_PANEL_ANCHORS: ReadonlySet<PanelAnchor> = new Set(["profile", "permission", "model", "effort"]);
+// Profile/permission buttons sit in the composer's left group; their panels
+// anchor to the bottom-left like the buttons they belong to.
+const LEFT_PANEL_ANCHORS: ReadonlySet<PanelAnchor> = new Set(["profile", "permission"]);
+
+// Model/effort buttons sit in the composer's right group, so their panels
+// pop from the right screen edge like the buttons they belong to.
+const RIGHT_PANEL_ANCHORS: ReadonlySet<PanelAnchor> = new Set(["model", "effort"]);
 
 function defaultPanelAnchor(panel: PanelSpec): PanelAnchor {
   if (panel.kind === "sessions") return "history";
@@ -373,12 +531,17 @@ function PanelOptionRow({ option, active, busy, theme, icons, onSelect }: { opti
           <span fg={tone}>{` ${option.label}`}</span>
         </text>
       )}
-      {option.description && !busy ? <text fg={theme.subtle}>{`     ${option.description}`}</text> : null}
+      {option.description && !busy ? (
+        <text fg={theme.subtle}>
+          {`     ${option.description}`}
+          {option.badge ? <span fg={theme.accent}>{` · ${option.badge}`}</span> : null}
+        </text>
+      ) : null}
     </box>
   );
 }
 
-function PanelView({ panel, theme, icons, onSelect, busyId }: { panel: PanelSpec; theme: Theme; icons: IconSet; onSelect: (id: string) => void; busyId: string | null }) {
+function PanelView({ panel, textWidth, theme, icons, onSelect, busyId }: { panel: PanelSpec; textWidth: number; theme: Theme; icons: IconSet; onSelect: (id: string) => void; busyId: string | null }) {
   const [query, setQuery] = useState("");
   const scrollRef = useRef<ScrollBoxRenderable | null>(null);
   const options = useMemo(() => (panel.options ?? []).filter((item) => `${item.label} ${item.description ?? ""}`.toLowerCase().includes(query.toLowerCase())), [panel.options, query]);
@@ -403,28 +566,52 @@ function PanelView({ panel, theme, icons, onSelect, busyId }: { panel: PanelSpec
     : panel.searchable
       ? "输入搜索 · Esc 关闭"
       : "Esc 关闭";
+  // ScrollBoxRenderable stretches to maxHeight with short content and fails
+  // to paint at tiny heights, so only use one when scrolling is actually
+  // needed; otherwise render a plain box and the panel fits its content.
+  const optionsMaxHeight = panel.searchable ? 10 : 12;
+  const optionContentRows = options.reduce((sum, option) => sum + 1 + (option.description ? 1 : 0), 0);
+  const optionsScrollNeeded = optionContentRows > optionsMaxHeight;
+  const bodyMaxHeight = options.length ? 5 : 8;
+  const bodyTextWidth = Math.max(8, textWidth - 4);
+  const bodyAllRows = panel.body
+    ? Math.max(1, Math.ceil(stringWidth(panel.body) / bodyTextWidth))
+    : 0;
+  const bodyRows = Math.min(bodyAllRows, bodyMaxHeight);
+  const bodyScrollNeeded = bodyAllRows > bodyMaxHeight;
+  const optionRows = options.map((option, index) => (
+    <box id={`panel-option-${index}`} key={option.id} style={{ flexDirection: "column" }}>
+      <PanelOptionRow
+        option={option}
+        active={index === selected}
+        busy={option.id === busyId}
+        theme={theme}
+        icons={icons}
+        onSelect={() => { if (!busyId) onSelect(option.id); }}
+      />
+    </box>
+  ));
   return (
     <box style={{ flexDirection: "column", width: "100%", maxHeight: "100%", minHeight: 3, backgroundColor: theme.surface }}>
       <box style={{ flexDirection: "row", height: 1, paddingLeft: 1, paddingRight: 1, backgroundColor: theme.surfaceRaised }}>
         <text fg={theme.accent}><strong>{`${panelIcon(panel.kind, icons)} ${panel.title}`}</strong></text>
       </box>
       {panel.searchable ? <input value={query} placeholder={`${icons.search} 搜索会话…`} focused onInput={setQuery} style={{ paddingLeft: 1, paddingRight: 1, backgroundColor: theme.surface, textColor: theme.text, cursorColor: theme.accent, placeholderColor:theme.muted }} /> : null}
-      {panel.body ? <scrollbox style={{ maxHeight: options.length ? 5 : 8, flexShrink: 1, paddingLeft: 1, paddingRight: 1 }}><text fg={theme.muted}>{panel.body}</text></scrollbox> : null}
+      {bodyRows ? (
+        bodyScrollNeeded ? (
+          <scrollbox style={{ height: bodyMaxHeight, paddingLeft: 1, paddingRight: 1 }}><text fg={theme.muted}>{panel.body}</text></scrollbox>
+        ) : (
+          <box style={{ paddingLeft: 1, paddingRight: 1 }}><text fg={theme.muted}>{panel.body}</text></box>
+        )
+      ) : null}
       {options.length ? (
-        <scrollbox ref={scrollRef} style={{ maxHeight: panel.searchable ? 10 : 12, flexShrink: 1, minHeight: 1, paddingTop: 1, paddingBottom: 1 }}>
-          {options.map((option, index) => (
-            <box id={`panel-option-${index}`} key={option.id} style={{ flexDirection: "column" }}>
-              <PanelOptionRow
-                option={option}
-                active={index === selected}
-                busy={option.id === busyId}
-                theme={theme}
-                icons={icons}
-                onSelect={() => { if (!busyId) onSelect(option.id); }}
-              />
-            </box>
-          ))}
-        </scrollbox>
+        optionsScrollNeeded ? (
+          <scrollbox ref={scrollRef} style={{ height: optionsMaxHeight, paddingTop: 1, paddingBottom: 1 }}>
+            {optionRows}
+          </scrollbox>
+        ) : (
+          <box style={{ paddingTop: 1, paddingBottom: 1 }}>{optionRows}</box>
+        )
       ) : null}
       <text fg={theme.subtle} style={{ paddingLeft: 1 }}>{footer}</text>
     </box>
@@ -449,12 +636,14 @@ function PanelOverlay({ panel, anchor, theme, icons, terminalWidth, terminalHeig
   });
   const modalWidth = Math.min(60, Math.max(30, terminalWidth - 12));
   const modalHeight = Math.min(18, Math.max(7, terminalHeight - 4));
-  const footerLeft = BOTTOM_PANEL_ANCHORS.has(anchor) ? 2 : Math.max(2, Math.min(12, terminalWidth - modalWidth - 2));
+  const footerLeft = LEFT_PANEL_ANCHORS.has(anchor) ? 2 : Math.max(2, Math.min(12, terminalWidth - modalWidth - 2));
   const placement = anchor === "history"
     ? { top: 1, right: 2 }
     : anchor === "top-right"
       ? { top: 2, right: 2 }
-      : { bottom: 2, left: footerLeft };
+      : RIGHT_PANEL_ANCHORS.has(anchor)
+        ? { bottom: 2, right: 2 }
+        : { bottom: 2, left: footerLeft };
   return (
     <box
       position="absolute"
@@ -466,7 +655,9 @@ function PanelOverlay({ panel, anchor, theme, icons, terminalWidth, terminalHeig
       onMouseDown={onClose}
       style={{ width: "100%", height: "100%" }}
     >
-      <box position="absolute" top={0} left={0} width="100%" height="100%" style={{ backgroundColor: theme.background, opacity: 0.35 }} />
+      {/* No dimming mask: OpenTUI's opacity compositing wipes the covered
+          cells' text and bleeds blended colors into their backgrounds. The
+          background content stays fully visible; clicking it closes the panel. */}
       <box
         position="absolute"
         {...placement}
@@ -476,7 +667,7 @@ function PanelOverlay({ panel, anchor, theme, icons, terminalWidth, terminalHeig
         onMouseDown={(event) => event.stopPropagation()}
         style={{ width: modalWidth, maxWidth: "100%", maxHeight: modalHeight, flexShrink: 1, backgroundColor: theme.surface, zIndex: 21 }}
       >
-        <PanelView key={panel.kind} panel={panel} theme={theme} icons={icons} onSelect={onSelect} busyId={busyId} />
+        <PanelView key={panel.kind} panel={panel} textWidth={modalWidth - 2} theme={theme} icons={icons} onSelect={onSelect} busyId={busyId} />
       </box>
     </box>
   );
@@ -509,12 +700,21 @@ function InteractionOptionRow({ index, label, description, active, deny, theme, 
   );
 }
 
+// Fixed approval reasons come from permissions.py; translate the known ones
+// instead of exposing English internals. Unknown reasons pass through.
+const APPROVAL_REASON_LABELS: Record<string, string> = {
+  "shell command mutates external paths": "将修改工作区外的文件",
+  "shell command writes inside the workspace": "将修改工作区文件",
+  "shell command mutates git remote state": "将修改远程 Git 状态",
+  "shell executes a program whose effects cannot be determined": "将运行无法完全判断影响的程序",
+};
+
 function InteractionView({ interaction, theme, icons, narrow, onResolve }: { interaction: Interaction; theme: Theme; icons: IconSet; narrow: boolean; onResolve: (result: Record<string, unknown>) => void }) {
   const [selected, setSelected] = useState(0);
   const selectedRef = useRef(0);
   const otherRef = useRef<InputRenderable | null>(null);
   const approvalOptions = interaction.kind === "approval"
-    ? [{ label: "仅本次允许", value: "approve" }, ...(interaction.payload.persistAvailable ? [{ label: "以后允许这类命令", value: "persist" }] : []), { label: "拒绝", value: "deny" }]
+    ? [{ label: "仅本次允许", value: "approve" }, ...(interaction.payload.persistAvailable ? [{ label: "本项目后续允许", value: "persist" }] : []), { label: "拒绝", value: "deny" }]
     : [];
   const questionOptions = interaction.kind === "question" ? interaction.payload.options : [];
   const options = interaction.kind === "approval" ? approvalOptions : questionOptions.map((option, index) => ({ ...option, label: option.label, value: String(index) }));
@@ -557,21 +757,36 @@ function InteractionView({ interaction, theme, icons, narrow, onResolve }: { int
       }
     }
   });
-  const argsText = interaction.kind === "approval" ? JSON.stringify(interaction.payload.args, null, 2) : "";
+  const isBash = interaction.kind === "approval" && interaction.payload.toolName === "run_bash";
+  const commandText = isBash ? String(interaction.payload.args?.command ?? "").trim() : "";
+  const argsText = interaction.kind === "approval" && !isBash ? JSON.stringify(interaction.payload.args, null, 2) : "";
   const argsHeight = Math.min(Math.max(2, argsText.split("\n").length), 6);
+  const commandHeight = Math.min(Math.max(1, commandText.split("\n").length), 6);
+  const reasonText = interaction.kind === "approval"
+    ? (APPROVAL_REASON_LABELS[interaction.payload.reason] ?? interaction.payload.reason)
+    : "";
   return (
     <box border borderStyle="rounded" borderColor={interaction.kind === "approval" ? theme.warning : theme.accent} style={{ flexDirection: "column", flexShrink: 0, marginLeft: narrow ? 1 : 2, marginRight: narrow ? 1 : 2, paddingLeft: 1, paddingRight: 1, paddingTop: 1, paddingBottom: 1, backgroundColor: theme.surfaceRaised }}>
       <text fg={interaction.kind === "approval" ? theme.warning : theme.accent}><strong>{interaction.kind === "approval" ? "需要确认" : interaction.payload.question}</strong></text>
       {interaction.kind === "approval" ? (
-        <box style={{ flexDirection: "column", flexShrink: 0 }}>
-          <text>
-            <span fg={theme.warning}>{`${interaction.payload.toolName} · ${interaction.payload.risk}`}</span>
-          </text>
-          <text fg={theme.muted}>{`原因：${interaction.payload.reason}`}</text>
-          <text fg={theme.subtle}>参数</text>
-          <scrollbox style={{ height: argsHeight, backgroundColor: theme.surface }}>
-            <text fg={theme.muted}>{argsText}</text>
-          </scrollbox>
+        <box style={{ flexDirection: "column", flexShrink: 0, marginTop: 1 }}>
+          {isBash ? (
+            <>
+              <text fg={theme.subtle}>执行命令</text>
+              <scrollbox style={{ height: commandHeight, backgroundColor: theme.surface }}>
+                <text fg={theme.text}>{commandText}</text>
+              </scrollbox>
+            </>
+          ) : (
+            <>
+              <text fg={theme.warning}>{interaction.payload.toolName}</text>
+              <text fg={theme.subtle}>参数</text>
+              <scrollbox style={{ height: argsHeight, backgroundColor: theme.surface }}>
+                <text fg={theme.muted}>{argsText}</text>
+              </scrollbox>
+            </>
+          )}
+          <text fg={theme.muted}>{reasonText}</text>
         </box>
       ) : null}
       <box style={{ flexDirection: "column", paddingTop: 1 }}>
@@ -662,6 +877,13 @@ function ContextGauge({ percent, tokens, windowTokens, theme }: { percent: numbe
   const details = windowTokens > 0
     ? [`上下文剩余 ${formatTokenK(remainingTokens)} / ${formatTokenK(windowTokens)}`, `已使用 ${used}%`]
     : [`已使用 ${used}%`];
+  // Absolute boxes mis-measure intrinsic width against these CJK lines and
+  // collapse to ~2 columns, so derive it explicitly.
+  const detailWidth = Math.max(...details.map((line) => stringWidth(line))) + 2;
+  const popoverWidth = detailWidth + 2;
+  // Expand left by default; if that would leave the screen on the left side,
+  // expand right instead.
+  const expandRight = (ref.current?.x ?? 0) + 6 - popoverWidth < 0;
   return (
     <box
       ref={ref}
@@ -677,13 +899,13 @@ function ContextGauge({ percent, tokens, windowTokens, theme }: { percent: numbe
       {active ? (
         <box
           position="absolute"
-          right={2}
+          {...(expandRight ? { left: 0 } : { right: 2 })}
           bottom={3}
           zIndex={40}
           border
           borderStyle="rounded"
           borderColor={theme.border}
-          style={{ flexDirection: "column", backgroundColor: theme.surfaceRaised, paddingLeft: 1, paddingRight: 1 }}
+          style={{ flexDirection: "column", width: detailWidth + 2, backgroundColor: theme.surfaceRaised, paddingLeft: 1, paddingRight: 1 }}
         >
           {details.map((line) => <text key={line} fg={theme.text}>{line}</text>)}
         </box>
@@ -858,6 +1080,11 @@ function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queu
     />
   );
   const composerBottomOffset = narrow ? 11 : 8;
+  // The model button shares the right-side row with the gauge and effort
+  // selector; a fixed truncation made the row wider than the screen in
+  // compact/narrow windows, so the group shrank and left a gap on the right.
+  const modelTextBudget = Math.max(8, narrow ? terminalWidth - 26 : terminalWidth - 50);
+  const modelText = truncateText(compact ? shortModelLabel(snapshot.model) : snapshot.model, modelTextBudget);
   const paletteMaxHeight = Math.max(5, Math.min(14, terminalHeight - composerBottomOffset - 1));
   const paletteBodyRows = Math.min(
     candidates.length + (commandMode ? 0 : mentionSections.length),
@@ -908,7 +1135,7 @@ function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queu
             style={{ flexGrow: 1, minHeight: 2, maxHeight: 6, backgroundColor: theme.surface, textColor: theme.text, cursorColor: theme.accent, placeholderColor: theme.muted }}
           />
         </box>
-        <box style={{ flexDirection: narrow ? "column" : "row", alignItems: narrow ? "flex-start" : "center", justifyContent: "space-between", paddingLeft: 1, paddingRight: 1 }}>
+        <box style={{ flexDirection: narrow ? "column" : "row", alignItems: narrow ? "flex-start" : "center", justifyContent: "space-between", paddingLeft: 1, paddingRight: 1, marginTop: 1 }}>
           <box style={{ flexDirection: "row", alignItems: "center", flexShrink: 1, minWidth: 0 }}>
             <AttachAction theme={theme} onAddFiles={onAddFiles} />
             <ToolbarAction label={`${snapshot.routingMode === "auto" ? "自动" : profileLabel(snapshot.profile)} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("profile")} />
@@ -916,7 +1143,7 @@ function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queu
           </box>
           <box style={{ flexDirection: "row", alignItems: "center", flexGrow: narrow ? 1 : 0, flexShrink: 1, minWidth: 0, justifyContent: narrow ? "space-between" : "flex-start", width: narrow ? "100%" : undefined, marginLeft: narrow ? 0 : 2 }}>
             <ContextGauge percent={snapshot.contextPercent} tokens={snapshot.contextTokens ?? 0} windowTokens={snapshot.contextWindowTokens ?? 0} theme={theme} />
-            <ToolbarAction label={`${icons.assistant} ${compact ? shortModelLabel(snapshot.model) : truncateText(snapshot.model, 26)} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("model")} />
+            <ToolbarAction label={`${icons.assistant} ${modelText} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("model")} />
             <ToolbarAction label={`${effortLabel(snapshot.reasoningEffort)} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("effort")} />
             {queueDepth ? <text fg={theme.subtle}>{` 已排队 ${queueDepth}`}</text> : null}
             {stopping ? <text fg={theme.subtle}> 停止中…</text> : running ? <StopAction icon={icons.stop} theme={theme} onStop={onCancel} /> : null}
@@ -1175,7 +1402,7 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
     <box style={{ flexDirection: "column", width: "100%", height: "100%", backgroundColor: theme.background }}>
       <Header cwd={state.snapshot.cwd} theme={theme} icons={icons} compact={compact} narrow={narrow} onHistory={() => void invoke("open_sessions", undefined, "history")} onNew={() => void invoke("new_session")} />
       <Transcript items={state.items} theme={theme} icons={icons} narrow={narrow} />
-      {state.interaction ? <InteractionView interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : panel ? null : externalPaths ? (
+      {state.interaction ? <InteractionView interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : externalPaths ? (
         <box border borderStyle="rounded" borderColor={theme.warning} style={{ flexDirection: "column", marginLeft: narrow ? 1 : 2, marginRight: narrow ? 1 : 2, paddingLeft: 1, paddingRight: 1 }}>
           <text fg={theme.warning}><strong>允许读取工作区外文件？</strong></text>
           {externalPaths.map((path) => <text key={path} fg={theme.text}>{path}</text>)}
@@ -1184,7 +1411,7 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
             <ActionButton label="拒绝" theme={theme} color={theme.error} defaultBg={theme.surfaceRaised} onInvoke={() => setExternalPaths(null)} />
           </box>
         </box>
-      ) : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping} sessionReady={state.snapshot.status === "ready"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
+      ) : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping} sessionReady={Boolean(state.snapshot.sessionId) && state.snapshot.status !== "failed"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
       {panel && !state.interaction ? <PanelOverlay panel={panel} anchor={panelAnchor} theme={theme} icons={icons} terminalWidth={width} terminalHeight={height} onClose={() => setPanel(null)} onSelect={selectPanel} busyId={panelBusyId} /> : null}
     </box>
   );

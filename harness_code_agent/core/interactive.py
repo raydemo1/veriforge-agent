@@ -696,9 +696,7 @@ class InteractiveSession:
         turn_instruction: str | None = None,
         attachments: tuple[Attachment, ...] = (),
     ) -> TurnResult:
-        self._ensure_mcp_tools_loaded()
         turn_started_at = time.time()
-        baseline = capture_git_baseline(self.cwd) if self.checkpoint.auto else None
         self._apply_profile_task_timeout(user_prompt)
         resolved = resolve_mentions(
             user_prompt,
@@ -752,6 +750,11 @@ class InteractiveSession:
                 "attachments": attachment_metadata,
             },
         )
+        # Slow preparation (MCP cold start, git baseline) runs after the
+        # turn_started event so the UI shows the assistant immediately; both
+        # only need to be ready before the first model call / turn teardown.
+        self._ensure_mcp_tools_loaded()
+        baseline = capture_git_baseline(self.cwd) if self.checkpoint.auto else None
         turn_event_start = len(getattr(self.event_bus, "events", []))
         text = self.conversation.submit(
             model_content,

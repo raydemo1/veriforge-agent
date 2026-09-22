@@ -185,10 +185,12 @@ def _rg_has_explicit_path(command: str) -> bool:
 
 def _is_broad_recursive_shell_listing(command: str) -> bool:
     lowered = _collapse(command.lower())
+    if re.search(r"\b(get-childitem|gci|ls)\b.*\s-recurse\b", lowered):
+        # Only unbounded sweeps stay blocked; a concrete subdirectory is fine.
+        return not _has_bounded_recursive_target(command)
     if any(
         re.search(pattern, lowered)
         for pattern in (
-            r"\b(get-childitem|gci|ls)\b.*\s-recurse\b",
             r"\bdir\b.*\s/s\b",
             r"\bfindstr\b.*\s/s\b",
             r"\bfind\s+\.\s+.*-type\s+f\b",
@@ -197,6 +199,48 @@ def _is_broad_recursive_shell_listing(command: str) -> bool:
     ):
         return True
     return _is_broad_recursive_grep(command)
+
+
+_PWSH_RECURSE_VALUE_OPTIONS = {"-path", "-literalpath", "-filter", "-include", "-exclude", "-depth"}
+
+
+def _has_bounded_recursive_target(command: str) -> bool:
+    """True when a recursive listing names a concrete subdirectory instead of a
+    whole-drive or home-directory sweep (or relying on the current directory)."""
+    tokens = _tokens(command)
+    if len(tokens) <= 1:
+        return False
+    positionals: list[str] = []
+    index = 1
+    while index < len(tokens):
+        token = str(tokens[index]).strip("\"'").lower()
+        if token in _PWSH_RECURSE_VALUE_OPTIONS:
+            if token in {"-path", "-literalpath"} and index + 1 < len(tokens):
+                positionals.append(str(tokens[index + 1]))
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        positionals.append(str(tokens[index]))
+        index += 1
+    if not positionals:
+        return False
+    return _is_bounded_recursive_path(positionals[0])
+
+
+def _is_bounded_recursive_path(target: str) -> bool:
+    normalized = target.strip().strip("\"'").replace("/", "\\")
+    lowered = normalized.lower().rstrip("\\")
+    if not lowered:
+        return False
+    # Whole-drive roots, current/parent dirs, and the home directory itself
+    # are unbounded; anything naming a concrete path below them is bounded.
+    if lowered in {".", "..", "~", "$home", "$env:userprofile", "userprofile"}:
+        return False
+    if re.fullmatch(r"[a-z]:", lowered):
+        return False
+    return True
 
 
 def _is_broad_recursive_grep(command: str) -> bool:

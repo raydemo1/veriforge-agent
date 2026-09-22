@@ -140,8 +140,14 @@ class TuiState:
         if event_type == "agent_fallback":
             self.snapshot.status = "blocked"
             self.snapshot.running_tool = ""
-            reason = str(payload.get("reason") or "stopped").replace("_", " ")
-            body = f"已停止：{_FAILURE_LABELS.get(reason, '任务未完成')}"
+            reason = str(payload.get("reason") or "stopped")
+            if reason == "approval_denied":
+                # The user made this decision; the "操作已拒绝" tool result
+                # already says so — an extra "代理已停止" block would read
+                # like a system malfunction.
+                return None
+            display_reason = reason.replace("_", " ")
+            body = f"已停止：{_FAILURE_LABELS.get(display_reason, '任务未完成')}"
             last_tool = str(payload.get("last_tool") or "")
             if last_tool:
                 body += f"（最后工具：{last_tool}）"
@@ -274,7 +280,15 @@ class TuiState:
                 turn=self.snapshot.turn,
             )
         self.snapshot.status = "running"
-        error = str(payload.get("error") or "")
+        raw_metadata = payload.get("metadata")
+        metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        # Approval/policy rejections collapse to a single short line in the
+        # UI; the model still receives the full error text for recovery.
+        rejection = {
+            "approval": "操作已拒绝",
+            "tool_policy": "该执行方式受限",
+            "permission": "操作被安全策略拦截",
+        }.get(str(metadata.get("status_source") or ""))
         return_code = payload.get("return_code")
         # run_bash reports status="success" even on non-zero exit; treat a bad
         # exit as failure so the title/color match reality, and keep the raw
@@ -282,16 +296,26 @@ class TuiState:
         bash_failed = tool == "run_bash" and return_code not in (None, 0)
         if bash_failed:
             status = "failed"
-        parts = []
-        if return_code not in (None, 0):
-            parts.append(f"退出码 {return_code}")
-        body = "  ".join(parts)
-        if error:
-            localized_error = _localize_error(error)
-            body += f"\n{localized_error}" if body else localized_error
-            raw_tail = _bounded_tail(error, 600)
-            if raw_tail and raw_tail not in body:
-                body += f"\n{raw_tail}"
+        if rejection:
+            # A guard block is an intermediate self-correction step (the model
+            # retries with list_files/repo_search), so it is not shown to the
+            # user at all. Approval denials and permission bans stay visible.
+            self._take_active_tool_block(tool)
+            if str(metadata.get("status_source")) == "tool_policy":
+                return None
+            body = rejection
+        else:
+            error = str(payload.get("error") or "")
+            parts = []
+            if return_code not in (None, 0):
+                parts.append(f"退出码 {return_code}")
+            body = "  ".join(parts)
+            if error:
+                localized_error = _localize_error(error)
+                body += f"\n{localized_error}" if body else localized_error
+                raw_tail = _bounded_tail(error, 600)
+                if raw_tail and raw_tail not in body:
+                    body += f"\n{raw_tail}"
         if bash_failed:
             output_tail = _bounded_tail(str(payload.get("output") or ""), 1200)
             if output_tail and output_tail not in body:
@@ -317,13 +341,15 @@ class TuiState:
         return None
 
     def _apply_failure(self, payload: dict[str, Any]) -> TranscriptBlock | None:
+        tool = str(payload.get("tool") or "")
+        if tool:
+            # The tool_result event is already the user-facing record for a
+            # failed tool; rendering the failure too would duplicate it.
+            return None
         category = str(payload.get("category") or "error").replace("_", " ")
         message = _localize_error(payload.get("message")) if payload.get("message") else ""
-        tool = str(payload.get("tool") or "")
         category_label = _FAILURE_LABELS.get(category, "执行失败")
         body = f"{category_label}：{message}" if message else category_label
-        if tool:
-            body += f"\n执行工具：{tool}"
         return TranscriptBlock("failure", "错误", body, "failed", turn=self.snapshot.turn)
 
     def _update_todo_steps_from_metadata(self, metadata: Any) -> None:

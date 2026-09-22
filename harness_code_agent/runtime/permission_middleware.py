@@ -133,10 +133,7 @@ class PermissionMiddleware(AgentMiddleware):
                     "PermissionMiddleware: user denied %s (reason=%s)",
                     tool_name, approval_result.reason,
                 )
-                message = (
-                    f"[approval_denied] 工具未执行：该操作未获得审批（{approval_result.reason}）。"
-                    "请向用户明确说明未执行，不要假设文件或外部状态已经改变；如需继续，请先确认操作范围并准备备份。"
-                )
+                message = "[approval_denied] 用户已拒绝该操作。"
                 return ToolResult(
                     tool=tool_name,
                     status="failed",

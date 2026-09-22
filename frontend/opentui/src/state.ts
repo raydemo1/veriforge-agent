@@ -21,20 +21,25 @@ const STARTUP_COPY: Record<string, string> = {
   "checking workspace": "正在检查工作区…",
   "loading skills": "正在加载技能…",
   "connecting tools": "正在连接工具…",
+  "connecting external tools": "正在连接外部工具…",
 };
-const READY_HINT = "输入任务开始，/ 查看命令，@ 添加上下文";
+const READY_HINT = "今天想造点什么？";
+// "ready" = core session usable; "external tools ready" = background MCP
+// warm-up also finished, i.e. the whole startup is done.
+const READY_STATUSES = new Set(["ready", "external tools ready"]);
 
 export function reduceEvent(state: AppState, event: UiEvent): AppState {
   if (event.type === "snapshot") return { ...state, snapshot: event.snapshot };
   if (event.type === "session_reset") return { ...state, snapshot: event.snapshot, items: event.items ?? [], turnState: "idle", queueDepth: 0, interaction: null };
   if (event.type === "commands") return { ...state, commands: event.commands };
   if (event.type === "progress") {
-    const welcomeState = event.status === "ready"
+    const isReady = READY_STATUSES.has(event.status);
+    const welcomeState = isReady
       ? "success"
       : event.status === "failed"
         ? "failed"
         : "running";
-    const welcomeBody = event.status === "ready"
+    const welcomeBody = isReady
       ? READY_HINT
       : event.status === "failed"
         ? (event.detail || "会话启动失败")

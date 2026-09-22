@@ -585,12 +585,12 @@ class PolicyDecisionTests(unittest.TestCase):
         # the count as a circuit breaker.
         self.assertEqual(self.state.failures.turn_failure_count, 4)
 
-    def test_approval_denied_never_stops_or_counts(self):
-        for _ in range(5):
-            action = self._decide(self._observe(FailureKind.APPROVAL_DENIED))
-            self.assertEqual(action.mode, FailureMode.RETURN_TO_AGENT)
-        self.assertFalse(self.state.fallback.stop_requested)
-        self.assertEqual(self.state.failures.turn_failure_count, 0)
+    def test_approval_denied_stops_the_turn_immediately(self):
+        # A human denial ends the turn: the agent must not keep trying
+        # alternative paths after the user said no.
+        action = self._decide(self._observe(FailureKind.APPROVAL_DENIED))
+        self.assertEqual(action.mode, FailureMode.STOP)
+        self.assertEqual(action.stop_reason, "approval_denied")
 
     def test_blocking_policy_exposes_once_then_guides_but_never_stops(self):
         args = {"command": "grep -r secret ."}

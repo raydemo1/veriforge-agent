@@ -157,10 +157,18 @@ class ToolFailurePolicyMiddleware(AgentMiddleware):
                 )
             return FailureAction.return_to_agent()
 
-        # Human / external gates: never request regeneration.
+        # A human denial ends the turn: the user said no, so the agent must
+        # not keep trying alternative paths this turn. The next user message
+        # re-evaluates from scratch. Other gates stay recoverable.
+        if failure.kind == FailureKind.APPROVAL_DENIED:
+            return FailureAction.stop(
+                reason="approval_denied",
+                message="[stop] 用户已拒绝该操作，本轮任务终止。",
+                limit_type="approval_denied",
+                limit=1,
+            )
         if (
-            failure.kind == FailureKind.APPROVAL_DENIED
-            or failure.kind == FailureKind.USER_ATTENTION_REQUIRED
+            failure.kind == FailureKind.USER_ATTENTION_REQUIRED
             or failure.kind == FailureKind.BUDGET_EXCEEDED
         ):
             return FailureAction.return_to_agent()

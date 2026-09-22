@@ -877,6 +877,167 @@ def _dedupe(items: list) -> list:
 # Approval prefixes (persisted allowlist rules)
 # ---------------------------------------------------------------------------
 
+def _strip_redirections(segment: str) -> str:
+    """Remove redirections (2>$null, >>file, <in, 2>&1) outside quotes."""
+    out: list[str] = []
+    quote = ""
+    index = 0
+    text = segment
+    while index < len(text):
+        char = text[index]
+        if quote:
+            out.append(char)
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            out.append(char)
+            index += 1
+            continue
+        if char in "<>":
+            while out and out[-1].isdigit():
+                out.pop()
+            index += 1
+            while index < len(text) and text[index].isspace():
+                index += 1
+            while index < len(text) and not text[index].isspace():
+                index += 1
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out).strip()
+
+
+def _split_approval_stages(command: str) -> list[str]:
+    """Split into pipeline stages (quotes aware, redirections stripped).
+
+    Returns [] for syntax the allowlist cannot represent (unclosed quotes,
+    single & backgrounding, || conditionals).
+    """
+    stages: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        stripped = _strip_redirections("".join(current))
+        current.clear()
+        if stripped:
+            stages.append(stripped)
+
+    quote = ""
+    text = command.strip()
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        if char == ";":
+            flush()
+            index += 1
+            continue
+        if char == "&":
+            if index + 1 < len(text) and text[index + 1] == "&":
+                flush()
+                index += 2
+                continue
+            if current and current[-1] == ">":
+                current.append(char)  # 2>&1 — stripped later
+                index += 1
+                continue
+            return []
+        if char == "|":
+            if index + 1 < len(text) and text[index + 1] == "|":
+                return []
+            flush()
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    if quote:
+        return []
+    flush()
+    return [stage.lstrip("(") for stage in stages]
+
+
+def _derive_stage_prefix(command: str) -> list[str] | None:
+    """Head token per pipeline stage (command head only, no arguments).
+
+    Stage-level rules read as "allow this command head inside a pipeline",
+    so arguments must not leak into the prefix; python keeps its
+    launcher/module special case.
+    """
+    tokens = _tokenize_approval_command(command)
+    if not tokens:
+        return None
+    normalized = [_normalize_token(token) for token in tokens]
+    python_index = next(
+        (index for index, token in enumerate(normalized) if token in _PYTHON_COMMANDS),
+        None,
+    )
+    if python_index is None:
+        return [normalized[0]]
+    rest = normalized[python_index + 1:]
+    if not rest:
+        return None
+    launcher = rest[0]
+    if launcher in {"-", "-c", "-i"}:
+        return None
+    if launcher == "-m":
+        if len(rest) < 2:
+            return None
+        return normalized[: python_index + 3]
+    if launcher.startswith("-"):
+        return None
+    return normalized[: python_index + 2]
+
+
+def derive_persistent_stage_prefixes(command: str) -> list[list[str]] | None:
+    """Return one prefix per pipeline stage, or None if any stage is opaque."""
+    stages = _split_approval_stages(command)
+    if not stages:
+        return None
+    prefixes: list[list[str]] = []
+    for stage in stages:
+        if _is_literal_expression(stage):
+            continue
+        prefix = _derive_stage_prefix(stage)
+        if not prefix:
+            return None
+        prefixes.append(prefix)
+    return prefixes or None
+
+
+def command_matches_stage_prefixes(command: str, prefixes: list[list[str]]) -> bool:
+    """Match each meaningful pipeline stage against the rule in order."""
+    stages = _split_approval_stages(command)
+    if not stages:
+        return False
+    checked = 0
+    for stage in stages:
+        if _is_literal_expression(stage):
+            continue
+        if checked >= len(prefixes):
+            return False
+        tokens = [
+            _normalize_token(token) for token in _tokenize_approval_command(stage)
+        ]
+        prefix = prefixes[checked]
+        if not tokens or tokens[: len(prefix)] != prefix:
+            return False
+        checked += 1
+    return checked == len(prefixes)
+
+
 def derive_persistent_prefix(command: str) -> list[str] | None:
     """Return one stable approval prefix for a simple command or compound."""
     segments = _split_simple_compound(command)

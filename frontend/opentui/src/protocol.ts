@@ -65,7 +65,7 @@ export type QuestionInteraction = {
 };
 export type Interaction = ApprovalInteraction | QuestionInteraction;
 
-export type PanelOption = { id: string; label: string; description?: string; tone?: "default" | "success" | "warning" | "danger"; selected?: boolean };
+export type PanelOption = { id: string; label: string; description?: string; badge?: string; tone?: "default" | "success" | "warning" | "danger"; selected?: boolean };
 export type PanelSpec = {
   kind: "sessions" | "profile" | "permission" | "model" | "effort" | "checkpoint" | "mcp" | "observe" | "help";
   title: string;
