@@ -599,58 +599,41 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", completions.calls[0])
         self.assertEqual(completions.calls[0]["extra_body"], {"thinking": {"type": "disabled"}})
 
-    def test_local_turn_router_conservatively_routes_product_profiles(self):
+    def test_model_router_applies_profile_transitions(self):
         from harness_code_agent.profiles import router
 
         cases = [
-            ("你是谁", "general", "general", "stay", "normal"),
-            ("帮我修复这个 bug 并跑测试", "general", "coding-agent", "switch_profile", "normal"),
-            ("帮我 review 这段代码有没有问题", "general", "review", "switch_profile", "normal"),
-            ("先给我一个实现方案，不要改代码", "general", "plan", "switch_profile", "normal"),
-            ("做一个好看的 todo 网页", "general", "app-builder", "switch_profile", "normal"),
-            ("你是谁", "coding-agent", "coding-agent", "direct_answer", "direct_answer"),
-            ("审阅这个 PR 的改动，然后修掉问题并跑测试", "general", "coding-agent", "switch_profile", "normal"),
-            ("只审查这个分支，不要修改任何文件", "general", "review", "switch_profile", "normal"),
-            ("检查为什么启动慢并直接优化", "general", "coding-agent", "switch_profile", "normal"),
-            ("解释一下这个报错是什么意思，不要改代码", "general", "general", "stay", "normal"),
-            ("先设计方案，等我确认后再实现", "general", "plan", "switch_profile", "normal"),
-            ("设计并实现一个新的缓存模块", "general", "coding-agent", "switch_profile", "normal"),
-            ("做一个漂亮的 TUI 界面", "general", "coding-agent", "switch_profile", "normal"),
-            ("检查当前 Ruff 修改，没修完的一并修掉", "general", "coding-agent", "switch_profile", "normal"),
-            ("帮我看下代码有没有安全问题，发现问题直接修复", "general", "coding-agent", "switch_profile", "normal"),
-            ("review the PR, fix the findings, and run tests", "general", "coding-agent", "switch_profile", "normal"),
-            ("review this patch only; do not edit files", "general", "review", "switch_profile", "normal"),
-            ("build a polished terminal UI", "general", "coding-agent", "switch_profile", "normal"),
-            ("build a polished React dashboard", "general", "app-builder", "switch_profile", "normal"),
-            ("plan the migration but do not implement it", "general", "plan", "switch_profile", "normal"),
-            ("不要修复，只解释这个异常", "general", "general", "stay", "normal"),
+            ("general", "general", "general", "stay", "normal"),
+            ("general", "coding-agent", "coding-agent", "switch_profile", "normal"),
+            ("coding-agent", "general", "coding-agent", "direct_answer", "direct_answer"),
+            ("plan", "coding-agent", "coding-agent", "switch_profile", "normal"),
+            ("coding-agent", "review", "review", "switch_profile", "normal"),
         ]
-
-        for prompt, current, expected, expected_action, expected_turn_mode in cases:
-            with self.subTest(prompt=prompt, current=current):
-                decision = router.route_profile_for_turn(prompt, current_profile=current)
+        for current, matched, expected, action, turn_mode in cases:
+            with self.subTest(current=current, matched=matched):
+                decision = router.route_profile_for_turn(
+                    "本轮任务", current_profile=current,
+                    llm_classifier=lambda matched=matched, **_: router.LlmRouteResult(profile_name=matched, confidence=0.96),
+                )
                 self.assertEqual(decision.profile_name, expected)
-                self.assertEqual(decision.action, expected_action)
-                self.assertEqual(decision.turn_mode, expected_turn_mode)
-                self.assertEqual(decision.source, "local")
+                self.assertEqual(decision.action, action)
+                self.assertEqual(decision.turn_mode, turn_mode)
+                self.assertEqual(decision.source, "llm")
                 self.assertFalse(decision.fallback_used)
+                self.assertTrue(decision.llm_called)
 
-    def test_high_precision_local_route_hops_between_specialized_profiles(self):
+    def test_model_route_hops_between_specialized_profiles(self):
         from harness_code_agent.profiles import router
 
         decision = router.route_profile_for_turn(
-            "帮我 review 这段代码",
-            current_profile="coding-agent",
-            llm_classifier=lambda **_: (_ for _ in ()).throw(
-                AssertionError("high precision review route should stay local")
-            ),
+            "帮我 review 这段代码", current_profile="coding-agent",
+            llm_classifier=lambda **_: router.LlmRouteResult(profile_name="review", confidence=0.96),
         )
-
         self.assertEqual(decision.profile_name, "review")
         self.assertEqual(decision.action, "switch_profile")
         self.assertFalse(decision.fallback_used)
-        self.assertEqual(decision.source, "local")
-        self.assertFalse(decision.llm_called)
+        self.assertEqual(decision.source, "llm")
+        self.assertTrue(decision.llm_called)
 
     def test_permission_policy_does_not_block_format_substrings_in_safe_commands(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy

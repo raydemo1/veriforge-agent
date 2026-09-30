@@ -34,6 +34,7 @@ from ..profiles.router import (
     ROUTING_MODE_AUTO,
     ROUTING_MODE_PINNED,
     TURN_MODE_DIRECT_ANSWER,
+    JevRouteClassifier,
     RouteDecision,
     route_profile_for_turn,
 )
@@ -132,6 +133,8 @@ class InteractiveSession:
     ):
         self.cwd = Path(cwd).resolve()
         self.lifecycle = LifecycleScope()
+        self.profile_router = JevRouteClassifier()
+        self.lifecycle.register("profile_router", self.profile_router.close, order=40)
         self.startup_sink = startup_sink
         self._report_startup("checking workspace")
         validate_shell_configuration()
@@ -493,6 +496,7 @@ class InteractiveSession:
             routing_mode=self.routing_mode,
             previous_user_task=self.last_user_task,
             previous_assistant_text=self.last_assistant_text,
+            llm_classifier=self.profile_router,
         )
         switched = decision.action == ROUTE_ACTION_SWITCH_PROFILE and decision.profile_name != current
         self.event_bus.emit(
@@ -514,9 +518,7 @@ class InteractiveSession:
                 "switched": switched,
                 "routing_mode": self.routing_mode,
                 "decisive_signal": getattr(decision, "decisive_signal", ""),
-                "local_candidate": getattr(decision, "local_candidate", ""),
-                "local_confidence": getattr(decision, "local_confidence", 0.0),
-                "local_margin": getattr(decision, "local_margin", 0.0),
+                "probabilities": decision.probabilities,
                 "llm_called": getattr(decision, "llm_called", False),
                 "llm_confidence": getattr(decision, "llm_confidence", 0.0),
                 "llm_provider": getattr(decision, "llm_provider", ""),
@@ -525,13 +527,6 @@ class InteractiveSession:
             },
         )
         if switched:
-            if getattr(decision, "decisive_signal", "") == "explicit_mode":
-                self.routing_mode = ROUTING_MODE_PINNED
-                if self.session is not None:
-                    self.session_store.update_routing_mode(
-                        self.session.id,
-                        self.routing_mode,
-                    )
             self._switch_profile(decision.profile_name, reason="auto route")
         return decision
 

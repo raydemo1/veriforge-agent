@@ -117,12 +117,20 @@ veriforge --profile review "Review the current branch"
 | `OPENAI_BASE_URL` | OpenAI-compatible API 地址 |
 | `HARNESS_MODEL` | 默认模型 |
 | `HARNESS_MODEL_INTENSITY` | `fast` / `normal` / `hard` / `max` |
+| `HARNESS_ROUTER_API_KEY` | 丑橘 `jev` 分组的独立路由 key |
+| `HARNESS_ROUTER_BASE_URL` | 路由 API 根地址，默认 `https://chouju.best/v1` |
+| `HARNESS_ROUTER_MODEL` | 路由模型，默认 `jev-latest` |
+| `HARNESS_ROUTER_TIMEOUT_SECONDS` | 路由请求超时，默认 3 秒，不重试 |
 | `HARNESS_PERMISSION_MODE` | `workspace-write` / `llm-auto` / `danger-full-access` |
 | `HARNESS_WINDOWS_SHELL` | `pwsh` 或 `wsl` |
 | `HARNESS_SANDBOX_MODE` | `host` 或 `docker` |
 | `HARNESS_MODEL_INPUT_MODE` | `text` 或 `multimodal` |
 
 完整配置见 `.env.template`。
+
+自动模式下，每个用户 turn 由 Jev 通过 `/v1/systemone` 的 Choice 问题选择工作模式，并参考上一轮任务和回答。选择 `auto` 时全部任务意图交给 Jev，不再使用关键词规则或 BM25；手动选择其他模式后固定执行，不请求路由模型。专用模式中的普通问答使用 `direct_answer`，保留当前工作上下文。
+
+路由器独立配置 API key、地址和模型，复用会话内的 HTTP 连接，会话关闭时释放连接。主模型和 `fast` 通道的配置不受影响。缺少路由配置、请求失败、响应无效或置信度低于 0.6 时保持当前模式，`profile_route_decision` 记录失败原因、实际模型、置信度和候选概率。路由模型仅判断工作模式，工具权限仍由 Runtime 控制。
 
 ## 测试
 
@@ -143,10 +151,13 @@ bun run check
 ## 评测
 
 ```bash
+python eval/scripts/run_profile_router_eval.py
 python eval/scripts/run_basic_metrics_eval.py --dry-run
 python eval/scripts/run_terminal_bench_eval.py --dry-run
 python eval/scripts/rebuild_eval_results.py --results-root eval/results --jobs-root jobs
 ```
+
+Profile 路由评测会用真实接口检查 38 条固定用例，默认每 5.2 秒发起一次请求以满足丑橘每分钟 12 次的限制，结果保存到 `eval/local_results/profile_router_jev.json`。
 
 评测结果和运行说明：
 

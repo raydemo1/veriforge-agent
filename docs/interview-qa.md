@@ -1252,7 +1252,7 @@ memory.db                   BM25 索引、提炼队列、租约、usage、suppre
 
 ### 自动路由：`route_profile_for_turn()`
 
-用户不需要每次手动选 profile。系统默认从 `general` 开始，每个用户 turn 进入 agent 前都会先跑本地路由：用高精度规则和 profile prototype 的 BM25 + cosine 匹配生成 `RouteDecision`。本地证据不足时，才调用一次受限的 fast model，并把上一轮任务和回答作为上下文。
+用户不需要每次手动选 profile。系统默认从 `general` 开始，自动模式下每个用户 turn 进入 agent 前都会调用 Jev，结合本轮要求、上一轮任务和回答，在五个产品 profile 中做结构化选择。手动选择其他模式后固定执行，只有重新选择 `auto` 才会调用路由模型。路由使用独立的 `HARNESS_ROUTER_API_KEY`、`HARNESS_ROUTER_BASE_URL` 和 `HARNESS_ROUTER_MODEL`，通过丑橘的 `/v1/systemone` 接口请求 choice 分类，不占用主模型和 fast lane。
 
 这里有一个重要边界：`terminal` 不在产品自动路由候选里。它还在 `PROFILES` 中，所以 eval runner 和 `--profile terminal` 可以显式使用；TUI 的 profile 面板只展示产品 profile。
 
@@ -1261,28 +1261,24 @@ memory.db                   BM25 索引、提炼队列、租约、usage、suppre
 路由动作主要有三种：
 
 - `stay`：保持当前 profile。
-- `switch_profile`：当前是 `general`，且明确匹配到 `coding-agent` / `plan` / `review` / `app-builder` 这类专用 profile。
+- `switch_profile`：匹配到不同的专用 profile，可以在专用 profile 之间切换。
 - `direct_answer`：当前已经在专用 profile，但本轮只是普通问答；此时不切回 `general`，而是在当前 slot 注入 direct-answer 指令，避免污染实现上下文。
 
-### 为什么不是每次都调用 LLM 路由
+### 为什么由 Jev 统一判断任务语义
 
-大多数 turn 可以由本地规则和 prototype 直接判断，不需要额外请求。遇到短句、歧义请求或专用 profile 之间的切换时，路由器才调用 fast model；请求设置 3 秒超时且不重试，低置信度、非法响应或 provider 失败都会保留当前 profile。这样把额外延迟和失败面限制在需要判断的少数 turn 内。
+组合要求、否定指令和“继续”“按方案实现”等跟进语句，需要结合最终交付目标和上下文判断。自动分类统一交给 Jev，避免本地关键词覆盖用户意图。每个会话持有并复用独立的路由客户端，结束时关闭连接；默认 3 秒超时，不重试。低于 0.6 的置信度、非法响应或请求失败都会保持当前 profile。
 
-路由结果会进入 `profile_route_decision` event，记录 matched_profile、action、turn_mode、confidence、margin、source、是否调用 LLM 以及 fallback 原因，便于复盘为什么切了 profile，或者为什么保持原 profile。
-
-### Fallback 安全网
-
-路由系统的设计原则是**保守 fallback**：本地和 fast model 都没有足够证据时保持当前 profile，不自动乱跳；`terminal` 始终保持显式入口，用户 pinned 后也不会被自动路由改写。`RouteDecision` 里有 `fallback_used` 和 `fallback_reason` 字段，可以在 trace/event 里看到为什么触发 fallback。
+路由结果进入 `profile_route_decision` event，记录 matched_profile、action、turn_mode、confidence、五类 probabilities、前两类概率差 margin、source、实际模型名和失败原因。`terminal` 保持显式入口，用户 pinned 后也不会被自动分类改写。
 
 ### 扩展：新增一个 profile 需要什么？
 
 1. 创建 `profiles/my_profile.py`，继承 `BaseProfile`，实现 `name()` + `description()` + `main_agent()`（~80-100 行）
 2. 在 `profiles/__init__.py` 的 `PROFILES` 字典里注册
-3. 如果希望它成为产品可见 profile，需要进入 `PRODUCT_PROFILES` 和 profile 面板选项；如果希望自动路由能识别它，还需要把 profile 加进 `profiles/router.py` 的本地 prototype 集合。否则仍可通过显式 `--profile` 使用，但不会被普通产品入口展示或自动选择。
+3. 如果希望它成为产品可见 profile，需要进入 `PRODUCT_PROFILES` 和 profile 面板选项；如果希望自动路由能识别它，还需要把 profile 加进 `profiles/router.py` 的 Jev 分类 criteria。否则仍可通过显式 `--profile` 使用，但不会被普通产品入口展示或自动选择。
 
 ### 如果面试官追问"profile 切换会丢上下文吗？"
 
-TUI 层的 profile 切换使用底部 profile 选择面板：创建或重建目标 Agent 运行时，并把同一个 Conversation 重新绑定到新的 prompt 与 tools。用户选择具体模式后进入 pinned；重新选择自动模式后，才恢复本地优先、fast model 兜底的自动路由。详见 Q12。
+TUI 层的 profile 切换使用底部 profile 选择面板：创建或重建目标 Agent 运行时，并把同一个 Conversation 重新绑定到新的 prompt 与 tools。用户选择具体模式后进入 pinned；重新选择自动模式后，才恢复由 Jev 判断任务语义的自动路由。详见 Q12。
 
 ---
 

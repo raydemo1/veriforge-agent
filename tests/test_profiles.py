@@ -61,29 +61,20 @@ class ProfilePromptTests(unittest.TestCase):
         self.assertTrue(decision.fallback_used)
         self.assertEqual(decision.fallback_reason, "profile is sticky")
 
-    def test_profile_router_prefers_explicit_workflow_contracts_over_similarity(self):
-        cases = [
-            ("先给我方案，不要修改代码", "plan"),
-            ("只审查这个实现，不要改动文件", "review"),
-            ("审查后直接修复这个 parser bug", "coding-agent"),
-            ("帮我写一个计算器", "coding-agent"),
-            ("给我创建一个霜叶转换器", "coding-agent"),
-            ("写个排序函数", "coding-agent"),
-            ("开发一个潮汐索引器", "coding-agent"),
-            ("创建一个响应式网页看板", "app-builder"),
-            ("解释这段代码是什么意思", "general"),
-        ]
-        for prompt, expected in cases:
-            with self.subTest(prompt=prompt):
-                decision = route_profile_for_turn(prompt, current_profile="general")
-                self.assertEqual(decision.profile_name, expected)
-                self.assertEqual(decision.reason, f"High-precision local contract matched {expected}.")
-                self.assertEqual(decision.confidence, 0.98)
-                self.assertFalse(decision.llm_called)
+    def test_profile_router_uses_model_for_workflow_contracts(self):
+        decision = route_profile_for_turn(
+            "先给我方案，不要修改代码", current_profile="general",
+            llm_classifier=lambda **_: LlmRouteResult(profile_name="plan", confidence=0.98),
+        )
+        self.assertEqual(decision.profile_name, "plan")
+        self.assertEqual(decision.source, "llm")
+        self.assertTrue(decision.llm_called)
 
     def test_profile_router_keeps_specialized_profile_sticky_for_general_followup(self):
-        decision = route_profile_for_turn("help me understand this concept", current_profile="coding-agent")
-
+        decision = route_profile_for_turn(
+            "help me understand this concept", current_profile="coding-agent",
+            llm_classifier=lambda **_: LlmRouteResult(profile_name="general", confidence=0.98),
+        )
         self.assertEqual(decision.profile_name, "coding-agent")
         self.assertEqual(decision.action, "direct_answer")
         self.assertEqual(decision.matched_profile, "general")
@@ -117,16 +108,6 @@ class ProfilePromptTests(unittest.TestCase):
         self.assertEqual(decision.action, "switch_profile")
         self.assertEqual(decision.source, "llm")
         self.assertTrue(decision.llm_called)
-
-    def test_explicit_mode_can_transition_and_pins_at_session_layer(self):
-        decision = route_profile_for_turn(
-            "切换到编码模式",
-            current_profile="plan",
-        )
-
-        self.assertEqual(decision.profile_name, "coding-agent")
-        self.assertEqual(decision.decisive_signal, "explicit_mode")
-        self.assertEqual(decision.action, "switch_profile")
 
     def test_low_evidence_route_keeps_non_unit_confidence(self):
         decision = route_profile_for_turn(

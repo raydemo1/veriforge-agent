@@ -1,0 +1,316 @@
+{
+  "cases": [
+    {
+      "prompt": "你是谁",
+      "current_profile": "general",
+      "expected_profile": "general",
+      "expected_matched_profile": "general",
+      "expected_action": "stay",
+      "id": "route-01"
+    },
+    {
+      "prompt": "帮我修复这个 bug 并跑测试",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-02"
+    },
+    {
+      "prompt": "帮我 review 这段代码有没有问题",
+      "current_profile": "general",
+      "expected_profile": "review",
+      "expected_matched_profile": "review",
+      "expected_action": "switch_profile",
+      "id": "route-03"
+    },
+    {
+      "prompt": "先给我一个实现方案，不要改代码",
+      "current_profile": "general",
+      "expected_profile": "plan",
+      "expected_matched_profile": "plan",
+      "expected_action": "switch_profile",
+      "id": "route-04"
+    },
+    {
+      "prompt": "做一个好看的 todo 网页",
+      "current_profile": "general",
+      "expected_profile": "app-builder",
+      "expected_matched_profile": "app-builder",
+      "expected_action": "switch_profile",
+      "id": "route-05"
+    },
+    {
+      "prompt": "你是谁",
+      "current_profile": "coding-agent",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "general",
+      "expected_action": "direct_answer",
+      "id": "route-06"
+    },
+    {
+      "prompt": "审阅这个 PR 的改动，然后修掉问题并跑测试",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-07"
+    },
+    {
+      "prompt": "只审查这个分支，不要修改任何文件",
+      "current_profile": "general",
+      "expected_profile": "review",
+      "expected_matched_profile": "review",
+      "expected_action": "switch_profile",
+      "id": "route-08"
+    },
+    {
+      "prompt": "检查为什么启动慢并直接优化",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-09"
+    },
+    {
+      "prompt": "解释一下这个报错是什么意思，不要改代码",
+      "current_profile": "general",
+      "expected_profile": "general",
+      "expected_matched_profile": "general",
+      "expected_action": "stay",
+      "id": "route-10"
+    },
+    {
+      "prompt": "先设计方案，等我确认后再实现",
+      "current_profile": "general",
+      "expected_profile": "plan",
+      "expected_matched_profile": "plan",
+      "expected_action": "switch_profile",
+      "id": "route-11"
+    },
+    {
+      "prompt": "设计并实现一个新的缓存模块",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-12"
+    },
+    {
+      "prompt": "做一个漂亮的 TUI 界面",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-13"
+    },
+    {
+      "prompt": "检查当前 Ruff 修改，没修完的一并修掉",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-14"
+    },
+    {
+      "prompt": "帮我看下代码有没有安全问题，发现问题直接修复",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-15"
+    },
+    {
+      "prompt": "review the PR, fix the findings, and run tests",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-16"
+    },
+    {
+      "prompt": "review this patch only; do not edit files",
+      "current_profile": "general",
+      "expected_profile": "review",
+      "expected_matched_profile": "review",
+      "expected_action": "switch_profile",
+      "id": "route-17"
+    },
+    {
+      "prompt": "build a polished terminal UI",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-18"
+    },
+    {
+      "prompt": "build a polished React dashboard",
+      "current_profile": "general",
+      "expected_profile": "app-builder",
+      "expected_matched_profile": "app-builder",
+      "expected_action": "switch_profile",
+      "id": "route-19"
+    },
+    {
+      "prompt": "plan the migration but do not implement it",
+      "current_profile": "general",
+      "expected_profile": "plan",
+      "expected_matched_profile": "plan",
+      "expected_action": "switch_profile",
+      "id": "route-20"
+    },
+    {
+      "prompt": "不要修复，只解释这个异常",
+      "current_profile": "general",
+      "expected_profile": "general",
+      "expected_matched_profile": "general",
+      "expected_action": "stay",
+      "id": "route-21"
+    },
+    {
+      "prompt": "先给我方案，不要修改代码",
+      "current_profile": "general",
+      "expected_profile": "plan",
+      "expected_matched_profile": "plan",
+      "expected_action": "switch_profile",
+      "id": "route-22"
+    },
+    {
+      "prompt": "只审查这个实现，不要改动文件",
+      "current_profile": "general",
+      "expected_profile": "review",
+      "expected_matched_profile": "review",
+      "expected_action": "switch_profile",
+      "id": "route-23"
+    },
+    {
+      "prompt": "审查后直接修复这个 parser bug",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-24"
+    },
+    {
+      "prompt": "帮我写一个计算器",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-25"
+    },
+    {
+      "prompt": "给我创建一个霜叶转换器",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-26"
+    },
+    {
+      "prompt": "写个排序函数",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-27"
+    },
+    {
+      "prompt": "开发一个潮汐索引器",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-28"
+    },
+    {
+      "prompt": "创建一个响应式网页看板",
+      "current_profile": "general",
+      "expected_profile": "app-builder",
+      "expected_matched_profile": "app-builder",
+      "expected_action": "switch_profile",
+      "id": "route-29"
+    },
+    {
+      "prompt": "解释这段代码是什么意思",
+      "current_profile": "general",
+      "expected_profile": "general",
+      "expected_matched_profile": "general",
+      "expected_action": "stay",
+      "id": "route-30"
+    },
+    {
+      "prompt": "继续",
+      "current_profile": "review",
+      "previous_user_task": "只审查这个补丁，不要修改代码",
+      "previous_assistant_text": "已发现两个问题，继续检查剩余文件。",
+      "expected_profile": "review",
+      "expected_matched_profile": "review",
+      "expected_action": "stay",
+      "id": "route-31"
+    },
+    {
+      "prompt": "按这个方案实现",
+      "current_profile": "plan",
+      "previous_user_task": "先设计缓存方案，暂时不要改代码",
+      "previous_assistant_text": "方案已完成，下一步可以实现缓存模块。",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-32"
+    },
+    {
+      "prompt": "把这些问题修掉",
+      "current_profile": "review",
+      "previous_user_task": "审查登录接口",
+      "previous_assistant_text": "发现缺少参数校验和异常处理。",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-33"
+    },
+    {
+      "prompt": "总结一下刚才的改动",
+      "current_profile": "coding-agent",
+      "previous_user_task": "修复登录错误",
+      "previous_assistant_text": "已修复并通过回归测试。",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "general",
+      "expected_action": "direct_answer",
+      "id": "route-34"
+    },
+    {
+      "prompt": "重新设计当前项目的个人资料页面并实现",
+      "current_profile": "general",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "coding-agent",
+      "expected_action": "switch_profile",
+      "id": "route-35"
+    },
+    {
+      "prompt": "创建一个全新的天气查询网页应用",
+      "current_profile": "general",
+      "expected_profile": "app-builder",
+      "expected_matched_profile": "app-builder",
+      "expected_action": "switch_profile",
+      "id": "route-36"
+    },
+    {
+      "prompt": "这个实现并发时安全吗？只给结论",
+      "current_profile": "coding-agent",
+      "expected_profile": "coding-agent",
+      "expected_matched_profile": "general",
+      "expected_action": "direct_answer",
+      "id": "route-37"
+    },
+    {
+      "prompt": "不要切换到编码模式，只解释这个错误",
+      "current_profile": "review",
+      "expected_profile": "review",
+      "expected_matched_profile": "general",
+      "expected_action": "direct_answer",
+      "id": "route-38"
+    }
+  ]
+}
