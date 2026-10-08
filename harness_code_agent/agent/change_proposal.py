@@ -112,6 +112,42 @@ class ChangeProposalStore:
             raise KeyError(f"unknown proposal: {proposal_id}")
         return proposal
 
+    def snapshot_proposals(self) -> list[dict]:
+        """Plain serialisable view for the TUI Work State projection."""
+
+        with self._lock:
+            open_conflicts = {
+                conflict.proposal_id: conflict
+                for conflict in self._conflicts.values()
+                if conflict.status == "open"
+            }
+            snapshots: list[dict] = []
+            for proposal in self._proposals.values():
+                files = [
+                    {
+                        "path": entry.path,
+                        "operation": entry.operation,
+                        **_entry_stats(entry),
+                    }
+                    for entry in proposal.entries
+                ]
+                conflict = open_conflicts.get(proposal.id)
+                snapshots.append({
+                    "id": proposal.id,
+                    "agentId": proposal.agent_id,
+                    "status": proposal.status,
+                    "files": files,
+                    "additions": sum(item["additions"] for item in files),
+                    "deletions": sum(item["deletions"] for item in files),
+                    "invalidReasons": list(proposal.invalid_reasons),
+                    "conflict": (
+                        {"id": conflict.id, "paths": sorted(conflict.conflicts)}
+                        if conflict is not None
+                        else None
+                    ),
+                })
+        return snapshots
+
     def proposal_paths(self, proposal_id: str) -> list[str]:
         return [entry.path for entry in self.get(proposal_id).entries]
 
@@ -459,6 +495,22 @@ def _entry_diff(entry: ChangeEntry) -> str:
     before = (entry.base_content or "").splitlines()
     after = entry.result_content.splitlines()
     return "\n".join(difflib.unified_diff(before, after, fromfile=f"a/{entry.path}", tofile=f"b/{entry.path}", lineterm=""))
+
+
+def _entry_stats(entry: ChangeEntry) -> dict[str, int]:
+    additions = deletions = 0
+    for line in difflib.unified_diff(
+        (entry.base_content or "").splitlines(),
+        entry.result_content.splitlines(),
+        lineterm="",
+    ):
+        if line.startswith("+++ ") or line.startswith("--- "):
+            continue
+        if line.startswith("+"):
+            additions += 1
+        elif line.startswith("-"):
+            deletions += 1
+    return {"additions": additions, "deletions": deletions}
 
 
 def _applied_payload(

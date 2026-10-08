@@ -2635,19 +2635,20 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertTrue(safe_shell_decision.allowed)
         self.assertTrue(risky_shell_decision.requires_approval)
         self.assertEqual(risky_shell_decision.risk, "shell_risky")
-        self.assertTrue(mkdir_decision.requires_approval)
-        self.assertEqual(mkdir_decision.risk, "shell_risky")
-        self.assertTrue(reset_decision.requires_approval)
-        self.assertEqual(reset_decision.risk, "shell_risky")
+        # workspace-write trusts proven workspace-scoped mutations: creating
+        # directories, local commits and recursive in-workspace deletes run
+        # without a prompt. Cross-boundary and unknown effects still ask/deny.
+        self.assertTrue(mkdir_decision.allowed)
+        self.assertEqual(mkdir_decision.risk, "shell_safe")
+        self.assertTrue(reset_decision.allowed)
+        self.assertEqual(reset_decision.risk, "shell_safe")
         for command, blocked_decision in zip(blocked_commands, blocked_decisions):
             with self.subTest(command=command):
                 self.assertFalse(blocked_decision.allowed)
                 self.assertFalse(blocked_decision.requires_approval)
                 self.assertEqual(blocked_decision.risk, "shell_blocked")
-        # Recursive deletion inside the workspace is not catastrophic: it
-        # follows the workspace-write action (ask) rather than a hard deny.
-        self.assertTrue(workspace_delete_decision.requires_approval)
-        self.assertTrue(glob_delete_decision.requires_approval)
+        self.assertTrue(workspace_delete_decision.allowed)
+        self.assertTrue(glob_delete_decision.allowed)
         self.assertTrue(unknown_decision.requires_approval)
         self.assertTrue(llm_read_decision.allowed)
         self.assertTrue(llm_repo_search_decision.allowed)
@@ -3615,7 +3616,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
             with patch(
                 "harness_code_agent.runtime.middleware.verification._check_ruff",
-                return_value=[],
+                return_value=([], True),
             ):
                 result = mw.pre_exit(messages=[])
 
@@ -3643,7 +3644,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
             with patch(
                 "harness_code_agent.runtime.middleware.verification._check_ruff",
-                return_value=[],
+                return_value=([], True),
             ):
                 result = mw.pre_exit(messages=[])
 
@@ -3664,7 +3665,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
             with patch(
                 "harness_code_agent.runtime.middleware.verification._check_ruff",
-                return_value=[],
+                return_value=([], True),
             ):
                 result = mw.pre_exit(messages=[])
 
@@ -3685,7 +3686,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
             with patch(
                 "harness_code_agent.runtime.middleware.verification._check_ruff",
-                return_value=[("warn.py", "W292", "no newline at end of file", 1)],
+                return_value=([("warn.py", "W292", "no newline at end of file", 1)], True),
             ):
                 first = mw.pre_exit(messages=[])
                 second = mw.pre_exit(messages=[])
@@ -3783,9 +3784,10 @@ class ProductRuntimeTests(unittest.TestCase):
             raise FileNotFoundError
 
         with _patch("subprocess.run", side_effect=fake_run):
-            result = _check_ruff("/tmp", ["x.py"])
+            findings, ran = _check_ruff("/tmp", ["x.py"])
 
-        self.assertEqual(result, [])
+        self.assertEqual(findings, [])
+        self.assertFalse(ran)
 
     def test_check_ruff_timeout_is_non_blocking_warning(self):
         import subprocess
@@ -3798,12 +3800,50 @@ class ProductRuntimeTests(unittest.TestCase):
             raise subprocess.TimeoutExpired(cmd="ruff", timeout=30)
 
         with _patch("subprocess.run", side_effect=fake_run):
-            result = _check_ruff("/tmp", ["x.py"])
+            findings, ran = _check_ruff("/tmp", ["x.py"])
 
-        self.assertEqual(len(result), 1)
-        self.assertTrue(result[0][1].startswith("RUFF"))
-        self.assertNotIn("E", result[0][1][:1])
-        self.assertNotIn("F", result[0][1][:1])
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(ran)
+        self.assertTrue(findings[0][1].startswith("RUFF"))
+        self.assertNotIn("E", findings[0][1][:1])
+        self.assertNotIn("F", findings[0][1][:1])
+
+    def test_static_verifier_emits_checks_recorded_on_event_bus(self):
+        import subprocess
+
+        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
+
+        class FakeBus:
+            def __init__(self):
+                self.events = []
+
+            def emit(self, event_type, agent=None, payload=None):
+                self.events.append((event_type, agent, payload))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, check=False)
+            (root / "ok.py").write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, check=False)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, check=False)
+
+            mw = StaticVerifierMiddleware(workspace_root=str(root))
+            mw.begin_turn("task", messages=[])
+            (root / "new.py").write_text("y = 2\n", encoding="utf-8")
+            bus = FakeBus()
+
+            with patch(
+                "harness_code_agent.runtime.middleware.verification._check_ruff",
+                return_value=([], True),
+            ):
+                mw.pre_exit(messages=[], runtime_state=SimpleNamespace(event_bus=bus))
+
+        self.assertEqual(len(bus.events), 1)
+        event_type, agent, payload = bus.events[0]
+        self.assertEqual(event_type, "checks_recorded")
+        self.assertIsNone(agent)
+        names = {item["name"]: item["status"] for item in payload["checks"]}
+        self.assertEqual(names, {"Python syntax": "passed", "Ruff lint": "passed"})
 
     # ------------------------------------------------------------------
     # safe_args_preview
@@ -3973,6 +4013,181 @@ class SessionResumeTests(unittest.TestCase):
         panel = bridge._sessions_panel()
         ids = {option["id"] for option in panel["options"]}
         self.assertNotIn(source.id, ids)
+
+    def _seed_plan_event(self, *, executed: bool, markdown: str = "# Plan\n\n1. alpha\n2. beta\n"):
+        self.interactive.event_bus.emit(
+            "plan_ready",
+            agent="main_agent",
+            payload={
+                "profile": "plan",
+                "plan_path": "global_plan/current/plan.md",
+                "plan_revision": 3,
+                "plan_markdown": markdown,
+            },
+        )
+        if executed:
+            self.interactive.event_bus.emit(
+                "profile_switched",
+                agent="main_agent",
+                payload={
+                    "previous_profile": "plan",
+                    "profile": "coding-agent",
+                    "reason": "execute approved plan",
+                },
+            )
+        return markdown
+
+    def test_resume_restores_pending_plan_from_journal(self):
+        markdown = self._seed_plan_event(executed=False)
+        source = self.interactive.session
+        self.interactive.fork_current_session()  # leave source behind as history
+
+        self.interactive.resume_from_session(source.id)
+
+        self.assertEqual(self.interactive.pending_plan_markdown, markdown.strip())
+        self.assertEqual(self.interactive.pending_plan_revision, 3)
+
+    def test_resume_does_not_restore_already_executed_plan(self):
+        self._seed_plan_event(executed=True)
+        source = self.interactive.session
+        self.interactive.fork_current_session()
+
+        self.interactive.resume_from_session(source.id)
+
+        self.assertIsNone(self.interactive.pending_plan_markdown)
+
+    def test_revised_plan_ready_resets_executed_flag(self):
+        # Executed plan 1, then a new plan_ready (revision 2) is pending again.
+        self._seed_plan_event(executed=True)
+        self.interactive.event_bus.emit(
+            "plan_ready",
+            agent="main_agent",
+            payload={
+                "profile": "plan",
+                "plan_path": "global_plan/current/plan.md",
+                "plan_revision": 4,
+                "plan_markdown": "# Plan 2\n\n1. gamma\n",
+            },
+        )
+        source = self.interactive.session
+        self.interactive.fork_current_session()
+
+        self.interactive.resume_from_session(source.id)
+
+        self.assertEqual(self.interactive.pending_plan_markdown, "# Plan 2\n\n1. gamma")
+        self.assertEqual(self.interactive.pending_plan_revision, 4)
+
+
+class PlanReadyDecisionTests(unittest.TestCase):
+    """A ready plan in explicit plan mode is settled via the question surface."""
+
+    def setUp(self):
+        import shutil
+
+        from harness_code_agent.core.interactive import InteractiveSession
+        from harness_code_agent.runtime.questions import QuestionResult
+
+        self.shutil = shutil
+        self.QuestionResult = QuestionResult
+        self.temp_dir = Path(tempfile.mkdtemp())
+        self.env_patch = patch.dict(os.environ, {
+            "HARNESS_MEMORY_GENERATION_DISABLED": "1",
+        })
+        self.env_patch.start()
+
+        self.answers = []
+
+        def ask(_request):
+            return self.answers.pop(0)
+
+        self.interactive = InteractiveSession(
+            cwd=self.temp_dir,
+            profile_name="plan",
+            question_provider=SimpleNamespace(ask=ask),
+            enable_turn_summary=False,
+        )
+        self.calls = []
+        first = SimpleNamespace(kind="planning-turn")
+        self.executed = SimpleNamespace(kind="executed")
+        self.revised = SimpleNamespace(kind="revised")
+
+        def fake_execute(*, attachments=()):
+            self.calls.append(("execute", attachments))
+            # Mirrors the real switch: pending plan is consumed.
+            self.interactive.pending_plan_markdown = None
+            return self.executed
+
+        def fake_revise(feedback, *, attachments=()):
+            self.calls.append(("revise", feedback, attachments))
+            # The revised turn produces a fresh ready plan.
+            self.interactive.pending_plan_markdown = "# Revised plan\n"
+            return self.revised
+
+        self.interactive.execute_pending_plan = fake_execute
+        self.interactive.revise_pending_plan = fake_revise
+        self.first = first
+
+    def tearDown(self):
+        self.interactive.close()
+        self.env_patch.stop()
+        self.shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _answer(self, value, *, custom_text="", cancelled=False):
+        self.answers.append(self.QuestionResult(
+            value=value,
+            is_other=(value == "revise"),
+            custom_text=custom_text,
+            cancelled=cancelled,
+        ))
+
+    def _settle(self):
+        return self.interactive._settle_ready_plan(self.first)
+
+    def test_execute_dispatches_to_execute_pending_plan(self):
+        self.interactive.pending_plan_markdown = "# Plan\n"
+        self._answer("execute")
+        result = self._settle()
+        self.assertIs(result, self.executed)
+        self.assertEqual(self.calls, [("execute", ())])
+
+    def test_defer_keeps_the_pending_plan_without_dispatch(self):
+        self.interactive.pending_plan_markdown = "# Plan\n"
+        self._answer("defer")
+        result = self._settle()
+        self.assertIs(result, self.first)
+        self.assertEqual(self.interactive.pending_plan_markdown, "# Plan\n")
+        self.assertEqual(self.calls, [])
+
+    def test_cancelled_question_is_equivalent_to_defer(self):
+        self.interactive.pending_plan_markdown = "# Plan\n"
+        self._answer("defer", cancelled=True)
+        result = self._settle()
+        self.assertIs(result, self.first)
+        self.assertEqual(self.interactive.pending_plan_markdown, "# Plan\n")
+        self.assertEqual(self.calls, [])
+
+    def test_revise_with_feedback_revises_then_asks_again(self):
+        self.interactive.pending_plan_markdown = "# Plan\n"
+        self._answer("revise", custom_text="补上验收测试")
+        self._answer("defer")
+        result = self._settle()
+        self.assertIs(result, self.revised)
+        self.assertEqual(self.calls, [("revise", "补上验收测试", ())])
+        self.assertEqual(self.interactive.pending_plan_markdown, "# Revised plan\n")
+
+    def test_revise_with_empty_feedback_defers(self):
+        self.interactive.pending_plan_markdown = "# Plan\n"
+        self._answer("revise", custom_text="   ")
+        result = self._settle()
+        self.assertIs(result, self.first)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.interactive.pending_plan_markdown, "# Plan\n")
+
+    def test_no_pending_plan_does_not_ask(self):
+        result = self._settle()
+        self.assertIs(result, self.first)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.answers, [])
 
 
 class ContextCommandTests(unittest.TestCase):

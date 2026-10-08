@@ -49,14 +49,16 @@ SHELL_GOLDEN_TABLE: dict[str, tuple[str, str, str, str]] = {
     ),
     # Unknown effects: middleware never blocked these; the session decides.
     "unknown_program": ("./mystery.sh", "deny", "ask", "allow"),
-    # Pre-existing quirk locked deliberately: the old predicate ran without a
-    # workspace root, so an absolute path resolving inside the workspace was
-    # classified external and NOT blocked under full access.  The migration
-    # preserves this exactly rather than quietly tightening it.
+    # Pre-existing quirk locked deliberately: the preset predicate runs
+    # without a workspace root, so an absolute path resolving inside the
+    # workspace is classified external and the preset does not deny it; the
+    # session policy (which does have the root) decides instead. Read-only
+    # denies the write, workspace-write trusts proven workspace-scoped writes,
+    # and full access allows.
     "absolute_inside_workspace": None,  # filled in at runtime (needs tmp root)
 }
 
-EXPECTED_ABSOLUTE_INSIDE = ("deny", "ask", "allow")
+EXPECTED_ABSOLUTE_INSIDE = ("deny", "allow", "allow")
 
 
 def _iter_shell_cases(workspace_root: str):

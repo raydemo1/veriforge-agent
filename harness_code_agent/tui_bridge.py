@@ -17,6 +17,7 @@ import queue
 import sys
 import threading
 import traceback
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -48,7 +49,8 @@ from .sessions.observability import (
 )
 from .tui.approval import ApprovalAllowlist, _persistent_prefix_for_request
 from .tui.commands import default_command_registry
-from .tui.completion import MentionIndex, mention_candidates
+from .tui.completion import MentionIndex
+from .tui.projection import SECTION_EVENTS, WorkStateProjection
 from .tui.protocol import UI_PROTOCOL_VERSION, validate_ui_event
 from .tui.state import SessionStatusSnapshot, TranscriptBlock, TuiState, _localize_error
 
@@ -125,6 +127,24 @@ def _localize_observability(text: str) -> str:
     for source, target in replacements.items():
         text = text.replace(source, target)
     return text
+
+
+def _format_attachment_size(size: int) -> str:
+    """Mirror the frontend formatBytes helper for transcript summaries."""
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+def _user_transcript_body(text: str, attachments: tuple) -> str:
+    """Build the user transcript row body, matching the optimistic client row."""
+    lines = [text.strip()]
+    for item in attachments:
+        data = item.public_dict()
+        lines.append(f"[{data['kind']}] {data['name']} ({_format_attachment_size(int(data['size']))})")
+    return "\n".join(line for line in lines if line)
 
 
 class BridgeInteractionProvider:
@@ -240,7 +260,8 @@ class BridgeServer:
         self.profile_name = profile_name
         self.profile_explicit = profile_explicit
         self._write_lock = threading.Lock()
-        self._tasks: queue.Queue[PreparedTurn | None] = queue.Queue()
+        self._tasks: queue.Queue[PreparedTurn | Any | None] = queue.Queue()
+        self.work = WorkStateProjection(self.cwd)
         self._active_token: CancellationToken | None = None
         self._active_lock = threading.Lock()
         self._stopping = threading.Event()
@@ -323,8 +344,11 @@ class BridgeServer:
                 return
             self._emit_commands()
             self._send_snapshot()
+            # session_reset must precede work state: the reset reducer
+            # restores the initial empty work state.
             if reset_ui:
                 self._send_event({"type": "session_reset", "snapshot": self._snapshot_payload(), "items": []})
+            self._send_work_state()
             self._send_event({"type": "progress", "status": "ready", "detail": "Python 会话已就绪。"})
             self._start_mcp_warm(session)
         except Exception as exc:  # pragma: no cover - exercised by real startup failures
@@ -374,6 +398,11 @@ class BridgeServer:
     def _event_listener(self, event: SessionEvent) -> None:
         try:
             block = self.state.apply_event(event)
+            changed = self.work.apply_event(event)
+            if self._refresh_proposal_state():
+                changed.add("changes")
+            for key in changed:
+                self._send_work_section(key)
             event_type = event.type
             if event_type == "turn_started":
                 self._begin_assistant_group(int(event.payload.get("turn") or self.state.snapshot.turn))
@@ -511,7 +540,6 @@ class BridgeServer:
             "error": "error",
             "failure": "error",
             "plan": "plan",
-            "todo": "todo",
             "user": "user",
             "file": "file",
             "thought": "thought",
@@ -542,6 +570,24 @@ class BridgeServer:
 
     def _send_snapshot(self) -> None:
         self._send_event({"type": "snapshot", "snapshot": self._snapshot_payload()})
+
+    def _refresh_proposal_state(self) -> bool:
+        session = self._session
+        coordinator = getattr(getattr(session, "tool_context", None), "agent_coordinator", None)
+        if coordinator is None:
+            return False
+        try:
+            return self.work.merge_proposals(coordinator.changes.snapshot_proposals())
+        except Exception:
+            return False
+
+    def _send_work_section(self, key: str) -> None:
+        self._send_event({"type": SECTION_EVENTS[key], key: self.work.section(key)})
+
+    def _send_work_state(self) -> None:
+        self._refresh_proposal_state()
+        for key in SECTION_EVENTS:
+            self._send_work_section(key)
 
     def _snapshot_payload(self) -> dict[str, Any]:
         snapshot = self.state.snapshot
@@ -606,6 +652,17 @@ class BridgeServer:
             if task is None:
                 self._tasks.task_done()
                 return
+            if callable(task):
+                self._send_event({"type": "turn_state", "state": "running"})
+                try:
+                    task()
+                except Exception as exc:
+                    self._notice("error", _localize_error(exc, "操作执行失败，请稍后重试"))
+                    log.debug("OpenTUI queued action failed\n%s", traceback.format_exc())
+                finally:
+                    self._send_event({"type": "turn_state", "state": "idle"})
+                    self._tasks.task_done()
+                continue
             token = CancellationToken()
             with self._active_lock:
                 self._active_token = token
@@ -632,6 +689,36 @@ class BridgeServer:
                     self._stopping.clear()
                 self._send_event({"type": "turn_state", "state": "idle"})
                 self._tasks.task_done()
+
+    def _enqueue_external_submission(self, submission: TurnSubmission) -> None:
+        """Queue approval-then-submit for a prompt referencing external files.
+
+        Runs on the worker thread so the approval interaction can block while
+        the stdin loop keeps processing resolve_interaction. On approval the
+        real user transcript row is emitted (optimistic rows only exist for
+        accepted submissions) and the prepared turn re-enters the normal task
+        path; on denial nothing is submitted.
+        """
+
+        def task() -> None:
+            session = self._require_session()
+            try:
+                prepared = session.prepare_with_external_approval(submission)
+            except AttachmentError as exc:
+                self._notice("info", str(exc))
+                return
+            self._send_event({
+                "type": "transcript",
+                "item": {
+                    "id": f"user-{uuid.uuid4().hex}",
+                    "kind": "user",
+                    "title": "你",
+                    "body": _user_transcript_body(submission.text, prepared.attachments),
+                },
+            })
+            self._tasks.put(prepared)
+
+        self._tasks.put(task)
 
     def _run_task(self, task: PreparedTurn, token: CancellationToken) -> None:
         session = self._session
@@ -846,6 +933,10 @@ class BridgeServer:
             session.resume_from_session(action)
             items = self._history_items(action)
             self._send_event({"type": "session_reset", "snapshot": self._snapshot_payload(), "items": items})
+            # Work state must land after session_reset: the reset reducer
+            # restores the initial empty work state.
+            self._refresh_proposal_state()
+            self._send_work_state()
             return {"ok": True, "message": "已从历史会话创建分支"}
         if panel == "command":
             if action == "compact":
@@ -911,6 +1002,26 @@ class BridgeServer:
             return {"ok": True}
         return {"ok": True, "message": str(message or "")}
 
+    def _workbench_action(self, params: dict[str, Any]) -> dict[str, Any]:
+        # Workbench is observation-only: these ops are pure inspections.
+        # Proposal integration/conflict resolution are owned by the main
+        # agent, and the plan decision is a question interaction.
+        session = self._require_session()
+        coordinator = getattr(session.tool_context, "agent_coordinator", None)
+        op = str(params.get("op") or "")
+
+        if coordinator is None:
+            raise RuntimeError("当前会话没有多代理协调器")
+        changes = coordinator.changes
+        proposal_id = str(params.get("proposalId") or "")
+        if op == "read_proposal":
+            result = changes.read_changes(proposal_id)
+            return {"ok": True, "content": result["content"], "paths": result["paths"], "totalChars": result["total_chars"]}
+        if op == "read_conflict":
+            result = changes.read_conflicts(str(params.get("conflictId") or ""))
+            return {"ok": True, "content": result["content"], "paths": result["paths"], "totalChars": result["total_chars"]}
+        raise ValueError(f"unknown workbench action: {op}")
+
     def _history_items(self, session_id: str) -> list[dict[str, Any]]:
         session = self._require_session()
         replay = TuiState(snapshot=SessionStatusSnapshot(
@@ -922,8 +1033,10 @@ class BridgeServer:
             cwd=self.cwd,
         ))
         items = []
+        self.work = WorkStateProjection(self.cwd)
         for event in session.session_store.read_events(session_id):
             block = replay.apply_event(event)
+            self.work.apply_event(event)
             if block is not None:
                 replay.add_block(block)
                 items.append(self._block_item(block))
@@ -939,6 +1052,7 @@ class BridgeServer:
             old_session.close()
         self._session = None
         self._session_error = None
+        self.work = WorkStateProjection(self.cwd)
         self._assistant_id = None
         self.state = TuiState(snapshot=SessionStatusSnapshot(
             profile=self.profile_name,
@@ -967,6 +1081,8 @@ class BridgeServer:
             return {"ok": True, "panel": self._panel(str(params.get("panel") or ""))}
         if name == "panel_action":
             return self._panel_action(str(params.get("panel") or ""), str(params.get("action") or ""))
+        if name == "workbench_action":
+            return self._workbench_action(params)
         if name == "toggle_permission":
             self._require_session().toggle_permission_mode()
             self._send_snapshot()
@@ -1064,17 +1180,26 @@ class BridgeServer:
             elif self._stopping.is_set():
                 self._response(request_id, error="当前回合正在停止，请稍候")
             else:
+                submission = TurnSubmission(
+                    text=text,
+                    attachment_ids=tuple(str(item) for item in attachment_ids),
+                    authorized_paths=tuple(str(item) for item in authorized_paths),
+                )
                 try:
-                    prepared = self._require_session().prepare_submission(TurnSubmission(
-                        text=text,
-                        attachment_ids=tuple(str(item) for item in attachment_ids),
-                        authorized_paths=tuple(str(item) for item in authorized_paths),
-                    ))
-                except ExternalPathConfirmationRequired as exc:
-                    self._response(request_id, result={
-                        "accepted": False,
-                        "confirmation": {"kind": "external_paths", "paths": exc.paths},
-                    })
+                    prepared = self._require_session().prepare_submission(submission)
+                except ExternalPathConfirmationRequired:
+                    # The single decision surface handles this as an approval
+                    # interaction. It must be requested on the worker thread:
+                    # the worker blocks waiting for the reply while this stdin
+                    # loop stays free to receive resolve_interaction. The
+                    # client keeps its draft (accepted: false) and shows no
+                    # custom confirmation UI.
+                    self._enqueue_external_submission(submission)
+                    with self._active_lock:
+                        active = self._active_token is not None
+                    if active:
+                        self._send_event({"type": "turn_state", "state": "queued", "queueDepth": self._tasks.qsize()})
+                    self._response(request_id, result={"accepted": False})
                     return True
                 except Exception as exc:
                     self._response(request_id, error=_localize_error(exc, "附件校验失败，请重试"))

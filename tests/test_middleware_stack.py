@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from harness_code_agent.runtime.middleware import (
     AgentMiddleware,
+    ProposalIntegrationMiddleware,
     StaticVerifierMiddleware,
     ToolFailurePolicyMiddleware,
     ToolGuardMiddleware,
@@ -47,6 +48,7 @@ class MiddlewareStackFactoryTests(unittest.TestCase):
                     ToolFailurePolicyMiddleware,
                     PermissionMiddleware,
                     StaticVerifierMiddleware,
+                    ProposalIntegrationMiddleware,
                 ],
             )
             self.assertIs(stack[1].tool_registry, registry)
@@ -54,6 +56,7 @@ class MiddlewareStackFactoryTests(unittest.TestCase):
             self.assertIs(stack[2]._registry, registry)
             self.assertEqual(stack[3]._workspace_root, str(root))
             self.assertIs(stack[3]._workspace, workspace)
+            self.assertIs(stack[4]._tool_context, context)
 
     def test_user_middlewares_run_before_guards(self):
         # User middlewares from ~/.harness/middlewares.json run before the
@@ -79,6 +82,7 @@ class MiddlewareStackFactoryTests(unittest.TestCase):
                     ToolFailurePolicyMiddleware,
                     PermissionMiddleware,
                     StaticVerifierMiddleware,
+                    ProposalIntegrationMiddleware,
                 ],
             )
             # The same instance, loaded once per session.

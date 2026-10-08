@@ -1,5 +1,5 @@
-import type { CommandItem, Interaction, Snapshot, TranscriptItem, UiEvent } from "./protocol.ts";
-import { DEFAULT_COMMANDS } from "./protocol.ts";
+import type { CommandItem, Interaction, Snapshot, TranscriptItem, UiEvent, WorkState } from "./protocol.ts";
+import { DEFAULT_COMMANDS, initialWorkState } from "./protocol.ts";
 import { formatUserError } from "./errors.ts";
 
 export const initialSnapshot: Snapshot = {
@@ -9,11 +9,13 @@ export const initialSnapshot: Snapshot = {
 export type AppState = {
   snapshot: Snapshot; items: TranscriptItem[]; commands: CommandItem[];
   turnState: "idle" | "running" | "queued" | "cancelling" | "cancelled"; queueDepth: number; interaction: Interaction | null;
+  work: WorkState;
 };
 export const initialState: AppState = {
   snapshot: initialSnapshot,
   items: [{ id: "welcome", kind: "status", title: "VeriForge", body: "准备工作区…", state: "running" }],
   commands: DEFAULT_COMMANDS, turnState: "idle", queueDepth: 0, interaction: null,
+  work: initialWorkState,
 };
 
 const STARTUP_COPY: Record<string, string> = {
@@ -30,7 +32,7 @@ const READY_STATUSES = new Set(["ready", "external tools ready"]);
 
 export function reduceEvent(state: AppState, event: UiEvent): AppState {
   if (event.type === "snapshot") return { ...state, snapshot: event.snapshot };
-  if (event.type === "session_reset") return { ...state, snapshot: event.snapshot, items: event.items ?? [], turnState: "idle", queueDepth: 0, interaction: null };
+  if (event.type === "session_reset") return { ...state, snapshot: event.snapshot, items: event.items ?? [], turnState: "idle", queueDepth: 0, interaction: null, work: initialWorkState };
   if (event.type === "commands") return { ...state, commands: event.commands };
   if (event.type === "progress") {
     const isReady = READY_STATUSES.has(event.status);
@@ -77,6 +79,12 @@ export function reduceEvent(state: AppState, event: UiEvent): AppState {
   };
   if (event.type === "interaction") return { ...state, interaction: event };
   if (event.type === "interaction_closed" && state.interaction?.id === event.id) return { ...state, interaction: null };
+  if (event.type === "plan_updated") return { ...state, work: { ...state.work, plan: event.plan } };
+  if (event.type === "tasks_updated") return { ...state, work: { ...state.work, tasks: event.tasks } };
+  if (event.type === "agent_run_updated") return { ...state, work: { ...state.work, agents: event.agents } };
+  if (event.type === "changes_updated") return { ...state, work: { ...state.work, changes: event.changes } };
+  if (event.type === "verification_updated") return { ...state, work: { ...state.work, checks: event.checks } };
+  if (event.type === "artifact_updated") return { ...state, work: { ...state.work, artifacts: event.artifacts } };
   return state;
 }
 

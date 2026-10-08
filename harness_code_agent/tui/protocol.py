@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-UI_PROTOCOL_VERSION = 4
+UI_PROTOCOL_VERSION = 5
 
 _EVENT_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
     "snapshot": frozenset({"snapshot"}),
@@ -19,6 +19,13 @@ _EVENT_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
     "panel": frozenset({"panel"}),
     "interaction": frozenset({"id", "kind", "payload"}),
     "interaction_closed": frozenset({"id"}),
+    # Work State (protocol v5): one event per section, full-section payload.
+    "plan_updated": frozenset({"plan"}),
+    "tasks_updated": frozenset({"tasks"}),
+    "agent_run_updated": frozenset({"agents"}),
+    "changes_updated": frozenset({"changes"}),
+    "verification_updated": frozenset({"checks"}),
+    "artifact_updated": frozenset({"artifacts"}),
     "shutdown": frozenset(),
 }
 

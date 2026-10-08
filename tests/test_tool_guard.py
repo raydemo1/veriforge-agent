@@ -223,9 +223,10 @@ class ShellPermissionPolicyTests(unittest.TestCase):
                 with self.subTest(mode=policy.mode, command=command):
                     self.assertTrue(self._decide(policy, command).allowed)
 
-    # --- workspace writes: ask in workspace-write, allow in eval ----------
+    # --- workspace writes: proven workspace-scoped writes run without a
+    # prompt in workspace-write mode; only unrecognized executors still ask ---
 
-    def test_workspace_writes_ask_in_workspace_mode_and_run_in_eval(self):
+    def test_workspace_writes_run_in_workspace_mode_and_eval(self):
         commands = [
             "Set-Content -Path app.py -Value 'changed'",
             "echo x > file.txt",
@@ -234,17 +235,22 @@ class ShellPermissionPolicyTests(unittest.TestCase):
             "printf x &> combined.log",
             "rg foo . | tee out.txt",
             "sed -i 's/foo/bar/g' app.py",
-            "python -m ruff check --fix .",
             "gofmt -w main.go",
             "git apply fix.patch",
             "git commit --allow-empty -m test",
             "rm -rf build",
         ]
-        for command in commands:
-            with self.subTest(command=command):
-                decision = self._decide(self.workspace, command)
-                self.assertTrue(decision.requires_approval, command)
-                self.assertTrue(self._decide(self.eval, command).allowed, command)
+        for policy in (self.workspace, self.eval):
+            for command in commands:
+                with self.subTest(mode=policy.mode, command=command):
+                    self.assertTrue(self._decide(policy, command).allowed, command)
+
+    def test_unrecognized_executor_still_asks_even_when_it_writes_workspace_files(self):
+        # The write stays inside the workspace, but `python` is an unrecognized
+        # executor with unknown side effects, so workspace-write keeps asking.
+        decision = self._decide(self.workspace, "python -m ruff check --fix .")
+        self.assertTrue(decision.requires_approval)
+        self.assertTrue(self._decide(self.eval, "python -m ruff check --fix .").allowed)
 
     def test_container_absolute_paths_are_workspace_targets_in_docker(self):
         analysis = analyze_shell_command("rm -rf /tests/build", sandbox_mode="docker")

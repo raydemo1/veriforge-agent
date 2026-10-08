@@ -10,6 +10,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from .. import config
 from ..agent.conversation import AgentConversation
@@ -50,7 +51,12 @@ from ..runtime.mcp import McpClientManager
 from ..runtime.middleware.loader import load_user_middlewares
 from ..runtime.middleware.stack import build_main_agent_middlewares
 from ..runtime.permissions import PermissionPolicy
-from ..runtime.questions import ConsoleQuestionProvider, QuestionProvider
+from ..runtime.questions import (
+    ConsoleQuestionProvider,
+    QuestionOption,
+    QuestionProvider,
+    QuestionRequest,
+)
 from ..runtime.tool_context import ToolContext
 from ..runtime.tool_registry import tool_schemas_for_profile
 from ..sessions.events import (
@@ -434,8 +440,13 @@ class InteractiveSession:
 
     def submit(self, user_prompt: str | TurnSubmission, cancellation_token=None) -> TurnResult:
         submission = user_prompt if isinstance(user_prompt, TurnSubmission) else TurnSubmission(user_prompt)
+        prepared = self.prepare_with_external_approval(submission)
+        return self.submit_prepared(prepared, cancellation_token=cancellation_token)
+
+    def prepare_with_external_approval(self, submission: TurnSubmission) -> PreparedTurn:
+        """Prepare a turn, routing external-path reads through the approval surface."""
         try:
-            prepared = self.prepare_submission(submission)
+            return self.prepare_submission(submission)
         except ExternalPathConfirmationRequired as exc:
             approval = self.approval_provider.request(ApprovalRequest(
                 tool_name="read_external_attachment",
@@ -447,35 +458,43 @@ class InteractiveSession:
             ))
             if not approval.approved:
                 raise AttachmentError("已拒绝读取工作区外文件，本次任务未提交")
-            prepared = self.prepare_submission(replace(
+            return self.prepare_submission(replace(
                 submission,
                 authorized_paths=tuple(exc.paths),
             ))
-        return self.submit_prepared(prepared, cancellation_token=cancellation_token)
 
     def submit_prepared(self, prepared: PreparedTurn, cancellation_token=None) -> TurnResult:
         user_prompt = prepared.text
         self.ensure_profile_bound_for_first_task(user_prompt)
         skill_invocation = self.skill_registry.build_user_invocation(user_prompt)
         if skill_invocation is not None:
-            return self._submit_to_current_agent(
+            result = self._submit_to_current_agent(
                 user_prompt,
                 cancellation_token=cancellation_token,
                 turn_instruction=skill_invocation.prompt,
                 attachments=prepared.attachments,
             )
-        if self.pending_plan_markdown and self.profile.name() == "plan":
+        elif self.pending_plan_markdown and self.profile.name() == "plan":
+            # Text entry after deferring the question still works: an
+            # explicit confirmation executes; anything else is revision
+            # feedback, which produces a fresh ready plan -> ask again.
             if _is_plan_execution_confirmation(user_prompt):
-                return self.execute_pending_plan(attachments=prepared.attachments)
-            return self.revise_pending_plan(user_prompt, attachments=prepared.attachments)
-        route_decision = self._maybe_auto_route_profile(user_prompt)
-        turn_instruction = _turn_instruction_for_route(route_decision)
-        return self._submit_to_current_agent(
-            user_prompt,
-            cancellation_token=cancellation_token,
-            turn_instruction=turn_instruction,
-            attachments=prepared.attachments,
-        )
+                result = self.execute_pending_plan(attachments=prepared.attachments)
+            else:
+                result = self.revise_pending_plan(user_prompt, attachments=prepared.attachments)
+        else:
+            route_decision = self._maybe_auto_route_profile(user_prompt)
+            turn_instruction = _turn_instruction_for_route(route_decision)
+            result = self._submit_to_current_agent(
+                user_prompt,
+                cancellation_token=cancellation_token,
+                turn_instruction=turn_instruction,
+                attachments=prepared.attachments,
+            )
+        # Explicit plan mode is the one case where runtime cannot continue
+        # without a user decision. Route it through the single interaction
+        # surface (question), never through Workbench buttons.
+        return self._settle_ready_plan(result)
 
     def ensure_profile_bound_for_first_task(self, user_prompt: str) -> None:
         if self.is_bound:
@@ -885,6 +904,53 @@ class InteractiveSession:
             attachments=attachments,
         )
 
+    def _settle_ready_plan(self, first_result: TurnResult) -> TurnResult:
+        """Ask the plan-mode decision question until execute/defer.
+
+        Runs after the planning turn has closed, so execute/revise start
+        fresh turns. "revise" loops: the revised plan asks again. Defer (or
+        a cancelled/non-interactive question) keeps the pending plan, which
+        the user can later execute with continue/继续 or revise by typing
+        feedback in the composer.
+        """
+        result = first_result
+        while self.pending_plan_markdown and self.profile.name() == "plan":
+            answer = self.question_provider.ask(QuestionRequest(
+                question="计划已经准备好，下一步？",
+                options=[
+                    QuestionOption(
+                        label="执行计划",
+                        value="execute",
+                        description="切换到 coding-agent 并执行该计划",
+                    ),
+                    QuestionOption(
+                        label="修改计划",
+                        value="revise",
+                        description="在输入框中说明要调整的内容",
+                        is_other=True,
+                    ),
+                    QuestionOption(
+                        label="暂时不执行",
+                        value="defer",
+                        description="保留计划，稍后可继续",
+                    ),
+                ],
+                agent_name=self.agent.name if self.agent else None,
+                session_id=self.session_id,
+            ))
+            if answer.cancelled or answer.value == "defer":
+                return result
+            if answer.value == "execute":
+                return self.execute_pending_plan()
+            if answer.value == "revise":
+                feedback = (answer.custom_text or "").strip()
+                if not feedback:
+                    return result
+                result = self.revise_pending_plan(feedback)
+                continue
+            return result
+        return result
+
     def _capture_plan_handoff(self, text: str) -> str:
         if self.profile.name() != "plan" or not text.strip():
             return ""
@@ -898,13 +964,16 @@ class InteractiveSession:
                 "profile": self.profile.name(),
                 "plan_path": str(plan_path.relative_to(self.cwd)),
                 "plan_revision": self.pending_plan_revision,
+                # Immutable snapshot: the journal is historical truth;
+                # plan.md on disk is only a convenience artifact and may be
+                # overwritten by later sessions, so replay must not read it.
+                "plan_markdown": self.pending_plan_markdown,
                 "approval_source": "/plan",
             },
         )
         return (
-            "计划已写入 `global_plan/current/plan.md`。"
-            "在 TUI 中选择 `执行计划` 继续，或在 `修改计划` 输入框中输入修改理由。"
-            "非 TUI 入口可回复 continue/继续 执行，其他文本会作为修改理由。"
+            "计划已写入 `global_plan/current/plan.md`，请选择下一步。"
+            "非交互入口可回复 continue/继续 执行，或直接发送修改意见。"
         )
 
     def _write_pending_plan_artifact(self, plan_markdown: str) -> Path:
@@ -1209,12 +1278,17 @@ class InteractiveSession:
         """
         if self.session is not None and session_id == self.session.id:
             return
+        # The fork copies the journal (conversation messages) but not the
+        # event stream, which stays per-session; replay reads source events,
+        # so pending-plan recovery must read the source events as well.
+        source_events = self.session_store.read_events(session_id)
         branched = self.session_store.fork(session_id)
         recovered = SessionJournal(branched.journal_path).recovery_messages(
             self.agent.full_system_prompt
         )
         self._activate_session(branched)
         self.conversation._replace_messages(recovered)
+        self._restore_pending_plan(source_events)
         # The fork inherits the source session's profile in metadata; bring it
         # in line with the profile the live runtime is actually using.
         self.session_store.update_profile(
@@ -1223,6 +1297,44 @@ class InteractiveSession:
             profile_source=self._profile_source,
         )
         self.session_store.update_routing_mode(branched.id, self.routing_mode)
+
+    def _restore_pending_plan(self, events: list[dict[str, Any]]) -> None:
+        """Rebuild in-memory pending plan state from the forked journal.
+
+        The latest ``plan_ready`` snapshot is pending unless execution
+        already started afterwards (``profile_switched`` with the execute
+        reason). Without this, the Workbench would offer "执行计划" for a
+        resumed session while ``execute_pending_plan`` had nothing to run.
+        """
+        latest: dict[str, Any] | None = None
+        executed = False
+        for item in events:
+            payload = item.get("payload") if isinstance(item, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            event_type = str(item.get("type") or "")
+            if event_type == "plan_ready":
+                latest = payload
+                executed = False
+            elif (
+                event_type == "profile_switched"
+                and str(payload.get("reason") or "") == "execute approved plan"
+            ):
+                executed = True
+        if latest is None or executed:
+            return
+        markdown = latest.get("plan_markdown")
+        if not isinstance(markdown, str) or not markdown.strip():
+            # Events recorded before protocol v5: best-effort disk fallback.
+            rel_path = str(latest.get("plan_path") or "global_plan/current/plan.md")
+            try:
+                markdown = (self.cwd / rel_path).read_text(encoding="utf-8")
+            except OSError:
+                markdown = ""
+        if markdown.strip():
+            self.pending_plan_markdown = markdown.strip()
+            revision = latest.get("plan_revision")
+            self.pending_plan_revision = int(revision) if isinstance(revision, int) else 1
 
     def _activate_session(self, session: Session) -> None:
         """Rebind every live component onto an already-created session."""

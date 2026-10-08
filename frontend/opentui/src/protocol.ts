@@ -1,7 +1,7 @@
 export type ThemePreference = "auto" | "dark" | "light";
 export type IconPreference = "auto" | "nerd" | "unicode";
 
-export const UI_PROTOCOL_VERSION = 4;
+export const UI_PROTOCOL_VERSION = 5;
 
 export type Snapshot = {
   profile: string;
@@ -36,13 +36,12 @@ export type TurnSubmission = { text: string; attachmentIds: string[]; authorized
 export type SubmitResult = {
   accepted: boolean;
   attachments?: AttachmentItem[];
-  confirmation?: { kind: "external_paths"; paths: string[] };
 };
 
 export type CommandItem = { name: string; description: string; category?: string };
 export type TranscriptItem = {
   id: string;
-  kind: "user" | "assistant" | "tool" | "status" | "plan" | "todo" | "error" | "file" | "thought" | "profile" | "agent";
+  kind: "user" | "assistant" | "tool" | "status" | "plan" | "error" | "file" | "thought" | "profile" | "agent";
   title: string;
   body: string;
   state?: "running" | "success" | "failed" | "pending" | "changed";
@@ -74,14 +73,123 @@ export type PanelSpec = {
   searchable?: boolean;
 };
 
-export type ActionName = "open_sessions" | "new_session" | "open_panel" | "panel_action" | "toggle_permission" | "complete_mention" | "stage_attachments" | "remove_attachment";
+// ---------------------------------------------------------------------------
+// Work State (protocol v5): structured read model for the Work Strip/Workbench
+// ---------------------------------------------------------------------------
+
+export type PlanStep = { text: string; status: "pending" | "in_progress" | "completed" };
+export type PlanState = {
+  status: "ready" | "executing" | "completed" | "incomplete";
+  revision: number;
+  path: string;
+  steps: PlanStep[];
+  completedCount: number;
+  totalCount: number;
+} | null;
+
+export type TaskItem = {
+  id: string;
+  text: string;
+  status: "pending" | "in_progress" | "completed" | "cancelled";
+};
+export type TasksState = { items: TaskItem[]; completed: number; total: number };
+
+export type WorkAgent = {
+  id: string;
+  name: string;
+  role: string;
+  task: string;
+  status: "queued" | "running" | "completed" | "failed" | "blocked" | "interrupted";
+  isolation: "read-only" | "isolated workspace";
+  summary: string;
+  error: string | null;
+  proposalId: string | null;
+  durationSeconds: number | null;
+};
+
+export type WorkFile = { path: string; operation: string; additions: number; deletions: number };
+export type WorkProposal = {
+  id: string;
+  agentId: string;
+  agentName: string;
+  status: "ready" | "invalid" | "conflict" | "applied";
+  files: WorkFile[];
+  additions: number;
+  deletions: number;
+  invalidReasons: string[];
+  conflict: { id: string; paths: string[] } | null;
+};
+export type ChangesState = {
+  workspace: WorkFile[];
+  additions: number;
+  deletions: number;
+  proposals: WorkProposal[];
+};
+
+export type Check = {
+  id: string;
+  name: string;
+  status: "passed" | "failed" | "warning" | "running";
+  detail: string;
+};
+export type Artifact = {
+  id: string;
+  kind: "image" | "text";
+  path: string;
+  title: string;
+  detail: string;
+};
+
+export type WorkState = {
+  plan: PlanState;
+  tasks: TasksState;
+  agents: WorkAgent[];
+  changes: ChangesState;
+  checks: Check[];
+  artifacts: Artifact[];
+};
+
+export const initialWorkState: WorkState = {
+  plan: null,
+  tasks: { items: [], completed: 0, total: 0 },
+  agents: [],
+  changes: { workspace: [], additions: 0, deletions: 0, proposals: [] },
+  checks: [],
+  artifacts: [],
+};
+
+export type ActionName =
+  | "open_sessions"
+  | "new_session"
+  | "open_panel"
+  | "panel_action"
+  | "toggle_permission"
+  | "complete_mention"
+  | "stage_attachments"
+  | "remove_attachment"
+  | "workbench_action";
 export type ActionResult = {
   ok: boolean;
   message?: string;
   panel?: PanelSpec;
   candidates?: Array<{ insertText: string; display: string; description: string; kind: "file" | "session" }>;
   attachments?: AttachmentItem[];
+  queued?: boolean;
+  content?: string;
+  paths?: string[];
+  totalChars?: number;
+  status?: string;
+  conflictId?: string;
+  conflictPaths?: string[];
+  changedFiles?: string[];
 };
+
+export type WorkbenchOp =
+  | "read_proposal"
+  | "read_conflict";
+export type WorkbenchParams =
+  | { op: "read_proposal"; proposalId: string }
+  | { op: "read_conflict"; conflictId: string };
 
 export type UiEvent =
   | { type: "snapshot"; snapshot: Snapshot }
@@ -94,6 +202,12 @@ export type UiEvent =
   | { type: "notice"; text: string; level?: "info" | "warning" | "error" }
   | { type: "turn_state"; state: "idle" | "running" | "queued" | "cancelling" | "cancelled"; queueDepth?: number }
   | { type: "panel"; panel: PanelSpec }
+  | { type: "plan_updated"; plan: PlanState }
+  | { type: "tasks_updated"; tasks: TasksState }
+  | { type: "agent_run_updated"; agents: WorkAgent[] }
+  | { type: "changes_updated"; changes: ChangesState }
+  | { type: "verification_updated"; checks: Check[] }
+  | { type: "artifact_updated"; artifacts: Artifact[] }
   | Interaction
   | { type: "interaction_closed"; id: string }
   | { type: "shutdown"; reason?: string };

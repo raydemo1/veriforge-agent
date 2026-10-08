@@ -45,6 +45,76 @@ function mockEvents(): AsyncIterable<UiEvent> {
         ],
       };
       yield { type: "turn_state", state: "idle" };
+      yield {
+        type: "plan_updated",
+        plan: {
+          status: "executing",
+          revision: 1,
+          path: "global_plan/current/plan.md",
+          steps: [
+            { text: "Protocol v5：新增 Work State 事件", status: "completed" },
+            { text: "实现 Python 投影层", status: "completed" },
+            { text: "实现 Workbench Overlay", status: "in_progress" },
+            { text: "Changes 视图收敛为纯展示", status: "pending" },
+            { text: "窄屏适配与视觉收尾", status: "pending" },
+            { text: "补齐单测与端到端验证", status: "pending" },
+          ],
+          completedCount: 2,
+          totalCount: 6,
+        },
+      };
+      yield {
+        type: "tasks_updated",
+        tasks: {
+          items: [
+            { id: "t1", text: "Protocol v5：新增 Work State 事件", status: "completed" },
+            { id: "t2", text: "实现 Python 投影层", status: "completed" },
+            { id: "t3", text: "实现 Workbench Overlay", status: "in_progress" },
+            { id: "t4", text: "Changes 视图收敛为纯展示", status: "pending" },
+          ],
+          completed: 2,
+          total: 4,
+        },
+      };
+      yield {
+        type: "agent_run_updated",
+        agents: [
+          {
+            id: "agent-1", name: "worker-1", role: "worker", task: "实现 Workbench 变更视图",
+            status: "running", isolation: "isolated workspace", summary: "", error: null,
+            proposalId: "proposal_demo1", durationSeconds: 18,
+          },
+        ],
+      };
+      yield {
+        type: "changes_updated",
+        changes: {
+          workspace: [{ path: "harness_code_agent/tui/protocol.py", operation: "modify", additions: 8, deletions: 2 }],
+          additions: 8,
+          deletions: 2,
+          proposals: [
+            {
+              id: "proposal_demo1", agentId: "agent-1", agentName: "worker-1", status: "ready",
+              files: [{ path: "frontend/opentui/src/workbench/Workbench.tsx", operation: "create", additions: 420, deletions: 0 }],
+              additions: 420, deletions: 0, invalidReasons: [], conflict: null,
+            },
+          ],
+        },
+      };
+      yield {
+        type: "verification_updated",
+        checks: [
+          { id: "python-syntax", name: "Python syntax", status: "passed", detail: "4 files parsed" },
+          { id: "browser-verification", name: "Browser verification", status: "running", detail: "" },
+          { id: "ruff-lint", name: "Ruff lint", status: "failed", detail: "[F811] app.py:12: redefinition" },
+        ],
+      };
+      yield {
+        type: "artifact_updated",
+        artifacts: [
+          { id: "browser-png", kind: "image", path: ".harness/artifacts/browser.png", title: "browser.png", detail: "http://localhost:5173" },
+        ],
+      };
       yield { type: "notice", text: "OpenTUI 已就绪：输入 / 查看命令" };
     },
   };
@@ -300,6 +370,17 @@ function mockAction(name: ActionName, params?: Record<string, unknown>): Promise
     { insertText: "session:session-1", display: "重构命令栏滚动与焦点", description: "历史会话", kind: "session" },
     { insertText: "file:README.md", display: "README.md", description: "当前工作区文件", kind: "file" },
   ] });
+  if (name === "workbench_action") {
+    const op = String(params?.op ?? "");
+    if (op === "read_proposal" || op === "read_conflict") {
+      return Promise.resolve({
+        ok: true,
+        content: "@@ -1,3 +1,4 @@\n context\n+added line\n-removed line\n more context",
+        paths: ["frontend/opentui/src/workbench/Workbench.tsx"],
+        totalChars: 86,
+      });
+    }
+  }
   return Promise.resolve({ ok: true, message: "操作已完成" });
 }
 

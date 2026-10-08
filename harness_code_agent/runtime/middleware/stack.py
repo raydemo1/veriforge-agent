@@ -12,6 +12,7 @@ from typing import Any
 
 from ..permission_middleware import PermissionMiddleware
 from .base import AgentMiddleware
+from .integration import ProposalIntegrationMiddleware
 from .tool_failure_policy import ToolFailurePolicyMiddleware
 from .tool_guard import ToolGuardMiddleware
 from .verification import StaticVerifierMiddleware
@@ -44,6 +45,9 @@ def build_main_agent_middlewares(
     middlewares.append(
         StaticVerifierMiddleware(workspace_root=str(workspace), workspace=tool_context.workspace)
     )
+    # Last exit gate: worker proposals are the main agent's integration
+    # responsibility, so a ready/conflicting proposal blocks turn completion.
+    middlewares.append(ProposalIntegrationMiddleware(tool_context))
     return middlewares
 
 

@@ -54,4 +54,33 @@ describe("OpenTUI state", () => {
     const noticed = reduceEvent(initialState, { type: "notice", level: "info", text: "工具已同步" });
     expect(noticed.items.some((item) => item.id === "welcome")).toBe(true);
   });
+  test("work state section events update only their own section", () => {
+    const planEvent = { type: "plan_updated" as const, plan: { status: "executing" as const, revision: 1, path: "plan.md", steps: [], completedCount: 0, totalCount: 0 } };
+    const withPlan = reduceEvent(initialState, planEvent);
+    expect(withPlan.work.plan?.status).toBe("executing");
+    expect(withPlan.work.checks).toEqual([]);
+
+    const withChecks = reduceEvent(withPlan, {
+      type: "verification_updated",
+      checks: [{ id: "python-syntax", name: "Python syntax", status: "passed", detail: "ok" }],
+    });
+    expect(withChecks.work.checks).toHaveLength(1);
+    // Unrelated sections survive.
+    expect(withChecks.work.plan?.status).toBe("executing");
+
+    const withChanges = reduceEvent(withChecks, {
+      type: "changes_updated",
+      changes: { workspace: [], additions: 0, deletions: 0, proposals: [] },
+    });
+    expect(withChanges.work.changes).toEqual({ workspace: [], additions: 0, deletions: 0, proposals: [] });
+  });
+  test("session reset clears accumulated work state", () => {
+    const populated = reduceEvent(initialState, {
+      type: "artifact_updated",
+      artifacts: [{ id: "shot", kind: "image", path: ".harness/artifacts/browser.png", title: "browser.png", detail: "" }],
+    });
+    expect(populated.work.artifacts).toHaveLength(1);
+    const reset = reduceEvent(populated, { type: "session_reset", snapshot: initialState.snapshot, items: [] });
+    expect(reset.work).toEqual(initialState.work);
+  });
 });

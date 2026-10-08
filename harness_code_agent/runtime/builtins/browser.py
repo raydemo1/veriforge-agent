@@ -166,6 +166,9 @@ def browser_test(
     report_lines = []
     failed = False
     error_message = None
+    console_errors: list[str] = []
+    final_url = url
+    artifact_path: Path | None = None
 
     # Optionally start dev server
     if start_command:
@@ -207,11 +210,18 @@ def browser_test(
                     status="failed",
                     output="\n".join(report_lines),
                     error=f"Navigation failed: {e}",
-                    metadata={"url": url, "status_source": "browser"},
+                    metadata={
+                        "url": url,
+                        "status_source": "browser",
+                        "checks": [{
+                            "name": "Browser verification",
+                            "status": "failed",
+                            "detail": f"navigation failed: {url}",
+                        }],
+                    },
                 )
 
             # Check for console errors
-            console_errors = []
             page.on("console", lambda msg: console_errors.append(msg.text) if msg.type == "error" else None)
 
             # Execute actions
@@ -255,6 +265,7 @@ def browser_test(
                     page.wait_for_timeout(100)
 
             # Gather page info
+            final_url = page.url
             report_lines.append(f"Final URL: {page.url}")
             report_lines.append(f"Visible text (first 2000 chars): {page.inner_text('body')[:2000]}")
 
@@ -270,6 +281,7 @@ def browser_test(
                 ss_path = Path(tool_context.workspace.root) / ".harness" / "artifacts" / "browser.png"
                 ss_path.parent.mkdir(parents=True, exist_ok=True)
                 page.screenshot(path=str(ss_path), full_page=False)
+                artifact_path = ss_path
                 report_lines.append(f"Screenshot saved to {ss_path.relative_to(tool_context.workspace.root)}")
 
             browser.close()
@@ -279,12 +291,36 @@ def browser_test(
         failed = True
         error_message = f"Browser test failed: {e}"
 
+    check_status = "failed" if failed else ("warning" if console_errors else "passed")
+    check_detail = (
+        f"{len(console_errors)} console error(s)"
+        if console_errors and not failed
+        else final_url
+    )
+    metadata: dict = {
+        "url": url,
+        "status_source": "browser",
+        "checks": [{
+            "name": "Browser verification",
+            "status": check_status,
+            "detail": check_detail,
+        }],
+    }
+    if artifact_path is not None:
+        rel = artifact_path.relative_to(tool_context.workspace.root).as_posix()
+        metadata["artifacts"] = [{
+            "kind": "image",
+            "path": rel,
+            "title": artifact_path.name,
+            "detail": final_url,
+        }]
+
     return ToolResult(
         tool="browser_test",
         status="failed" if failed else "success",
         output="\n".join(report_lines),
         error=error_message,
-        metadata={"url": url, "status_source": "browser"},
+        metadata=metadata,
     )
 
 

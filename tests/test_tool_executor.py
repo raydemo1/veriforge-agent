@@ -757,7 +757,7 @@ class ToolExecutorTests(unittest.TestCase):
         registry = BUILTIN_TOOL_REGISTRY.copy()
         tool_calls = [
             _tool_call("tc_write", "write_file", {"path": "note.txt", "content": "created"}),
-            _tool_call("tc_risky", "run_bash", {"command": "git add ."}),
+            _tool_call("tc_risky", "run_bash", {"command": "npm install"}),
         ]
 
         approval_reads_file = []

@@ -102,7 +102,11 @@ class PermissionPolicy:
             PermissionAction.DENY,
         ),
         WORKSPACE_WRITE: ShellPermissionConfig(
-            PermissionAction.ASK,
+            # The mode name is the grant: commands whose writes the analyzer
+            # can prove stay inside the workspace run without another prompt.
+            # Anything it cannot prove (unknown executables/scripts), writes
+            # outside the workspace, and system writes still ask/deny.
+            PermissionAction.ALLOW,
             PermissionAction.DENY,
             PermissionAction.DENY,
             PermissionAction.DENY,

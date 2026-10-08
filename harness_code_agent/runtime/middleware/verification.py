@@ -81,13 +81,15 @@ class StaticVerifierMiddleware(AgentMiddleware):
 
         blocks: list[str] = []
         # --- ast.parse: syntax errors on changed files ---
-        for path, msg in _check_python_syntax(self._workspace_root, py_files):
+        syntax_errors = _check_python_syntax(self._workspace_root, py_files)
+        for path, msg in syntax_errors:
             blocks.append(f"  [syntax] {path}: {msg}")
 
         # --- ruff (JSON): only the changed files; E/F -> block, rest -> warn ---
+        ruff_findings, ruff_ran = _check_ruff(self._workspace_root, py_files)
         warns: list[str] = []
         warning_ids: list[tuple] = []
-        for rel_path, code, msg, row in _check_ruff(self._workspace_root, py_files):
+        for rel_path, code, msg, row in ruff_findings:
             if code[:1] in _RUFF_BLOCK_PREFIXES:
                 location = f"{rel_path}:{row}" if row else rel_path
                 blocks.append(f"  [{code}] {location}: {msg}")
@@ -95,6 +97,8 @@ class StaticVerifierMiddleware(AgentMiddleware):
                 location = f"{rel_path}:{row}" if row else rel_path
                 warns.append(f"  [{code}] {location}: {msg}")
                 warning_ids.append((rel_path, code, row))
+
+        _emit_checks(runtime_state, agent_name, py_files, syntax_errors, ruff_findings, ruff_ran)
 
         if blocks:
             details = "\n".join(blocks[:_MAX_REPORT_ITEMS])
@@ -299,16 +303,16 @@ def _check_python_syntax(
 
 def _check_ruff(
     workspace_root: str | None, py_files: list[str],
-) -> list[tuple[str, str, str, int | None]]:
+) -> tuple[list[tuple[str, str, str, int | None]], bool]:
     """Run ruff on the given files via JSON output.
 
-    Returns ``[(relative_path, rule_code, message, row)]``. Returns an empty
-    list when ruff is absent or its output is unusable; ruff-invocation
-    problems come back as a single non-blocking warning item (rule code not
-    starting with E/F), so tooling trouble never blocks an exit.
+    Returns ``(findings, ran)`` where ``ran`` tells whether ruff actually
+    executed (so an absent binary is never reported as a passing check).
+    Ruff-invocation problems come back as a single non-blocking warning item
+    (rule code not starting with E/F), so tooling trouble never blocks exit.
     """
     if not workspace_root or not py_files:
-        return []
+        return [], False
     try:
         result = subprocess.run(
             [
@@ -322,23 +326,23 @@ def _check_ruff(
             cwd=workspace_root,
         )
     except FileNotFoundError:
-        return []
+        return [], False
     except subprocess.TimeoutExpired:
-        return [("", "RUFF-TIMEOUT", f"ruff check timed out after {_SUBPROCESS_TIMEOUT_SECONDS}s", None)]
+        return [("", "RUFF-TIMEOUT", f"ruff check timed out after {_SUBPROCESS_TIMEOUT_SECONDS}s", None)], True
 
     stdout = (result.stdout or "").strip()
     if not stdout:
         # exit 0 = clean; exit >=2 with stderr is a ruff/config error.
         if result.returncode >= 2 and (result.stderr or "").strip():
             detail = result.stderr.strip().splitlines()[-1][:200]
-            return [("", "RUFF", f"ruff could not run: {detail}", None)]
-        return []
+            return [("", "RUFF", f"ruff could not run: {detail}", None)], True
+        return [], True
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError:
-        return []
+        return [], False
     if not isinstance(payload, list):
-        return []
+        return [], False
 
     root = Path(workspace_root).resolve()
     findings: list[tuple[str, str, str, int | None]] = []
@@ -353,7 +357,50 @@ def _check_ruff(
         location = item.get("location")
         row = location.get("row") if isinstance(location, dict) else None
         findings.append((rel_path, code, message, row))
-    return findings
+    return findings, True
+
+
+def _emit_checks(
+    runtime_state,
+    agent_name: str | None,
+    py_files: list[str],
+    syntax_errors: list[tuple[str, str]],
+    ruff_findings: list[tuple[str, str, str, int | None]],
+    ruff_ran: bool,
+) -> None:
+    """Publish objective static-verification evidence to the event stream."""
+
+    event_bus = getattr(runtime_state, "event_bus", None)
+    if event_bus is None:
+        return
+    checks: list[dict[str, str]] = []
+    if syntax_errors:
+        path, msg = syntax_errors[0]
+        checks.append({"name": "Python syntax", "status": "failed", "detail": f"{path}: {msg}"[:200]})
+    else:
+        checks.append({
+            "name": "Python syntax",
+            "status": "passed",
+            "detail": f"{len(py_files)} file{'s' if len(py_files) != 1 else ''} parsed",
+        })
+    if ruff_ran:
+        blocking = [item for item in ruff_findings if item[1][:1] in _RUFF_BLOCK_PREFIXES]
+        if blocking:
+            rel_path, code, msg, row = blocking[0]
+            location = f"{rel_path}:{row}" if row else rel_path
+            checks.append({"name": "Ruff lint", "status": "failed", "detail": f"[{code}] {location}: {msg}"[:200]})
+        elif ruff_findings:
+            rel_path, code, msg, row = ruff_findings[0]
+            location = f"{rel_path}:{row}" if row else rel_path
+            checks.append({"name": "Ruff lint", "status": "warning", "detail": f"[{code}] {location}: {msg}"[:200]})
+        else:
+            checks.append({"name": "Ruff lint", "status": "passed", "detail": "no findings"})
+    if checks:
+        event_bus.emit(
+            "checks_recorded",
+            agent=agent_name,
+            payload={"checks": checks},
+        )
 
 
 def _relative_display_path(filename: str, root: Path) -> str:

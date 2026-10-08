@@ -34,17 +34,10 @@ class TranscriptBlock:
     direction: str = ""
 
 
-@dataclass(frozen=True)
-class TodoStep:
-    text: str
-    status: str
-
-
 @dataclass
 class TuiState:
     snapshot: SessionStatusSnapshot
     blocks: list[TranscriptBlock] = field(default_factory=list)
-    todo_steps: list[TodoStep] = field(default_factory=list)
     active_tool_blocks: dict[str, list[TranscriptBlock]] = field(default_factory=dict)
     tool_call_counter: int = 0
     active_thought_block: TranscriptBlock | None = None
@@ -178,7 +171,7 @@ class TuiState:
             return TranscriptBlock(
                 "plan",
                 "计划已准备",
-                f"{path}{suffix}\n[计划已准备]  [如需修改，请描述要调整的内容]",
+                f"{path}{suffix}",
                 "pending",
             )
         if event_type == "context_compaction_started":
@@ -270,15 +263,10 @@ class TuiState:
         if tool == "ask_user":
             return None
         if tool == "update_todo" and status == "success":
-            self._update_todo_steps_from_metadata(payload.get("metadata"))
+            # Task detail lives in the Workbench Tasks section; the transcript
+            # only keeps the Work Strip counter.
             self.snapshot.status = "running"
-            return TranscriptBlock(
-                "todo",
-                "待办",
-                _format_todo_steps(self.todo_steps),
-                "updated",
-                turn=self.snapshot.turn,
-            )
+            return None
         self.snapshot.status = "running"
         raw_metadata = payload.get("metadata")
         metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
@@ -351,27 +339,6 @@ class TuiState:
         category_label = _FAILURE_LABELS.get(category, "执行失败")
         body = f"{category_label}：{message}" if message else category_label
         return TranscriptBlock("failure", "错误", body, "failed", turn=self.snapshot.turn)
-
-    def _update_todo_steps_from_metadata(self, metadata: Any) -> None:
-        if not isinstance(metadata, dict):
-            return
-        todo_state = metadata.get("todo_state")
-        if not isinstance(todo_state, dict):
-            return
-        raw_items = todo_state.get("items")
-        if not isinstance(raw_items, list):
-            return
-
-        todo_steps: list[TodoStep] = []
-        for raw in raw_items:
-            if not isinstance(raw, dict):
-                continue
-            text = str(raw.get("text") or "").strip()
-            if not text:
-                continue
-            status = str(raw.get("status") or "pending").strip()
-            todo_steps.append(TodoStep(text, status))
-        self.todo_steps = todo_steps
 
 
 _FILE_OPERATION_LABELS = {
@@ -567,16 +534,6 @@ _TOOL_RESULT_LABELS = {
     "stop_shell_job": "后台任务已停止",
     "stop_dev_server": "开发服务已停止",
 }
-
-
-def _format_todo_steps(steps: list[TodoStep]) -> str:
-    markers = {
-        "completed": "✓",
-        "in_progress": "›",
-        "pending": "○",
-        "cancelled": "—",
-    }
-    return "\n".join(f"{markers.get(step.status, '○')} {step.text}" for step in steps)
 
 
 def _payload_turn(payload: dict[str, Any], default: int) -> int:

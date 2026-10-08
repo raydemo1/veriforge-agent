@@ -8,10 +8,13 @@ import { resolveIcons } from "./icons.ts";
 import type { IconSet } from "./icons.ts";
 import { formatUserError } from "./errors.ts";
 import { clipboardFilePaths, formatBytes } from "./attachment-utils.ts";
-import type { ActionName, ActionResult, AttachmentItem, CommandItem, IconPreference, Interaction, PanelOption, PanelSpec, SubmitResult, ThemePreference, TranscriptItem, TurnSubmission, UiEvent } from "./protocol.ts";
+import type { ActionName, ActionResult, AttachmentItem, CommandItem, IconPreference, Interaction, PanelOption, PanelSpec, SubmitResult, ThemePreference, TranscriptItem, TurnSubmission, UiEvent, WorkbenchParams } from "./protocol.ts";
 import { initialState, reduceEvent, withOptimisticUserMessage } from "./state.ts";
 import { resolveTheme } from "./theme.ts";
 import type { Theme, ThemeMode } from "./theme.ts";
+import { WorkStrip } from "./workbench/WorkStrip.tsx";
+import { Workbench } from "./workbench/Workbench.tsx";
+import type { WorkbenchTab } from "./workbench/strip.ts";
 
 type AppProps = {
   events?: AsyncIterable<UiEvent>;
@@ -226,6 +229,7 @@ function GroupChildRow({ item, theme, icons }: { item: TranscriptItem; theme: Th
 }
 
 function isCollapsibleRow(item: TranscriptItem): boolean {
+  if (item.kind === "file") return true;
   return (item.kind === "tool" || item.kind === "thought") && item.state === "success";
 }
 
@@ -249,16 +253,34 @@ const TOOL_SUMMARY_PHRASES: Record<string, (count: number) => string> = {
 function summarizeToolRows(rows: TranscriptItem[]): string {
   const counts = new Map<string, number>();
   let unmapped = 0;
+  let fileCount = 0;
+  let additions = 0;
+  let deletions = 0;
   const keys = Object.keys(TOOL_SUMMARY_PHRASES);
   for (const row of rows) {
     if (row.kind === "thought") continue;
+    if (row.kind === "file") {
+      fileCount += 1;
+      for (const line of row.body.split("\n")) {
+        if (line.startsWith("+") && !line.startsWith("+++")) additions += 1;
+        else if (line.startsWith("-") && !line.startsWith("---")) deletions += 1;
+      }
+      continue;
+    }
     // Result titles carry a detail suffix ("文件已阅读  README.md"), so
-    // match the label as a prefix instead of an exact key.
+    // match the label as a prefix instead of an exact key. When a file_change
+    // row already describes the same write, don't count the tool row too.
     const key = keys.find((k) => row.title === k || row.title.startsWith(`${k}  `));
-    if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
-    else unmapped += 1;
+    if (key) {
+      if (fileCount > 0 && (key === "文件已写入" || key === "文件已修改")) continue;
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    } else unmapped += 1;
   }
   const parts = [...counts.entries()].map(([title, count]) => TOOL_SUMMARY_PHRASES[title](count));
+  if (fileCount > 0) {
+    const stats = [additions ? `+${additions}` : "", deletions ? `-${deletions}` : ""].filter(Boolean).join(" ");
+    parts.push(`已更新 ${fileCount} 个文件${stats ? ` · ${stats}` : ""}`);
+  }
   // Unknown tools are aggregated without naming them.
   if (unmapped > 0) parts.push(`执行了工具 ${unmapped} 次`);
   return parts.join("，");
@@ -758,8 +780,12 @@ function InteractionView({ interaction, theme, icons, narrow, onResolve }: { int
     }
   });
   const isBash = interaction.kind === "approval" && interaction.payload.toolName === "run_bash";
+  const isExternalRead = interaction.kind === "approval" && interaction.payload.toolName === "read_external_attachment";
+  const externalPaths = isExternalRead && Array.isArray(interaction.payload.args?.paths)
+    ? interaction.payload.args.paths.map((path) => String(path))
+    : [];
   const commandText = isBash ? String(interaction.payload.args?.command ?? "").trim() : "";
-  const argsText = interaction.kind === "approval" && !isBash ? JSON.stringify(interaction.payload.args, null, 2) : "";
+  const argsText = interaction.kind === "approval" && !isBash && !isExternalRead ? JSON.stringify(interaction.payload.args, null, 2) : "";
   const argsHeight = Math.min(Math.max(2, argsText.split("\n").length), 6);
   const commandHeight = Math.min(Math.max(1, commandText.split("\n").length), 6);
   const reasonText = interaction.kind === "approval"
@@ -775,6 +801,15 @@ function InteractionView({ interaction, theme, icons, narrow, onResolve }: { int
               <text fg={theme.subtle}>执行命令</text>
               <scrollbox style={{ height: commandHeight, backgroundColor: theme.surface }}>
                 <text fg={theme.text}>{commandText}</text>
+              </scrollbox>
+            </>
+          ) : isExternalRead ? (
+            <>
+              <text fg={theme.warning}>读取工作区外文件</text>
+              <scrollbox style={{ height: Math.min(Math.max(2, externalPaths.length), 6), backgroundColor: theme.surface }}>
+                <box style={{ flexDirection: "column" }}>
+                  {externalPaths.map((path) => <text key={path} fg={theme.text}>{path}</text>)}
+                </box>
               </scrollbox>
             </>
           ) : (
@@ -1197,11 +1232,12 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
   const [state, dispatch] = useReducer(reduceEvent, initialState);
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
-  const [externalPaths, setExternalPaths] = useState<string[] | null>(null);
   const [composerVersion, setComposerVersion] = useState(0);
   const [panel, setPanel] = useState<PanelSpec | null>(null);
   const [panelBusyId, setPanelBusyId] = useState<string | null>(null);
   const [panelAnchor, setPanelAnchor] = useState<PanelAnchor>("top-right");
+  const [workbenchOpen, setWorkbenchOpen] = useState(false);
+  const [workbenchTab, setWorkbenchTab] = useState<WorkbenchTab>("plan");
   const [detectedTheme, setDetectedTheme] = useState<ThemeMode | null>(null);
   const renderer = useRenderer();
   const { width, height } = useTerminalDimensions();
@@ -1233,9 +1269,9 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
           if (event.type === "interaction") setPanel(null);
           if (event.type === "session_reset") {
             setPanel(null);
+            setWorkbenchOpen(false);
             setDraft("");
             setAttachments([]);
-            setExternalPaths(null);
             setComposerVersion((version) => version + 1);
           }
           dispatch(event);
@@ -1264,6 +1300,20 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
     }
   };
 
+  const openWorkbench = (tab: WorkbenchTab) => {
+    setWorkbenchTab(tab);
+    setWorkbenchOpen(true);
+  };
+  const workbenchOp = async (params: WorkbenchParams): Promise<ActionResult | undefined> => {
+    if (!onAction) return undefined;
+    try {
+      return await onAction("workbench_action", params as unknown as Record<string, unknown>);
+    } catch (error) {
+      dispatch({ type: "notice", level: "error", text: formatUserError(error) });
+      return undefined;
+    }
+  };
+
   useKeyboard((key) => {
     if (key.ctrl && key.name === "c") {
       key.preventDefault();
@@ -1284,6 +1334,11 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
     }
     else if (key.ctrl && key.name === "o") { key.preventDefault(); void invoke("open_panel", { panel: "observe" }); }
     else if (key.ctrl && key.name === "p") { key.preventDefault(); void invoke("open_panel", { panel: "permission" }); }
+    else if (key.ctrl && key.name === "w") {
+      if (panel || state.interaction) return;
+      key.preventDefault();
+      setWorkbenchOpen((open) => !open);
+    }
   });
 
   useEffect(() => {
@@ -1344,7 +1399,7 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
       dispatch({ type: "notice", level: "error", text: formatUserError(error) });
     });
   };
-  const submitWithAuthorization = async (authorizedPaths: string[] = []) => {
+  const submitTurn = async () => {
     const text = draft.trim();
     if (!text && !attachments.length) return;
     if (state.snapshot.status === "failed") {
@@ -1356,23 +1411,22 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
     if (!attachments.length && (text === "/compact" || text === "/fork")) { setDraft(""); void invoke("panel_action", { panel: "command", action: text.slice(1) }); return; }
     if (!onSubmit) return;
     try {
-      const result = await onSubmit({ text, attachmentIds: attachments.map((item) => item.id), authorizedPaths });
-      if (!result.accepted) {
-        setExternalPaths(result.confirmation?.paths ?? null);
-        return;
-      }
+      // accepted:false means the runtime is requesting an approval/question
+      // interaction (e.g. reading files outside the workspace); the draft
+      // stays put and the decision happens in the Interaction surface.
+      const result = await onSubmit({ text, attachmentIds: attachments.map((item) => item.id) });
+      if (!result.accepted) return;
       const submittedAttachments = result.attachments ?? attachments;
       const summary = submittedAttachments.map((item) => `[${item.kind}] ${item.name} (${formatBytes(item.size)})`).join("\n");
       const body = [text, summary].filter(Boolean).join("\n");
       dispatch({ type: "transcript", item: withOptimisticUserMessage(state, body).items.at(-1)! });
       setDraft("");
       setAttachments([]);
-      setExternalPaths(null);
     } catch (error) {
       dispatch({ type: "notice", level: "error", text: formatUserError(error) });
     }
   };
-  const submit = () => { void submitWithAuthorization(); };
+  const submit = () => { void submitTurn(); };
   const selectPanel = (id: string) => {
     if (!panel) return;
     void (async () => {
@@ -1402,17 +1456,20 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
     <box style={{ flexDirection: "column", width: "100%", height: "100%", backgroundColor: theme.background }}>
       <Header cwd={state.snapshot.cwd} theme={theme} icons={icons} compact={compact} narrow={narrow} onHistory={() => void invoke("open_sessions", undefined, "history")} onNew={() => void invoke("new_session")} />
       <Transcript items={state.items} theme={theme} icons={icons} narrow={narrow} />
-      {state.interaction ? <InteractionView interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : externalPaths ? (
-        <box border borderStyle="rounded" borderColor={theme.warning} style={{ flexDirection: "column", marginLeft: narrow ? 1 : 2, marginRight: narrow ? 1 : 2, paddingLeft: 1, paddingRight: 1 }}>
-          <text fg={theme.warning}><strong>允许读取工作区外文件？</strong></text>
-          {externalPaths.map((path) => <text key={path} fg={theme.text}>{path}</text>)}
-          <box style={{ flexDirection: "row", gap: 1 }}>
-            <ActionButton label="允许本次读取" theme={theme} color={theme.success} defaultBg={theme.surfaceRaised} onInvoke={() => void submitWithAuthorization(externalPaths)} />
-            <ActionButton label="拒绝" theme={theme} color={theme.error} defaultBg={theme.surfaceRaised} onInvoke={() => setExternalPaths(null)} />
-          </box>
-        </box>
-      ) : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping} sessionReady={Boolean(state.snapshot.sessionId) && state.snapshot.status !== "failed"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
+      <WorkStrip work={state.work} width={width} theme={theme} onOpen={openWorkbench} />
+      {state.interaction ? <InteractionView interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping || workbenchOpen} sessionReady={Boolean(state.snapshot.sessionId) && state.snapshot.status !== "failed"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
       {panel && !state.interaction ? <PanelOverlay panel={panel} anchor={panelAnchor} theme={theme} icons={icons} terminalWidth={width} terminalHeight={height} onClose={() => setPanel(null)} onSelect={selectPanel} busyId={panelBusyId} /> : null}
+      {workbenchOpen && !state.interaction ? (
+        <Workbench
+          work={state.work}
+          theme={theme}
+          terminalWidth={width}
+          terminalHeight={height}
+          initialTab={workbenchTab}
+          onClose={() => setWorkbenchOpen(false)}
+          onWorkbench={workbenchOp}
+        />
+      ) : null}
     </box>
   );
 }

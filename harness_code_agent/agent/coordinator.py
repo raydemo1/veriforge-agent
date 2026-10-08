@@ -452,6 +452,7 @@ class AgentCoordinator:
             "agent_id": record.id,
             "name": record.name,
             "role": record.role,
+            "task": record.task,
             "status": record.state,
             "summary": record.summary,
             "error": record.error,
