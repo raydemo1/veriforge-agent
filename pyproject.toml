@@ -16,9 +16,12 @@ dependencies = [
     "psutil>=5.9.8,<8",
     "mcp>=1.0.0",
     "BM25>=0.3,<1",
+    "pygls>=2.1,<3",
+    "watchfiles>=1.1,<2",
 ]
 
 [project.optional-dependencies]
+test = ["pytest>=8,<10"]
 eval = [
     "datasets>=5.0.0",
     "pyarrow>=21.0.0",
@@ -33,6 +36,8 @@ veriforge = "harness_code_agent.cli:main"
 # run artifacts (including stale symlink trees on Windows) that are not
 # tests and break collection when pytest recurses the whole repository.
 testpaths = ["tests"]
+addopts = "--strict-markers -m 'not integration'"
+markers = ["integration: requires installed external tools"]
 
 [tool.setuptools.packages.find]
 include = ["harness_code_agent*"]
@@ -56,6 +61,7 @@ include = ["harness_code_agent*"]
 "harness_code_agent/runtime/builtins/shell.py" = ["BLE001"]
 "harness_code_agent/runtime/builtins/web.py" = ["BLE001"]
 "harness_code_agent/runtime/mcp.py" = ["BLE001"]
+"harness_code_agent/runtime/language_service.py" = ["BLE001"]
 "harness_code_agent/runtime/middleware/verification.py" = ["BLE001"]
 "harness_code_agent/runtime/tool_runner.py" = ["BLE001"]
 "harness_code_agent/sessions/events.py" = ["BLE001"]

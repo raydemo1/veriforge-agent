@@ -51,6 +51,59 @@ describe("OpenTUI app interactions", () => {
     setup?.renderer.destroy();
   });
 
+  test.each([50, 100])("rewind appears only on hover and keeps layout stable at W=%d", async (width) => {
+    const stream = eventStream();
+    const actions: Array<{ name: ActionName; params?: Record<string, unknown> }> = [];
+    setup = await testRender(<App events={stream.events} onAction={async (name, params) => { actions.push({ name, params }); return { ok: true }; }} />, { width, height: 30 });
+    stream.push({ type: "transcript", item: { id: "user-one", kind: "user", title: "你", body: "调整认证逻辑" } });
+    stream.push({ type: "transcript", item: { id: "group-one", kind: "assistant", title: "助手", body: "", role: "group", state: "success", turn: 1 } });
+    stream.push({ type: "transcript", item: { id: "answer-one", kind: "assistant", title: "助手", body: "认证逻辑已调整", parentId: "group-one", state: "success" } });
+    stream.push({ type: "recovery_available", turn: 1, pointId: "point-one" });
+    await sleep(300);
+    const initial = await setup.waitForFrame((frame) => frame.includes("认证逻辑已调整"));
+    expect(initial).not.toContain("回撤到此处");
+    expect(initial.split("\n")[0]).not.toContain("回撤");
+    const answerRow = initial.split("\n").findIndex((row) => row.includes("认证逻辑已调整"));
+    const userRow = initial.split("\n").findIndex((row) => row.includes("调整认证逻辑"));
+    await setup.mockMouse.moveTo(5, userRow);
+    await sleep(50);
+    const hovered = await setup.waitForFrame((frame) => frame.includes("回撤到此处"));
+    expect(hovered.split("\n").findIndex((row) => row.includes("认证逻辑已调整"))).toBe(answerRow);
+    const buttonRow = hovered.split("\n").findIndex((row) => row.includes("回撤到此处"));
+    const buttonColumn = hovered.split("\n")[buttonRow].indexOf("回撤到此处");
+    await setup.mockMouse.moveTo(buttonColumn + 1, buttonRow);
+    await sleep(30);
+    expect(setup.captureCharFrame()).toContain("回撤到此处");
+    await setup.mockMouse.click(buttonColumn + 1, buttonRow);
+    await sleep(30);
+    expect(actions).toEqual([{ name: "rewind", params: { pointId: "point-one" } }]);
+    await setup.mockMouse.moveTo(0, 0);
+    await sleep(100);
+    await setup.waitForFrame((frame) => !frame.includes("回撤到此处"));
+  });
+
+  test("keyboard focus exposes rewind and running turns disable it", async () => {
+    const stream = eventStream();
+    const actions: ActionName[] = [];
+    setup = await testRender(<App events={stream.events} onAction={async (name) => { actions.push(name); return { ok: true }; }} />, { width: 100, height: 30 });
+    stream.push({ type: "transcript", item: { id: "group-keyboard", kind: "assistant", title: "助手", body: "", role: "group", state: "success", turn: 1, recoveryPointId: "point-keyboard" } });
+    await setup.renderOnce();
+    await sleep(50);
+    const node = setup.renderer.root.findDescendantById("recovery-turn-group-keyboard")!;
+    node.focus();
+    await sleep(100);
+    await setup.waitForFrame((frame) => frame.includes("回撤到此处"));
+    setup.mockInput.pressEnter();
+    await sleep(30);
+    expect(actions).toEqual(["rewind"]);
+    stream.push({ type: "turn_state", state: "running" });
+    await sleep(50);
+    await setup.waitForFrame((frame) => !frame.includes("回撤到此处"));
+    setup.mockInput.pressEnter();
+    await sleep(30);
+    expect(actions).toEqual(["rewind"]);
+  });
+
   test("agent transcript rows show direction arrows", async () => {
     const stream = eventStream();
     setup = await testRender(
@@ -395,8 +448,8 @@ describe("OpenTUI app interactions", () => {
     const { unicodeIcons } = await import("./icons.ts");
     expect(unicodeIcons.running).not.toBe(unicodeIcons.prompt);
     expect(unicodeIcons.running).toBe("·");
-    expect(unicodeIcons.checkpoint).not.toBe(unicodeIcons.assistant);
-    expect(unicodeIcons.checkpoint).toBe("◈");
+    expect(unicodeIcons.rewind).not.toBe(unicodeIcons.assistant);
+    expect(unicodeIcons.rewind).toBe("◈");
   });
 
   test("mouse click on a header button does not leave focus on it", async () => {

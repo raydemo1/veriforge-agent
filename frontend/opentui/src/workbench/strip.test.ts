@@ -75,6 +75,13 @@ describe("work strip", () => {
     expect(segments.find((s) => s.key === "changes")).toMatchObject({ text: "3 变更" });
   });
 
+  test("skipped checks never look like passed evidence", () => {
+    const skipped = { id: "b", name: "Ruff", status: "skipped" as const, detail: "missing" };
+    expect(workSegments(work({ checks: [skipped] }))).toContainEqual({ key: "checks", label: "检查", text: "已跳过", tone: "muted" });
+    const mixed = workSegments(work({ checks: [{ id: "a", name: "Python", status: "passed", detail: "" }, skipped] }));
+    expect(mixed.find((s) => s.key === "checks")).toMatchObject({ text: "1/1 · 1 跳过", tone: "muted" });
+  });
+
   test("narrow widths hide segments before wrapping", () => {
     const wide = work({
       plan: { status: "ready", revision: 1, path: "plan.md", steps: [], completedCount: 0, totalCount: 1 },

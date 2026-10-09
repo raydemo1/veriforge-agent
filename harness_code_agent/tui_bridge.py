@@ -262,6 +262,7 @@ class BridgeServer:
         self._write_lock = threading.Lock()
         self._tasks: queue.Queue[PreparedTurn | Any | None] = queue.Queue()
         self.work = WorkStateProjection(self.cwd)
+        self._rewind_pending = False
         self._active_token: CancellationToken | None = None
         self._active_lock = threading.Lock()
         self._stopping = threading.Event()
@@ -410,6 +411,8 @@ class BridgeServer:
                     self._send_event({"type": "turn_state", "state": "running"})
             elif event_type == "turn_finished":
                 self._close_assistant_group("success")
+            elif event_type == "recovery_point_created":
+                self._send_event({"type": "recovery_available", "turn": event.payload["turn"], "pointId": event.payload["point_id"]})
                 self._send_event({"type": "turn_state", "state": "idle"})
             elif event_type == "session_started":
                 self._send_snapshot()
@@ -484,6 +487,7 @@ class BridgeServer:
                     "body": "",
                     "state": "running",
                     "role": "group",
+                    "turn": turn,
                 },
             }
         )
@@ -562,6 +566,8 @@ class BridgeServer:
             "body": block.body,
             "state": state,
         }
+        if block.turn is not None:
+            item["turn"] = block.turn
         if block.direction:
             item["direction"] = block.direction
         if self._assistant_group_id:
@@ -737,7 +743,7 @@ class BridgeServer:
                 if getattr(result, "text", ""):
                     self._notice("info", str(result.text))
                 action = getattr(result, "action", None)
-                if action in {"profile", "checkpoint", "mcp", "observe"}:
+                if action in {"profile", "mcp", "observe"}:
                     self._send_event({"type": "panel", "panel": self._panel(str(action))})
                 elif action == "compact":
                     self._notice("info", session.compact_current_context())
@@ -748,17 +754,10 @@ class BridgeServer:
             return
         # Open the assistant group before routing/preparation so the transcript
         # shows "助手" immediately; turn_started later finds it already open.
-        self._begin_assistant_group(0)
+        self._begin_assistant_group(session.turn_count + 1)
         result = session.submit_prepared(task, cancellation_token=token)
         if getattr(result, "notice", ""):
             self._notice("info", str(result.notice))
-        checkpoint = str(getattr(result, "checkpoint", "") or "").strip()
-        if checkpoint and checkpoint not in {
-            "no changes to checkpoint",
-            "checkpoint auto off",
-            "checkpoint cadence skipped",
-        }:
-            self._notice("info", checkpoint)
 
     def _sessions_panel(self) -> dict[str, Any]:
         session = self._require_session()
@@ -872,19 +871,7 @@ class BridgeServer:
                 for effort in config.REASONING_EFFORTS
             ]
             return {"kind": "effort", "title": "推理强度", "options": options}
-        if kind == "checkpoint":
-            checkpoint = session.checkpoint
-            return {
-                "kind": "checkpoint",
-                "title": "检查点",
-                "body": f"当前：自动{'开启' if checkpoint.auto else '关闭'} · 每 {checkpoint.every_turns} 轮",
-                "options": [
-                    {"id": "create", "label": "立即创建检查点"},
-                    {"id": "auto_on", "label": "开启自动检查点"},
-                    {"id": "auto_off", "label": "关闭自动检查点"},
-                    {"id": "every_turn", "label": "每轮创建"},
-                ],
-            }
+
         if kind == "mcp":
             session.mcp_status()
             manager = session.mcp_manager
@@ -928,6 +915,8 @@ class BridgeServer:
         raise ValueError(f"unknown panel: {kind}")
 
     def _panel_action(self, panel: str, action: str) -> dict[str, Any]:
+        if self._rewind_pending:
+            raise ValueError("回撤正在进行，请稍候")
         session = self._require_session()
         if panel == "sessions":
             session.resume_from_session(action)
@@ -953,24 +942,7 @@ class BridgeServer:
             session.apply_model_override(model=action)
         elif panel == "effort":
             session.apply_model_override(reasoning_effort=action)
-        elif panel == "checkpoint":
-            if action == "create":
-                message = session.create_checkpoint(manual=True)
-            elif action == "auto_on":
-                result = session.set_auto_checkpoint(True)
-                message = "自动检查点已开启" if session.checkpoint.auto else result
-            elif action == "auto_off":
-                session.set_auto_checkpoint(False)
-                message = "自动检查点已关闭"
-            elif action == "every_turn":
-                result = session.set_auto_checkpoint(True)
-                if session.checkpoint.auto:
-                    session.checkpoint.every_turns = 1
-                    message = "检查点频率已设为每轮"
-                else:
-                    message = result
-            else:
-                raise ValueError(f"unknown checkpoint action: {action}")
+
         elif panel == "mcp":
             name = action.split(":", 1)[1] if ":" in action else ""
             if action == "reload":
@@ -1025,24 +997,75 @@ class BridgeServer:
     def _history_items(self, session_id: str) -> list[dict[str, Any]]:
         session = self._require_session()
         replay = TuiState(snapshot=SessionStatusSnapshot(
-            profile=self.state.snapshot.profile,
-            model=self.state.snapshot.model,
-            provider=self.state.snapshot.provider,
-            permission_mode=self.state.snapshot.permission_mode,
-            session_id=self.state.snapshot.session_id,
-            cwd=self.cwd,
+            profile=self.state.snapshot.profile, model=self.state.snapshot.model,
+            provider=self.state.snapshot.provider, permission_mode=self.state.snapshot.permission_mode,
+            session_id=session.session.id, cwd=self.cwd,
         ))
         items = []
         self.work = WorkStateProjection(self.cwd)
-        for event in session.session_store.read_events(session_id):
+        group = None
+        for index, event in enumerate(session.session_store.read_history_events(session_id)):
+            if event["type"] == "turn_started":
+                turn = event["payload"]["turn"]
+                group = {"id": f"history-group-{turn}", "kind": "assistant", "title": "助手", "body": "", "state": "success", "role": "group", "turn": turn}
+                items.append(group)
             block = replay.apply_event(event)
             self.work.apply_event(event)
             if block is not None:
                 replay.add_block(block)
-                items.append(self._block_item(block))
+                item = self._block_item(block)
+                item["id"] = f"history-{index}-{block.kind}"
+                item.pop("parentId", None)
+                if group is not None and item["kind"] != "user":
+                    item["parentId"] = group["id"]
+                items.append(item)
+            if event["type"] == "recovery_point_created":
+                turn = event["payload"]["turn"]
+                for item in items:
+                    if item.get("role") == "group" and item.get("turn") == turn:
+                        item["recoveryPointId"] = event["payload"]["point_id"]
+            if event["type"] == "turn_finished":
+                group = None
+        for point_id, point in session.recovery_points().items():
+            if point["turn"] == 0:
+                items.insert(0, {"id": "recovery-origin", "kind": "status", "title": "会话开始", "body": "", "turn": 0, "recoveryPointId": point_id})
+            for item in items:
+                if item.get("role") == "group" and item.get("turn") == point["turn"]:
+                    item["recoveryPointId"] = point_id
+        self.state = replay
+        self.state.snapshot.session_id = session.session.id
+        self.state.snapshot.profile = session.profile.name()
+        self.state.snapshot.permission_mode = session.permission_mode
+        self.state.snapshot.status = "idle"
+        self._assistant_group_id = None
+        self._assistant_id = None
+        session.turn_count = replay.snapshot.turn
         return items
 
+    def _queue_rewind(self, point_id: str) -> dict[str, Any]:
+        session = self._require_session()
+        with self._active_lock:
+            if self._active_token is not None or self._rewind_pending or self._tasks.unfinished_tasks or self._stopping.is_set():
+                raise ValueError("请等待当前操作结束，再回撤")
+            if point_id not in session.recovery_points():
+                raise ValueError("回撤点已失效，请重新选择")
+            self._rewind_pending = True
+            def rewind():
+                try:
+                    if session.rewind_to_point(point_id):
+                        items = self._history_items(session.session.id)
+                        self._send_event({"type": "session_reset", "snapshot": self._snapshot_payload(), "items": items})
+                        self._send_work_state()
+                        destination = "会话开始时" if session.turn_count == 0 else f"第 {session.turn_count} 轮结束时"
+                        self._notice("info", f"已回撤到{destination}")
+                finally:
+                    self._rewind_pending = False
+            self._tasks.put(rewind)
+        return {"ok": True, "queued": True}
+
     def _new_session(self) -> dict[str, Any]:
+        if self._rewind_pending:
+            raise ValueError("回撤正在进行，请稍候")
         if self._active_token is not None:
             raise RuntimeError("当前回合仍在执行，暂时无法新建会话")
         if self._session_thread.is_alive():
@@ -1073,6 +1096,8 @@ class BridgeServer:
         return self._session
 
     def _action(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
+        if name == "rewind":
+            return self._queue_rewind(str(params.get("pointId") or ""))
         if name == "open_sessions":
             return {"ok": True, "panel": self._sessions_panel()}
         if name == "new_session":
@@ -1177,6 +1202,8 @@ class BridgeServer:
                 self._response(request_id, error="附件参数格式错误，请重试")
             elif not text and not attachment_ids:
                 self._response(request_id, error="请输入任务或添加附件后再提交")
+            elif self._rewind_pending:
+                self._response(request_id, error="回撤正在进行，请稍候")
             elif self._stopping.is_set():
                 self._response(request_id, error="当前回合正在停止，请稍候")
             else:
@@ -1279,6 +1306,8 @@ class BridgeServer:
                 self._tasks.put(None)
                 break
             discarded += 1
+            if callable(task) and self._rewind_pending:
+                self._rewind_pending = False
             self._tasks.task_done()
         return discarded
 

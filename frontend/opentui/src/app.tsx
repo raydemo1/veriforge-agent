@@ -339,7 +339,29 @@ function AssistantGroupBlock({ item, rows, theme, icons }: { item: TranscriptIte
   );
 }
 
-function Transcript({ items, theme, icons, narrow }: { items: TranscriptItem[]; theme: Theme; icons: IconSet; narrow: boolean }) {
+function RecoverableTurn({ item, theme, children, onRewind }: { item: TranscriptItem; theme: Theme; children: ReactNode; onRewind?: (pointId: string) => void }) {
+  const [hovered, setHovered] = useState(false);
+  const { ref, focused } = useKeyboardFocusVisible<BoxRenderable>();
+  const available = Boolean(item.recoveryPointId && onRewind && item.state !== "running");
+  const visible = available && (hovered || focused);
+  const invoke = () => { if (available) onRewind?.(item.recoveryPointId!); };
+  return (
+    <box ref={ref} id={`recovery-turn-${item.id}`} focusable={available}
+      onMouseOver={() => setHovered(true)}
+      onMouseOut={() => setHovered(false)}
+      onKeyDown={(key) => { if (focused && (isEnterKey(key.name) || key.name === "space")) { key.preventDefault(); invoke(); } }}
+      style={{ flexDirection: "column", gap: 1 }}>
+      {children}
+      {item.recoveryPointId ? <box style={{ height: 1, flexDirection: "row", justifyContent: "flex-end" }}>
+        {visible ? <box onMouseDown={(event) => { event.stopPropagation(); invoke(); setTimeout(() => ref.current?.blur(), 0); }} style={{ paddingLeft: 1, paddingRight: 1, backgroundColor: theme.surfaceRaised }}>
+          <text fg={theme.accent}>回撤到此处</text>
+        </box> : null}
+      </box> : null}
+    </box>
+  );
+}
+
+function Transcript({ items, theme, icons, narrow, onRewind }: { items: TranscriptItem[]; theme: Theme; icons: IconSet; narrow: boolean; onRewind?: (pointId: string) => void }) {
   const childrenByGroup = new Map<string, TranscriptItem[]>();
   for (const item of items) {
     if (item.parentId) {
@@ -348,79 +370,90 @@ function Transcript({ items, theme, icons, narrow }: { items: TranscriptItem[]; 
       else childrenByGroup.set(item.parentId, [item]);
     }
   }
+  const topLevel = items.filter((item) => !item.parentId || !childrenByGroup.has(item.parentId));
+  const renderItem = (item: TranscriptItem) => {
+
+    if (item.kind === "assistant" && item.role === "group") {
+      return <AssistantGroupBlock key={item.id} item={item} rows={childrenByGroup.get(item.id) ?? []} theme={theme} icons={icons} />;
+    }
+    if (item.kind === "user" || item.kind === "assistant") {
+      const assistant = item.kind === "assistant";
+      return (
+        <box key={item.id} style={{ flexDirection: "column", maxWidth: 96 }}>
+          <text>
+            <span fg={theme.accent}><strong>{assistant ? icons.assistant : icons.prompt}</strong></span>
+            <span fg={theme.text}><strong>{` ${assistant ? "助手" : "你"}`}</strong></span>
+          </text>
+          {assistant ? <MarkdownText text={item.body} color={theme.text} streaming={item.state === "running"} /> : <text fg={theme.text}>{item.body}</text>}
+        </box>
+      );
+    }
+    if (item.kind === "file") return <FileDiffBlock key={item.id} item={item} theme={theme} icons={icons} />;
+    if (item.kind === "agent") {
+      const directed = item.direction !== undefined;
+      const running = item.state === "running";
+      const markerColor = directed ? theme.accent : toneFor(item, theme);
+      const stackBody = directed || item.state === "failed" || item.body.includes("\n");
+      return (
+        <box key={item.id} style={{ flexDirection: "column", maxWidth: 110 }}>
+          <box style={{ flexDirection: "row" }}>
+            {directed
+              ? <text fg={markerColor}>{item.direction === "in" ? "←" : "→"}</text>
+              : running
+                ? <Spinner color={markerColor} />
+                : <text fg={markerColor}>{markerFor(item, icons)}</text>}
+            <text fg={markerColor}>{` ${item.title}${!stackBody && item.body ? `  · ${item.body}` : ""}`}</text>
+          </box>
+          {stackBody && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
+        </box>
+      );
+    }
+    if (item.id === "welcome" && item.kind === "status") {
+      // Startup/welcome row: bare copy when ready, spinner while loading,
+      // failure marker only when it actually failed. Scoped to the
+      // welcome row — other status blocks carry meaningful titles.
+      const failed = item.state === "failed";
+      const ready = item.state === "success";
+      const tone = failed ? theme.error : ready ? theme.success : theme.accent;
+      return (
+        <box key={item.id} style={{ flexDirection: "column", maxWidth: 110 }}>
+          <box style={{ flexDirection: "row" }}>
+            {item.state === "running" ? <Spinner color={tone} /> : failed ? <text fg={tone}>{icons.failure}</text> : null}
+            <text fg={tone}>{ready ? item.body : ` ${failed ? item.title : item.body}`}</text>
+          </box>
+          {failed && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
+        </box>
+      );
+    }
+    const genericTone = toneFor(item, theme);
+    const genericRunning = item.state === "running";
+    const stackGenericBody = item.state === "failed" || item.body.includes("\n");
+    return (
+      <box key={item.id} style={{ flexDirection: "column", maxWidth: 110, marginLeft: item.parentId ? 2 : 0 }}>
+        <box style={{ flexDirection: "row" }}>
+          {genericRunning
+            ? <Spinner color={genericTone} />
+            : <text fg={genericTone}>{markerFor(item, icons)}</text>}
+          <text fg={genericTone}>{` ${item.title}${!stackGenericBody && item.body ? `  ${item.body}` : ""}`}</text>
+        </box>
+        {stackGenericBody && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
+      </box>
+    );
+  };
+  const rendered: ReactNode[] = [];
+  for (let index = 0; index < topLevel.length; index += 1) {
+    const item = topLevel[index];
+    const next = topLevel[index + 1];
+    if (item.kind === "user" && next?.role === "group") {
+      rendered.push(<RecoverableTurn key={next.id} item={next} theme={theme} onRewind={onRewind}>{renderItem(item)}{renderItem(next)}</RecoverableTurn>);
+      index += 1;
+    } else if (item.role === "group" || item.recoveryPointId) {
+      rendered.push(<RecoverableTurn key={item.id} item={item} theme={theme} onRewind={onRewind}>{renderItem(item)}</RecoverableTurn>);
+    } else rendered.push(renderItem(item));
+  }
   return (
     <scrollbox stickyScroll focused style={{ height: 1, flexGrow: 1, flexShrink: 1, minHeight: 0, paddingLeft: narrow ? 1 : 2, paddingRight: narrow ? 1 : 2 }}>
-      <box style={{ flexDirection: "column", gap: 1, paddingTop: 1, paddingBottom: 1 }}>
-        {items.map((item) => {
-          if (item.kind === "assistant" && item.role === "group") {
-            return <AssistantGroupBlock key={item.id} item={item} rows={childrenByGroup.get(item.id) ?? []} theme={theme} icons={icons} />;
-          }
-          if (item.parentId && childrenByGroup.has(item.parentId)) return null;
-          if (item.kind === "user" || item.kind === "assistant") {
-            const assistant = item.kind === "assistant";
-            return (
-              <box key={item.id} style={{ flexDirection: "column", maxWidth: 96 }}>
-                <text>
-                  <span fg={theme.accent}><strong>{assistant ? icons.assistant : icons.prompt}</strong></span>
-                  <span fg={theme.text}><strong>{` ${assistant ? "助手" : "你"}`}</strong></span>
-                </text>
-                {assistant ? <MarkdownText text={item.body} color={theme.text} streaming={item.state === "running"} /> : <text fg={theme.text}>{item.body}</text>}
-              </box>
-            );
-          }
-          if (item.kind === "file") return <FileDiffBlock key={item.id} item={item} theme={theme} icons={icons} />;
-          if (item.kind === "agent") {
-            const directed = item.direction !== undefined;
-            const running = item.state === "running";
-            const markerColor = directed ? theme.accent : toneFor(item, theme);
-            const stackBody = directed || item.state === "failed" || item.body.includes("\n");
-            return (
-              <box key={item.id} style={{ flexDirection: "column", maxWidth: 110 }}>
-                <box style={{ flexDirection: "row" }}>
-                  {directed
-                    ? <text fg={markerColor}>{item.direction === "in" ? "←" : "→"}</text>
-                    : running
-                      ? <Spinner color={markerColor} />
-                      : <text fg={markerColor}>{markerFor(item, icons)}</text>}
-                  <text fg={markerColor}>{` ${item.title}${!stackBody && item.body ? `  · ${item.body}` : ""}`}</text>
-                </box>
-                {stackBody && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
-              </box>
-            );
-          }
-          if (item.id === "welcome" && item.kind === "status") {
-            // Startup/welcome row: bare copy when ready, spinner while loading,
-            // failure marker only when it actually failed. Scoped to the
-            // welcome row — other status blocks carry meaningful titles.
-            const failed = item.state === "failed";
-            const ready = item.state === "success";
-            const tone = failed ? theme.error : ready ? theme.success : theme.accent;
-            return (
-              <box key={item.id} style={{ flexDirection: "column", maxWidth: 110 }}>
-                <box style={{ flexDirection: "row" }}>
-                  {item.state === "running" ? <Spinner color={tone} /> : failed ? <text fg={tone}>{icons.failure}</text> : null}
-                  <text fg={tone}>{ready ? item.body : ` ${failed ? item.title : item.body}`}</text>
-                </box>
-                {failed && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
-              </box>
-            );
-          }
-          const genericTone = toneFor(item, theme);
-          const genericRunning = item.state === "running";
-          const stackGenericBody = item.state === "failed" || item.body.includes("\n");
-          return (
-            <box key={item.id} style={{ flexDirection: "column", maxWidth: 110, marginLeft: item.parentId ? 2 : 0 }}>
-              <box style={{ flexDirection: "row" }}>
-                {genericRunning
-                  ? <Spinner color={genericTone} />
-                  : <text fg={genericTone}>{markerFor(item, icons)}</text>}
-                <text fg={genericTone}>{` ${item.title}${!stackGenericBody && item.body ? `  ${item.body}` : ""}`}</text>
-              </box>
-              {stackGenericBody && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
-            </box>
-          );
-        })}
-      </box>
+      <box style={{ flexDirection: "column", gap: 1, paddingTop: 1, paddingBottom: 1 }}>{rendered}</box>
     </scrollbox>
   );
 }
@@ -498,7 +531,6 @@ function panelIcon(kind: PanelSpec["kind"], icons: IconSet): string {
   if (kind === "sessions") return icons.session;
   if (kind === "observe") return icons.observe;
   if (kind === "permission") return icons.approval;
-  if (kind === "checkpoint") return icons.checkpoint;
   if (kind === "model") return icons.assistant;
   return icons.profile;
 }
@@ -1406,7 +1438,7 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
       dispatch({ type: "notice", level: "error", text: "会话未就绪，暂时无法提交。" });
       return;
     }
-    const panelCommands: Record<string, string> = { "/checkpoint": "checkpoint", "/mcp": "mcp", "/observe": "observe" };
+    const panelCommands: Record<string, string> = { "/mcp": "mcp", "/observe": "observe" };
     if (!attachments.length && panelCommands[text]) { setDraft(""); void invoke("open_panel", { panel: panelCommands[text] }); return; }
     if (!attachments.length && (text === "/compact" || text === "/fork")) { setDraft(""); void invoke("panel_action", { panel: "command", action: text.slice(1) }); return; }
     if (!onSubmit) return;
@@ -1455,7 +1487,7 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
   return (
     <box style={{ flexDirection: "column", width: "100%", height: "100%", backgroundColor: theme.background }}>
       <Header cwd={state.snapshot.cwd} theme={theme} icons={icons} compact={compact} narrow={narrow} onHistory={() => void invoke("open_sessions", undefined, "history")} onNew={() => void invoke("new_session")} />
-      <Transcript items={state.items} theme={theme} icons={icons} narrow={narrow} />
+      <Transcript items={state.items} theme={theme} icons={icons} narrow={narrow} onRewind={!running && !state.interaction && !workbenchOpen && !panel && onAction ? (pointId) => void invoke("rewind", { pointId }) : undefined} />
       <WorkStrip work={state.work} width={width} theme={theme} onOpen={openWorkbench} />
       {state.interaction ? <InteractionView interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping || workbenchOpen} sessionReady={Boolean(state.snapshot.sessionId) && state.snapshot.status !== "failed"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
       {panel && !state.interaction ? <PanelOverlay panel={panel} anchor={panelAnchor} theme={theme} icons={icons} terminalWidth={width} terminalHeight={height} onClose={() => setPanel(null)} onSelect={selectPanel} busyId={panelBusyId} /> : null}

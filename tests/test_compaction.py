@@ -1,29 +1,9 @@
 """Tests for context compaction strategy (PLAN.md)."""
 import os
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-
-def _install_fake_openai_module() -> None:
-    if "openai" in sys.modules:
-        return
-    openai = types.ModuleType("openai")
-
-    class OpenAI:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    openai.OpenAI = OpenAI
-    sys.modules["openai"] = openai
-
-
-_install_fake_openai_module()
-
-
 
 # ---------------------------------------------------------------------------
 # CompactionGate — controls when compaction is allowed

@@ -15,6 +15,7 @@ from harness_code_agent.runtime.middleware.stack import (
     build_subagent_middlewares,
 )
 from harness_code_agent.runtime.permission_middleware import PermissionMiddleware
+from harness_code_agent.runtime.verification import VerificationEngine
 from harness_code_agent.workspace.service import WorkspaceService
 
 
@@ -54,8 +55,8 @@ class MiddlewareStackFactoryTests(unittest.TestCase):
             self.assertIs(stack[1].tool_registry, registry)
             self.assertIs(stack[2]._ctx, context)
             self.assertIs(stack[2]._registry, registry)
-            self.assertEqual(stack[3]._workspace_root, str(root))
-            self.assertIs(stack[3]._workspace, workspace)
+            self.assertEqual(stack[3]._root, workspace.root)
+            self.assertIsInstance(stack[3].engine, VerificationEngine)
             self.assertIs(stack[4]._tool_context, context)
 
     def test_user_middlewares_run_before_guards(self):

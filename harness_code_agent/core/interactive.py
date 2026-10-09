@@ -4,7 +4,6 @@ import hashlib
 import json
 import logging
 import os
-import subprocess
 import threading
 import time
 from collections.abc import Callable
@@ -57,6 +56,7 @@ from ..runtime.questions import (
     QuestionProvider,
     QuestionRequest,
 )
+from ..runtime.recovery import RecoveryService, atomic_json
 from ..runtime.tool_context import ToolContext
 from ..runtime.tool_registry import tool_schemas_for_profile
 from ..sessions.events import (
@@ -93,15 +93,8 @@ log = logging.getLogger("harness")
 
 
 @dataclass
-class CheckpointConfig:
-    auto: bool = False
-    every_turns: int = 1
-
-
-@dataclass
 class TurnResult:
     text: str
-    checkpoint: str
     notice: str = ""
     streamed: bool = False
 
@@ -134,7 +127,6 @@ class InteractiveSession:
         stream_callback=None,
         profile_explicit: bool | None = None,
         enable_turn_summary: bool = True,
-        allow_checkpoint_init_failure: bool = False,
         startup_sink: Callable[[str], None] | None = None,
     ):
         self.cwd = Path(cwd).resolve()
@@ -155,9 +147,7 @@ class InteractiveSession:
         self.enable_turn_summary = enable_turn_summary
         self.memory_use_enabled = os.environ.get("HARNESS_MEMORY_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
         self.memory_auto_extract_enabled = os.environ.get("HARNESS_MEMORY_GENERATION_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
-        self.checkpoint = CheckpointConfig()
-        self._allow_checkpoint_init_failure = allow_checkpoint_init_failure
-        self.checkpoint_init_error: str = ""
+        self.recovery = RecoveryService(self.cwd)
         self._report_startup("loading skills")
         self.skill_registry = SkillRegistry()
         self._slash_registry = None
@@ -240,6 +230,7 @@ class InteractiveSession:
             tool_context=self.tool_context,
             tool_registry=self.tool_registry,
             workspace=self.cwd,
+            recovery=self.recovery,
         )
         # The memory index is dynamic reference material: it stays separate
         # from the stable prefix so cache boundaries (and diagnostics) treat
@@ -579,22 +570,6 @@ class InteractiveSession:
             encoding="utf-8",
         )
         self.event_bus = self.session_store.event_bus(self.session, listener=self.event_listener)
-        if self.checkpoint_init_error:
-            metadata = self.session_store.read_metadata(self.session.id)
-            metadata["checkpoint_status"] = "disabled"
-            metadata["checkpoint_init_error"] = self.checkpoint_init_error
-            self.session.metadata_path.write_text(
-                json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
-                encoding="utf-8",
-            )
-            self.event_bus.emit(
-                "checkpoint_disabled",
-                agent="main_agent",
-                payload={
-                    "reason": "git repository initialization failed",
-                    "error": self.checkpoint_init_error,
-                },
-            )
         self._prepare_tool_registry()
         self.tool_context = ToolContext(
             workspace=WorkspaceService(
@@ -703,7 +678,24 @@ class InteractiveSession:
         # history. Approved plans are now carried by the execution turn itself.
         return created
 
-    def _submit_to_current_agent(
+    def _submit_to_current_agent(self, user_prompt: str, cancellation_token=None, turn_instruction: str | None = None, attachments: tuple[Attachment, ...] = ()) -> TurnResult:
+        with self.recovery.store.exclusive():
+            self.recovery.begin_turn(
+                session_id=self.session.id, turn=self.turn_count,
+                journal_sequence=self.conversation.journal.sequence,
+                event_count=len(self.session_store.read_events(self.session.id)),
+            )
+            try:
+                return self._run_turn(user_prompt, cancellation_token, turn_instruction, attachments)
+            except BaseException:
+                try:
+                    self.recovery.observed = self.recovery.store.capture()
+                    self._announce_recovery_origin()
+                except (OSError, ValueError, RuntimeError):
+                    pass
+                raise
+
+    def _run_turn(
         self,
         user_prompt: str,
         cancellation_token=None,
@@ -764,11 +756,9 @@ class InteractiveSession:
                 "attachments": attachment_metadata,
             },
         )
-        # Slow preparation (MCP cold start, git baseline) runs after the
-        # turn_started event so the UI shows the assistant immediately; both
-        # only need to be ready before the first model call / turn teardown.
+        # MCP cold start follows turn_started so the UI shows the assistant
+        # immediately while tools are loading.
         self._ensure_mcp_tools_loaded()
-        baseline = capture_git_baseline(self.cwd) if self.checkpoint.auto else None
         turn_event_start = len(getattr(self.event_bus, "events", []))
         text = self.conversation.submit(
             model_content,
@@ -788,15 +778,13 @@ class InteractiveSession:
         )
         self.last_user_task = user_prompt
         self.last_assistant_text = text
+        if self.profile.name() == "plan":
+            self.recovery.protect()
         notice = self._capture_plan_handoff(text)
-        checkpoint = self._maybe_auto_checkpoint(
-            baseline=baseline,
-        )
         duration_seconds = time.time() - turn_started_at
         self._maybe_emit_turn_summary(
             user_prompt=user_prompt,
             assistant_text=text,
-            checkpoint=checkpoint,
             turn_event_start=turn_event_start,
             duration_seconds=duration_seconds,
         )
@@ -805,18 +793,24 @@ class InteractiveSession:
             agent="main_agent",
             payload={
                 "turn": self.turn_count,
-                "checkpoint": checkpoint,
                 "duration_seconds": duration_seconds,
             },
         )
-        return TurnResult(text=text, checkpoint=checkpoint, notice=notice, streamed=streamed)
+        point = self.recovery.finish_turn(
+            session_id=self.session.id,
+            turn=self.turn_count,
+            journal_sequence=self.conversation.journal.sequence,
+            event_count=len(self.session_store.read_events(self.session.id)),
+        )
+        self._announce_recovery_origin()
+        self.event_bus.emit("recovery_point_created", agent="main_agent", payload={"turn": self.turn_count, "point_id": point["id"]})
+        return TurnResult(text=text, notice=notice, streamed=streamed)
 
     def _maybe_emit_turn_summary(
         self,
         *,
         user_prompt: str,
         assistant_text: str,
-        checkpoint: str,
         turn_event_start: int,
         duration_seconds: float,
     ) -> None:
@@ -838,7 +832,6 @@ class InteractiveSession:
             events,
             user_prompt=user_prompt,
             assistant_text=assistant_text,
-            checkpoint=checkpoint,
         )
         self.event_bus.emit_event(
             TurnSummaryEvent(
@@ -847,7 +840,6 @@ class InteractiveSession:
                 duration_seconds=duration_seconds,
                 tool_counts=summary.tool_counts,
                 changed_files=summary.changed_files,
-                checkpoint=checkpoint,
                 generated_by=summary.generated_by,
             ).to_event()
         )
@@ -1281,13 +1273,16 @@ class InteractiveSession:
         # The fork copies the journal (conversation messages) but not the
         # event stream, which stays per-session; replay reads source events,
         # so pending-plan recovery must read the source events as well.
-        source_events = self.session_store.read_events(session_id)
+        source_events = self.session_store.read_history_events(session_id)
         branched = self.session_store.fork(session_id)
         recovered = SessionJournal(branched.journal_path).recovery_messages(
             self.agent.full_system_prompt
         )
         self._activate_session(branched)
         self.conversation._replace_messages(recovered)
+        self.turn_count = next((event["payload"]["turn"] for event in reversed(source_events) if isinstance((event.get("payload") or {}).get("turn"), int)), 0)
+        self.last_user_task = next((event["payload"].get("text", "") for event in reversed(source_events) if event["type"] == "user_input"), "")
+        self.last_assistant_text = next((event["payload"].get("text", "") for event in reversed(source_events) if event["type"] == "assistant_message"), "")
         self._restore_pending_plan(source_events)
         # The fork inherits the source session's profile in metadata; bring it
         # in line with the profile the live runtime is actually using.
@@ -1306,6 +1301,8 @@ class InteractiveSession:
         reason). Without this, the Workbench would offer "执行计划" for a
         resumed session while ``execute_pending_plan`` had nothing to run.
         """
+        self.pending_plan_markdown = None
+        self.pending_plan_revision = 0
         latest: dict[str, Any] | None = None
         executed = False
         for item in events:
@@ -1336,6 +1333,210 @@ class InteractiveSession:
             revision = latest.get("plan_revision")
             self.pending_plan_revision = int(revision) if isinstance(revision, int) else 1
 
+    def _announce_recovery_origin(self) -> None:
+        origin = self.recovery.origin
+        metadata = self.session_store.read_metadata(self.session.id)
+        if origin is not None and metadata.get("recovery_origin_point") != origin["id"]:
+            metadata["recovery_origin_point"] = origin["id"]
+            atomic_json(self.session.metadata_path, metadata)
+            self.event_bus.emit("recovery_point_created", agent="main_agent", payload={"turn": 0, "point_id": origin["id"]})
+
+    def _sync_recovery_session_state(self) -> None:
+        self.recovery.origin = next((point for point in self.recovery_points().values() if point["turn"] == 0), None)
+        self.recovery.observed = self.recovery.store.capture()
+        self.recovery.begin_turn()
+
+    def _profile_at_history(self, session_id: str, events: list[dict[str, Any]]) -> tuple[str, str]:
+        metadata = self.session_store.read_metadata(session_id)
+        profile = metadata["initial_profile"]
+        source = metadata["profile_source"]
+        for event in events:
+            payload = event.get("payload") or {}
+            if event["type"] == "session_started":
+                profile = payload["profile"]
+                source = payload["profile_source"]
+            elif event["type"] == "profile_switched":
+                profile = payload["profile"]
+                source = payload["reason"]
+        return profile, source
+
+    def recovery_points(self) -> dict[str, dict]:
+        points = {}
+        current = self.session.id
+        limit = None
+        seen = set()
+        while current:
+            if current in seen:
+                raise ValueError("会话历史存在循环")
+            seen.add(current)
+            metadata = self.session_store.read_metadata(current)
+            events = self.session_store.read_events(current)
+            for event in events if limit is None else events[:limit]:
+                if event.get("type") == "recovery_point_created":
+                    point_id = event["payload"]["point_id"]
+                    points[point_id] = self.recovery.store.read_point(point_id)
+            if metadata.get("recovery_base_point"):
+                point_id = metadata["recovery_base_point"]
+                points[point_id] = self.recovery.store.read_point(point_id)
+            if metadata.get("recovery_origin_point"):
+                point_id = metadata["recovery_origin_point"]
+                points[point_id] = self.recovery.store.read_point(point_id)
+            current = metadata.get("forked_from")
+            limit = metadata.get("forked_from_event_count")
+        return {point_id: point for point_id, point in points.items() if point["session_id"] in seen}
+
+    def rewind_to_point(self, point_id: str) -> bool:
+        from ..agent.runtime_state import AgentRuntimeState, TodoItem, TodoList
+        from ..workspace.change_journal import WorkspaceChangeJournal
+        from ..workspace.shell_jobs import ShellJobManager
+
+        coordinator = self.tool_context.agent_coordinator
+        if coordinator.has_active_agents():
+            raise ValueError("请先停止运行中的子代理，再回撤")
+        jobs = self.conversation.runtime_state.shell_job_manager
+        if jobs is not None and jobs.running_jobs():
+            raise ValueError("请先停止后台命令，再回撤")
+        if self.tool_context.tool_tasks.pending_count:
+            raise ValueError("请等待工具操作结束，再回撤")
+        with self.recovery.store.exclusive():
+            point = self.recovery_points().get(point_id)
+            if point is None:
+                raise ValueError("此回撤点不属于当前对话")
+            store = self.recovery.store
+            current = store.capture()
+            target = point["snapshot"]
+            changed = store.changed(current, target)
+            target_manifest, current_manifest = store.manifest(target), store.manifest(current)
+            files = [name for name in changed if any(manifest.get(name, {}).get("kind") in {"file", "link"} for manifest in (target_manifest, current_manifest))]
+            observed = self.recovery.observed
+            if observed is None:
+                latest = max(self.recovery_points().values(), key=lambda p: p["turn"], default=None)
+                observed = latest["snapshot"] if latest else current
+            conflicts = set(store.changed(current, observed)) & set(changed)
+            detail = f"保留前 {point['turn']} 轮对话，撤回后续 {max(0, self.turn_count - point['turn'])} 轮，恢复 {len(files)} 个文件。"
+            if conflicts:
+                detail += "\n以下路径在最近一次记录后发生了修改，将被覆盖：\n" + "\n".join(sorted(conflicts))
+            destination = "会话开始时" if point["turn"] == 0 else f"第 {point['turn']} 轮结束时"
+            answer = self.question_provider.ask(QuestionRequest(
+                question=f"回撤到{destination}？\n{detail}",
+                options=[QuestionOption("取消", "cancel"), QuestionOption("确认回撤", "rewind")],
+                agent_name="main_agent", session_id=self.session.id,
+            ))
+            if answer.cancelled or answer.value != "rewind":
+                return False
+            if store.capture() != current:
+                raise ValueError("确认期间工作区发生变化，请重新发起回撤")
+            source = self.session
+            events = self.session_store.read_history_events(point["session_id"], event_count=point["event_count"])
+            target_profile, target_profile_source = self._profile_at_history(point["session_id"], events)
+            messages = SessionJournal(self.session_store._session_root(point["session_id"]) / "journal.jsonl").recovery_messages(
+                self.agent.full_system_prompt, through_sequence=point["journal_sequence"],
+            )
+            todo_payload = None
+            for event in events:
+                payload = event.get("payload") or {}
+                if event.get("type") == "tool_result" and event.get("agent") == "main_agent":
+                    state = (payload.get("metadata") or {}).get("todo_state")
+                    if state is not None:
+                        todo_payload = state
+            todo = None
+            if todo_payload:
+                todo = TodoList(
+                    items=[TodoItem(**item) for item in todo_payload["items"]],
+                    revision=todo_payload.get("revision", 0),
+                    updated_at=todo_payload.get("updated_at", ""),
+                    next_seq=todo_payload.get("next_seq", 0),
+                )
+            branched = self.session_store.fork_at(
+                point["session_id"], journal_sequence=point["journal_sequence"],
+                event_count=point["event_count"], recovery_point_id=point_id,
+            )
+            runtime = AgentRuntimeState(
+                shell_job_manager=ShellJobManager(self.cwd), todo=todo,
+                session_id=branched.id, permission_mode=self.permission_mode,
+                current_turn_start_index=len(messages),
+            )
+            transaction = {"status": "prepared", "before": current, "target": target, "source_session": source.id, "target_session": branched.id}
+            transaction_path = store.root / "transactions" / f"{branched.id}.json"
+            atomic_json(transaction_path, transaction)
+            old_conversation = dict(self.conversation.__dict__)
+            old_task_metadata = self.agent.current_task_metadata
+            old_profile = (self.profile, self.agent, self._active_profile_name, self._profile_source)
+            old_slots = {name: ProfileRuntime(slot.profile, slot.agent, slot.conversation) for name, slot in self.profile_runtimes.items()}
+            old_policy = (self.tool_context.permission_policy, self.tool_context.allowed_tool_permissions, self.tool_context.blocked_tool_names)
+            old_recovery = (self.recovery.origin, self.recovery.observed, self.recovery.before, self.recovery._start_location)
+            old_state = (self.turn_count, self.pending_plan_markdown, self.pending_plan_revision, self.last_user_task, self.last_assistant_text)
+            old_changes = self.tool_context.workspace.change_journal
+            new_coordinator = AgentCoordinator(
+                self.tool_context,
+                parent_messages=lambda: list(self.conversation.messages),
+                parent_message_sink=self._queue_parent_message,
+            )
+            try:
+                store.restore(current, target)
+                if store.capture() != target:
+                    raise RuntimeError("恢复期间工作区发生变化，已取消回撤")
+                self._activate_session(branched)
+                self._activate_profile_runtime(target_profile)
+                self._profile_source = target_profile_source
+                messages[0] = {"role": "system", "content": self.agent.full_system_prompt}
+                self.conversation._replace_messages(messages)
+                self.conversation.runtime_state = runtime
+                runtime.event_bus = self.event_bus
+                self.conversation.fact_tracker = type(self.conversation.fact_tracker)()
+                self.conversation.compaction_gate = type(self.conversation.compaction_gate)()
+                self.conversation.context_manager = type(self.conversation.context_manager)()
+                self.conversation._queued_messages = []
+                self.conversation._iteration_offset = 0
+                self.conversation._cached_prompt_cache_key = None
+                self.conversation._last_prompt_cache_shape = None
+                self.conversation._pending_prompt_cache_shape = None
+                self.conversation.observation_store = type(self.conversation.observation_store)(self.conversation._observation_dir())
+                self.turn_count = point["turn"]
+                self.pending_plan_markdown = None
+                self.pending_plan_revision = 0
+                self._restore_pending_plan(events)
+                self.last_user_task = next((e["payload"].get("text", "") for e in reversed(events) if e["type"] == "user_input"), "")
+                self.last_assistant_text = next((e["payload"].get("text", "") for e in reversed(events) if e["type"] == "assistant_message"), "")
+                self.conversation.last_text = self.last_assistant_text
+                self.agent.current_task_metadata = {}
+                if todo_payload is not None:
+                    atomic_json(branched.root / "todo" / "state.json", todo_payload)
+                self.tool_context.workspace.change_journal = WorkspaceChangeJournal()
+                self.tool_context.agent_coordinator = new_coordinator
+                self.session_store.update_status(branched.id, "running")
+                self.session_store.update_permission_mode(branched.id, self.permission_mode)
+                self.session_store.update_profile(branched.id, self.profile.name(), self._profile_source)
+                self.session_store.update_routing_mode(branched.id, self.routing_mode)
+                transaction["status"] = "committed"
+                atomic_json(transaction_path, transaction)
+            except BaseException:
+                self._activate_session(source)
+                self.conversation.rebind_agent(old_profile[1])
+                self.conversation.__dict__.update(old_conversation)
+                self.profile, self.agent, self._active_profile_name, self._profile_source = old_profile
+                self.profile_runtimes = old_slots
+                self.tool_context.permission_policy, self.tool_context.allowed_tool_permissions, self.tool_context.blocked_tool_names = old_policy
+                self.agent.current_task_metadata = old_task_metadata
+                self.turn_count, self.pending_plan_markdown, self.pending_plan_revision, self.last_user_task, self.last_assistant_text = old_state
+                self.tool_context.workspace.change_journal = old_changes
+                self.tool_context.agent_coordinator = coordinator
+                new_coordinator.close()
+                runtime.shell_job_manager.close()
+                store.restore(store.capture(), current)
+                self.recovery.origin, self.recovery.observed, self.recovery.before, self.recovery._start_location = old_recovery
+                transaction["status"] = "rolled_back"
+                atomic_json(transaction_path, transaction)
+                self.session_store.update_status(branched.id, "discarded")
+                raise
+            self.recovery.observed = target
+            self.lifecycle.register("agent_coordinator", new_coordinator.close, order=30)
+            coordinator.close()
+            old_conversation["runtime_state"].close_shell_sessions()
+            if jobs is not None:
+                jobs.close()
+            return True
+
     def _activate_session(self, session: Session) -> None:
         """Rebind every live component onto an already-created session."""
         self.session = session
@@ -1361,6 +1562,7 @@ class InteractiveSession:
         if self.tool_context is not None:
             self.tool_context.session_id = session.id
             self.tool_context.event_bus = self.event_bus
+        self._sync_recovery_session_state()
 
     def _externalize_large_turn_text(self, label: str, text: str, *, intro: str) -> str:
         limit = _env_int("HARNESS_TURN_INLINE_CHAR_LIMIT", TURN_INLINE_CHAR_LIMIT)
@@ -1434,133 +1636,6 @@ class InteractiveSession:
         hits = MemoryService(self.cwd).search(user_prompt, scope="both", paths=mention_paths)
         return MemoryService.format_hits(hits)
 
-    def _handle_checkpoint_command(self, args: list[str]) -> str:
-        if not args:
-            return self.create_checkpoint(manual=True)
-        if args[:2] == ["auto", "on"]:
-            return self.set_auto_checkpoint(True)
-        if args[:2] == ["auto", "off"]:
-            return self.set_auto_checkpoint(False)
-        if args[:2] == ["every", "turn"]:
-            self.checkpoint.every_turns = 1
-            return "checkpoint cadence: every turn"
-        if (
-            args
-            and args[0] == "every"
-            and len(args) in (2, 3)
-            and (len(args) == 2 or args[2] in ("turn", "turns"))
-        ):
-                try:
-                    turns = int(args[1])
-                except ValueError as e:
-                    raise ValueError("Usage: /checkpoint every <N> turns") from e
-                if turns < 1:
-                    raise ValueError("Checkpoint cadence must be at least 1 turn")
-                self.checkpoint.every_turns = turns
-                return f"checkpoint cadence: every {turns} turns"
-
-        if args == ["status"]:
-            return (
-                f"checkpoint auto: {'on' if self.checkpoint.auto else 'off'}; "
-                f"cadence: every {self.checkpoint.every_turns} turn(s)"
-            )
-        raise ValueError("Usage: /checkpoint [auto on|auto off|every turn|every <N> turns|status]")
-
-    def set_auto_checkpoint(self, enabled: bool) -> str:
-        if enabled and not self._ensure_checkpoint_repository():
-            return "checkpoint unavailable: git repository initialization failed"
-        self.checkpoint.auto = enabled
-        return f"checkpoint auto: {'on' if enabled else 'off'}"
-
-    def _ensure_checkpoint_repository(self) -> bool:
-        if (self.cwd / ".git").exists():
-            return True
-        self._report_startup("preparing checkpoints")
-        try:
-            _ensure_git_repository(self.cwd)
-            self.checkpoint_init_error = ""
-            return True
-        except (OSError, subprocess.CalledProcessError) as exc:
-            if not self._allow_checkpoint_init_failure:
-                raise
-            self.checkpoint.auto = False
-            self.checkpoint_init_error = f"{type(exc).__name__}: {exc}"
-            if self.session is not None and self.event_bus is not None:
-                metadata = self.session_store.read_metadata(self.session.id)
-                metadata["checkpoint_status"] = "disabled"
-                metadata["checkpoint_init_error"] = self.checkpoint_init_error
-                self.session.metadata_path.write_text(
-                    json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                self.event_bus.emit(
-                    "checkpoint_disabled",
-                    agent="main_agent",
-                    payload={
-                        "reason": "git repository initialization failed",
-                        "error": self.checkpoint_init_error,
-                    },
-                )
-            return False
-
-    def _maybe_auto_checkpoint(
-        self,
-        *,
-        baseline: GitBaseline | None,
-    ) -> str:
-        if not self.checkpoint.auto:
-            return "checkpoint auto off"
-        if baseline is None:
-            return "checkpoint skipped: git status unavailable"
-        if self.turn_count % self.checkpoint.every_turns != 0:
-            return "checkpoint cadence skipped"
-        if baseline.staged_paths:
-            return "checkpoint skipped: staged changes existed before turn"
-        return self.create_checkpoint(manual=False, baseline_dirty=set(baseline.dirty_paths))
-
-    def create_checkpoint(
-        self,
-        *,
-        manual: bool,
-        baseline_dirty: set[str] | None = None,
-    ) -> str:
-        if self.session is None:
-            return "checkpoint skipped: no active session"
-        if not self._ensure_checkpoint_repository():
-            return "checkpoint skipped: git repository unavailable"
-        if self.checkpoint_init_error:
-            return "checkpoint skipped: git repository unavailable"
-        if not git_has_committable_changes(self.cwd):
-            return "no changes to checkpoint"
-        paths_to_add = None
-        if not manual and baseline_dirty is not None:
-            current_dirty = git_dirty_paths(self.cwd)
-            paths_to_add = sorted(current_dirty - baseline_dirty)
-            if not paths_to_add:
-                return "no changes to checkpoint"
-        if paths_to_add is None:
-            git_add_runtime_excluded(self.cwd)
-        else:
-            git_add_paths(self.cwd, paths_to_add)
-        if not git_has_staged_changes(self.cwd):
-            return "no changes to checkpoint"
-        detail = "manual" if manual else f"turn {self.turn_count}"
-        message = f"checkpoint: {self.session.id} {detail}"
-        subprocess.run(
-            git_commit_command(message),
-            cwd=self.cwd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
-        rev = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=self.cwd,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        return f"checkpoint created: {rev}"
 
     def close(self) -> None:
         with self._close_lock:
@@ -1713,17 +1788,3 @@ def print_turn_result(result: TurnResult) -> None:
         print(result.text)
     if result.notice:
         print(result.notice)
-    if result.checkpoint:
-        print(result.checkpoint)
-
-from .git_helpers import (
-    GitBaseline,
-    _ensure_git_repository,
-    capture_git_baseline,
-    git_add_paths,
-    git_add_runtime_excluded,
-    git_commit_command,
-    git_dirty_paths,
-    git_has_committable_changes,
-    git_has_staged_changes,
-)

@@ -362,7 +362,7 @@ function mockAction(name: ActionName, params?: Record<string, unknown>): Promise
       ],
     } });
     if (panel === "observe") return Promise.resolve({ ok: true, panel: { kind: "observe", title: "运行观察  当前会话", body: "当前会话  状态：就绪\n令牌：0\n工具：0", options: [{ id: "observe:project", label: "切换到项目概览" }] } });
-    if (panel === "checkpoint") return Promise.resolve({ ok: true, panel: { kind: "checkpoint", title: "检查点", body: "当前：自动开启  每 5 轮", options: [{ id: "create", label: "立即创建检查点" }, { id: "auto_on", label: "开启自动检查点" }, { id: "auto_off", label: "关闭自动检查点" }] } });
+
     if (panel === "mcp") return Promise.resolve({ ok: true, panel: { kind: "mcp", title: "MCP 管理", body: "已连接 0 个服务  已注册 0 个工具", options: [{ id: "reload", label: "重新加载全部 MCP 服务" }] } });
     return Promise.resolve({ ok: true, panel: { kind: "help", title: "快捷键与命令", body: "Enter 提交  Shift+Enter 换行  Ctrl+C 取消/退出  Ctrl+O 运行观察  Ctrl+P 打开审批模式" } });
   }

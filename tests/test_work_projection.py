@@ -35,7 +35,7 @@ class WorkStateProjectionTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_protocol_version_is_v5_and_accepts_work_events(self) -> None:
-        self.assertEqual(UI_PROTOCOL_VERSION, 5)
+        self.assertEqual(UI_PROTOCOL_VERSION, 6)
         validate_ui_event({"type": "plan_updated", "plan": None})
         validate_ui_event({"type": "tasks_updated", "tasks": {"items": [], "completed": 0, "total": 0}})
         validate_ui_event({"type": "agent_run_updated", "agents": []})
@@ -44,6 +44,12 @@ class WorkStateProjectionTests(unittest.TestCase):
         validate_ui_event({"type": "artifact_updated", "artifacts": []})
         with self.assertRaises(ValueError):
             validate_ui_event({"type": "plan_updated"})
+
+    def test_skipped_verification_is_preserved(self) -> None:
+        self.projection.apply_event(event("checks_recorded", {
+            "checks": [{"name": "TypeScript", "status": "skipped", "detail": "not installed"}],
+        }))
+        self.assertEqual(self.projection.section("checks")[0]["status"], "skipped")
 
     def test_plan_lifecycle_parses_steps_and_tracks_progress(self) -> None:
         changed = self.projection.apply_event(event("plan_ready", {

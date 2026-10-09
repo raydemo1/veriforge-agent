@@ -65,8 +65,8 @@ class SessionJournal:
                 continue
         return entries
 
-    def recovery_messages(self, system_prompt: str) -> list[dict]:
-        entries = self.read()
+    def recovery_messages(self, system_prompt: str, *, through_sequence: int | None = None) -> list[dict]:
+        entries = [entry for entry in self.read() if through_sequence is None or entry.sequence <= through_sequence]
         compactions = [entry for entry in entries if entry.kind == "compaction"]
         if compactions:
             latest = compactions[-1]

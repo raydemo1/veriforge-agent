@@ -1,29 +1,11 @@
 """Tests for the user middleware loader (~/.harness/middlewares.json)."""
 import json
 import os
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-
-
-def _install_fake_openai_module() -> None:
-    if "openai" in sys.modules:
-        return
-    openai = types.ModuleType("openai")
-
-    class OpenAI:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    openai.OpenAI = OpenAI
-    sys.modules["openai"] = openai
-
-
-_install_fake_openai_module()
 
 from harness_code_agent.agent.conversation import Agent, AgentConversation
 from harness_code_agent.runtime.middleware import AgentMiddleware
@@ -36,7 +18,6 @@ from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.runtime.tool_result import ToolResult
 from harness_code_agent.sessions.events import EventBus
 from harness_code_agent.workspace.service import WorkspaceService
-
 
 _MIDDLEWARE_SOURCE = '''
 from harness_code_agent.runtime.middleware import AgentMiddleware
@@ -160,7 +141,6 @@ class RecordingMiddleware(AgentMiddleware):
     def before_tool(self, tool_name, tool_args, messages, runtime_state=None,
                     agent_name=None, permission_decision=None):
         self._record("before_tool")
-        return None
 
     def on_tool_allowed(self, tool_name, tool_args, messages, runtime_state=None,
                         agent_name=None):
@@ -169,11 +149,9 @@ class RecordingMiddleware(AgentMiddleware):
     def post_tool(self, tool_name, tool_args, result, messages, runtime_state=None,
                   agent_name=None):
         self._record("post_tool")
-        return None
 
     def on_tool_failure(self, failure, messages, runtime_state=None, agent_name=None):
         self._record("on_tool_failure")
-        return None
 
     def on_context_compacted(self, messages, runtime_state=None, agent_name=None,
                              phase=None):
@@ -182,7 +160,6 @@ class RecordingMiddleware(AgentMiddleware):
 
     def pre_exit(self, messages, runtime_state=None, agent_name=None):
         self._record("pre_exit")
-        return None
 
     def on_conversation_close(self, messages, runtime_state=None, agent_name=None):
         self._record("on_conversation_close")

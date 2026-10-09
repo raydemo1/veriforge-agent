@@ -121,6 +121,29 @@ class SessionStore:
         )
         return session
 
+    def fork_at(self, source_session_id: str, *, journal_sequence: int, event_count: int, recovery_point_id: str) -> Session:
+        from ..runtime.recovery import atomic_bytes, atomic_json
+        from .journal import SessionJournal
+
+        entries = SessionJournal(self._session_root(source_session_id) / "journal.jsonl").read()
+        events = self.read_events(source_session_id)
+        if (journal_sequence != 0 and not any(entry.sequence == journal_sequence for entry in entries)) or not 0 <= event_count <= len(events):
+            raise ValueError("回撤点的对话位置无效")
+        branched = self.fork(source_session_id)
+        history = self.read_history_events(source_session_id, event_count=event_count)
+        atomic_bytes(
+            branched.journal_path,
+            "".join(json.dumps(entry.__dict__, ensure_ascii=False) + "\n" for entry in entries if entry.sequence <= journal_sequence).encode("utf-8"),
+        )
+        atomic_bytes(
+            branched.events_path,
+            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in history).encode("utf-8"),
+        )
+        metadata = self.read_metadata(branched.id)
+        metadata.update(status="restoring", forked_from_event_count=event_count, forked_from_journal_sequence=journal_sequence, recovery_base_point=recovery_point_id, events_include_lineage=True)
+        atomic_json(branched.metadata_path, metadata)
+        return branched
+
     def event_bus(
         self,
         session: Session,
@@ -137,6 +160,8 @@ class SessionStore:
             try:
                 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
+                continue
+            if metadata.get("status") in {"restoring", "discarded"}:
                 continue
             session_root = metadata_path.parent
             metadata.setdefault("id", session_root.name)
@@ -159,13 +184,12 @@ class SessionStore:
         return json.loads(metadata_path.read_text(encoding="utf-8"))
 
     def update_status(self, session_id: str, status: str) -> dict[str, Any]:
+        from ..runtime.recovery import atomic_json
+
         metadata = self.read_metadata(session_id)
         metadata["status"] = status
         metadata_path = self._session_root(session_id) / "session.json"
-        metadata_path.write_text(
-            json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        atomic_json(metadata_path, metadata)
         return metadata
 
     def update_permission_mode(self, session_id: str, permission_mode: str) -> dict[str, Any]:
@@ -212,6 +236,24 @@ class SessionStore:
                 continue
             events.append(json.loads(line))
         return events
+
+    def read_history_events(self, session_id: str, *, event_count: int | None = None) -> list[dict[str, Any]]:
+        seen = set()
+
+        def read(current: str, limit: int | None):
+            if current in seen:
+                raise ValueError(f"Session lineage cycle detected: {current}")
+            seen.add(current)
+            metadata = self.read_metadata(current)
+            events = self.read_events(current)
+            if limit is not None:
+                events = events[:limit]
+            source = metadata.get("forked_from")
+            if source and not metadata.get("events_include_lineage"):
+                return read(source, metadata.get("forked_from_event_count")) + events
+            return events
+
+        return read(session_id, event_count)
 
     def write_summary(self, session_id: str) -> str:
         from .summary import format_session_summary

@@ -40,6 +40,7 @@ from .agents import (
     wait_agents,
 )
 from .browser import browser_test, stop_dev_server
+from .code_intelligence import code_intelligence
 from .discovery import tool_search
 from .filesystem import (
     apply_patch,
@@ -84,6 +85,10 @@ def _build_builtin_tool_registry() -> ToolRegistry:
             effect=effect,
             capabilities=capabilities,
         )
+
+    add("code_intelligence", code_intelligence, TOOL_PERMISSION_READ,
+        lambda _args, context: CallEffect((workspace_claim(_root(context), ".", scope="global", access="read"),)),
+        capabilities=all_agents)
 
     add(
         "read_file",

@@ -247,7 +247,6 @@ class TurnSummaryEvent:
     duration_seconds: float
     tool_counts: dict[str, int] | None = None
     changed_files: list[str] | None = None
-    checkpoint: str = ""
     generated_by: dict[str, Any] | None = None
     long_task: bool = True
     fold_details: bool = True
@@ -264,7 +263,6 @@ class TurnSummaryEvent:
                 "duration_seconds": self.duration_seconds,
                 "tool_counts": dict(self.tool_counts or {}),
                 "changed_files": list(self.changed_files or []),
-                "checkpoint": self.checkpoint,
                 "generated_by": dict(self.generated_by or {}),
             },
             self.agent,
@@ -530,6 +528,11 @@ class EventBus:
         self._sequence = 0
         if self.events_path is not None:
             self.events_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.events_path.exists():
+                with self.events_path.open(encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.strip():
+                            self._sequence = max(self._sequence, int(json.loads(line)["sequence"]))
 
     def emit(
         self,

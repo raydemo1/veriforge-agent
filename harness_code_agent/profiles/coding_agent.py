@@ -33,7 +33,8 @@ class CodingAgentProfile(BaseProfile):
                 ),
                 working_style=(
                     "Study the relevant repository state and existing design before editing. Prefer the "
-                    "project's current abstractions and helper APIs, and make the narrowest complete "
+                    "project's current abstractions and helper APIs. When semantic code navigation would "
+                    "materially reduce uncertainty, prefer code_intelligence over text search. Make the narrowest complete "
                     "change that satisfies the request. Tests should reproduce bugs before fixes and "
                     "protect behavior changes when the repository has a suitable test seam.\n\n"
                     f"{TASK_TRACKING_POLICY}\n\n"

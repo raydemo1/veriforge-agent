@@ -660,7 +660,6 @@ class ProductRuntimeTests(unittest.TestCase):
             duration_seconds=12.5,
             tool_counts={"read_file": 1},
             changed_files=["app.py"],
-            checkpoint="checkpoint created: abc",
             generated_by={"intensity": "fast", "model": "custom-fast"},
         ).to_event()
 
@@ -713,7 +712,6 @@ class ProductRuntimeTests(unittest.TestCase):
                 [{"type": "tool_result", "payload": {"tool": "read_file"}}],
                 user_prompt="fix",
                 assistant_text="done",
-                checkpoint="",
                 llm_create=fake_create,
             )
 
@@ -735,7 +733,6 @@ class ProductRuntimeTests(unittest.TestCase):
             ],
             user_prompt="fix app",
             assistant_text="updated app.py",
-            checkpoint="checkpoint created: abc",
             llm_create=broken_create,
         )
 
@@ -3210,7 +3207,6 @@ class ProductRuntimeTests(unittest.TestCase):
                         "evidence contradicts the current plan",
                         tag="SUBAGENT MESSAGE from explorer",
                     )
-                return None
 
             def pre_exit(self, messages, runtime_state=None, agent_name=None):
                 return None
@@ -3615,7 +3611,7 @@ class ProductRuntimeTests(unittest.TestCase):
             (root / "good.py").write_text("def f(\n", encoding="utf-8")
 
             with patch(
-                "harness_code_agent.runtime.middleware.verification._check_ruff",
+                "harness_code_agent.runtime.verification.python._check_ruff",
                 return_value=([], True),
             ):
                 result = mw.pre_exit(messages=[])
@@ -3643,7 +3639,7 @@ class ProductRuntimeTests(unittest.TestCase):
             (root / "bad.py").write_text("def f(\n", encoding="utf-8")
 
             with patch(
-                "harness_code_agent.runtime.middleware.verification._check_ruff",
+                "harness_code_agent.runtime.verification.python._check_ruff",
                 return_value=([], True),
             ):
                 result = mw.pre_exit(messages=[])
@@ -3664,7 +3660,7 @@ class ProductRuntimeTests(unittest.TestCase):
             workspace.write_text("bad.py", "def f(\n")
 
             with patch(
-                "harness_code_agent.runtime.middleware.verification._check_ruff",
+                "harness_code_agent.runtime.verification.python._check_ruff",
                 return_value=([], True),
             ):
                 result = mw.pre_exit(messages=[])
@@ -3685,7 +3681,7 @@ class ProductRuntimeTests(unittest.TestCase):
             workspace.write_text("warn.py", "x = 1\n")
 
             with patch(
-                "harness_code_agent.runtime.middleware.verification._check_ruff",
+                "harness_code_agent.runtime.verification.python._check_ruff",
                 return_value=([("warn.py", "W292", "no newline at end of file", 1)], True),
             ):
                 first = mw.pre_exit(messages=[])
@@ -3722,7 +3718,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 returncode=1, stdout=payload, stderr="",
             ))
             with patch(
-                "harness_code_agent.runtime.middleware.verification.subprocess.run",
+                "harness_code_agent.runtime.verification.python.subprocess.run",
                 fake_run,
             ):
                 result = mw.pre_exit(messages=[])
@@ -3753,7 +3749,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 returncode=1, stdout="this is not json", stderr="",
             ))
             with patch(
-                "harness_code_agent.runtime.middleware.verification.subprocess.run",
+                "harness_code_agent.runtime.verification.python.subprocess.run",
                 fake_run,
             ):
                 self.assertIsNone(mw.pre_exit(messages=[]))
@@ -3778,7 +3774,7 @@ class ProductRuntimeTests(unittest.TestCase):
     def test_check_ruff_not_installed_gracefully_skips(self):
         from unittest.mock import patch as _patch
 
-        from harness_code_agent.runtime.middleware import _check_ruff
+        from harness_code_agent.runtime.verification.python import _check_ruff
 
         def fake_run(*a, **kw):
             raise FileNotFoundError
@@ -3791,10 +3787,9 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_check_ruff_timeout_is_non_blocking_warning(self):
         import subprocess
-
         from unittest.mock import patch as _patch
 
-        from harness_code_agent.runtime.middleware import _check_ruff
+        from harness_code_agent.runtime.verification.python import _check_ruff
 
         def fake_run(*a, **kw):
             raise subprocess.TimeoutExpired(cmd="ruff", timeout=30)
@@ -3833,7 +3828,7 @@ class ProductRuntimeTests(unittest.TestCase):
             bus = FakeBus()
 
             with patch(
-                "harness_code_agent.runtime.middleware.verification._check_ruff",
+                "harness_code_agent.runtime.verification.python._check_ruff",
                 return_value=([], True),
             ):
                 mw.pre_exit(messages=[], runtime_state=SimpleNamespace(event_bus=bus))

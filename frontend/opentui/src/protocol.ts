@@ -1,7 +1,7 @@
 export type ThemePreference = "auto" | "dark" | "light";
 export type IconPreference = "auto" | "nerd" | "unicode";
 
-export const UI_PROTOCOL_VERSION = 5;
+export const UI_PROTOCOL_VERSION = 6;
 
 export type Snapshot = {
   profile: string;
@@ -47,6 +47,8 @@ export type TranscriptItem = {
   state?: "running" | "success" | "failed" | "pending" | "changed";
   role?: "group" | "message";
   parentId?: string;
+  turn?: number;
+  recoveryPointId?: string;
   direction?: "in" | "out";
 };
 
@@ -66,7 +68,7 @@ export type Interaction = ApprovalInteraction | QuestionInteraction;
 
 export type PanelOption = { id: string; label: string; description?: string; badge?: string; tone?: "default" | "success" | "warning" | "danger"; selected?: boolean };
 export type PanelSpec = {
-  kind: "sessions" | "profile" | "permission" | "model" | "effort" | "checkpoint" | "mcp" | "observe" | "help";
+  kind: "sessions" | "profile" | "permission" | "model" | "effort" | "mcp" | "observe" | "help";
   title: string;
   body?: string;
   options?: PanelOption[];
@@ -129,7 +131,7 @@ export type ChangesState = {
 export type Check = {
   id: string;
   name: string;
-  status: "passed" | "failed" | "warning" | "running";
+  status: "passed" | "failed" | "warning" | "running" | "skipped";
   detail: string;
 };
 export type Artifact = {
@@ -159,6 +161,7 @@ export const initialWorkState: WorkState = {
 };
 
 export type ActionName =
+  | "rewind"
   | "open_sessions"
   | "new_session"
   | "open_panel"
@@ -196,6 +199,7 @@ export type UiEvent =
   | { type: "session_reset"; snapshot: Snapshot; items?: TranscriptItem[] }
   | { type: "transcript"; item: TranscriptItem }
   | { type: "transcript_update"; id: string; body: string; state?: TranscriptItem["state"] }
+  | { type: "recovery_available"; turn: number; pointId: string }
   | { type: "assistant_delta"; id: string; text: string }
   | { type: "commands"; commands: CommandItem[] }
   | { type: "progress"; status: string; detail: string }
@@ -224,7 +228,6 @@ export type BridgeMessage =
   | { type: "event"; event: UiEvent };
 
 export const DEFAULT_COMMANDS: CommandItem[] = [
-  { name: "/checkpoint", category: "工作流", description: "打开检查点管理" },
   { name: "/mcp", category: "工作流", description: "打开 MCP 服务与工具管理" },
   { name: "/compact", category: "工作流", description: "压缩当前对话上下文" },
   { name: "/context", category: "会话", description: "查看上下文预算组成" },

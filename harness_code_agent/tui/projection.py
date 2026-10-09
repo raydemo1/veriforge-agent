@@ -303,7 +303,7 @@ class WorkStateProjection:
     def _upsert_check(self, raw: dict[str, Any]) -> set[str]:
         name = str(raw.get("name") or "").strip()
         status = str(raw.get("status") or "").strip()
-        if not name or status not in {"passed", "failed", "warning", "running"}:
+        if not name or status not in {"passed", "failed", "warning", "running", "skipped"}:
             return set()
         check_id = _slug(name)
         self._checks[check_id] = {

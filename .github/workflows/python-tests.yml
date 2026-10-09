@@ -1,0 +1,66 @@
+name: Python tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: Runtime (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install Python dependencies
+        run: python -m pip install -e ".[test]"
+      - name: Run runtime and protocol tests
+        run: python -m pytest -q -m "not integration" -rs
+
+  lsp:
+    name: LSP integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.18.0'
+          package-manager-cache: false
+      - name: Install Python dependencies
+        run: python -m pip install -e ".[test]"
+      - name: Install pinned LSP tools outside the workspace
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP 'lsp-tools'
+          $cache = Join-Path $env:RUNNER_TEMP 'npm-cache'
+          npm install --global --prefix $prefix --cache $cache --ignore-scripts pyright@1.1.414 typescript-language-server@6.0.1 typescript@6.0.3
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bin = if ($IsWindows) { $prefix } else { Join-Path $prefix 'bin' }
+          Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin -Encoding utf8NoBOM
+      - name: Check installed tools
+        run: |
+          node --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm ls --global --prefix (Join-Path $env:RUNNER_TEMP 'lsp-tools') --depth=0
+      - name: Run required real-tool tests
+        run: python -m pytest -q -m integration --require-integration-tools -rs

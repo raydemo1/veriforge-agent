@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-UI_PROTOCOL_VERSION = 5
+UI_PROTOCOL_VERSION = 6
 
 _EVENT_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
     "snapshot": frozenset({"snapshot"}),
     "session_reset": frozenset({"snapshot"}),
     "transcript": frozenset({"item"}),
     "transcript_update": frozenset({"id", "body"}),
+    "recovery_available": frozenset({"turn", "pointId"}),
     "assistant_delta": frozenset({"id", "text"}),
     "commands": frozenset({"commands"}),
     "progress": frozenset({"status", "detail"}),

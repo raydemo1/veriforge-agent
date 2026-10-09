@@ -1,22 +1,6 @@
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
-
-
-def _install_fake_openai_module() -> None:
-    openai = types.ModuleType("openai")
-
-    class OpenAI:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    openai.OpenAI = OpenAI
-    sys.modules["openai"] = openai
-
-
-_install_fake_openai_module()
 
 from harness_code_agent.runtime.builtins.filesystem import read_skill_file
 from harness_code_agent.skills.registry import SKILLS_DIR, SkillRegistry
@@ -44,7 +28,7 @@ class SkillCatalogTests(unittest.TestCase):
                 "---\n"
                 "name: triage\n"
                 "description: Triage an issue.\n"
-                "argument-hint: \"<issue>\"\n"
+                'argument-hint: "<issue>"\n'
                 "disable-model-invocation: true\n"
                 "---\n\n"
                 "Triage the requested issue.\n",
@@ -161,7 +145,9 @@ class SkillCatalogTests(unittest.TestCase):
     def test_removed_and_replaced_workflows_are_not_registered(self):
         names = {skill.name for skill in SkillRegistry().skills}
 
-        self.assertTrue({"to-spec", "to-tickets", "skill-creator", "find-skills"} <= names)
+        self.assertTrue(
+            {"to-spec", "to-tickets", "skill-creator", "find-skills"} <= names
+        )
         self.assertTrue({"prd", "to-issues", "writing-great-skills"}.isdisjoint(names))
 
     def test_read_skill_file_rejects_catalog_directories(self):

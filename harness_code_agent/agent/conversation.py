@@ -575,7 +575,7 @@ class AgentConversation:
             "recent_errors": recent_errors,
             "failed_commands": failed_commands,
             "active_constraints": self._active_constraints(),
-            "latest_checkpoint_summary": self._latest_checkpoint_summary(),
+            "progress_summary": self._progress_summary(),
             "next_recommended_action": "continue from the active task and verify the next smallest change",
         }
 
@@ -627,18 +627,14 @@ class AgentConversation:
                 constraints.append(content[:300])
         return constraints[-5:]
 
-    def _latest_checkpoint_summary(self) -> str:
-        root = self._workspace_root()
-        for rel in ("progress.md", ".harness/checkpoints/latest.md"):
-            path = root / rel
-            if path.exists() and path.is_file():
-                try:
-                    text = path.read_text(encoding="utf-8", errors="replace").strip()
-                    if text:
-                        return text[:4_000]
-                except OSError:
-                    continue
-        return "none"
+    def _progress_summary(self) -> str:
+        try:
+            text = (self._workspace_root() / "progress.md").read_text(
+                encoding="utf-8", errors="replace"
+            ).strip()
+            return text[:4_000] or "none"
+        except OSError:
+            return "none"
 
     def submit(
         self,
@@ -1003,6 +999,8 @@ class AgentConversation:
         self.runtime_state.close_shell_sessions()
         if self.runtime_state.shell_job_manager is not None:
             self.runtime_state.shell_job_manager.close()
+        if self.agent.tool_context is not None:
+            self.agent.tool_context.close_language_service()
         with contextlib.suppress(Exception):
             self.client.close()
 

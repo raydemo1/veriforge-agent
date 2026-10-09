@@ -24,6 +24,7 @@ def build_main_agent_middlewares(
     tool_context: Any,
     tool_registry: Any,
     workspace: Path,
+    recovery=None,
 ) -> list[AgentMiddleware]:
     """Build the main-agent middleware stack.
 
@@ -42,6 +43,10 @@ def build_main_agent_middlewares(
             tool_registry=tool_registry,
         )
     )
+    if recovery is not None:
+        from ..recovery import RecoveryMiddleware
+
+        middlewares.append(RecoveryMiddleware(recovery, tool_context, tool_registry))
     middlewares.append(
         StaticVerifierMiddleware(workspace_root=str(workspace), workspace=tool_context.workspace)
     )

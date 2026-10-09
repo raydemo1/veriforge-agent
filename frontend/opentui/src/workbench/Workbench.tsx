@@ -385,19 +385,19 @@ function ChecksView({ checks, theme }: { checks: Check[]; theme: Theme }) {
             ? "×"
             : check.status === "warning"
               ? "!"
-              : "›";
+              : check.status === "skipped" ? "–" : "›";
         const color = check.status === "passed"
           ? theme.success
           : check.status === "failed"
             ? theme.error
             : check.status === "warning"
               ? theme.warning
-              : theme.accent;
+              : check.status === "skipped" ? theme.subtle : theme.accent;
         return (
           <box key={check.id} style={{ flexDirection: "row", gap: 1 }}>
             <text fg={color}>{marker}</text>
             <text fg={theme.text}>{check.name}</text>
-            <text fg={theme.subtle}>{check.status === "running" ? "运行中…" : check.detail}</text>
+            <text fg={theme.subtle}>{check.status === "running" ? "运行中…" : check.status === "skipped" ? `已跳过 · ${check.detail}` : check.detail}</text>
           </box>
         );
       })}

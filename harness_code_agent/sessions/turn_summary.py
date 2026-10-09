@@ -55,7 +55,6 @@ def generate_turn_summary(
     *,
     user_prompt: str,
     assistant_text: str,
-    checkpoint: str,
     llm_create: Callable[..., Any] | None = None,
 ) -> TurnSummaryResult:
     """Generate a concise summary using the configured fast model profile."""
@@ -74,7 +73,6 @@ def generate_turn_summary(
         assistant_text=assistant_text,
         tool_counts=counts,
         changed_files=files,
-        checkpoint=checkpoint,
     )
 
     try:
@@ -82,7 +80,6 @@ def generate_turn_summary(
             events,
             user_prompt=user_prompt,
             assistant_text=assistant_text,
-            checkpoint=checkpoint,
         )
         adapter = ProviderAdapter(profile.provider)
         kwargs = adapter.chat_kwargs(
@@ -115,7 +112,6 @@ def _summary_messages(
     *,
     user_prompt: str,
     assistant_text: str,
-    checkpoint: str,
 ) -> list[dict[str, str]]:
     facts = {
         "user_prompt": _truncate(user_prompt, 2000),
@@ -123,7 +119,6 @@ def _summary_messages(
         "tool_counts": dict(_tool_counts(events)),
         "changed_files": _changed_files(events),
         "failures": _failure_summaries(events),
-        "checkpoint": checkpoint,
     }
     return [
         {
@@ -148,7 +143,6 @@ def _fallback_summary(
     assistant_text: str,
     tool_counts: dict[str, int],
     changed_files: list[str],
-    checkpoint: str,
 ) -> str:
     lines = []
     if user_prompt:
@@ -160,8 +154,6 @@ def _fallback_summary(
     if tool_counts:
         details = ", ".join(f"{name}={count}" for name, count in sorted(tool_counts.items()))
         lines.append(f"- Tools used: {details}")
-    if checkpoint:
-        lines.append(f"- Checkpoint: {checkpoint}")
     return "\n".join(lines) if lines else "- Turn completed."
 
 

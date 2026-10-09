@@ -1,25 +1,9 @@
 import json
 import os
 import shutil
-import sys
-import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-
-
-def _install_fake_openai_module() -> None:
-    openai = types.ModuleType("openai")
-
-    class OpenAI:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    openai.OpenAI = OpenAI
-    sys.modules["openai"] = openai
-
-
-_install_fake_openai_module()
 
 from harness_code_agent import config
 from harness_code_agent.agent.conversation import AgentRuntimeState

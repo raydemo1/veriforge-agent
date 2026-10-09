@@ -72,6 +72,10 @@ export function reduceEvent(state: AppState, event: UiEvent): AppState {
     };
   }
   if (event.type === "transcript_update") return { ...state, items: state.items.map((item) => item.id === event.id ? { ...item, body: event.body, state: event.state ?? item.state } : item) };
+  if (event.type === "recovery_available") {
+    if (event.turn === 0) return { ...state, items: [{ id: "recovery-origin", kind: "status", title: "会话开始", body: "", turn: 0, recoveryPointId: event.pointId }, ...state.items.filter((item) => item.id !== "recovery-origin")] };
+    return { ...state, items: state.items.map((item) => item.role === "group" && item.turn === event.turn ? { ...item, recoveryPointId: event.pointId } : item) };
+  }
   if (event.type === "assistant_delta") return { ...state, items: state.items.map((item) => item.id === event.id ? { ...item, body: item.body + event.text } : item) };
   if (event.type === "notice") return {
     ...state,

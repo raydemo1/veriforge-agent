@@ -10,6 +10,23 @@ CORE_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "code_intelligence",
+            "description": "Read semantic definitions, references, document symbols or diagnostics from a system-installed language server outside the workspace. Workspace-local servers are never automatically executed. Returns unavailable when the server or operation is unavailable; continue with repo_search/read_file. Diagnostics are code-understanding information, not completion verification.",
+            "parameters": {
+                "type": "object",
+                "required": ["operation", "path"],
+                "properties": {
+                    "operation": {"type": "string", "enum": ["definition", "references", "symbols", "diagnostics"]},
+                    "path": {"type": "string", "description": "File path inside the workspace"},
+                    "line": {"type": "integer", "minimum": 1, "description": "1-based line, required for definition/references"},
+                    "column": {"type": "integer", "minimum": 1, "description": "1-based Unicode character column, required for definition/references"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "read_file",
             "description": (
                 "Read a workspace file. Prefer bounded reads with start_line and max_lines unless the file is known small. "

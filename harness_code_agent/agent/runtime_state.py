@@ -38,6 +38,7 @@ class TodoList:
         return {
             "revision": self.revision,
             "updated_at": self.updated_at,
+            "next_seq": self.next_seq,
             "items": [
                 {"id": item.id, "text": item.text, "status": item.status}
                 for item in self.items

@@ -49,8 +49,10 @@ export function workSegments(work: WorkState): StripSegment[] {
     const running = work.checks.some((check) => check.status === "running");
     const failed = work.checks.some((check) => check.status === "failed");
     const warned = work.checks.some((check) => check.status === "warning");
-    const tone: StripTone = failed ? "error" : warned ? "warning" : running ? "accent" : "success";
-    segments.push({ key: "checks", label: "检查", text: `${passed}/${work.checks.length}`, tone });
+    const skipped = work.checks.filter((check) => check.status === "skipped").length;
+    const tone: StripTone = failed ? "error" : warned ? "warning" : running ? "accent" : skipped ? "muted" : "success";
+    const text = skipped === work.checks.length ? "已跳过" : `${passed}/${work.checks.length - skipped}${skipped ? ` · ${skipped} 跳过` : ""}`;
+    segments.push({ key: "checks", label: "检查", text, tone });
   }
 
   if (work.artifacts.length) {

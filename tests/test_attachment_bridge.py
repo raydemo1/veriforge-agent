@@ -22,6 +22,7 @@ class AttachmentBridgeTests(unittest.TestCase):
         server._stopping = threading.Event()
         server._active_lock = threading.Lock()
         server._active_token = None
+        server._rewind_pending = False
         server._send_event = lambda event: None
         server.responses = []
         server._response = lambda request_id, result=None, error=None: server.responses.append(

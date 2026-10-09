@@ -1,27 +1,11 @@
 import json
-import sys
 import tempfile
 import threading
 import time
-import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-
-
-def _install_fake_openai_module() -> None:
-    openai = types.ModuleType("openai")
-
-    class OpenAI:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    openai.OpenAI = OpenAI
-    sys.modules["openai"] = openai
-
-
-_install_fake_openai_module()
 
 from harness_code_agent.agent.conversation import Agent, AgentConversation
 from harness_code_agent.runtime import shell_classification
@@ -33,11 +17,11 @@ from harness_code_agent.runtime.execution_planner import (
 )
 from harness_code_agent.runtime.middleware import AgentMiddleware
 from harness_code_agent.runtime.permissions import PermissionPolicy
+from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.runtime.tool_registry import (
     ToolRegistry,
     tool_schemas_for_profile,
 )
-from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.runtime.tool_result import ToolResult
 from harness_code_agent.sessions.events import EventBus
 from harness_code_agent.workspace.service import WorkspaceService

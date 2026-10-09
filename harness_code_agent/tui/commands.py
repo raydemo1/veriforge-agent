@@ -82,7 +82,6 @@ class SlashCommandRegistry:
 
 def default_command_registry(skill_registry=None) -> SlashCommandRegistry:
     specs = [
-        CommandSpec("/checkpoint", "工作流", "/checkpoint", "打开检查点管理", _checkpoint_picker),
         CommandSpec("/mcp", "工作流", "/mcp", "打开 MCP 服务与工具管理", _mcp_picker),
         CommandSpec("/compact", "工作流", "/compact", "压缩当前对话上下文", _compact_now),
         CommandSpec("/context", "会话", "/context", "查看上下文预算组成", _context_status),
@@ -137,10 +136,6 @@ def _user_skill(command_name: str) -> CommandHandler:
 def _panel_action(action: str, args: list[str], usage: str) -> CommandResult:
     _no_args(args, f"用法：{usage}")
     return CommandResult(action=action)
-
-
-def _checkpoint_picker(session: Any, args: list[str], registry: SlashCommandRegistry) -> CommandResult:
-    return _panel_action("checkpoint", args, "/checkpoint")
 
 
 def _mcp_picker(session: Any, args: list[str], registry: SlashCommandRegistry) -> CommandResult:

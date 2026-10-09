@@ -14,6 +14,8 @@ VeriForge 是一个面向真实代码仓库的可验证 Coding-Agent Runtime。
 - 工具治理：文件、Shell、Web、浏览器、MCP 和 Agent 统一经过 registry、权限和 middleware
 - 资源感知调度：无冲突调用可并行，冲突资源按顺序执行，结果按模型顺序回写
 - 安全修改：工作区路径保护、快照、审批、危险命令拦截和退出前验证
+- 代码理解：单一只读 `code_intelligence` 工具，支持定义、引用、文件符号和诊断
+- 多语言验证：本轮修改触发 Python AST/Ruff、TypeScript 静态检查和 Go 格式检查；项目代码执行经过 Shell 权限体系
 - 子代理协作：只读 Agent 并行调查，worker 在隔离副本中生成可复查提案
 - 上下文与记忆：可恢复的 JSONL 会话手账、结构化压缩、Markdown 长期记忆和可重建索引
 - OpenTUI：命令与 `@` 补全、审批、会话、运行观察和模型设置
@@ -57,7 +59,6 @@ veriforge -p "Review this repository"
 常用入口：
 
 ```text
-/checkpoint   管理检查点
 /mcp          管理 MCP 服务
 /compact      压缩上下文
 /context      查看上下文预算
@@ -67,6 +68,32 @@ veriforge -p "Review this repository"
 ```
 
 输入 `/` 或 `@` 会打开遮罩补全面板。Enter/Tab 接受候选，点击外层关闭；修改或清空指令后会重新匹配。普通状态面板可点击外层或按 Esc 关闭。
+
+每轮对话结束后会自动保存回撤点。鼠标悬停到该轮对话，或用键盘聚焦该轮，即可显示「回撤到此处」。确认后保留这一轮，对话和文件一起恢复到该轮结束时的状态；原来的后续历史保留在原会话中。「会话开始」也支持回撤，可撤回第一轮。首次允许修改前保存原始状态，相同内容的快照自动复用。
+
+回撤使用 `.harness/recovery` 中独立的文件快照，不创建 Git commit，也不修改 Git 暂存区。源码、未跟踪文件、二进制文件和 shell 修改均纳入快照；`.git`、`.harness`、依赖目录、虚拟环境、缓存及 `build`/`dist` 目录排除。硬链接、目录联接和特殊文件会阻止快照保存。数据库、远端操作等外部副作用不在恢复范围内。后台命令和子代理需先停止；手动修改的覆盖风险会显示在同一次确认中。恢复事务中断后，下次启动会先恢复事务前的文件状态。
+
+退出前验证只检查本轮改动，在没有 Git 的目录中也能发现 shell 修改；已有脏文件未在本轮改动时不会进入检查。自动执行 Python AST 和可用的 Ruff、最近 `tsconfig.json` 对应的 `tsc --noEmit`、`gofmt -d`。ESLint 会加载项目配置或插件，`go test` 会执行测试代码，`cargo check` 可能执行构建脚本或过程宏，因此自动验证将它们标为「已跳过」，同时提供对应目录和参数；需要运行时由 Agent 通过 `run_bash` 经过现有会话权限体系执行。优先复用项目已安装的工具，不自动安装依赖。缺失或超时的工具也标为「已跳过」，不计为通过。
+
+源码验证与 LSP 文件变更扫描固定排除 `.harbor` 评测产物，以及依赖、缓存和构建目录。
+
+`code_intelligence` 按需启动已有的 basedpyright/pyright、typescript-language-server、gopls 或 rust-analyzer，通过 pygls 通信。`definition` / `references` 接收文件路径和从 1 开始的行、列；`symbols` / `diagnostics` 只需文件路径。服务器缺失、崩溃或响应异常时返回 `available: false`，Agent 可继续使用文本搜索和文件读取。它不执行重命名、格式化或 workspace edit；LSP 诊断用于理解代码，不作为退出前验证证据。
+
+安装 Python 与 TypeScript 语言服务器（Node.js 22.22.2+）：
+
+```bash
+npm install --global --ignore-scripts pyright typescript-language-server typescript@6
+```
+
+Windows 可将工具和下载缓存放到 D 盘，并将 `D:\Tools\lsp` 加入用户 PATH 后重新打开终端：
+
+```powershell
+npm install --global --prefix D:\Tools\lsp --cache D:\Tools\npm-cache --ignore-scripts pyright typescript-language-server typescript@6
+```
+
+Python 通信与文件监听依赖 `pygls` 和 `watchfiles` 随 `pip install -e .` 安装。只自动启动 PATH 中位于工作区之外的语言服务器；工作区 `.venv`、`node_modules`、工作区内的 PATH 入口及链接回工作区的程序均不自动执行。Windows 下支持全局 npm 的 `.cmd` 入口，并检查实际 Node 和 JS 文件的位置。TypeScript 固定使用工作区之外安装的 `tsserver`，不注册项目插件；因此语义结果可能与项目本地 TypeScript 版本或插件提供的结果不同。服务器启动时建立源码文件列表，后续查询通过原生文件监听发送增量变更，不再逐次读取并 hash 全仓源码。会话关闭时释放监听器和服务器进程。
+
+语言服务器关闭自动类型包下载、Rust 构建脚本/过程宏执行和保存时编译检查；Go 使用只读模块设置。Rust 导航可能因此缺少构建生成代码或过程宏展开信息。项目的编译和测试按需通过 `run_bash` 执行。
 
 ## 工作模式
 
@@ -134,10 +161,27 @@ veriforge --profile review "Review the current branch"
 
 ## 测试
 
-Python runtime：
+安装 Python 测试依赖并运行日常测试：
 
 ```bash
-python -m unittest discover -s tests -p "test_*.py"
+python -m pip install -e ".[test]"
+python -m pytest -q
+```
+
+默认排除标记为 `integration` 的外部工具测试；单元测试和使用仓库内假服务器的 LSP 协议测试不要求安装真实语言服务器。
+
+真实 LSP 与 Node.js 执行边界测试单独运行：
+
+```bash
+python -m pytest -q -m integration -rs
+```
+
+本地缺少 Node.js、Python/TypeScript 语言服务器或外部 TypeScript 编译器时，对应测试明确跳过并显示原因。工具安装方法见上文；Windows 可继续使用 `D:\Tools\lsp`，安装目录需要加入当前终端的 `PATH`。跳过不代表验证通过。
+
+`.github/workflows/python-tests.yml` 在 Linux 和 Windows 分别运行日常测试与真实 LSP 测试。LSP 任务固定 Node.js `24.18.0`、Pyright `1.1.414`、typescript-language-server `6.0.1` 和 TypeScript `6.0.3`，在 runner 临时目录中安装，位于工作区之外。安装和版本检查在测试前完成；测试不自动下载工具。CI 使用严格命令，缺少工具直接失败：
+
+```bash
+python -m pytest -q -m integration --require-integration-tools -rs
 ```
 
 OpenTUI：

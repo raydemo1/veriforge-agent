@@ -1,27 +1,11 @@
 import asyncio
 import os
 import shutil
-import sys
 import threading
-import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
-
-
-def _install_fake_openai_module() -> None:
-    openai = types.ModuleType("openai")
-
-    class OpenAI:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    openai.OpenAI = OpenAI
-    sys.modules["openai"] = openai
-
-
-_install_fake_openai_module()
 
 from harness_code_agent.agent.cancellation import CancellationToken
 from harness_code_agent.runtime.builtins.registry import (
@@ -35,9 +19,9 @@ from harness_code_agent.runtime.execution_planner import (
     ResourceCoordinator,
 )
 from harness_code_agent.runtime.mcp import McpClientManager, McpToolBinding
-from harness_code_agent.runtime.tool_registry import ToolRegistry
 from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
+from harness_code_agent.runtime.tool_registry import ToolRegistry
 from harness_code_agent.sessions.events import EventBus
 from harness_code_agent.workspace.service import WorkspaceService
 
