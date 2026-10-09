@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -59,6 +60,27 @@ def test_stdio_operations_and_close(service, tmp_path, operation):
     pid = server.client._server.pid
     manager.close()
     assert not psutil.pid_exists(pid)
+
+
+def test_graceful_shutdown_closes_child_processes(service, tmp_path):
+    (tmp_path / "main.py").write_text("hello", encoding="utf-8")
+    manager = service("child")
+    assert manager.query("symbols", "main.py")["available"]
+    server = next(iter(manager._servers.values()))
+    children = psutil.Process(server.client._server.pid).children(recursive=True)
+    assert children
+    try:
+        manager.close()
+        live = []
+        for child in children:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                if child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+                    live.append(child.pid)
+        assert not live, f"Language server left running children: {live}"
+    finally:
+        for child in children:
+            with contextlib.suppress(psutil.NoSuchProcess):
+                child.kill()
 
 
 @pytest.mark.parametrize("mode", ["normal", "push", "push-canonical"])

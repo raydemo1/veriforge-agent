@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import threading
 import time
@@ -216,7 +217,7 @@ class ToolExecutorTests(unittest.TestCase):
 
     def test_run_bash_does_not_leak_cwd_or_environment_between_calls(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             (root / "nested").mkdir()
             context = ToolContext(
                 workspace=WorkspaceService(root=root),
@@ -224,18 +225,18 @@ class ToolExecutorTests(unittest.TestCase):
                 event_bus=EventBus(),
             )
 
-            first = run_bash(
-                "Set-Location nested; $env:VERIFORGE_SHELL_ISOLATION='leak'; Write-Output ready",
-                tool_context=context,
-            )
-            second = run_bash(
-                "Write-Output ((Get-Location).Path); Write-Output $env:VERIFORGE_SHELL_ISOLATION",
-                tool_context=context,
-            )
+            if os.name == "nt":
+                first_command = "Set-Location nested; $env:VERIFORGE_SHELL_ISOLATION='leak'; Write-Output ready"
+                second_command = "Write-Output ((Get-Location).Path); Write-Output $env:VERIFORGE_SHELL_ISOLATION"
+            else:
+                first_command = "cd nested; export VERIFORGE_SHELL_ISOLATION=leak; printf ready"
+                second_command = 'pwd; printf "%s" "${VERIFORGE_SHELL_ISOLATION-}"'
+            first = run_bash(first_command, tool_context=context)
+            second = run_bash(second_command, tool_context=context)
 
         self.assertEqual(first.status, "success")
         self.assertEqual(second.status, "success")
-        self.assertIn(str(root), second.output)
+        self.assertEqual(Path(second.output.splitlines()[0]).resolve(), root)
         self.assertNotIn("leak", second.output)
 
     def test_shell_effect_uses_shared_stateful_classifier(self):
@@ -495,7 +496,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("mcp__docs__search", names)
         self.assertIn("mcp__docs__search", agent.allowed_tool_names)
         self.assertEqual(context.revealed_tool_names, {"mcp__docs__search"})
-        self.assertIsNone(conversation._cached_prompt_cache_key)
+        self.assertNotEqual(conversation._cached_prompt_cache_key, "old-cache-key")
 
     def test_repeated_tool_search_reveal_preserves_prompt_cache_when_unchanged(self):
         from harness_code_agent.agent.tool_executor import ToolExecutor

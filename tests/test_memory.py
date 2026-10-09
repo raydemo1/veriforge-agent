@@ -15,7 +15,7 @@ from harness_code_agent.sessions.journal import SessionJournal
 
 class MemorySystemTests(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp())
+        self.temp_dir = Path(tempfile.mkdtemp()).resolve()
         self.workspace = self.temp_dir / "workspace"
         self.workspace.mkdir()
         self.root = self.temp_dir / "memory"

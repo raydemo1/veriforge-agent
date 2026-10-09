@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -47,9 +48,19 @@ class RepositoryToolPolicyTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_repo_search_uses_bounded_explicit_path_and_excludes_generated_dirs(self) -> None:
-        result = repo_search("needle", path=".", max_results=5)
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="pkg/target.py:1:VALUE = 'needle'\n", stderr=""
+        )
+        with patch(
+            "harness_code_agent.runtime.builtins.filesystem.subprocess.run",
+            return_value=completed,
+        ) as run:
+            result = repo_search("needle", path=".", max_results=5)
 
         self.assertEqual(result.status, "success")
+        command = run.call_args.args[0]
+        self.assertEqual(command[-3:], ["--", "needle", "."])
+        self.assertIn("!**/__pycache__/**", command)
         self.assertEqual(result.metadata["explicit_path"], ".")
         self.assertIn("pkg/target.py", result.output.replace("\\", "/"))
         self.assertNotIn("__pycache__", result.output)

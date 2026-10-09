@@ -24,7 +24,7 @@ class ShellJobManagerTests(unittest.TestCase):
                 manager._start_windows_process("python -m http.server")
 
         args = popen.call_args.args[0]
-        self.assertEqual(args[:4], ["C:/Windows/System32/wsl.exe", "--cd", tmp, "--exec"])
+        self.assertEqual(args[:4], ["C:/Windows/System32/wsl.exe", "--cd", str(Path(tmp).resolve()), "--exec"])
         self.assertEqual(args[4:6], ["bash", "-lc"])
         self.assertEqual(args[6], "python -m http.server")
 

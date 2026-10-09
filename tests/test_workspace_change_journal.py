@@ -41,7 +41,7 @@ class WorkspaceChangeJournalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = WorkspaceService(root=tmp)
             binary_path = Path(tmp) / "payload.bin"
-            failing_path = Path(tmp) / "later.txt"
+            failing_path = (Path(tmp) / "later.txt").resolve()
             original_bytes = b"\xff\xfe\x00original"
             binary_path.write_bytes(original_bytes)
             original_write_text = Path.write_text

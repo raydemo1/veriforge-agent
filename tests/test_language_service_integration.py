@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -124,4 +125,9 @@ def test_real_server_navigation_diagnostics_refresh_and_close(
     finally:
         manager.close()
     assert manager._thread is None
-    assert not any(process.is_running() for process in processes)
+    live = []
+    for process in processes:
+        with contextlib.suppress(psutil.NoSuchProcess):
+            if process.is_running() and process.status() != psutil.STATUS_ZOMBIE:
+                live.append((process.pid, process.status()))
+    assert not live, f"Language server left running processes: {live}"

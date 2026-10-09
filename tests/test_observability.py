@@ -190,7 +190,7 @@ class ObservationArtifactAdoptionTests(unittest.TestCase):
         )
 
         # The observation points at the streamed artifact, not a new .txt.
-        self.assertEqual(observation.raw_output_path, artifact)
+        self.assertEqual(observation.raw_output_path, artifact.resolve())
         self.assertTrue(observation.artifact_adopted)
         self.assertEqual(observation.output_chars, 20000)
         self.assertEqual(observation.output_hash, sha[:16])

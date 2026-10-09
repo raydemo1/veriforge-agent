@@ -2,6 +2,15 @@ from __future__ import annotations
 
 import pytest
 
+from harness_code_agent import config
+
+
+@pytest.fixture(autouse=True)
+def isolate_model_credentials(monkeypatch):
+    monkeypatch.setattr(config, "API_KEY", "test-key")
+    monkeypatch.setattr(config, "BASE_URL", "https://model.example.invalid/v1")
+    monkeypatch.setattr(config, "ROUTER_API_KEY", "")
+
 
 def pytest_addoption(parser):
     parser.addoption(

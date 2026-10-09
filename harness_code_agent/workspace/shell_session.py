@@ -127,7 +127,7 @@ class _BaseShellBackend:
         *,
         spool_dir: Path,
         preview_bytes: int | None = None,
-    ) -> "_OutputCapture | None":
+    ) -> _OutputCapture | None:
         """Drain output until ``token`` (followed by a newline) or deadline.
 
         Draining never stops early because of output volume: the capture
@@ -259,7 +259,7 @@ class _BaseShellBackend:
 
     def _parse_spilled_capture(
         self,
-        capture: "_OutputCapture",
+        capture: _OutputCapture,
         *,
         stdout_marker: str,
         stderr_marker: str,
@@ -1134,7 +1134,7 @@ def _posix_capture_script(
     # preserves cwd/env side effects of the command as before.  Output is
     # always replayed in full: the host-side reader streams it to a bounded
     # sink/artifact, so there is no shell-side byte ceiling.
-    block_open, block_close = ("(\n", ")\n") if preamble else ("{\n", "}\n")
+    block_open, block_close = ("(\n", ")") if preamble else ("{\n", "}")
     inner = preamble + f"{command}\n"
     return (
         f"{prefix}_out=$(mktemp)\n"

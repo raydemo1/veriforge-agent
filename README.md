@@ -168,7 +168,7 @@ python -m pip install -e ".[test]"
 python -m pytest -q
 ```
 
-默认排除标记为 `integration` 的外部工具测试；单元测试和使用仓库内假服务器的 LSP 协议测试不要求安装真实语言服务器。
+默认排除标记为 `integration` 的外部工具测试；单元测试和使用仓库内假服务器的 LSP 协议测试不要求安装真实语言服务器。测试统一使用假模型凭据，不依赖开发机的 API key；搜索参数与过滤规则通过 mock 验证，不要求安装 `rg`。
 
 真实 LSP 与 Node.js 执行边界测试单独运行：
 

@@ -2,10 +2,18 @@
 
 import json
 import os
+import subprocess
 import sys
 import time
 
 mode = sys.argv[1]
+if mode == "child":
+    subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 documents = {}
 versions = {}
 watched = []

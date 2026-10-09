@@ -25,7 +25,7 @@ class RecoveryStoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.store = RecoveryStore(self.root)
 
     def test_exact_bytes_create_delete_rename_and_directory_transitions(self):

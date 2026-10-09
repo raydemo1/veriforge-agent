@@ -512,7 +512,10 @@ class _Server:
             self.watch.close()
             self.watch = None
         proc = self.client._server
+        children = []
         if proc is not None and proc.returncode is None:
+            with contextlib.suppress(psutil.Error):
+                children = psutil.Process(proc.pid).children(recursive=True)
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(
                     self.client.protocol.send_request_async("shutdown", None), 0.5
@@ -522,12 +525,14 @@ class _Server:
             if proc.returncode is None:
                 with contextlib.suppress(psutil.Error):
                     parent = psutil.Process(proc.pid)
-                    for child in parent.children(recursive=True):
-                        with contextlib.suppress(psutil.Error):
-                            child.kill()
                     parent.kill()
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(proc.wait(), 1)
+        for child in reversed(children):
+            with contextlib.suppress(psutil.Error):
+                child.kill()
+        if children:
+            await asyncio.to_thread(psutil.wait_procs, children, timeout=1)
         for task in self.tasks + self.client._async_tasks:
             task.cancel()
         await asyncio.gather(

@@ -440,6 +440,7 @@ class CaptureScriptAndResourceTests(unittest.TestCase):
         self.assertNotIn("head -c", script)
         self.assertIn("{\n", script)
         self.assertNotIn("ulimit", script)
+        self.assertIn('} 1>"$__hca_out" 2>"$__hca_err"\n', script)
 
     def test_posix_script_runs_command_in_subshell_when_ulimits_enabled(self):
         with patch.object(config, "SHELL_CPU_SECONDS", 10), patch.object(
@@ -449,6 +450,7 @@ class CaptureScriptAndResourceTests(unittest.TestCase):
         self.assertIn("ulimit -t 10", script)
         self.assertIn("(\n", script)
         self.assertNotIn("__hca_max", script)
+        self.assertIn(') 1>"$__hca_out" 2>"$__hca_err"\n', script)
 
     def test_docker_resource_args_default_unlimited(self):
         with patch.object(config, "DOCKER_MEMORY_MB", 0), patch.object(
@@ -553,7 +555,7 @@ class BoundedPipeSinkTests(unittest.TestCase):
             out.feed("x" * 100)
         err.feed("boom")
         out.finish_writing(); err.finish_writing()
-        path, preview, total_bytes, _total_chars, sha = _stream_sinks_to_artifact(
+        path, preview, _total_bytes, _total_chars, sha = _stream_sinks_to_artifact(
             out, err, artifact_dir=d / "art", preview_chars=300
         )
         content = Path(path).read_text(encoding="utf-8")
