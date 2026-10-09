@@ -133,7 +133,7 @@ class RewindTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.env = patch.dict(os.environ, {"HARNESS_MEMORY_GENERATION_DISABLED": "1", "HARNESS_MEMORY_DISABLED": "1"})
         self.env.start()
         self.addCleanup(self.env.stop)

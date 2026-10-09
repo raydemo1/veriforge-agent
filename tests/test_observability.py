@@ -149,7 +149,7 @@ class ObservabilityAggregationTests(unittest.TestCase):
 class ObservationArtifactAdoptionTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
-        self.root = Path(self.temp_dir)
+        self.root = Path(self.temp_dir).resolve()
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -190,7 +190,7 @@ class ObservationArtifactAdoptionTests(unittest.TestCase):
         )
 
         # The observation points at the streamed artifact, not a new .txt.
-        self.assertEqual(observation.raw_output_path, artifact.resolve())
+        self.assertEqual(observation.raw_output_path, artifact)
         self.assertTrue(observation.artifact_adopted)
         self.assertEqual(observation.output_chars, 20000)
         self.assertEqual(observation.output_hash, sha[:16])
