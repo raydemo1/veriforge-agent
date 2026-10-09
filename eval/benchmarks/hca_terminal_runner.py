@@ -128,11 +128,8 @@ def install_artifact_export_hooks(state: dict[str, Any]) -> None:
 
     def export(reason: str) -> None:
         session_id = str(state.get("session_id") or "")
-        session_store = state.get("session_store")
-        if not session_id or session_store is None:
-            return
-        root = getattr(session_store, "root", None)
-        if not root:
+        root = state.get("harness_root")
+        if not session_id or not root:
             return
         try:
             export_session_artifacts(
@@ -192,8 +189,7 @@ def start_periodic_artifact_export(
     def loop() -> None:
         while not stop_event.wait(interval):
             session_id = str(state.get("session_id") or "")
-            session_store = state.get("session_store")
-            root = getattr(session_store, "root", None) if session_store is not None else None
+            root = state.get("harness_root")
             if not session_id or not root:
                 continue
             try:
@@ -245,15 +241,9 @@ def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("HARNESS_STREAM", "0")
     os.environ.setdefault("HARNESS_MEMORY_DISABLED", "1")
 
-    session: Any | None = None
-    session_store: Any | None = None
-    session_id = ""
-    result: Any | None = None
-    session_started = False
-    runner_error = ""
     hook_state: dict[str, Any] = {
         "session_id": "",
-        "session_store": None,
+        "harness_root": None,
         "runner_error": "",
     }
     install_artifact_export_hooks(hook_state)
@@ -263,102 +253,63 @@ def main(argv: list[str] | None = None) -> int:
             build_session_eval_metrics,
             print_eval_metrics,
         )
-        from harness_code_agent.core.interactive import (
-            InteractiveSession,
-            print_turn_result,
-        )
+        from harness_code_agent.headless import SessionInfo, print_run_result, run_task
+        from harness_code_agent.sessions.store import SessionStore
 
-        session = InteractiveSession(
-            cwd=workspace,
-            profile_name="terminal",
-            profile_explicit=True,
-            stream_sink=None,
-            allow_checkpoint_init_failure=True,
-        )
-        session_started = True
-        session.checkpoint.auto = False
-        session_id = session.session_id
-        session_store = session.session_store
-        hook_state["session_id"] = session_id
-        hook_state["session_store"] = session_store
-        if session.checkpoint_init_error:
-            runner_error = "\n".join(
-                part
-                for part in (
-                    runner_error.strip(),
-                    f"checkpoint disabled: {session.checkpoint_init_error}",
-                )
-                if part
-            )
-            hook_state["runner_error"] = runner_error
-        print(f"veriforge session: {session_id}", flush=True)
-        print(f"workspace: {session.cwd}", flush=True)
-        try:
-            manifest_path = write_session_manifest(
-                session_id=session_id,
-                workspace=session.cwd,
-                harness_root=session_store.root,
-                artifacts_root=os.environ.get("HCA_ARTIFACTS_ROOT", "/logs/artifacts"),
-            )
-            print(f"veriforge early artifacts: {manifest_path}", flush=True)
-        except Exception:
-            print("Failed to write early VeriForge artifact manifest:", file=sys.stderr)
-            traceback.print_exc()
-        try:
-            result = session.submit(args.prompt)
-        except Exception:
-            runner_error = traceback.format_exc()
-            hook_state["runner_error"] = runner_error
-            print(runner_error, file=sys.stderr, end="")
-        finally:
-            session_id = session_id or session.session_id
-            session_store = session_store or session.session_store
-            hook_state["session_id"] = session_id
-            hook_state["session_store"] = session_store
-            hook_state["runner_error"] = runner_error
-            if session.session_id:
-                print(f"veriforge session: {session.session_id}", flush=True)
-            print(f"workspace: {session.cwd}", flush=True)
-            if result is not None:
-                print_turn_result(result)
+        def on_session_started(info: SessionInfo) -> None:
+            hook_state["session_id"] = info.session_id
+            hook_state["harness_root"] = info.harness_root
+            print(f"veriforge session: {info.session_id}", flush=True)
+            print(f"workspace: {info.cwd}", flush=True)
             try:
-                session.close()
-            except Exception:
-                close_error = traceback.format_exc()
-                runner_error = "\n".join(
-                    part for part in (runner_error.strip(), close_error.strip()) if part
+                manifest_path = write_session_manifest(
+                    session_id=info.session_id,
+                    workspace=info.cwd,
+                    harness_root=info.harness_root,
+                    artifacts_root=os.environ.get("HCA_ARTIFACTS_ROOT", "/logs/artifacts"),
                 )
-                hook_state["runner_error"] = runner_error
-                print(close_error, file=sys.stderr, end="")
-            if session_store is not None and session_id:
-                try:
-                    artifact_path = export_session_artifacts(
-                        harness_root=session_store.root,
-                        session_id=session_id,
-                        artifacts_root=os.environ.get("HCA_ARTIFACTS_ROOT", "/logs/artifacts"),
-                        runner_error=runner_error,
-                    )
-                    print(f"veriforge artifacts: {artifact_path}", flush=True)
-                except Exception:
-                    print("Failed to export VeriForge session artifacts:", file=sys.stderr)
-                    traceback.print_exc()
-            periodic_export_stop.set()
-        if session_store is not None and session_id:
+                print(f"veriforge early artifacts: {manifest_path}", flush=True)
+            except Exception:
+                print("Failed to write early VeriForge artifact manifest:", file=sys.stderr)
+                traceback.print_exc()
+
+        result = run_task(
+            cwd=workspace,
+            task=args.prompt,
+            profile="terminal",
+            profile_explicit=True,
+            on_session_started=on_session_started,
+        )
+        hook_state["runner_error"] = result.error
+        periodic_export_stop.set()
+        print_run_result(result)
+        if result.error:
+            print(result.error.rstrip(), file=sys.stderr)
+        if result.harness_root is not None and result.session_id:
+            try:
+                artifact_path = export_session_artifacts(
+                    harness_root=result.harness_root,
+                    session_id=result.session_id,
+                    artifacts_root=os.environ.get("HCA_ARTIFACTS_ROOT", "/logs/artifacts"),
+                    runner_error=result.error,
+                )
+                print(f"veriforge artifacts: {artifact_path}", flush=True)
+            except Exception:
+                print("Failed to export VeriForge session artifacts:", file=sys.stderr)
+                traceback.print_exc()
             metrics = build_session_eval_metrics(
-                session_store,
-                session_id,
+                SessionStore(result.harness_root),
+                result.session_id,
                 model=os.environ.get("HARNESS_MODEL", ""),
             )
             print_eval_metrics(metrics)
+        return result.exit_code
     except Exception:
-        periodic_export_stop.set()
-        traceback.print_exc()
+        hook_state["runner_error"] = traceback.format_exc()
+        print(hook_state["runner_error"], file=sys.stderr, end="")
         return 1
     finally:
         periodic_export_stop.set()
-    if session_started:
-        return 0
-    return 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

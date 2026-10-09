@@ -928,7 +928,7 @@ class AgentConversation:
                 log.error(f"[{agent.name}] LLM request failed: {e}")
                 self.trace.error("api_error", str(e))
                 self.trace.finish("api_error", iteration)
-                break
+                raise
 
             assistant_msg, finish_reason = completion
             content = assistant_msg.get("content")

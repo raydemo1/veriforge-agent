@@ -131,64 +131,75 @@ class InteractiveSession:
     ):
         self.cwd = Path(cwd).resolve()
         self.lifecycle = LifecycleScope()
-        self.profile_router = JevRouteClassifier()
-        self.lifecycle.register("profile_router", self.profile_router.close, order=40)
-        self.startup_sink = startup_sink
-        self._report_startup("checking workspace")
-        validate_shell_configuration()
-        self.stream_sink = stream_sink or stream_callback
-        self.event_listener = event_listener
-        self.permission_mode = os.environ.get("HARNESS_PERMISSION_MODE", "workspace-write")
-        PermissionPolicy(mode=self.permission_mode)
-        self._manual_approval_provider = approval_provider or ConsoleApprovalProvider()
-        self.approval_provider = self._approval_provider_for_mode(self.permission_mode)
-        self.question_provider = question_provider or ConsoleQuestionProvider()
-        self.output_sink = output_sink or print
-        self.enable_turn_summary = enable_turn_summary
-        self.memory_use_enabled = os.environ.get("HARNESS_MEMORY_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
-        self.memory_auto_extract_enabled = os.environ.get("HARNESS_MEMORY_GENERATION_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
-        self.recovery = RecoveryService(self.cwd)
-        self._report_startup("loading skills")
-        self.skill_registry = SkillRegistry()
-        self._slash_registry = None
-        self.last_command_result = None
-        self.session_store = SessionStore(self.cwd / ".harness")
-        self.session_store.root.mkdir(parents=True, exist_ok=True)
-        inferred_explicit = profile_name != PRODUCT_DEFAULT_PROFILE
-        self.profile_explicit = inferred_explicit if profile_explicit is None else profile_explicit
-        self.routing_mode = ROUTING_MODE_PINNED if self.profile_explicit else ROUTING_MODE_AUTO
-        self._pending_profile_name = profile_name
-        self._profile_source = "explicit" if self.profile_explicit else "default"
-        self.profile = get_profile(self._pending_profile_name)
-        self.session: Session | None = None
-        self.attachment_manager: AttachmentManager | None = None
-        self.event_bus = None
-        self.tool_context: ToolContext | None = None
-        self.tool_registry = None
-        self.mcp_manager = None
-        self._mcp_tools_loaded = False
-        self._mcp_load_lock = threading.Lock()
-        self.agent = None
-        self.conversation: AgentConversation | None = None
-        self.profile_runtimes: dict[str, ProfileRuntime] = {}
-        self._active_profile_name: str | None = None
-        self.turn_count = 0
-        self.pending_plan_markdown: str | None = None
-        self.pending_plan_revision = 0
-        self.last_user_task: str = ""
-        self.last_assistant_text: str = ""
-        self.profile_history: list[ProfileSwitchEvent] = []
-        self._resolved_task_timeout: float | None = None
-        self._closed = False
-        self._close_lock = threading.Lock()
-        # User middlewares are loaded exactly once per session; profile
-        # switches reuse the same instances.
-        self.user_middlewares = load_user_middlewares()
-        self._report_startup("connecting tools")
-        self._bind_profile(self._pending_profile_name, source=self._profile_source)
-        if self.memory_auto_extract_enabled:
-            start_memory_worker(self.cwd)
-        self._report_startup("ready")
+        try:
+            self.profile_router = JevRouteClassifier()
+            self.lifecycle.register("profile_router", self.profile_router.close, order=40)
+            self.startup_sink = startup_sink
+            self._report_startup("checking workspace")
+            validate_shell_configuration()
+            self.stream_sink = stream_sink or stream_callback
+            self.event_listener = event_listener
+            self.permission_mode = os.environ.get("HARNESS_PERMISSION_MODE", "workspace-write")
+            PermissionPolicy(mode=self.permission_mode)
+            self._manual_approval_provider = approval_provider or ConsoleApprovalProvider()
+            self.approval_provider = self._approval_provider_for_mode(self.permission_mode)
+            self.question_provider = question_provider or ConsoleQuestionProvider()
+            self.output_sink = output_sink or print
+            self.enable_turn_summary = enable_turn_summary
+            self.memory_use_enabled = os.environ.get("HARNESS_MEMORY_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
+            self.memory_auto_extract_enabled = os.environ.get("HARNESS_MEMORY_GENERATION_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
+            self.recovery = RecoveryService(self.cwd)
+            self._report_startup("loading skills")
+            self.skill_registry = SkillRegistry()
+            self._slash_registry = None
+            self.last_command_result = None
+            self.session_store = SessionStore(self.cwd / ".harness")
+            self.session_store.root.mkdir(parents=True, exist_ok=True)
+            inferred_explicit = profile_name != PRODUCT_DEFAULT_PROFILE
+            self.profile_explicit = inferred_explicit if profile_explicit is None else profile_explicit
+            self.routing_mode = ROUTING_MODE_PINNED if self.profile_explicit else ROUTING_MODE_AUTO
+            self._pending_profile_name = profile_name
+            self._profile_source = "explicit" if self.profile_explicit else "default"
+            self.profile = get_profile(self._pending_profile_name)
+            self.session: Session | None = None
+            self.attachment_manager: AttachmentManager | None = None
+            self.event_bus = None
+            self.tool_context: ToolContext | None = None
+            self.tool_registry = None
+            self.mcp_manager = None
+            self._mcp_tools_loaded = False
+            self._mcp_load_lock = threading.Lock()
+            self.agent = None
+            self.conversation: AgentConversation | None = None
+            self.profile_runtimes: dict[str, ProfileRuntime] = {}
+            self._active_profile_name: str | None = None
+            self.turn_count = 0
+            self.pending_plan_markdown: str | None = None
+            self.pending_plan_revision = 0
+            self.last_user_task: str = ""
+            self.last_assistant_text: str = ""
+            self.profile_history: list[ProfileSwitchEvent] = []
+            self._resolved_task_timeout: float | None = None
+            self._closed = False
+            self._close_lock = threading.Lock()
+            # User middlewares are loaded exactly once per session; profile
+            # switches reuse the same instances.
+            self.user_middlewares = load_user_middlewares()
+            self._report_startup("connecting tools")
+            self._bind_profile(self._pending_profile_name, source=self._profile_source)
+            if self.memory_auto_extract_enabled:
+                start_memory_worker(self.cwd)
+            self._report_startup("ready")
+        except BaseException:
+            for error in self.lifecycle.close():
+                log.warning("Failed to close session resource %s: %s", error.name, error.error)
+            session = getattr(self, "session", None)
+            if session is not None:
+                try:
+                    self.session_store.update_status(session.id, "failed")
+                except Exception as exc:
+                    log.warning("Failed to update session status for %s: %s", session.id, exc)
+            raise
 
     def _report_startup(self, stage: str) -> None:
         if self.startup_sink is not None:

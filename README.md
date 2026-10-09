@@ -56,6 +56,22 @@ veriforge "Fix the failing tests"
 veriforge -p "Review this repository"
 ```
 
+CLI `-p`、无 TTY 的批处理，以及 Terminal-Bench / Claw-SWE-Bench runner 都通过同一个 Headless API 执行单轮任务：
+
+```python
+from harness_code_agent.headless import run_task
+
+result = run_task(cwd="/path/to/project", task="Fix the failing tests", profile="coding-agent")
+print(result.session_id, result.status)
+if result.turn_result is not None:
+    print(result.turn_result.text)
+raise SystemExit(result.exit_code)
+```
+
+`RunResult` 返回工作区、会话 ID、记录目录 `harness_root`、`TurnResult`、运行状态和错误信息。`completed` 表示本轮正常结束，任务是否通过仍由测试或评测器判断；`failed` 表示初始化、执行或关闭抛出异常；`interrupted` 表示键盘中断，对应退出码分别为 `0`、`1`、`130`。执行失败后仍返回已启动会话的 ID 和记录目录。系统终止信号引发的 `SystemExit` 在资源关闭后继续传播，保留原退出码。
+
+`on_session_started` 回调在提交任务前接收 `SessionInfo(session_id, cwd, harness_root)`，可立即写入 manifest 或在运行期间导出日志。接口统一负责关闭会话，保留正常的 Recovery 与权限检查；无界面运行不从 stdin 请求审批或问题答案，需要人工审批的操作拒绝执行，问题按取消处理。评测 runner 的权限模式仍由各自运行环境配置。
+
 常用入口：
 
 ```text

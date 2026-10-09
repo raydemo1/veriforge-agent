@@ -12,17 +12,9 @@ from typing import TYPE_CHECKING
 from . import config
 
 if TYPE_CHECKING:
-    from .core.interactive import InteractiveSession
     from .sessions.store import SessionStore
 
 PRODUCT_DEFAULT_PROFILE = "general"
-
-
-def InteractiveSession(**kwargs):
-    """Lazy session constructor kept patchable for CLI tests and embedders."""
-    from .core.interactive import InteractiveSession as Session
-
-    return Session(**kwargs)
 
 
 def TuiApp(**kwargs):
@@ -137,47 +129,19 @@ def run_batch(
     stream_sink=None,
     profile_explicit: bool = False,
 ) -> int:
-    from .attachments import AttachmentError
-    from .core.interactive import print_turn_result
-    from .core.mentions import MentionResolutionError
+    from .headless import print_run_result, run_task
 
-    try:
-        session = InteractiveSession(
-            cwd=cwd,
-            profile_name=profile_name,
-            profile_explicit=profile_explicit,
-            stream_sink=stream_sink,
-        )
-    except Exception as e:
-        _print_error(f"Error: {e}")
-        return 1
-
-    try:
-        if first_task.startswith("/"):
-            from .tui.commands import default_command_registry
-
-            registry = default_command_registry(skill_registry=session.skill_registry)
-            if not registry.is_agent_command(first_task):
-                if session.session_id:
-                    print(f"veriforge session: {session.session_id}")
-                print(f"workspace: {session.cwd}")
-                session.handle_slash_command(first_task)
-                return 0
-
-        result = session.submit(first_task)
-        if session.session_id:
-            print(f"veriforge session: {session.session_id}")
-        print(f"workspace: {session.cwd}")
-        print_turn_result(result)
-    except (AttachmentError, MentionResolutionError) as e:
-        _print_error(f"Error: {e}")
-        return 1
-    except KeyboardInterrupt:
-        _print_error("\nInterrupted.")
-        return 130
-    finally:
-        session.close()
-    return 0
+    result = run_task(
+        cwd=cwd,
+        task=first_task,
+        profile=profile_name,
+        profile_explicit=profile_explicit,
+        stream_sink=stream_sink,
+    )
+    print_run_result(result)
+    if result.error:
+        _print_error(result.error.rstrip())
+    return result.exit_code
 
 
 def _is_interactive_tty() -> bool:

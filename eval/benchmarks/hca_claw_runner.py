@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import traceback
 from pathlib import Path
 
@@ -19,30 +20,21 @@ def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("HARNESS_MENTION_MODE", "off")
 
     try:
-        from harness_code_agent.core.interactive import (
-            InteractiveSession,
-            print_turn_result,
-        )
+        from harness_code_agent.headless import print_run_result, run_task
 
-        session = InteractiveSession(
+        result = run_task(
             cwd=workspace,
-            profile_name="coding-agent",
+            task=prompt,
+            profile="coding-agent",
             profile_explicit=True,
-            stream_sink=None,
         )
-        session.checkpoint.auto = False
-        try:
-            result = session.submit(prompt)
-            if session.session_id:
-                print(f"veriforge session: {session.session_id}")
-            print(f"workspace: {session.cwd}")
-            print_turn_result(result)
-        finally:
-            session.close()
+        print_run_result(result)
+        if result.error:
+            print(result.error.rstrip(), file=sys.stderr)
+        return result.exit_code
     except Exception:
         traceback.print_exc()
         return 1
-    return 0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

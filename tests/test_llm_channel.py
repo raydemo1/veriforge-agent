@@ -99,11 +99,10 @@ class StreamFallbackPolicyTests(unittest.TestCase):
     def test_exhausted_retryable_error_does_not_fall_back_to_nonstream(self):
         conv, completions = _make_conversation(rate_limit=True)
         channel = ch.LlmChannel(conv)
-        with patch.object(ch.config, "LLM_MAX_RETRIES", 0):
-            with self.assertRaises(_RateLimited):
-                channel.request_assistant_message(
-                    {"model": "m", "messages": []}, cancellation_token=None
-                )
+        with patch.object(ch.config, "LLM_MAX_RETRIES", 0), self.assertRaises(_RateLimited):
+            channel.request_assistant_message(
+                {"model": "m", "messages": []}, cancellation_token=None
+            )
         # No second retry budget spent on the non-streaming path.
         self.assertEqual(completions.nonstream_calls, 0)
         self.assertEqual(conv.trace.errors, [])
@@ -180,16 +179,16 @@ class EmptyChoicesRetryTests(unittest.TestCase):
         with (
             patch.object(ch.config, "LLM_MAX_RETRIES", 2),
             patch.object(ch.time, "sleep"),
+            self.assertRaises(ch._EmptyChoicesError),
         ):
-            with self.assertRaises(ch._EmptyChoicesError):
-                channel.request_assistant_message(
-                    {"model": "m", "messages": []}
-                )
+            channel.request_assistant_message(
+                {"model": "m", "messages": []}
+            )
         self.assertEqual(completions.calls, 3)
 
 
 class ConversationErrorBoundaryTests(unittest.TestCase):
-    def test_channel_failure_ends_turn_with_a_single_request(self):
+    def test_channel_failure_propagates_after_a_single_request(self):
         from harness_code_agent.agent.conversation import Agent
 
         # The LLM call is stubbed below, so constructing a real OpenAI
@@ -207,10 +206,10 @@ class ConversationErrorBoundaryTests(unittest.TestCase):
                 side_effect=ValueError("auth failed"),
             ) as request,
             patch.object(conv.trace, "finish", side_effect=lambda *a: finishes.append(a)),
+            self.assertRaisesRegex(ValueError, "auth failed"),
         ):
-            result = conv.run_until_idle()
+            conv.run_until_idle()
         request.assert_called_once()
-        self.assertEqual(result, "")
         self.assertEqual(finishes[0][0], "api_error")
 
 
