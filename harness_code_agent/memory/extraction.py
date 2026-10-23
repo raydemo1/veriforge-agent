@@ -94,6 +94,14 @@ class ExtractionQueue:
         with self.database.connect(write=True) as db:
             db.execute("UPDATE extraction_sessions SET enabled=1 WHERE namespace=? AND session_id=?",
                        (self.database.namespace, session_id))
+            self._set_candidate_activity(db, session_id, active=True)
+            available_at = time.time() + config.MEMORY_EXTRACTION_IDLE_SECONDS
+            db.execute("UPDATE consolidation_tasks SET status='pending',available_at=? "
+                       "WHERE extraction_task IN (SELECT id FROM extraction_tasks WHERE namespace=? AND session_id=?) "
+                       "AND status='cancelled'", (available_at, self.database.namespace, session_id))
+            db.execute("UPDATE extraction_tasks SET status='pending',available_at=? "
+                       "WHERE namespace=? AND session_id=? AND status='cancelled'",
+                       (available_at, self.database.namespace, session_id))
 
     def enqueue(self, session_id: str, journal_path: Path, *, boundary: int | None = None,
                 idle_seconds: float | None = None) -> int:
@@ -147,9 +155,29 @@ class ExtractionQueue:
             db.execute("UPDATE consolidation_tasks SET status='cancelled',lease_until=NULL,lease_token=NULL "
                        "WHERE extraction_task IN (SELECT id FROM extraction_tasks WHERE namespace=? AND session_id=?) "
                        "AND status IN ('pending','running')", (self.database.namespace, session_id))
+            self._set_candidate_activity(db, session_id, active=False)
             db.execute("UPDATE extraction_tasks SET status='cancelled',lease_until=NULL,lease_token=NULL "
                        "WHERE namespace=? AND session_id=? AND status IN ('pending','running')",
                        (self.database.namespace, session_id))
+
+    def _set_candidate_activity(self, db, session_id: str, *, active: bool) -> None:
+        rows = db.execute(
+            "SELECT c.* FROM memory_candidates c JOIN consolidation_members m ON m.candidate_id=c.id "
+            "JOIN consolidation_tasks t ON t.id=m.task_id WHERE c.owner_namespace=? AND c.session_id=? "
+            "AND c.status IN ('pending','cancelled') AND t.status='cancelled'",
+            (self.database.namespace, session_id),
+        ).fetchall()
+        for candidate in rows:
+            if active:
+                hold_matching_facts(db, candidate["target_namespace"], candidate["id"], json.loads(candidate["payload"]))
+            else:
+                db.execute("INSERT OR IGNORE INTO export_outbox SELECT m.namespace,m.topic_id FROM memories m "
+                           "JOIN memory_holds h ON h.memory_id=m.id WHERE h.candidate_id=?", (candidate["id"],))
+                db.execute("DELETE FROM memory_holds WHERE candidate_id=?", (candidate["id"],))
+            db.execute("UPDATE memory_candidates SET status=? WHERE id=?",
+                       ("pending" if active else "cancelled", candidate["id"]))
+        if rows:
+            db.execute("UPDATE state SET revision=revision+1 WHERE id=1")
 
     def claim(self) -> dict | None:
         now = time.time()
@@ -267,7 +295,8 @@ class ExtractionQueue:
                 line = handle.readline(task["boundary"] - boundary)
                 entry = json.loads(line)
                 if (entry.get("kind") not in {"user_input", "verification"}
-                        or entry.get("payload", {}).get("memory_generation") != self.generation):
+                        or entry.get("payload", {}).get("memory_generation") != self.generation
+                        or not entry.get("payload", {}).get("auto_extract", True)):
                     continue
                 payload = entry["payload"]
                 text = payload.get("text")

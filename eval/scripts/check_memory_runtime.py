@@ -70,12 +70,16 @@ def checks(root):
         first = InteractiveSession(cwd=workspace, profile_name="general", profile_explicit=True,
                                    approval_provider=NoApprovalProvider(), enable_turn_summary=False)
         try:
+            first.memory_command(["generate", "off"])
             first.submit(raw)
             stored = first.memory_service.stores["user"].records()
             assert len(stored) == 1, requests
             assert first.conversation.runtime_state.current_user_task == raw
             source = [e for e in first.conversation.journal.read() if e.kind == "user_input"]
             assert len(source) == 1 and source[0].payload["text"] == raw
+            assert source[0].payload["auto_extract"] is False
+            assert first.tool_context.memory_user_sequence == source[0].sequence
+            first.memory_command(["generate", "on"])
             old = deepcopy(first.conversation.messages)
             first.submit("用哪种语言回复我？")
             assert first.conversation.messages[:len(old)] == old
@@ -111,6 +115,7 @@ def checks(root):
         assert result["model_calls"] == 2, result
         assert service.stores["project"].records()[0].body == "使用 BUILD_RUNTIME_1。"
     return ["source isolation and native tool execution", "append-only references and bounded automatic recall",
+            "explicit native save with automatic generation disabled",
             "cross-session pinned preference", "session close stops future background scheduling",
             "independent extraction/consolidation/index queues through the runtime worker"]
 

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -46,6 +47,59 @@ def enqueue(queue, journal):
 def rows(database, table):
     with database.connect() as db:
         return [dict(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+
+
+def test_cancel_resume_requeues_conflict_without_stranding_hold(runtime):
+    from harness_code_agent.memory.reconciliation import (
+        ConsolidationQueue,
+        CurrentMemoryView,
+    )
+
+    database, queue, journal = runtime
+    old = database.write(topic="构建规范", fact_key="build.command", kind="convention", body="构建使用 BUILD_V0",
+                         evidence=[EvidenceReference("manual", 1, "manual", "a" * 64)]).record
+    user(queue, journal)
+    _, task = enqueue(queue, journal)
+    assert queue.process(task, invoke=lambda **kw: reply([candidate()]))["state"] == "done"
+    consolidation = ConsolidationQueue(database)
+    stale = consolidation.claim()
+    view = CurrentMemoryView(database)
+    assert view.read(old.id)["status"] == "pending_update"
+    with database.connect(write=True) as db:
+        db.execute("CREATE TRIGGER fail_cancel BEFORE UPDATE OF status ON memory_candidates "
+                   "WHEN NEW.status='cancelled' BEGIN SELECT RAISE(ABORT,'cancel failed'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="cancel failed"):
+        queue.cancel("session-1")
+    assert view.read(old.id)["status"] == "pending_update"
+    assert rows(database, "consolidation_tasks")[0]["status"] == "running"
+    with database.connect(write=True) as db:
+        db.execute("DROP TRIGGER fail_cancel")
+    queue.cancel("session-1")
+    assert view.read(old.id)["body"] == old.body
+    assert queue.candidates()[0]["status"] == "cancelled"
+    queue.resume("session-1")
+    assert view.read(old.id)["status"] == "pending_update"
+    resumed = consolidation.claim()
+    assert resumed["id"] == stale["id"] and resumed["lease_token"] != stale["lease_token"]
+    assert consolidation.process(stale, invoke=Mock())["state"] == "obsolete"
+    revision, candidates, records = consolidation._batch(resumed)
+    item = candidates[0]
+    consolidation._commit(resumed, revision, candidates, [{"candidate_id": item["id"], "action": "update",
+                          "target_id": old.id, "topic": old.topic, "fact_key": old.fact_key,
+                          "applicability": "", "body": "构建使用 BUILD_V1", "reason": "confirmed change"}], records)
+    assert view.read(old.id)["body"] == "构建使用 BUILD_V1"
+
+
+def test_generation_disabled_sources_are_not_extracted_after_resume(runtime):
+    _, queue, journal = runtime
+    journal.append_user_input("请保存 DISABLED_SOURCE", turn_id="off", memory_generation=queue.generation,
+                              auto_extract=False)
+    user(queue, journal)
+    _, task = enqueue(queue, journal)
+    invoke = Mock(return_value=reply([candidate()]))
+    assert queue.process(task, invoke=invoke)["state"] == "done"
+    assert invoke.call_count == 1
+    assert "DISABLED_SOURCE" not in json.dumps(invoke.call_args.kwargs)
 
 
 def ready(database):

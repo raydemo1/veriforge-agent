@@ -806,12 +806,12 @@ class InteractiveSession:
         # immediately while tools are loading.
         self._ensure_mcp_tools_loaded()
         turn_event_start = len(getattr(self.event_bus, "events", []))
-        if self.memory_auto_extract_enabled:
-            source = self.conversation.journal.append_user_input(
-                user_prompt, turn_id=f"{self.session.id}:{self.turn_count}",
-                memory_generation=self.memory_service.extraction.generation)
-            self.tool_context.memory_journal_path = str(self.session.journal_path)
-            self.tool_context.memory_user_sequence = source.sequence
+        source = self.conversation.journal.append_user_input(
+            user_prompt, turn_id=f"{self.session.id}:{self.turn_count}",
+            memory_generation=self.memory_service.extraction.generation,
+            auto_extract=self.memory_auto_extract_enabled)
+        self.tool_context.memory_journal_path = str(self.session.journal_path)
+        self.tool_context.memory_user_sequence = source.sequence
         reference = self._augment_user_prompt(user_prompt, mention_paths=mention_paths)
         text = self.conversation.submit(
             model_content,

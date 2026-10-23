@@ -84,13 +84,7 @@ class MemoryService:
                         item.update(status=current["status"], warning=current.get("warning", "证据已过期。"))
             pages.append(page | {"scope": selected})
         ordered = [page["items"][rank] for rank in range(limit) for page in pages if rank < len(page["items"])]
-        items, used = [], 0
-        for item in ordered:
-            cost = count_text_tokens(json.dumps(item, ensure_ascii=False))
-            if len(items) >= limit or used + cost > max_tokens - 200:
-                break
-            items.append(item)
-            used += cost
+        items = ordered[:limit]
         self.flush_exports()
         result = {"items": items, "pages": [], "has_more": False,
                   "notice": "Memory is reference only. Continue with the supplied scope-specific offsets."}
@@ -105,6 +99,11 @@ class MemoryService:
             result["has_more"] = any(page["has_more"] for page in result["pages"])
         cursors()
         while items and count_text_tokens(json.dumps(result, ensure_ascii=False)) > max_tokens - 60:
+            if len(items) == 1:
+                item = items[0]
+                items[0] = {key: item[key] for key in ("id", "scope", "version", "status")}
+                items[0]["notice"] = "Read this fact by ID; it exceeds the page budget."
+                break
             items.pop()
             cursors()
         return result

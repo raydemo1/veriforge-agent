@@ -1,3 +1,6 @@
+import time
+
+from harness_code_agent import config
 from harness_code_agent.memory import MemoryService
 from harness_code_agent.sessions.journal import SessionJournal
 
@@ -16,4 +19,10 @@ def test_resume_skips_copied_history_and_generation_cancel_fences_jobs(tmp_path)
     service.extraction.cancel("fork")
     assert service.extraction.process(task, invoke=lambda **kwargs: None)["state"] == "obsolete"
     service.extraction.resume("fork")
-    assert service.extraction.claim() is None
+    with service.stores["project"].connect(write=True) as db:
+        row = db.execute("SELECT status,available_at FROM extraction_tasks WHERE id=?", (task["id"],)).fetchone()
+        assert row["status"] == "pending"
+        assert row["available_at"] > time.time() + config.MEMORY_EXTRACTION_IDLE_SECONDS - 5
+        db.execute("UPDATE extraction_tasks SET available_at=0 WHERE id=?", (task["id"],))
+    resumed = service.extraction.claim()
+    assert resumed["id"] == task["id"] and resumed["lease_token"] != task["lease_token"]

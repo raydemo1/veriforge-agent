@@ -54,7 +54,7 @@ class CurrentMemoryView:
             revision = db.execute("SELECT revision FROM state WHERE id=1").fetchone()[0]
             lexical = db.execute(
                 "SELECT m.id FROM memory_search f JOIN memories m ON m.id=f.memory_id "
-                "WHERE memory_search MATCH ? AND m.namespace=? "
+                "WHERE memory_search MATCH ? AND m.namespace=? AND m.status<>'expired' "
                 "ORDER BY bm25(memory_search),m.id LIMIT 200",
                 (expression, self.database.namespace),
             ).fetchall() if expression else []

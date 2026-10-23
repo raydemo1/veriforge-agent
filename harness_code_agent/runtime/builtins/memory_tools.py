@@ -13,9 +13,8 @@ from ..tool_result import ToolResult
 def _service(context, *, write=False):
     if context is None or context.workspace is None:
         raise ValueError("memory requires a workspace context")
-    flag = "memory_auto_extract_enabled" if write else "memory_use_enabled"
-    if not getattr(context, flag, True):
-        raise ValueError("memory generation is disabled" if write else "memory use is disabled")
+    if not write and not getattr(context, "memory_use_enabled", True):
+        raise ValueError("memory use is disabled")
     service = getattr(context, "memory_service", None)
     if service is None:
         service = MemoryService(context.workspace.root)

@@ -403,3 +403,16 @@ def test_identical_retained_messages_keep_their_recent_source_identity(tmp_path)
     history.start_epoch("compaction", [message], {}, journal=journal)
     assert history.sequences == (latest,)
     assert journal.read()[-1].payload["source_sequences"] == [latest]
+
+
+def test_contract_epoch_keeps_latest_repeated_user_turn_boundary(runtime_conversation):
+    conversation = runtime_conversation
+    conversation.add_user_turn("continue")
+    conversation.append_message({"role": "assistant", "content": "first result"})
+    conversation.add_user_turn("continue")
+    start = conversation.runtime_state.current_turn_start_index
+    sequence = conversation.history.sequences[start]
+    conversation.agent.system_prompt = "new rules"
+    conversation._ensure_request_contract()
+    assert conversation.runtime_state.current_turn_start_index == start
+    assert conversation.history.sequences[start] == sequence

@@ -31,11 +31,13 @@ class SessionJournal:
     def append_message(self, message: dict, *, metadata: dict | None = None) -> JournalEntry:
         return self.append("message", {"message": _json_safe(message), "metadata": metadata or {}})
 
-    def append_user_input(self, text: str, *, turn_id: str, memory_generation: str) -> JournalEntry:
+    def append_user_input(self, text: str, *, turn_id: str, memory_generation: str,
+                          auto_extract: bool = True) -> JournalEntry:
         if not isinstance(text, str) or not text.strip() or not turn_id or not memory_generation:
             raise ValueError("user input requires text, turn identity and memory generation")
         return self.append("user_input", {
             "text": text, "turn_id": turn_id, "memory_generation": memory_generation,
+            "auto_extract": auto_extract,
         })
 
     def append_verification(self, *, summary: str, outcome: str, tool_call_id: str,

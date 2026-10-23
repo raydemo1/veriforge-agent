@@ -242,12 +242,12 @@ class AgentConversation:
 
     def start_epoch(self, reason: str, base_messages: list[dict], request_contract=None) -> None:
         contract = request_contract if request_contract is not None else self._request_contract()
-        old_messages = self.messages
         start = self.runtime_state.current_turn_start_index
-        anchor = old_messages[start] if start < len(old_messages) else None
+        sequences = self.history.sequences
+        anchor = sequences[start] if start < len(sequences) else None
         self.history.start_epoch(reason, base_messages, contract, journal=self.journal)
-        if anchor in base_messages:
-            self.runtime_state.current_turn_start_index = base_messages.index(anchor)
+        if anchor and anchor in self.history.sequences:
+            self.runtime_state.current_turn_start_index = self.history.sequences.index(anchor)
         else:
             self.runtime_state.current_turn_start_index = max(1, len(base_messages) - 1)
         self.runtime_state.epoch_id = self.history.epoch.id
