@@ -5,20 +5,22 @@ from dataclasses import dataclass
 
 from .. import config
 
-
 # ---------------------------------------------------------------------------
 # Thresholds
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class CompactionThresholds:
-    compact: int          # 85% — start lightweight auto-compaction
+    compact: int
 
 
-def get_thresholds(context_window: int | None = None) -> CompactionThresholds:
-    w = context_window or config.CONTEXT_WINDOW_TOKENS
+def get_thresholds(
+    context_window: int | None = None, *, max_output_tokens: int = 0
+) -> CompactionThresholds:
+    w = config.CONTEXT_WINDOW_TOKENS if context_window is None else context_window
+    configured = int(w * 0.80) if context_window is not None else config.COMPRESS_THRESHOLD
     return CompactionThresholds(
-        compact=int(w * 0.85) if context_window is not None else config.COMPRESS_THRESHOLD,
+        compact=max(0, min(configured, w - max_output_tokens)),
     )
 
 

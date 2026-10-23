@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 from collections.abc import Callable
@@ -27,7 +28,11 @@ from ..attachments import (
     model_input_mode,
 )
 from ..memory import MemoryService, MemoryWriteCommand
-from ..memory.background import start_memory_worker
+from ..memory.background import (
+    begin_memory_turn,
+    finish_memory_turn,
+    start_memory_worker,
+)
 from ..profiles import get_profile
 from ..profiles.base import BaseProfile
 from ..profiles.router import (
@@ -714,6 +719,33 @@ class InteractiveSession:
         turn_instruction: str | None = None,
         attachments: tuple[Attachment, ...] = (),
     ) -> TurnResult:
+        session_id = self.session.id
+        tracking = self.memory_auto_extract_enabled
+        completed = False
+        if tracking:
+            try:
+                begin_memory_turn(self.cwd, session_id)
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                log.debug("Failed to defer memory extraction: %s", exc)
+        try:
+            result = self._run_turn_impl(user_prompt, cancellation_token, turn_instruction, attachments)
+            completed = True
+            return result
+        finally:
+            if tracking:
+                try:
+                    journal = self.session.journal_path if completed and self.memory_auto_extract_enabled else None
+                    finish_memory_turn(self.cwd, session_id, journal)
+                except (OSError, ValueError, sqlite3.Error) as exc:
+                    log.debug("Failed to schedule memory extraction: %s", exc)
+
+    def _run_turn_impl(
+        self,
+        user_prompt: str,
+        cancellation_token=None,
+        turn_instruction: str | None = None,
+        attachments: tuple[Attachment, ...] = (),
+    ) -> TurnResult:
         turn_started_at = time.time()
         self._apply_profile_task_timeout(user_prompt)
         resolved = resolve_mentions(
@@ -1069,9 +1101,9 @@ class InteractiveSession:
                 if self.tool_context is not None:
                     self.tool_context.memory_auto_extract_enabled = enabled
                 if enabled:
-                    # Kick a one-shot pass so jobs queued while generate was
-                    # off are processed immediately.
                     start_memory_worker(self.cwd)
+                elif self.session is not None:
+                    service.stores["project"].cancel_extraction(self.session.id)
             suffix = "；启动索引将在下次新会话刷新" if args[0] == "use" else ""
             return f"memory {args[0]}: {args[1]}{suffix}"
         if args[0] == "search" and len(args) > 1:
@@ -1685,20 +1717,6 @@ class InteractiveSession:
             self.session_store.write_summary(self.session.id)
         except Exception as exc:
             log.warning("Failed to write summary for session %s: %s", self.session.id, exc)
-        if self.memory_auto_extract_enabled and self.session.journal_path.exists():
-            try:
-                service = MemoryService(self.cwd)
-                service.stores["project"].enqueue_extraction(
-                    self.session.id,
-                    self.session.journal_path.stat().st_size,
-                    self.session.journal_path,
-                )
-                # Enqueue happens on close; kick the one-shot worker so the
-                # job actually runs in this process.
-                start_memory_worker(self.cwd)
-            except (OSError, ValueError) as exc:
-                log.debug("Failed to enqueue memory extraction: %s", exc)
-
 
 def _env_int(name: str, default: int) -> int:
     value = os.environ.get(name)

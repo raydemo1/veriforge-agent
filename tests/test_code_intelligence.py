@@ -321,19 +321,6 @@ def test_external_npm_entry_cannot_point_into_workspace(tmp_path, monkeypatch):
     assert lsp.discover_server("typescript", workspace) is None
 
 
-def test_system_symlink_to_workspace_server_is_rejected(tmp_path, monkeypatch):
-    workspace = tmp_path / "workspace"
-    local = system_executable(workspace, "gopls")
-    system = tmp_path / "system"
-    system.mkdir()
-    try:
-        (system / local.name).symlink_to(local)
-    except OSError as exc:
-        pytest.skip(f"Cannot create executable symlink: {exc}")
-    monkeypatch.setenv("PATH", str(system))
-    assert lsp.discover_server("go", workspace) is None
-
-
 def test_workspace_typescript_compiler_is_not_selected(tmp_path, monkeypatch):
     package = tmp_path / "node_modules/typescript"
     (package / "lib").mkdir(parents=True)

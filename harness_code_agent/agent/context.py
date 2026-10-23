@@ -172,10 +172,10 @@ def _messages_to_text(messages: list[dict]) -> str:
         if isinstance(content, list):
             content, _attachment_tokens = _content_text_and_attachment_tokens(content)
         if content:
-            parts.append(f"[{role}] {content[:3000]}")
+            parts.append(f"[{role}] {content}")
         for tc in msg.get("tool_calls", []):
             fn = tc.get("function", {})
-            parts.append(f"[tool_call] {fn.get('name', '?')}({fn.get('arguments', '')[:500]})")
+            parts.append(f"[tool_call] {fn.get('name', '?')}({fn.get('arguments', '')})")
     return "\n".join(parts)
 
 

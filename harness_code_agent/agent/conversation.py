@@ -885,7 +885,8 @@ class AgentConversation:
             log.info(f"[{agent.name}] iteration={iteration}  tokens~{token_count}")
             self.trace.iteration(iteration, token_count)
 
-            thresholds = get_thresholds()
+            max_output_tokens = 32768
+            thresholds = get_thresholds(max_output_tokens=max_output_tokens)
             action = compaction_action(token_count, thresholds)
             anxiety = context.detect_anxiety(self.messages)
             if anxiety and self.runtime_state.context_anxiety_turn_start_index != self.runtime_state.current_turn_start_index:
@@ -909,7 +910,7 @@ class AgentConversation:
             chat_args = {
                 "profile": profile,
                 "messages": prompt_messages,
-                "max_tokens": 32768,
+                "max_tokens": max_output_tokens,
             }
             if agent.use_tools:
                 chat_args["tools"] = tool_schemas

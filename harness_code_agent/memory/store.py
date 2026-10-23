@@ -296,12 +296,37 @@ class MemoryStore:
             return self.set_status(doc.id, "review_required", expected_version=doc.version)
         return doc
 
-    def enqueue_extraction(self, session_id: str, boundary: int, journal_path: str | Path) -> None:
+    def enqueue_extraction(
+        self, session_id: str, boundary: int, journal_path: str | Path, *, idle_seconds: float = 0
+    ) -> None:
         self.ensure_initialized()
         with self.connect() as db:
             db.execute(
-                "INSERT OR IGNORE INTO extraction_jobs(session_id,boundary,journal_path,available_at) VALUES(?,?,?,?)",
-                (session_id, boundary, str(Path(journal_path).resolve()), time.time()),
+                "UPDATE extraction_jobs SET status='superseded' "
+                "WHERE session_id=? AND boundary<? AND status IN ('pending','running')",
+                (session_id, boundary),
+            )
+            db.execute(
+                "INSERT INTO extraction_jobs(session_id,boundary,journal_path,available_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(session_id,boundary) DO UPDATE SET available_at=excluded.available_at, "
+                "status='pending',attempts=0 WHERE extraction_jobs.status IN ('pending','cancelled')",
+                (session_id, boundary, str(Path(journal_path).resolve()), time.time() + idle_seconds),
+            )
+
+    def defer_extraction(self, session_id: str, idle_seconds: float) -> None:
+        self.ensure_initialized()
+        with self.connect() as db:
+            db.execute(
+                "UPDATE extraction_jobs SET available_at=? WHERE session_id=? AND status IN ('pending','running')",
+                (time.time() + idle_seconds, session_id),
+            )
+
+    def cancel_extraction(self, session_id: str) -> None:
+        self.ensure_initialized()
+        with self.connect() as db:
+            db.execute(
+                "UPDATE extraction_jobs SET status='cancelled',lease_until=NULL "
+                "WHERE session_id=? AND status IN ('pending','running')", (session_id,),
             )
 
     def sync_index(self, *, force: bool = False) -> None:

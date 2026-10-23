@@ -185,7 +185,8 @@ MODEL = MODEL_PROFILE.model
 
 # --- Token budgets ---
 CONTEXT_WINDOW_TOKENS = int(os.environ.get("HARNESS_CONTEXT_WINDOW_TOKENS", "200000"))
-COMPRESS_THRESHOLD = int(os.environ.get("COMPRESS_THRESHOLD", str(int(CONTEXT_WINDOW_TOKENS * 0.85))))
+COMPRESS_THRESHOLD = int(os.environ.get("COMPRESS_THRESHOLD", str(int(CONTEXT_WINDOW_TOKENS * 0.80))))
+MEMORY_EXTRACTION_IDLE_SECONDS = max(0.0, float(os.environ.get("HARNESS_MEMORY_IDLE_SECONDS", "21600")))
 
 # Tool output larger than this (chars) is stored to file; only a compact
 # ref + head+tail preview goes into the message list.  Smaller outputs are

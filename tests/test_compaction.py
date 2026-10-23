@@ -55,7 +55,22 @@ class CompactionThresholdTests(unittest.TestCase):
         with patch.dict(os.environ, {"HARNESS_CONTEXT_WINDOW_TOKENS": "100000"}):
             from harness_code_agent.agent import compaction
             thresholds = compaction.get_thresholds(100000)
-            self.assertEqual(thresholds.compact, 85000)          # 85%
+            self.assertEqual(thresholds.compact, 80000)
+
+    def test_threshold_is_capped_by_output_reserve(self):
+        from harness_code_agent.agent.compaction import get_thresholds
+
+        self.assertEqual(get_thresholds(64000, max_output_tokens=32768).compact, 31232)
+
+    def test_configured_threshold_cannot_exceed_input_capacity(self):
+        from harness_code_agent import config
+        from harness_code_agent.agent.compaction import get_thresholds
+
+        with (
+            patch.object(config, "CONTEXT_WINDOW_TOKENS", 200000),
+            patch.object(config, "COMPRESS_THRESHOLD", 190000),
+        ):
+            self.assertEqual(get_thresholds(max_output_tokens=32768).compact, 167232)
 
     def test_below_compact_threshold_no_action(self):
         from harness_code_agent.agent.compaction import (
@@ -170,6 +185,58 @@ class CompactCommandTests(unittest.TestCase):
 
 
 class AgentConversationCompactionLifecycleTests(unittest.TestCase):
+    def test_compacts_before_rejecting_a_request_in_the_old_threshold_gap(self):
+        from harness_code_agent import config
+        from harness_code_agent.agent.context_manager import CompactionResult
+        from harness_code_agent.agent.conversation import Agent
+
+        agent = Agent("test_agent", "sys", use_tools=False)
+        conv = agent.start_conversation("task")
+        original = conv.messages
+        candidate = [original[0], {"role": "user", "content": "recovered task"}]
+
+        with (
+            patch.object(config, "CONTEXT_WINDOW_TOKENS", 200000),
+            patch.object(config, "COMPRESS_THRESHOLD", 190000),
+            patch(
+                "harness_code_agent.agent.conversation.context.count_request_tokens",
+                side_effect=[168000, 1000, 1000],
+            ),
+            patch.object(conv.context_manager, "compact", return_value=CompactionResult(candidate, "summary", 1)) as compact,
+            patch.object(
+                conv.llm, "request_assistant_message",
+                return_value=({"role": "assistant", "content": "done"}, "stop"),
+            ) as request,
+        ):
+            conv.run_until_idle()
+
+        compact.assert_called_once()
+        request.assert_called_once()
+        self.assertEqual(request.call_args.args[0]["max_tokens"], 32768)
+        self.assertEqual(conv.history.epoch.reason, "compaction")
+
+    def test_failed_compaction_preserves_history_and_stops_an_oversize_request(self):
+        from harness_code_agent import config
+        from harness_code_agent.agent.conversation import Agent
+
+        agent = Agent("test_agent", "sys", use_tools=False)
+        conv = agent.start_conversation("task")
+        original = conv.messages
+
+        with (
+            patch.object(config, "CONTEXT_WINDOW_TOKENS", 200000),
+            patch.object(config, "COMPRESS_THRESHOLD", 190000),
+            patch("harness_code_agent.agent.conversation.context.count_request_tokens", return_value=168000),
+            patch.object(conv.context_manager, "compact", return_value=None) as compact,
+            patch.object(conv.llm, "request_assistant_message") as request,
+        ):
+            conv.run_until_idle()
+
+        compact.assert_called_once()
+        request.assert_not_called()
+        self.assertEqual(conv.messages, original)
+        self.assertEqual(conv.runtime_state.fallback.stop_reason, "context_budget_exceeded")
+
     def test_context_compacted_hook_replaces_dynamic_context_block(self):
         from harness_code_agent.agent.conversation import Agent
         from harness_code_agent.runtime.middleware import AgentMiddleware
@@ -587,7 +654,7 @@ class ContextWindowConfigTests(unittest.TestCase):
             from harness_code_agent import config
             importlib.reload(config)
             self.assertEqual(config.CONTEXT_WINDOW_TOKENS, 200000)
-            self.assertEqual(config.COMPRESS_THRESHOLD, 170000)
+            self.assertEqual(config.COMPRESS_THRESHOLD, 160000)
             # Restore default for later tests in this process.
             importlib.reload(config)
 
@@ -600,7 +667,7 @@ class ContextWindowConfigTests(unittest.TestCase):
             from harness_code_agent import config
             importlib.reload(config)
             self.assertEqual(config.CONTEXT_WINDOW_TOKENS, 64000)
-            self.assertEqual(config.COMPRESS_THRESHOLD, 54400)
+            self.assertEqual(config.COMPRESS_THRESHOLD, 51200)
             # Restore default
             importlib.reload(config)
 

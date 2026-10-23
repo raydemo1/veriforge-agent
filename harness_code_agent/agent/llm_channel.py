@@ -13,6 +13,7 @@ from collections.abc import Callable
 from email.utils import parsedate_to_datetime
 
 from .. import config
+from . import context
 from .cancellation import CancelledError
 from .providers import ProviderAdapter, client_scope
 from .utils import _usage_to_dict
@@ -197,6 +198,9 @@ def llm_call_simple(messages: list[dict], *, diagnostics=None, trace=None, epoch
 
     def _invoke() -> str:
         kwargs = adapter.chat_kwargs(profile=profile, messages=messages, max_tokens=10000)
+        if context.count_request_tokens(kwargs["messages"]) + kwargs["max_tokens"] > config.CONTEXT_WINDOW_TOKENS:
+            log.warning("Skipping compaction: summary request exceeds context budget")
+            return ""
         record = diagnostics.begin(kwargs, provider=profile.provider, epoch=epoch,
                                    request_id="summary") if diagnostics is not None else None
         try:

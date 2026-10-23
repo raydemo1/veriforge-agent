@@ -59,7 +59,9 @@ class ContextManager:
         older = [{**message, "content": message["content"].split("[CURRENT RUNTIME FACTS]", 1)[0]}
                  if isinstance(message.get("content"), str) and message["content"].startswith(SUMMARY_MARKER)
                  else message for message in older]
-        if not older or (not force and not context._compaction_economics(older)):
+        unsummarized = [message for message in older
+                        if not str(message.get("content") or "").startswith(SUMMARY_MARKER)]
+        if not unsummarized or (not force and not context._compaction_economics(unsummarized)):
             return None
         prompt = (
             "Summarize this coding-agent history as durable working state. Return exactly these Markdown headings:\n"

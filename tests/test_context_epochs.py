@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from harness_code_agent import config
-from harness_code_agent.agent.context_manager import ContextManager
+from harness_code_agent.agent.context_manager import SUMMARY_MARKER, ContextManager
 from harness_code_agent.agent.conversation import Agent
 from harness_code_agent.agent.history import ContextHistory, tool_pairs_closed
 from harness_code_agent.agent.providers import ProviderAdapter
@@ -165,6 +165,58 @@ def test_long_turn_compaction_preserves_complete_tail_and_reasoning():
     assert result.messages[-2]["reasoning_content"] == messages[-2]["reasoning_content"]
     assert "[CURRENT RUNTIME FACTS]" in result.messages[1]["content"]
     assert messages[1]["content"] == "task"
+
+
+def test_existing_summary_alone_is_not_compacted_again():
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": SUMMARY_MARKER + "\nold summary " * 1000},
+        {"role": "user", "content": "current task"},
+    ]
+    with patch("harness_code_agent.agent.conversation.llm_call_simple") as summarize:
+        result = ContextManager().compact(
+            messages, summarize, current_turn_start_index=2, state={}, force=True,
+        )
+    assert result is None
+    summarize.assert_not_called()
+
+
+def test_summary_input_keeps_long_tool_results_and_arguments_without_reasoning():
+    arguments = json.dumps({"path": "x" * 600, "important_option": "ARGUMENT_TAIL"})
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "old task"},
+        {
+            "role": "assistant", "content": None, "reasoning_content": "PRIVATE_REASONING",
+            "tool_calls": [{"id": "read", "function": {"name": "read", "arguments": arguments}}],
+        },
+        {"role": "tool", "tool_call_id": "read", "content": "log " * 1000 + "IMPORTANT_RESULT_TAIL"},
+        {"role": "user", "content": "next task"},
+    ]
+    captured = []
+
+    def summarize(request):
+        captured.append(request[-1]["content"])
+        return "## Task goal\nContinue"
+
+    assert ContextManager().compact(
+        messages, summarize, current_turn_start_index=4, state={}, force=True,
+    ) is not None
+    assert "IMPORTANT_RESULT_TAIL" in captured[0]
+    assert "ARGUMENT_TAIL" in captured[0]
+    assert "PRIVATE_REASONING" not in captured[0]
+
+
+def test_oversize_summary_request_does_not_call_provider():
+    from harness_code_agent.agent.llm_channel import llm_call_simple
+
+    with (
+        patch.object(config, "CONTEXT_WINDOW_TOKENS", 200000),
+        patch("harness_code_agent.agent.llm_channel.context.count_request_tokens", return_value=190001),
+        patch("harness_code_agent.agent.llm_channel.client_scope") as client,
+    ):
+        assert llm_call_simple([{"role": "user", "content": "history"}]) == ""
+    client.assert_not_called()
 
 
 @pytest.fixture

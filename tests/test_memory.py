@@ -286,6 +286,7 @@ class MemorySystemTests(unittest.TestCase):
         target.cwd = self.workspace
         target.memory_use_enabled = True
         target.memory_auto_extract_enabled = False
+        target.session = SimpleNamespace(id="s1")
         target.tool_context = SimpleNamespace(memory_auto_extract_enabled=False)
         with (
             patch("harness_code_agent.core.interactive.MemoryService"),
@@ -313,7 +314,7 @@ class MemorySystemTests(unittest.TestCase):
         entered_b = threading.Event()
         release = threading.Event()
 
-        def fake_extract(service, journal_path, session_id):
+        def fake_extract(service, journal_path, session_id, **boundaries):
             if Path(journal_path).parent == ws_a:
                 entered_a.set()
             else:
