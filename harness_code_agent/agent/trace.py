@@ -42,7 +42,7 @@ class TraceWriter:
                 "event": event_type,
                 **data,
             }
-            line = json.dumps(entry, ensure_ascii=False)[:10000]
+            line = json.dumps(entry, ensure_ascii=False)
             # Write to file
             with open(self._path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")

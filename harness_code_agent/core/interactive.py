@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -1290,7 +1291,7 @@ class InteractiveSession:
             self.agent.full_system_prompt
         )
         self._activate_session(branched)
-        self.conversation._replace_messages(recovered)
+        self.conversation._replace_messages(recovered, reason="resume")
         self.turn_count = next((event["payload"]["turn"] for event in reversed(source_events) if isinstance((event.get("payload") or {}).get("turn"), int)), 0)
         self.last_user_task = next((event["payload"].get("text", "") for event in reversed(source_events) if event["type"] == "user_input"), "")
         self.last_assistant_text = next((event["payload"].get("text", "") for event in reversed(source_events) if event["type"] == "assistant_message"), "")
@@ -1471,6 +1472,8 @@ class InteractiveSession:
             transaction_path = store.root / "transactions" / f"{branched.id}.json"
             atomic_json(transaction_path, transaction)
             old_conversation = dict(self.conversation.__dict__)
+            old_conversation["history"] = copy.copy(self.conversation.history)
+            old_conversation["runtime_state"] = copy.copy(self.conversation.runtime_state)
             old_task_metadata = self.agent.current_task_metadata
             old_profile = (self.profile, self.agent, self._active_profile_name, self._profile_source)
             old_slots = {name: ProfileRuntime(slot.profile, slot.agent, slot.conversation) for name, slot in self.profile_runtimes.items()}
@@ -1491,9 +1494,10 @@ class InteractiveSession:
                 self._activate_profile_runtime(target_profile)
                 self._profile_source = target_profile_source
                 messages[0] = {"role": "system", "content": self.agent.full_system_prompt}
-                self.conversation._replace_messages(messages)
                 self.conversation.runtime_state = runtime
                 runtime.event_bus = self.event_bus
+                runtime.agent_config = self.agent
+                self.conversation._replace_messages(messages, reason="rewind")
                 self.conversation.fact_tracker = type(self.conversation.fact_tracker)()
                 self.conversation.compaction_gate = type(self.conversation.compaction_gate)()
                 self.conversation.context_manager = type(self.conversation.context_manager)()
@@ -1523,8 +1527,9 @@ class InteractiveSession:
                 atomic_json(transaction_path, transaction)
             except BaseException:
                 self._activate_session(source)
-                self.conversation.rebind_agent(old_profile[1])
+                self.conversation.agent._conversations.discard(self.conversation)
                 self.conversation.__dict__.update(old_conversation)
+                self.conversation.agent._conversations.add(self.conversation)
                 self.profile, self.agent, self._active_profile_name, self._profile_source = old_profile
                 self.profile_runtimes = old_slots
                 self.tool_context.permission_policy, self.tool_context.allowed_tool_permissions, self.tool_context.blocked_tool_names = old_policy
@@ -1635,11 +1640,7 @@ class InteractiveSession:
         return path
 
     def _append_conversation_message(self, message: dict) -> None:
-        append = getattr(self.conversation, "_append_message", None)
-        if append is not None:
-            append(message)
-        else:
-            self.conversation.messages.append(message)
+        self.conversation._append_message(message)
 
     def _augment_user_prompt(self, user_prompt: str, *, mention_paths: list[str]) -> str:
         if self.agent is None or self.conversation is None or not getattr(self, "memory_use_enabled", True):

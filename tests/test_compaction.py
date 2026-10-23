@@ -154,7 +154,7 @@ class CompactCommandTests(unittest.TestCase):
         from harness_code_agent.agent.conversation import Agent
 
         conv = Agent("test_agent", "sys", use_tools=False).start_conversation()
-        conv.add_user_turn("older task")
+        conv.add_user_turn("older task" * 200)
         conv._append_message({"role": "assistant", "content": "older answer"})
         conv.add_user_turn("current task")
         with patch(
@@ -217,6 +217,7 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
                 "harness_code_agent.agent.conversation.context.count_tokens",
                 side_effect=[
                     thresholds.compact,
+                    thresholds.compact - 1,
                     thresholds.compact - 1,
                 ],
             ),
@@ -340,6 +341,7 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
                 side_effect=[
                     thresholds.compact,       # main loop → trigger
                     thresholds.compact,       # after summarize → still over → suspend this turn
+                    thresholds.compact,       # outbound request size
                 ],
             ),
             patch("harness_code_agent.agent.conversation.context.detect_anxiety", return_value=False),

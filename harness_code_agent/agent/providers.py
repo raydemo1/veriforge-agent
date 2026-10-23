@@ -161,6 +161,9 @@ class ProviderAdapter:
 
         tool_calls = [_normalize_tool_call(tc) for tc in (_get(msg, "tool_calls") or [])]
         if tool_calls:
+            for index, call in enumerate(tool_calls):
+                if not call.get("id"):
+                    call["id"] = f"call_{index}"
             assistant_msg["tool_calls"] = tool_calls
         return assistant_msg
 
@@ -308,7 +311,8 @@ def _strip_response_only_message_fields(
             cleaned.append(message)
             continue
         outbound = dict(message)
-        outbound.pop("reasoning_content", None)
+        if provider_name != "deepseek":
+            outbound.pop("reasoning_content", None)
         if has_internal_attachment_metadata:
             outbound["content"] = [_provider_content_block(block, provider_name) for block in content]
         cleaned.append(outbound)

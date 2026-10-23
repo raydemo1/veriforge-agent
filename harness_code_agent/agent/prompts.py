@@ -29,6 +29,8 @@ as input at your next boundary. Agents cannot message each other directly: all c
 Worker changes stay isolated until read_agent_changes and apply_agent_changes. Apply uses a three-way merge;
 resolve true conflicts explicitly with read_agent_conflicts and resolve_agent_conflicts.
 Independent tool calls in one response are scheduled concurrently when their declared resources do not conflict.
+Runtime events describe facts at their position in history and apply only to their stated scope.
+Use get_runtime_status when current state is needed for a decision; do not poll or repeat state already returned by tools.
 Direct deletion and blacklisted dangerous commands remain blocked. Do not delegate user/product decisions, final
 completion, or small obvious one-file changes.
 """

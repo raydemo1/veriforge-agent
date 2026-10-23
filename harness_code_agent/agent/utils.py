@@ -25,15 +25,12 @@ def _usage_to_dict(usage) -> dict | None:
     completion_tokens = _get(usage, "completion_tokens")
     total_tokens = _get(usage, "total_tokens")
     details = _get(usage, "prompt_tokens_details") or {}
-    cache_hit_tokens = _usage_int(usage, "prompt_cache_hit_tokens")
-    if cache_hit_tokens == 0:
-        cache_hit_tokens = _int_or_zero(_get(details, "cached_tokens", 0))
-    cache_miss_tokens = _usage_int(usage, "prompt_cache_miss_tokens")
-    if cache_miss_tokens == 0 and cache_hit_tokens and prompt_tokens is not None:
-        try:
-            cache_miss_tokens = max(0, int(prompt_tokens) - cache_hit_tokens)
-        except (TypeError, ValueError):
-            cache_miss_tokens = 0
+    cache_hit_tokens = _usage_optional_int(usage, "prompt_cache_hit_tokens")
+    if cache_hit_tokens is None:
+        cache_hit_tokens = _usage_optional_int(details, "cached_tokens")
+    cache_miss_tokens = _usage_optional_int(usage, "prompt_cache_miss_tokens")
+    if cache_miss_tokens is None and cache_hit_tokens is not None and prompt_tokens is not None:
+        cache_miss_tokens = max(0, int(prompt_tokens) - cache_hit_tokens)
     return {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
@@ -164,6 +161,16 @@ def _canonical_schema_value(value, *, parent_key: str = ""):
             return sorted(items)
         return items
     return value
+
+
+def _usage_optional_int(usage, key: str) -> int | None:
+    value = _get(usage, key, None)
+    if value is None:
+        value = _get(_get(usage, "model_extra") or {}, key, None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _usage_int(usage, key: str) -> int:

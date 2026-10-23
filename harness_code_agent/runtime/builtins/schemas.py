@@ -10,6 +10,17 @@ CORE_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "get_runtime_status",
+            "description": "Read current task, budget, verification, environment or agent state when needed. Do not poll after each tool call.",
+            "parameters": {
+                "type": "object", "required": ["section"],
+                "properties": {"section": {"type": "string", "enum": ["task", "budget", "verification", "environment", "agents"]}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "code_intelligence",
             "description": "Read semantic definitions, references, document symbols or diagnostics from a system-installed language server outside the workspace. Workspace-local servers are never automatically executed. Returns unavailable when the server or operation is unavailable; continue with repo_search/read_file. Diagnostics are code-understanding information, not completion verification.",
             "parameters": {

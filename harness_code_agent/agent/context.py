@@ -54,7 +54,7 @@ def count_tokens(messages: list[dict]) -> int:
             text, attachment_tokens = _content_text_and_attachment_tokens(content)
             content = text
             total += attachment_tokens
-        text = str(content)
+        text = str(content) + str(msg.get("reasoning_content") or "")
         if enc:
             total += len(enc.encode(text)) + 4
         else:

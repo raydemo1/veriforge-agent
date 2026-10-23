@@ -451,7 +451,7 @@ class ContextManagerTests(unittest.TestCase):
         calls = []
         messages = [
             {"role": "system", "content": "rules"},
-            {"role": "user", "content": "old task"},
+            {"role": "user", "content": "old task" * 200},
             {"role": "assistant", "content": "old result"},
             {"role": "user", "content": "current task"},
         ]

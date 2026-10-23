@@ -7,7 +7,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
-from .. import config
 from ..runtime.execution_planner import (
     CallEffect,
     ExecutionPlanner,
@@ -482,6 +481,8 @@ class ToolExecutor:
             emit_call=False,
         )
         self._reveal_tool_schemas_from_result(tool_result)
+        if tool_result.metadata.get("file_changes") or prepared.name == "run_bash":
+            self.runtime_state.verification_stale = True
         result = tool_result.to_text()
         log.debug("[%s] tool result: %s", self.agent.name, result[:200])
         self.conversation.trace.tool_call(prepared.name, prepared.args, result)

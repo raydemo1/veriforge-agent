@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import copy
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -26,8 +28,8 @@ class SessionJournal:
         self._lock = threading.Lock()
         self._sequence = self._last_sequence()
 
-    def append_message(self, message: dict) -> JournalEntry:
-        return self.append("message", {"message": _json_safe(message)})
+    def append_message(self, message: dict, *, metadata: dict | None = None) -> JournalEntry:
+        return self.append("message", {"message": _json_safe(message), "metadata": metadata or {}})
 
     def append_compaction(
         self,
@@ -49,10 +51,12 @@ class SessionJournal:
 
     def append(self, kind: str, payload: dict[str, Any]) -> JournalEntry:
         with self._lock:
-            self._sequence += 1
-            entry = JournalEntry(self._sequence, kind, time.time(), payload)
+            entry = JournalEntry(self._sequence + 1, kind, time.time(), copy.deepcopy(payload))
             with self.path.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(json.dumps(entry.__dict__, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._sequence = entry.sequence
             return entry
 
     def read(self) -> list[JournalEntry]:
@@ -67,6 +71,15 @@ class SessionJournal:
 
     def recovery_messages(self, system_prompt: str, *, through_sequence: int | None = None) -> list[dict]:
         entries = [entry for entry in self.read() if through_sequence is None or entry.sequence <= through_sequence]
+        epochs = [entry for entry in entries if entry.kind == "context_epoch"]
+        if epochs:
+            latest = epochs[-1]
+            messages = copy.deepcopy(latest.payload["base_messages"])
+            if messages and messages[0].get("role") == "system":
+                messages[0] = {"role": "system", "content": system_prompt}
+            messages.extend(copy.deepcopy(entry.payload["message"]) for entry in entries
+                            if entry.kind == "message" and entry.sequence > latest.sequence)
+            return messages
         compactions = [entry for entry in entries if entry.kind == "compaction"]
         if compactions:
             latest = compactions[-1]
@@ -80,7 +93,8 @@ class SessionJournal:
                 for entry in entries
                 if entry.kind == "message"
                 and entry.sequence >= boundary
-                and entry.payload.get("message", {}).get("role") != "system"
+                and (entry.payload.get("message", {}).get("role") != "system"
+                     or entry.payload.get("metadata", {}).get("kind") == "runtime_event")
             )
             return messages
         return [
@@ -89,7 +103,8 @@ class SessionJournal:
                 entry.payload["message"]
                 for entry in entries
                 if entry.kind == "message"
-                and entry.payload.get("message", {}).get("role") != "system"
+                and (entry.payload.get("message", {}).get("role") != "system"
+                     or entry.payload.get("metadata", {}).get("kind") == "runtime_event")
             ],
         ]
 

@@ -30,6 +30,13 @@ class StaticVerifierMiddleware(AgentMiddleware):
         if not files:
             return None
         results = self.engine.verify(files, self._root)
+        if runtime_state is not None:
+            runtime_state.verification = {
+                "checks": [check.to_dict() for check in results],
+                "fingerprints": current,
+                "sequence": getattr(runtime_state, "observation_sequence", None),
+            }
+            runtime_state.verification_stale = False
         bus = getattr(runtime_state, "event_bus", None)
         if bus is not None and results:
             bus.emit(

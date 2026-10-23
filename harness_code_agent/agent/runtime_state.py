@@ -169,6 +169,16 @@ class AgentRuntimeState:
     auto_compaction_suspended: bool = False
     context_anxiety_turn_start_index: int = -1
     event_bus: Any = None
+    turn_id: str = ""
+    current_user_task: str = ""
+    epoch_id: str = ""
+    observation_sequence: int = 0
+    run_started: float | None = None
+    time_budget: float | None = None
+    pending_budget_warnings: set[str] = field(default_factory=set)
+    verification: dict | None = None
+    verification_stale: bool = False
+    agent_config: Any = None
 
     def register_shell_session(self, session: PersistentShellSession) -> None:
         with self._shell_sessions_lock:

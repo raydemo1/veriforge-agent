@@ -185,24 +185,30 @@ def _reset_client_after_stream_timeout(conv) -> None:
     conv._client_needs_refresh = True
 
 
-def llm_call_simple(messages: list[dict]) -> str:
+def llm_call_simple(messages: list[dict], *, diagnostics=None, trace=None, epoch=None) -> str:
     """Simple LLM call without tools — used for summarization.
 
     Retries 429/5xx/transport errors with bounded backoff so context
-    compaction does not crash the agent; a terminal failure still returns
-    a placeholder summary instead of propagating.
+    compaction does not crash the agent; a terminal failure returns no summary.
     """
     profile = config.resolve_model_profile("fast")
     adapter = ProviderAdapter(profile.provider)
     attempts = max(1, int(config.LLM_MAX_RETRIES) + 1)
 
     def _invoke() -> str:
-        with client_scope() as client:
-            resp = client.chat.completions.create(**adapter.chat_kwargs(
-                profile=profile,
-                messages=messages,
-                max_tokens=10000,
-            ))
+        kwargs = adapter.chat_kwargs(profile=profile, messages=messages, max_tokens=10000)
+        record = diagnostics.begin(kwargs, provider=profile.provider, epoch=epoch,
+                                   request_id="summary") if diagnostics is not None else None
+        try:
+            with client_scope() as client:
+                resp = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            if record is not None and trace is not None:
+                trace._write("request_diagnostics", {"purpose": "summary", **diagnostics.finish(record, error=exc)})
+            raise
+        if record is not None and trace is not None:
+            trace._write("request_diagnostics", {"purpose": "summary", **diagnostics.finish(
+                record, usage=_usage_to_dict(getattr(resp, "usage", None)))})
         return resp.choices[0].message.content or ""
 
     try:
@@ -211,8 +217,7 @@ def llm_call_simple(messages: list[dict]) -> str:
         raise
     except Exception as e:
         log.error("llm_call_simple failed: %s", e)
-        # Return a minimal summary rather than crashing
-        return "[context summarization failed — continuing with truncated context]"
+        return ""
 
 
 class LlmChannel:
@@ -222,6 +227,40 @@ class LlmChannel:
         # The channel reads provider/client/trace/stream state through the
         # conversation it serves; it owns no state of its own.
         self.conversation = conversation
+
+    def _create(self, client, kwargs, request_id):
+        conv = self.conversation
+        diagnostics = getattr(conv, "request_diagnostics", None)
+        if diagnostics is None:
+            return client.chat.completions.create(**kwargs)
+        record = diagnostics.begin(kwargs, provider=getattr(conv.provider, "name", config.PROVIDER),
+                                   epoch=conv.history.epoch, request_id=request_id)
+
+        def finish(usage=None, error=None):
+            conv.trace._write("request_diagnostics", diagnostics.finish(record, usage=usage, error=error))
+
+        try:
+            response = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            finish(error=exc)
+            raise
+        if not kwargs.get("stream"):
+            finish(_usage_to_dict(getattr(response, "usage", None)))
+            return response
+
+        def chunks():
+            usage = None
+            error = None
+            try:
+                for chunk in response:
+                    usage = _usage_to_dict(getattr(chunk, "usage", None)) or usage
+                    yield chunk
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                finish(usage, error)
+        return chunks()
 
     def request_assistant_message(self, kwargs: dict, cancellation_token=None) -> tuple[dict, str | None]:
         conv = self.conversation
@@ -286,7 +325,7 @@ class LlmChannel:
                 def _stream_attempt():
                     # Only errors before the first chunk are safe to retry;
                     # once deltas were produced the caller already saw them.
-                    stream = _stream_client(conv.client).chat.completions.create(**stream_kwargs)
+                    stream = self._create(_stream_client(conv.client), stream_kwargs, call_id)
                     return conv.provider.assistant_message_from_stream(
                         stream,
                         on_text_delta=on_text_delta,
@@ -346,7 +385,7 @@ class LlmChannel:
         remove_cancel_callback = self._interrupt_client_on_cancel(cancellation_token)
         try:
             def _nonstream_attempt():
-                response = conv.client.chat.completions.create(**kwargs)
+                response = self._create(conv.client, kwargs, call_id)
                 if not response.choices:
                     raise _EmptyChoicesError("API returned no choices")
                 return response

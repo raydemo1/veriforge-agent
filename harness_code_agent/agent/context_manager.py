@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from . import context
+from .history import tool_pairs_closed
 
 SUMMARY_MARKER = "[COMPACTED CONTEXT — structured working state]"
 SUMMARY_HEADINGS = (
@@ -36,13 +37,28 @@ class ContextManager:
         current_turn_start_index: int,
         state: dict,
         force: bool = False,
+        refresh: Callable | None = None,
     ) -> CompactionResult | None:
         if not messages:
             return None
         system = [messages[0]] if messages[0].get("role") == "system" else []
         system_len = len(system)
         split = max(system_len, min(current_turn_start_index, len(messages)))
+        if context.count_tokens(messages[split:]) > context.DEFAULT_RECENT_TAIL_TOKENS:
+            tail = max(system_len, len(messages) - context.DEFAULT_MIN_RECENT_MESSAGES)
+            while tail > system_len and context.count_tokens(messages[tail - 1:]) <= context.DEFAULT_RECENT_TAIL_TOKENS:
+                tail -= 1
+            split = max(split, tail)
+        while split > system_len and not tool_pairs_closed(messages[split:]):
+            split -= 1
         older, current = messages[system_len:split], messages[split:]
+        current = [message for message in current if not str(message.get("content") or "").startswith("[HARNESS_RUNTIME_EVENT")]
+        older = [message for message in older
+                 if not str(message.get("content") or "").startswith((
+                     "[HARNESS_RUNTIME_EVENT", "[HARNESS_DYNAMIC_CONTEXT:"))]
+        older = [{**message, "content": message["content"].split("[CURRENT RUNTIME FACTS]", 1)[0]}
+                 if isinstance(message.get("content"), str) and message["content"].startswith(SUMMARY_MARKER)
+                 else message for message in older]
         if not older or (not force and not context._compaction_economics(older)):
             return None
         prompt = (
@@ -51,7 +67,9 @@ class ContextManager:
             "## Validation\n## Unresolved issues\n## Next action\n## Evidence references\n"
             "Preserve concrete paths, commands, failures, decisions, tool-result relationships, and current status. "
             "Exclude hidden reasoning, repeated logs, and resolved branches. Do not claim unverified success.\n\n"
-            "Runtime state:\n" + _state_text(state) + "\n\nHistory:\n" + context._messages_to_text(older)
+            "This is a historical work summary, not current runtime state. "
+            "Do not reproduce old budget counters or TODO snapshots.\n\nHistory:\n"
+            + context._messages_to_text(older)
         )
         try:
             summary = llm_call([
@@ -63,8 +81,17 @@ class ContextManager:
         if not isinstance(summary, str) or not summary.strip():
             return None
         summary = _normalize_summary(summary)
+        runtime = "[CURRENT RUNTIME FACTS]\n" + _state_text(state)
+        candidate = system + [{"role": "user", "content": f"{SUMMARY_MARKER}\n{summary}\n\n{runtime}"}] + current
+        if refresh is not None:
+            try:
+                candidate = refresh(candidate)
+            except Exception:  # noqa: BLE001 - a failed hook cannot partially commit a new context
+                return None
+        if not tool_pairs_closed(candidate) or context.count_tokens(candidate) >= context.count_tokens(messages):
+            return None
         return CompactionResult(
-            messages=system + [{"role": "user", "content": f"{SUMMARY_MARKER}\n{summary}"}] + current,
+            messages=candidate,
             summary=summary,
             first_kept_index=split,
         )

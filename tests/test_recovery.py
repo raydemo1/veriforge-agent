@@ -272,6 +272,19 @@ class RewindTests(unittest.TestCase):
         self.assertEqual(self.session.session.id, source)
         self.assertEqual(self.session.conversation.messages, messages)
 
+    def test_late_restore_failure_preserves_history_epoch_and_source_journal(self):
+        first = self.turn("one", {"a": b"one"})
+        self.turn("two", {"a": b"two"})
+        messages = self.session.conversation.messages
+        epoch = self.session.conversation.history.epoch
+        source_journal = self.session.conversation.journal
+        with patch.object(self.session, "_restore_pending_plan", side_effect=OSError("late failure")), self.assertRaisesRegex(OSError, "late failure"):
+            self.session.rewind_to_point(first["id"])
+        self.assertEqual(self.session.conversation.messages, messages)
+        self.assertEqual(self.session.conversation.history.epoch, epoch)
+        self.assertEqual(source_journal.recovery_messages(self.session.agent.full_system_prompt), messages)
+        self.assertEqual((self.root / "a").read_bytes(), b"two")
+
     def test_future_compaction_cannot_leak_into_rewound_conversation(self):
         first = self.turn("one", {"a": b"one"})
         self.turn("two", {"a": b"two"})

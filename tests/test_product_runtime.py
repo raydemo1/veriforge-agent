@@ -274,7 +274,7 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertEqual(result.assistant_message["tool_calls"][0]["function"]["name"], "read_file")
         self.assertEqual(result.assistant_message["tool_calls"][0]["function"]["arguments"], '{"path":"README.md"}')
 
-    def test_provider_chat_kwargs_strip_response_only_reasoning_content(self):
+    def test_deepseek_chat_kwargs_preserve_reasoning_content(self):
         from harness_code_agent.agent.providers import ProviderAdapter
 
         messages = [
@@ -298,7 +298,7 @@ class ProductRuntimeTests(unittest.TestCase):
             max_tokens=10,
         )
 
-        self.assertNotIn("reasoning_content", kwargs["messages"][0])
+        self.assertEqual(kwargs["messages"][0]["reasoning_content"], "provider-only thinking")
         self.assertEqual(messages[0]["reasoning_content"], "provider-only thinking")
 
     def test_provider_streaming_checks_cancellation_between_chunks(self):
@@ -1006,8 +1006,8 @@ class ProductRuntimeTests(unittest.TestCase):
                 {"type": "text", "text": memory_block},
             ],
         )
-        self.assertIs(too_old, conversation.messages)
-        self.assertIs(deepseek_view, conversation.messages)
+        self.assertEqual(too_old, conversation.messages)
+        self.assertEqual(deepseek_view, conversation.messages)
         # The durable log keeps the plain-string system message.
         self.assertEqual(
             conversation.messages[0]["content"],
@@ -1023,7 +1023,7 @@ class ProductRuntimeTests(unittest.TestCase):
         with patch("harness_code_agent.agent.conversation.get_client"):
             conversation = AgentConversation(agent)
         conversation.provider = ProviderAdapter("openai")
-        self.assertIs(
+        self.assertEqual(
             conversation._outbound_messages(conversation.messages, "gpt-5.6"),
             conversation.messages,
         )
@@ -1261,7 +1261,7 @@ class ProductRuntimeTests(unittest.TestCase):
         second_diag = usage_events[1].payload["cache_diagnostics"]
         self.assertFalse(first_diag["prefix_changed"])
         self.assertTrue(second_diag["prefix_changed"])
-        self.assertEqual(second_diag["prefix_change_reasons"], ["tools"])
+        self.assertEqual(second_diag["prefix_change_reasons"], ["tools", "log_rewrite"])
         self.assertEqual(second_diag["cache_hit_tokens"], 80)
         self.assertEqual(second_diag["cache_miss_tokens"], 20)
 

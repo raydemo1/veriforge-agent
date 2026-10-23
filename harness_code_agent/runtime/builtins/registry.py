@@ -58,6 +58,7 @@ from .memory_tools import (
     memory_validate,
     memory_write,
 )
+from .runtime_status import get_runtime_status
 from .schemas import BROWSER_TOOL_SCHEMAS, CORE_TOOL_SCHEMAS
 from .shell import list_shell_jobs, read_shell_output, run_bash, stop_shell_job
 from .todo import update_todo
@@ -89,6 +90,8 @@ def _build_builtin_tool_registry() -> ToolRegistry:
     add("code_intelligence", code_intelligence, TOOL_PERMISSION_READ,
         lambda _args, context: CallEffect((workspace_claim(_root(context), ".", scope="global", access="read"),)),
         capabilities=all_agents)
+    add("get_runtime_status", get_runtime_status, TOOL_PERMISSION_READ,
+        CallEffect.global_exclusive(kind="control"), capabilities=all_agents)
 
     add(
         "read_file",

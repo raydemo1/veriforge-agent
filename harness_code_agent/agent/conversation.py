@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import logging
 import threading
 import time
+import uuid
 import weakref
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,7 @@ from . import context
 from .cancellation import CancelledError
 from .compaction import CompactionGate, compaction_action, get_thresholds
 from .context_manager import ContextManager
+from .history import ContextHistory, fingerprint, tool_pairs_closed
 from .llm_channel import (
     LlmChannel,
     LlmRequestTimeoutError,
@@ -36,6 +39,7 @@ from .providers import (
     get_client,
     supports_system_cache_breakpoint,
 )
+from .request_diagnostics import RequestDiagnostics
 from .runtime_state import (
     AgentFallbackState,
     AgentRuntimeState,
@@ -113,6 +117,7 @@ class Agent:
         return AgentRuntimeState(
             task_metadata=dict(self.current_task_metadata or {}),
             shell_job_manager=ShellJobManager(workspace),
+            agent_config=self,
         )
 
     def run(self, task: str) -> str:
@@ -162,7 +167,9 @@ class AgentConversation:
             self.runtime_state.session_id = agent.tool_context.session_id
         if agent.tool_context is not None and agent.tool_context.permission_policy is not None:
             self.runtime_state.permission_mode = agent.tool_context.permission_policy.mode
-        self.messages: list[dict] = [{"role": "system", "content": agent.full_system_prompt}]
+        self.history = ContextHistory()
+        self.request_diagnostics = RequestDiagnostics()
+        self.summary_diagnostics = RequestDiagnostics()
         self.client = get_client()
         self._client_needs_refresh = False
         self.provider: ProviderAdapter = current_adapter()
@@ -188,11 +195,16 @@ class AgentConversation:
         session_id = getattr(self.runtime_state, "session_id", "default")
         self.journal = None
         if session_id and session_id != "default":
+            child_id = getattr(agent.tool_context, "agent_id", None)
+            session_root = self._workspace_root() / ".harness" / "sessions" / session_id
+            if child_id:
+                session_root = session_root / "agents" / child_id
             self.journal = SessionJournal(
-                self._workspace_root() / ".harness" / "sessions" / session_id / "journal.jsonl"
+                session_root / "journal.jsonl"
             )
-            if not self.journal.read():
-                self.journal.append_message(self.messages[0])
+
+        self.append_message({"role": "system", "content": agent.full_system_prompt})
+        self.start_epoch("initial", self.messages)
         self._run_conversation_start_middlewares()
         if initial_task is not None:
             self.add_user_turn(initial_task)
@@ -205,22 +217,52 @@ class AgentConversation:
             getattr(self.runtime_state, "session_id", None),
         )
 
-    def _build_prompt(self) -> list[dict]:
-        """Build the messages list that will be sent to the LLM.
+    @property
+    def messages(self) -> list[dict]:
+        return self.history.snapshot()
 
-        The API prompt is the durable conversation log. Dynamic fact changes
-        are represented as appended messages, not as a regenerated prelude.
-        The current todo list is exposed as a short transient reminder so the
-        model always knows what remains; it is never written to history.
-        """
-        todo = self.runtime_state.todo
-        if todo is not None and todo.items:
-            reminder = (
-                "Current todo (state reminder; continue your work, "
-                "do not acknowledge this message):\n" + todo.render()
-            )
-            return [*self.messages, {"role": "user", "content": reminder}]
-        return self.messages
+    def _build_prompt(self) -> list[dict]:
+        return self.build_request_snapshot()
+
+    def build_request_snapshot(self) -> list[dict]:
+        return self.history.snapshot()
+
+    def _request_contract(self) -> dict:
+        profile = config.resolve_model_profile(self.agent.model_intensity or config.MODEL_INTENSITY)
+        return {
+            "profile": self.agent.name, "provider": profile.provider, "model": profile.model,
+            "thinking": profile.thinking, "reasoning_effort": profile.reasoning_effort,
+            "input_mode": profile.input_mode,
+            "system": self.agent.full_system_prompt,
+            "tools": _tool_schemas_for_agent(self.agent),
+            "permission_mode": self.runtime_state.permission_mode,
+            "blocked_tools": sorted(getattr(self.agent.tool_context, "blocked_tool_names", set())),
+            "allowed_permissions": sorted(getattr(self.agent.tool_context, "allowed_tool_permissions", None) or []),
+        }
+
+    def start_epoch(self, reason: str, base_messages: list[dict], request_contract=None) -> None:
+        contract = request_contract if request_contract is not None else self._request_contract()
+        old_messages = self.messages
+        start = self.runtime_state.current_turn_start_index
+        anchor = old_messages[start] if start < len(old_messages) else None
+        self.history.start_epoch(reason, base_messages, contract, journal=self.journal)
+        if anchor in base_messages:
+            self.runtime_state.current_turn_start_index = base_messages.index(anchor)
+        else:
+            self.runtime_state.current_turn_start_index = max(1, len(base_messages) - 1)
+        self.runtime_state.epoch_id = self.history.epoch.id
+        if self.journal is not None:
+            self.runtime_state.observation_sequence = self.journal.sequence
+        self._cached_prompt_cache_key = None
+        self._log_rewrite_version += 1
+        self._last_compaction_boundary = None
+
+    def _ensure_request_contract(self) -> None:
+        contract = self._request_contract()
+        if self.history.epoch.contract != fingerprint(contract):
+            messages = self.messages
+            messages[0] = {"role": "system", "content": self.agent.full_system_prompt}
+            self.start_epoch("request_contract_changed", messages, contract)
 
     def _outbound_messages(self, messages: list[dict], model: str) -> list[dict]:
         """Render provider-bound request messages without mutating history.
@@ -258,16 +300,19 @@ class AgentConversation:
         """
         if agent is self.agent:
             return
+        messages = self.messages
+        if messages and messages[0].get("role") == "system":
+            messages[0] = {"role": "system", "content": agent.full_system_prompt}
         previous = self.agent
-        conversations = getattr(previous, "_conversations", None)
-        if conversations is not None:
-            conversations.discard(self)
-        new_conversations = getattr(agent, "_conversations", None)
-        if new_conversations is not None:
-            new_conversations.add(self)
         self.agent = agent
-        if self.messages and self.messages[0].get("role") == "system":
-            self.messages[0] = {"role": "system", "content": agent.full_system_prompt}
+        try:
+            self.start_epoch("profile_changed", messages)
+        except BaseException:
+            self.agent = previous
+            raise
+        self.runtime_state.agent_config = agent
+        previous._conversations.discard(self)
+        agent._conversations.add(self)
         self._cached_prompt_cache_key = None
         self._last_prompt_cache_shape = None
         self._pending_prompt_cache_shape = None
@@ -285,18 +330,17 @@ class AgentConversation:
             self.messages,
             tool_schemas=_tool_schemas_for_agent(self.agent),
         )
-        self._strip_dynamic_context_messages()
         compacted = self.context_manager.compact(
             self.messages,
-            llm_call_simple,
+            self._summarize,
             current_turn_start_index=max(1, self.runtime_state.current_turn_start_index),
             state=self._working_context_state(),
             force=True,
+            refresh=lambda messages: self._refreshed_context(messages, phase="manual"),
         )
         if compacted is None:
             return "当前对话暂时无需压缩"
-        self._replace_messages(compacted.messages)
-        self._journal_compaction(compacted.summary, compacted.first_kept_index, "manual", messages_before)
+        self._replace_messages(compacted.messages, reason="compaction")
         summary_text = compacted.summary
         self._emit_compaction_committed(
             messages_before=messages_before,
@@ -305,8 +349,11 @@ class AgentConversation:
             summary_text=summary_text,
             phase="manual",
         )
-        self._refresh_dynamic_context_after_compaction(phase="manual")
         return f"已压缩对话：{messages_before} 条消息 → {len(self.messages)} 条"
+
+    def _summarize(self, messages: list[dict]) -> str:
+        return llm_call_simple(messages, diagnostics=self.summary_diagnostics,
+                               trace=self.trace, epoch=self.history.epoch)
 
     def add_user_turn(
         self,
@@ -315,7 +362,15 @@ class AgentConversation:
         task_text: str | None = None,
     ) -> None:
         logical_task = task_text if task_text is not None else str(task)
-        self.runtime_state.current_turn_start_index = len(self.messages)
+        turn_id = uuid.uuid4().hex
+        previous_messages = self.messages
+        sequence = self.history.append({"role": "user", "content": task}, journal=self.journal,
+                                       metadata={"kind": "user_input", "turn_id": turn_id})
+        self.runtime_state.turn_id = turn_id
+        self.runtime_state.current_user_task = logical_task
+        self.runtime_state.observation_sequence = sequence
+        self.runtime_state.pending_budget_warnings.clear()
+        self.runtime_state.current_turn_start_index = len(previous_messages)
         self.runtime_state.todo = None
         self.runtime_state.task_metadata = dict(self.agent.current_task_metadata or {})
         self.runtime_state.fallback = AgentFallbackState()
@@ -323,13 +378,8 @@ class AgentConversation:
         self.runtime_state.auto_compaction_suspended = False
         self.runtime_state.context_anxiety_turn_start_index = -1
         for mw in self.agent.middlewares:
-            mw.begin_turn(
-                logical_task,
-                self.messages,
-                runtime_state=self.runtime_state,
-                agent_name=self.agent.name,
-            )
-        self._append_message({"role": "user", "content": task})
+            mw.begin_turn(logical_task, previous_messages, runtime_state=self.runtime_state,
+                          agent_name=self.agent.name)
 
     def queue_message(self, message: str, *, tag: str = "PARENT STEERING MESSAGE") -> None:
         """Queue text for the next valid model-request boundary.
@@ -360,22 +410,13 @@ class AgentConversation:
             self.trace.middleware_inject("AgentInbox", "safe_boundary", message)
         return bool(pending)
 
-    def _append_message(self, message: dict) -> None:
-        self.messages.append(message)
-        if self.journal is not None:
-            self.journal.append_message(message)
+    def append_message(self, message: dict, metadata: dict | None = None) -> None:
+        metadata = {"turn_id": self.runtime_state.turn_id, **(metadata or {})}
+        sequence = self.history.append(message, journal=self.journal, metadata=metadata)
+        self.runtime_state.observation_sequence = sequence
 
-    def _journal_compaction(self, summary: str, first_kept_index: int, phase: str, messages_before: int) -> None:
-        if self.journal is None:
-            return
-        kept_count = max(0, messages_before - first_kept_index)
-        boundary = self.journal.first_sequence_of_recent_messages(kept_count)
-        self.journal.append_compaction(
-            summary=summary,
-            first_kept_sequence=boundary,
-            phase=phase,
-            state=self._working_context_state(),
-        )
+    def _append_message(self, message: dict) -> None:
+        self.append_message(message)
 
     def _run_conversation_start_middlewares(self) -> None:
         for mw in self.agent.middlewares:
@@ -395,56 +436,37 @@ class AgentConversation:
                     str(message.get("content") or ""),
                 )
 
-    def _replace_messages(self, messages: list[dict]) -> None:
-        self.messages = list(messages)
-        self._log_rewrite_version += 1
-
-    def _strip_dynamic_context_messages(self) -> bool:
-        kept: list[dict] = []
-        removed_before_turn = 0
-        changed = False
-        turn_start = self.runtime_state.current_turn_start_index
-        for idx, message in enumerate(self.messages):
-            content = _safe_message_content(message)
-            if content.startswith(DYNAMIC_CONTEXT_MARKER):
-                changed = True
-                if idx < turn_start:
-                    removed_before_turn += 1
-                continue
-            kept.append(message)
-        if not changed:
-            return False
-        self.messages = kept
-        self.runtime_state.current_turn_start_index = max(1, turn_start - removed_before_turn)
-        return True
-
-    def _inject_dynamic_context_after_system(self, injected: list[dict], *, source: str) -> None:
-        if not injected:
-            return
-        insert_at = 1 if self.messages and self.messages[0].get("role") == "system" else 0
-        for offset, message in enumerate(injected):
-            self.messages.insert(insert_at + offset, message)
-            self.trace.middleware_inject(
-                type(source).__name__ if not isinstance(source, str) else source,
-                "on_context_compacted",
-                str(message.get("content") or ""),
-            )
-        if self.runtime_state.current_turn_start_index >= insert_at:
-            self.runtime_state.current_turn_start_index += len(injected)
+    def _replace_messages(self, messages: list[dict], *, reason="restore") -> None:
+        self.start_epoch(reason, messages)
+        if reason in {"restore", "resume", "rewind"} and self.journal is not None:
+            users = [entry for entry in self.journal.read() if entry.kind == "message"
+                     and entry.payload.get("metadata", {}).get("kind") == "user_input"]
+            if users:
+                latest = users[-1]
+                self.runtime_state.turn_id = latest.payload["metadata"]["turn_id"]
+                self.runtime_state.current_user_task = _safe_message_content(latest.payload["message"])
+                self.runtime_state.fallback.budget_warnings = {
+                    line.removeprefix("limit_type: ") for message in messages
+                    if message.get("role") == "system"
+                    and str(message.get("content") or "").startswith("[HARNESS_RUNTIME_EVENT")
+                    and f"turn_id: {self.runtime_state.turn_id}" in message["content"]
+                    for line in message["content"].splitlines() if line.startswith("limit_type: ")
+                }
 
     def _refresh_dynamic_context_after_compaction(self, *, phase: str) -> None:
-        self._strip_dynamic_context_messages()
+        messages = self._refreshed_context(self.messages, phase=phase)
+        if messages != self.messages:
+            self.start_epoch("context_refreshed", messages)
+
+    def _refreshed_context(self, messages: list[dict], *, phase: str) -> list[dict]:
+        messages = [message for message in messages
+                    if not _safe_message_content(message).startswith(DYNAMIC_CONTEXT_MARKER)]
+        injected = []
         for mw in self.agent.middlewares:
-            on_compacted = getattr(mw, "on_context_compacted", None)
-            if on_compacted is None:
-                continue
-            injected = on_compacted(
-                self.messages,
-                runtime_state=self.runtime_state,
-                agent_name=self.agent.name,
-                phase=phase,
-            ) or []
-            self._inject_dynamic_context_after_system(injected, source=type(mw).__name__)
+            injected.extend(mw.on_context_compacted(
+                copy.deepcopy(messages), runtime_state=self.runtime_state,
+                agent_name=self.agent.name, phase=phase) or [])
+        return messages[:1] + injected + messages[1:]
 
     def _session_compacted_dir(self) -> Path | None:
         session_id = getattr(self.runtime_state, "session_id", None)
@@ -493,20 +515,17 @@ class AgentConversation:
 
     def _maybe_auto_compact(self, agent: Agent, *, token_count: int, thresholds) -> None:
         state = self.runtime_state
-        if state.auto_compaction_suspended:
+        boundary = self.history.sequences[-1:]
+        if state.auto_compaction_suspended and boundary == getattr(self, "_last_compaction_boundary", None):
             self.trace.context_event("auto_compaction_suspended", f"tokens={token_count}")
-            return
-        if state.auto_compaction_turn_start_index == state.current_turn_start_index:
-            state.auto_compaction_suspended = True
-            self.trace.context_event("auto_compaction_suspended", "already attempted this turn")
             return
         if not self.compaction_gate.can_compact():
             return
 
+        self._last_compaction_boundary = boundary
         state.auto_compaction_turn_start_index = state.current_turn_start_index
         messages_before = len(self.messages)
         token_count_before = token_count
-        self._strip_dynamic_context_messages()
 
         # Layer 1 — summarize older conversation via lightweight LLM call
         self.emitter.emit_compaction_started(
@@ -516,22 +535,17 @@ class AgentConversation:
         )
         compacted = self.context_manager.compact(
             self.messages,
-            llm_call_simple,
+            self._summarize,
             current_turn_start_index=state.current_turn_start_index,
             state=self._working_context_state(),
+            refresh=lambda messages: self._refreshed_context(messages, phase="summarizing_history"),
         )
         summary_chars = 0
         summary_text = ""
         if compacted is not None:
             summary_text = compacted.summary
             summary_chars = len(summary_text)
-            self._replace_messages(compacted.messages)
-            self._journal_compaction(
-                compacted.summary,
-                compacted.first_kept_index,
-                "summarizing_history",
-                messages_before,
-            )
+            self._replace_messages(compacted.messages, reason="compaction")
             self._emit_compaction_committed(
                 messages_before=messages_before,
                 token_count_before=token_count_before,
@@ -539,7 +553,6 @@ class AgentConversation:
                 summary_text=summary_text,
                 phase="summarizing_history",
             )
-            self._refresh_dynamic_context_after_compaction(phase="summarizing_history")
 
         tokens_after_summary = context.count_request_tokens(
             self.messages,
@@ -558,7 +571,6 @@ class AgentConversation:
         self.trace.context_event("auto_compaction_suspended", "summary still over threshold")
 
     def _working_context_state(self) -> dict:
-        recent_errors, failed_commands = self._recent_error_state()
         files = self._changed_workspace_files()
         observed_files = [
             key.removeprefix("file:")
@@ -568,15 +580,16 @@ class AgentConversation:
         ]
         files_touched = list(dict.fromkeys([*files, *observed_files]))
         return {
-            "current_user_task": self._latest_user_message(),
+            "current_user_task": self.runtime_state.current_user_task,
             "current_todo": self._current_todo_text(),
+            "current_budget": {"tool_calls": self.runtime_state.fallback.tool_call_count,
+                               "total_tokens": self.runtime_state.fallback.total_tokens},
             "changed_files": files,
             "files_touched": files_touched,
-            "recent_errors": recent_errors,
-            "failed_commands": failed_commands,
-            "active_constraints": self._active_constraints(),
-            "progress_summary": self._progress_summary(),
-            "next_recommended_action": "continue from the active task and verify the next smallest change",
+            "observed_at_sequence": self.runtime_state.observation_sequence,
+            "verification": {"checks": self.runtime_state.verification["checks"],
+                             "stale": self.runtime_state.verification_stale}
+                            if self.runtime_state.verification else None,
         }
 
     def _changed_workspace_files(self) -> list[str]:
@@ -589,52 +602,11 @@ class AgentConversation:
             return [str(path) for path in journal.changed_paths()]
         return [str(path) for path in getattr(workspace, "changed_files", [])]
 
-    def _latest_user_message(self) -> str:
-        for msg in reversed(self.messages):
-            if msg.get("role") == "user" and msg.get("content"):
-                return _safe_message_content(msg)
-        return ""
-
     def _current_todo_text(self) -> str:
         todo = self.runtime_state.todo
         if todo is None or not todo.items:
             return "none"
         return todo.render()
-
-    def _recent_error_state(self) -> tuple[list[str], list[str]]:
-        errors: list[str] = []
-        failed_commands: list[str] = []
-        for msg in self.messages[-30:]:
-            content = _safe_message_content(msg)
-            lowered = content.lower()
-            if "[error]" in lowered or "failed" in lowered or "traceback" in lowered:
-                errors.append(content[:500])
-            if msg.get("role") == "tool" and (
-                "return_code:" in lowered
-                or "status: failed" in lowered
-                or "[error]" in lowered
-                or ("[exit_code:" in lowered and "[exit_code: 0]" not in lowered)
-            ):
-                failed_commands.append(content[:300])
-        return errors[-5:], failed_commands[-5:]
-
-    def _active_constraints(self) -> list[str]:
-        constraints = []
-        for msg in self.messages[-20:]:
-            content = _safe_message_content(msg)
-            lowered = content.lower()
-            if "constraint" in lowered or "不要" in content or "must" in lowered or "only" in lowered:
-                constraints.append(content[:300])
-        return constraints[-5:]
-
-    def _progress_summary(self) -> str:
-        try:
-            text = (self._workspace_root() / "progress.md").read_text(
-                encoding="utf-8", errors="replace"
-            ).strip()
-            return text[:4_000] or "none"
-        except OSError:
-            return "none"
 
     def submit(
         self,
@@ -701,7 +673,7 @@ class AgentConversation:
         self.event_bus.emit_event(
             LlmUsageEvent(
                 provider=getattr(self.provider, "name", "unknown"),
-                model=config.MODEL,
+                model=getattr(self, "_active_model", config.MODEL),
                 prompt_tokens=usage.get("prompt_tokens"),
                 cached_tokens=cache_hit_tokens,
                 cache_hit_tokens=cache_hit_tokens,
@@ -721,6 +693,8 @@ class AgentConversation:
             return False
 
     def _maybe_emit_budget_warning(self, limit_type: str, used: int, limit: int) -> None:
+        if limit_type not in {"tool_calls", "total_tokens"}:
+            return
         if not self._limit_enabled(limit):
             return
         fallback = self.runtime_state.fallback
@@ -733,6 +707,7 @@ class AgentConversation:
         if used < threshold:
             return
         fallback.budget_warnings.add(limit_type)
+        self.runtime_state.pending_budget_warnings.add(limit_type)
         if self.event_bus is None:
             return
         from ..sessions.events import AgentBudgetWarningEvent
@@ -747,6 +722,20 @@ class AgentConversation:
             ).to_event()
         )
 
+    def _flush_runtime_events(self) -> None:
+        state = self.runtime_state
+        if state.fallback.stop_requested or not tool_pairs_closed(self.messages):
+            return
+        for kind in sorted(state.pending_budget_warnings):
+            used, limit = ((state.fallback.tool_call_count, config.MAX_AGENT_TOOL_CALLS)
+                           if kind == "tool_calls" else
+                           (state.fallback.total_tokens, config.MAX_AGENT_TOTAL_TOKENS))
+            content = ("[HARNESS_RUNTIME_EVENT v1]\nkind: budget_warning\n"
+                       f"turn_id: {state.turn_id}\nlimit_type: {kind}\n"
+                       f"used: {used}\nlimit: {limit}\nscope: current_turn")
+            self.append_message({"role": "system", "content": content}, {"kind": "runtime_event"})
+        state.pending_budget_warnings.clear()
+
     def _request_token_budget_stop_if_needed(self) -> bool:
         limit = config.MAX_AGENT_TOTAL_TOKENS
         fallback = self.runtime_state.fallback
@@ -759,6 +748,16 @@ class AgentConversation:
             limit=limit,
             recent_action_summary=fallback.recent_action_summary,
         )
+        return True
+
+    def _request_tool_budget_stop_if_needed(self) -> bool:
+        limit = config.MAX_AGENT_TOOL_CALLS
+        fallback = self.runtime_state.fallback
+        if not self._limit_enabled(limit) or fallback.tool_call_count < limit:
+            return False
+        fallback.request_stop(reason="tool_call_budget_exceeded", limit_type="tool_calls",
+                              used=fallback.tool_call_count, limit=limit,
+                              recent_action_summary=fallback.recent_action_summary)
         return True
 
     def _record_tool_call_budget(self, tool_name: str, tool_args: dict) -> bool:
@@ -833,6 +832,8 @@ class AgentConversation:
         agent = self.agent
         self.last_run_streamed_text = False
         run_started = time.monotonic()
+        self.runtime_state.run_started = run_started
+        self.runtime_state.time_budget = agent.time_budget
         turn_controller = TurnController(self)
 
         # No iteration cap: resources, side effects and runaway behavior are
@@ -845,6 +846,11 @@ class AgentConversation:
             # --- Cancellation check ---
             self._check_cancelled(cancellation_token)
             self._drain_queued_messages()
+            if self._request_token_budget_stop_if_needed() or self._request_tool_budget_stop_if_needed():
+                self.emitter.emit_agent_fallback(self.runtime_state.fallback)
+                self.last_text = self._fallback_text()
+                self.trace.finish("agent_fallback", iteration)
+                break
 
             # --- Time budget check ---
             budget_decision = turn_controller.check_time_budget(
@@ -867,8 +873,15 @@ class AgentConversation:
                     self.trace.middleware_inject(type(mw).__name__, "per_iteration", inject)
 
             # --- Context lifecycle check ---
+            self._ensure_request_contract()
+            self._flush_runtime_events()
             tool_schemas = _tool_schemas_for_agent(agent)
-            token_count = context.count_request_tokens(self.messages, tool_schemas=tool_schemas)
+            accounting_messages = self.messages
+            profile = config.resolve_model_profile(agent.model_intensity or config.MODEL_INTENSITY)
+            if profile.provider != "deepseek":
+                for message in accounting_messages:
+                    message.pop("reasoning_content", None)
+            token_count = context.count_request_tokens(accounting_messages, tool_schemas=tool_schemas)
             log.info(f"[{agent.name}] iteration={iteration}  tokens~{token_count}")
             self.trace.iteration(iteration, token_count)
 
@@ -890,6 +903,9 @@ class AgentConversation:
             # --- Build prompt and LLM call ---
             prompt_messages = self._build_prompt()
             profile = config.resolve_model_profile(agent.model_intensity or config.MODEL_INTENSITY)
+            if isinstance(self.provider, ProviderAdapter):
+                self.provider = ProviderAdapter(profile.provider)
+            self._active_model = profile.model
             chat_args = {
                 "profile": profile,
                 "messages": prompt_messages,
@@ -913,6 +929,13 @@ class AgentConversation:
                     )
                 chat_args["prompt_cache_key"] = self._cached_prompt_cache_key
             kwargs = self.provider.chat_kwargs(**chat_args)
+            input_tokens = context.count_request_tokens(kwargs["messages"], tool_schemas=tool_schemas)
+            if input_tokens + chat_args["max_tokens"] > config.CONTEXT_WINDOW_TOKENS:
+                self.runtime_state.fallback.request_stop(reason="context_budget_exceeded")
+                self.emitter.emit_agent_fallback(self.runtime_state.fallback)
+                self.last_text = self._fallback_text()
+                self.trace.finish("context_budget_exceeded", iteration)
+                break
 
             try:
                 completion = self.llm.request_assistant_message(kwargs, cancellation_token=cancellation_token)
