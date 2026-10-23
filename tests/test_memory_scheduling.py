@@ -138,6 +138,91 @@ def test_extractor_obeys_snapshot_boundary_and_excludes_reasoning_and_epoch_dupl
     ))
 
 
+def test_extraction_keeps_early_fact_and_complete_oversize_message(memory_runtime):
+    _, service, _, journal = memory_runtime
+    journal.append_message({"role": "user", "content": "REPORT_COPPER_4721"})
+    journal.append_message({"role": "assistant", "content": "x" * 70000 + "END_OF_MESSAGE"})
+    client = MagicMock()
+    client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))],
+    )
+    with patch.object(bg, "client_scope") as scope:
+        scope.return_value.__enter__.return_value = client
+        bg._extract_candidates(service, journal.path, "s1", start_boundary=0, end_boundary=journal.path.stat().st_size)
+    text = json.loads(client.chat.completions.create.call_args.kwargs["messages"][-1]["content"])["journal"]
+    assert "REPORT_COPPER_4721" in text
+    assert "x" * 70000 + "END_OF_MESSAGE" in text
+
+
+def test_extracted_sources_keep_only_workspace_evidence_files(memory_runtime):
+    workspace, service, _, journal = memory_runtime
+    (workspace / "evidence.md").write_text("verified", encoding="utf-8")
+    outside = workspace.parent / "outside.md"
+    outside.write_text("not workspace evidence", encoding="utf-8")
+    journal.append_message({"role": "user", "content": "remember a fact"})
+    client = MagicMock()
+    client.chat.completions.create.return_value = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps([{
+        "topic": "fact", "body": "verified fact",
+        "source_paths": ["会话用户消息：请记住", "missing.py", "evidence.md", "./evidence.md", str(outside), ".", 123],
+    }], ensure_ascii=False)))])
+    with patch.object(bg, "client_scope") as scope:
+        scope.return_value.__enter__.return_value = client
+        commands = bg._extract_candidates(service, journal.path, "s1", start_boundary=0, end_boundary=journal.path.stat().st_size)
+    assert commands[0].source_paths == ["evidence.md"]
+
+
+def test_failed_batch_retries_from_last_persisted_success(memory_runtime):
+    _, service, store, journal = memory_runtime
+    journal.append_message({"role": "user", "content": "first durable fact"})
+    first = journal.path.stat().st_size
+    journal.append_message({"role": "user", "content": "second durable fact"})
+    end = journal.path.stat().st_size
+    store.enqueue_extraction("s1", end, journal.path)
+    with (
+        patch.object(bg, "EXTRACTION_TEXT_LIMIT", 30),
+        patch.object(bg, "_extract_candidates", side_effect=[
+            [MemoryWriteCommand(topic="first", body="first durable fact")], RuntimeError("temporary"),
+        ]),
+    ):
+        bg._process_job(service, store, bg._claim_next_job(store))
+    with store.connect() as db:
+        rows = db.execute("SELECT boundary,status FROM extraction_jobs ORDER BY boundary").fetchall()
+        assert [(row["boundary"], row["status"]) for row in rows] == [(first, "done"), (end, "pending")]
+        db.execute("UPDATE extraction_jobs SET available_at=0 WHERE status='pending'")
+    with patch.object(bg, "_extract_candidates", return_value=[]) as extract:
+        bg._process_job(service, store, bg._claim_next_job(store))
+    assert extract.call_args.kwargs == {"start_boundary": first, "end_boundary": end}
+    assert len(store.list_documents()) == 1
+
+
+def test_batches_preserve_tool_pairs_and_utf8_byte_boundaries(memory_runtime):
+    _, _, _, journal = memory_runtime
+    journal.append_message({"role": "user", "content": "中文任务" * 20})
+    first = journal.path.stat().st_size
+    journal.append_message({
+        "role": "assistant", "content": None,
+        "tool_calls": [{"id": "check", "function": {"name": "check", "arguments": "{}"}}],
+    })
+    journal.append_message({"role": "tool", "tool_call_id": "check", "content": "检查结果" * 100})
+    tool_end = journal.path.stat().st_size
+    journal.append_message({"role": "user", "content": "下一轮" * 20})
+    end = journal.path.stat().st_size
+    with patch.object(bg, "EXTRACTION_TEXT_LIMIT", 100):
+        assert list(bg._batch_boundaries(journal.path, 0, end)) == [first, tool_end, end]
+
+
+def test_oversize_extraction_does_not_call_model_or_consume_job(memory_runtime):
+    _, service, store, journal = memory_runtime
+    journal.append_message({"role": "user", "content": "durable fact"})
+    end = journal.path.stat().st_size
+    store.enqueue_extraction("s1", end, journal.path)
+    with patch.object(config, "CONTEXT_WINDOW_TOKENS", 1), patch.object(bg, "client_scope") as client:
+        bg._process_job(service, store, bg._claim_next_job(store))
+    client.assert_not_called()
+    with store.connect() as db:
+        assert db.execute("SELECT status FROM extraction_jobs").fetchone()[0] == "pending"
+
+
 def test_cancel_during_extraction_prevents_writes_and_retry(memory_runtime):
     _, service, store, journal = memory_runtime
     journal.append_message({"role": "user", "content": "fact"})

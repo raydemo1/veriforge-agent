@@ -14,6 +14,7 @@ from .service import MemoryService
 from .store import MemoryWriteCommand
 
 log = logging.getLogger("harness")
+EXTRACTION_TEXT_LIMIT = 60_000
 _worker_lock = threading.Lock()
 #: Maps a workspace to a rerun flag while its kicked one-shot worker runs.
 #: A kick arriving while the worker is running sets the flag so the worker
@@ -186,23 +187,34 @@ def _process_job(service: MemoryService, store, row) -> None:
                 "SELECT COALESCE(MAX(boundary),0) FROM extraction_jobs "
                 "WHERE session_id=? AND status='done' AND boundary<?", (row["session_id"], row["boundary"]),
             ).fetchone()[0]
-        candidates = _extract_candidates(
-            service, Path(row["journal_path"]), row["session_id"],
-            start_boundary=start, end_boundary=row["boundary"],
-        )
-        if not _job_ready(store, row):
-            return
-        for candidate in candidates:
+        for boundary in _batch_boundaries(Path(row["journal_path"]), start, row["boundary"]):
             if not _job_ready(store, row):
                 return
-            for scoped_store in service.stores.values():
-                with scoped_store.connect() as db:
-                    suppressed = db.execute("SELECT 1 FROM suppressions WHERE key=?", (session_key,)).fetchone()
-                if suppressed:
-                    with store.connect() as db:
-                        db.execute("UPDATE extraction_jobs SET status='suppressed',lease_until=NULL WHERE id=?", (row["id"],))
+            candidates = _extract_candidates(
+                service, Path(row["journal_path"]), row["session_id"],
+                start_boundary=start, end_boundary=boundary,
+            )
+            if not _job_ready(store, row):
+                return
+            for candidate in candidates:
+                if not _job_ready(store, row):
                     return
-            service.write(candidate)
+                for scoped_store in service.stores.values():
+                    with scoped_store.connect() as db:
+                        suppressed = db.execute("SELECT 1 FROM suppressions WHERE key=?", (session_key,)).fetchone()
+                    if suppressed:
+                        with store.connect() as db:
+                            db.execute("UPDATE extraction_jobs SET status='suppressed',lease_until=NULL WHERE id=?", (row["id"],))
+                        return
+                service.write(candidate)
+            if boundary < row["boundary"]:
+                with store.connect() as db:
+                    db.execute(
+                        "INSERT INTO extraction_jobs(session_id,boundary,journal_path,status) VALUES(?,?,?,'done') "
+                        "ON CONFLICT(session_id,boundary) DO UPDATE SET status='done',lease_until=NULL,error=NULL",
+                        (row["session_id"], boundary, row["journal_path"]),
+                    )
+            start = boundary
         with store.connect() as db:
             db.execute(
                 "UPDATE extraction_jobs SET status='done',lease_until=NULL,error=NULL WHERE id=? AND status='running'",
@@ -216,6 +228,52 @@ def _process_job(service: MemoryService, store, row) -> None:
                 "lease_until=NULL,available_at=MAX(available_at,?),error=? WHERE id=? AND status='running'",
                 (time.time() + 300, str(exc)[:500], row["id"]),
             )
+
+
+def _batch_boundaries(journal_path: Path, start: int, end: int):
+    from ..agent.context import _messages_to_text
+
+    chars = 0
+    pending = set()
+    with journal_path.open("rb") as handle:
+        handle.seek(start)
+        while handle.tell() < end:
+            boundary = handle.tell()
+            line = handle.readline(end - boundary)
+            if not line:
+                break
+            try:
+                entry = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if entry.get("kind") != "message":
+                continue
+            message = entry.get("payload", {}).get("message") or {}
+            size = len(_messages_to_text([message])) if message.get("role") != "system" else 0
+            if chars and not pending and chars + size > EXTRACTION_TEXT_LIMIT:
+                yield boundary
+                chars = 0
+            chars += size
+            pending.update(str(call.get("id")) for call in message.get("tool_calls") or [])
+            if message.get("role") == "tool":
+                pending.discard(str(message.get("tool_call_id")))
+    if start < end:
+        yield end
+
+
+def _evidence_paths(workspace: Path, values) -> list[str]:
+    paths = []
+    for value in values if isinstance(values, list) else []:
+        if not isinstance(value, str):
+            continue
+        try:
+            path = (workspace / value).resolve(strict=True)
+            relative = path.relative_to(workspace).as_posix()
+            if path.is_file() and relative not in paths:
+                paths.append(relative)
+        except (OSError, ValueError, RuntimeError):
+            continue
+    return paths
 
 
 def _extract_candidates(
@@ -249,9 +307,9 @@ def _extract_candidates(
                 messages.append(message)
     if not messages:
         return []
-    from ..agent.context import _messages_to_text
+    from ..agent.context import _messages_to_text, count_request_tokens
 
-    text = _messages_to_text(messages)[-60_000:]
+    text = _messages_to_text(messages)
     existing = [
         {"id": doc.id, "version": doc.version, "scope": doc.scope, "topic": doc.topic, "body": doc.body[:300]}
         for store in service.stores.values()
@@ -269,6 +327,7 @@ def _extract_candidates(
             "Use supersedes with the old id and expected_version only for an evidence-backed correction of the same fact.",
             "Never merge or supersede memories merely because their paths overlap.",
             "Do not recreate existing memories or recalled memory text; extract only newly supported durable facts.",
+            "source_paths must contain only existing evidence files inside the workspace, not prose or conversation excerpts. Use [] for conversation-only evidence.",
         ],
     }
     profile = config.resolve_model_profile("fast")
@@ -281,6 +340,8 @@ def _extract_candidates(
         ],
         max_tokens=1600,
     )
+    if count_request_tokens(kwargs["messages"]) + kwargs["max_tokens"] > config.CONTEXT_WINDOW_TOKENS:
+        raise ValueError("Memory extraction batch exceeds context budget")
     with client_scope() as client:
         response = client.chat.completions.create(**kwargs)
     raw = str(response.choices[0].message.content or "").strip()
@@ -303,7 +364,7 @@ def _extract_candidates(
                 topic=str(value.get("topic") or body[:80]), body=body, scope=scope,
                 applicability=str(value.get("applicability") or ""),
                 source_sessions=[session_id],
-                source_paths=[str(item) for item in value.get("source_paths", []) if isinstance(item, str)],
+                source_paths=_evidence_paths(service.workspace, value.get("source_paths", [])),
                 supersedes=str(value.get("supersedes") or "") or None,
                 expected_version=value.get("expected_version"),
             )
