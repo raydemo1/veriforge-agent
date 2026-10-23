@@ -437,6 +437,13 @@ class AgentConversation:
                 )
 
     def _replace_messages(self, messages: list[dict], *, reason="restore") -> None:
+        if reason in {"restore", "resume", "rewind"}:
+            context = self.agent.tool_context
+            service = getattr(context, "memory_service", None)
+            if service is not None and getattr(context, "memory_use_enabled", True):
+                reference = service.startup_block()
+                if reference:
+                    messages = [*messages, {"role": "user", "content": reference}]
         self.start_epoch(reason, messages)
         if reason in {"restore", "resume", "rewind"} and self.journal is not None:
             users = [entry for entry in self.journal.read() if entry.kind == "message"
@@ -462,6 +469,12 @@ class AgentConversation:
         messages = [message for message in messages
                     if not _safe_message_content(message).startswith(DYNAMIC_CONTEXT_MARKER)]
         injected = []
+        tool_context = self.agent.tool_context
+        service = getattr(tool_context, "memory_service", None)
+        if service is not None and getattr(tool_context, "memory_use_enabled", True):
+            reference = service.startup_block()
+            if reference:
+                injected.append({"role": "user", "content": reference})
         for mw in self.agent.middlewares:
             injected.extend(mw.on_context_compacted(
                 copy.deepcopy(messages), runtime_state=self.runtime_state,
@@ -614,8 +627,11 @@ class AgentConversation:
         cancellation_token=None,
         *,
         task_text: str | None = None,
+        reference_context: str = "",
     ) -> str:
         self.add_user_turn(task, task_text=task_text)
+        if reference_context:
+            self.append_message({"role": "user", "content": reference_context}, {"kind": "memory_reference"})
         return self.run_until_idle(cancellation_token=cancellation_token)
 
     def next_call_id(self) -> str:

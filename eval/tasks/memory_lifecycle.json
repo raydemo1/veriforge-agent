@@ -1,0 +1,82 @@
+{
+  "reference": {
+    "url": "https://github.com/bojieli/ai-agent-book/tree/main/chapter3/user-memory-evaluation",
+    "readme_blob": "3d5071ff53a21e2e1cf4b41398a11257a0410d65",
+    "contradiction_case_blob": "7fb0e3fcd171fdb7db70233400b6a0840b0b9f64",
+    "adaptation": "Original coding-agent fixtures using the three-layer session-by-session memory-only protocol; not a reproduction or score of the upstream 60-case benchmark."
+  },
+  "cases": [
+    {
+      "id": "direct_recall", "layer": 1,
+      "sessions": ["请长期记住：我个人喜欢用中文交流。本仓库固定使用 uv run pytest tests/core 做核心回归。"],
+      "probes": [{"query": "我个人的交流语言偏好是什么，本仓库核心回归命令是什么？", "expected": {"language": ["中文", "Chinese", "zh-CN"], "command": ["uv run pytest tests/core"]}}],
+      "facts": [{"scope": "user", "pattern": "中文|Chinese|zh-CN"}, {"scope": "project", "pattern": "uv run pytest tests/core"}]
+    },
+    {
+      "id": "successive_corrections", "layer": 2,
+      "sessions": ["本仓库长期约定：初始化命令固定为 ORION_INIT_V1。请记住。", "更正本仓库长期初始化约定：ORION_INIT_V1 已废弃，正式改用 ORION_INIT_V2。", "再次确认最终规范：初始化只使用 ORION_INIT_V3，ORION_INIT_V2 已被替换。"],
+      "retire_pattern": "ORION_INIT_V[12]",
+      "probes": [{"query": "本仓库现在的初始化命令是什么？", "expected": {"command": ["ORION_INIT_V3"]}}],
+      "facts": [{"scope": "project", "pattern": "ORION_INIT_V3"}]
+    },
+    {
+      "id": "partial_update", "layer": 2,
+      "sessions": ["本仓库长期构建规范：构建命令是 BUILD_CEDAR_V1，回归测试集是 SUITE_MAPLE_27。这两项都要记住。", "本仓库构建规范更新：构建命令从 BUILD_CEDAR_V1 改为 BUILD_CEDAR_V2。回归测试集保持原先约定不变。"],
+      "retire_pattern": "BUILD_CEDAR_V1",
+      "probes": [{"query": "本仓库构建命令和回归测试集目前分别是什么？", "expected": {"command": ["BUILD_CEDAR_V2"], "suite": ["SUITE_MAPLE_27"]}}],
+      "facts": [{"scope": "project", "pattern": "BUILD_CEDAR_V2"}, {"scope": "project", "pattern": "SUITE_MAPLE_27"}]
+    },
+    {
+      "id": "scope_exception", "layer": 2,
+      "sessions": ["请记住我的个人长期偏好：所有新项目默认使用 pnpm。", "当前这个仓库是明确例外：受现有锁文件约束，本仓库固定用 npm。我的其他新项目仍默认使用 pnpm。请分别记住，项目例外不要覆盖个人默认。"],
+      "probes": [{"query": "本仓库和我其他新项目分别默认使用哪种包管理器？", "expected": {"repository": ["npm"], "other_projects": ["pnpm"]}}],
+      "facts": [{"scope": "user", "pattern": "pnpm"}, {"scope": "project", "pattern": "npm"}]
+    },
+    {
+      "id": "unconfirmed_change", "layer": 2,
+      "sessions": ["已正式确认并需要长期记住：本仓库数据库规范固定为 PostgreSQL 16。", "我在考虑将来改成 MySQL 8，但目前没有批准，也没有执行。当前规范依旧是 PostgreSQL 16，不要把设想当成已确定的变更。"],
+      "probes": [{"query": "本仓库当前已批准的数据库规范是什么？", "expected": {"database": ["PostgreSQL 16"]}}],
+      "facts": [{"scope": "project", "pattern": "PostgreSQL\\s*16"}]
+    },
+    {
+      "id": "paraphrase_dedup", "layer": 1,
+      "sessions": ["请长期记住我个人的沟通偏好：先给结论，再给支持结论的证据。", "再说一下我的一贯偏好：回答先说结果，之后补依据。这与之前的沟通习惯是同一个意思，没有新增要求。"],
+      "max_active": 1,
+      "probes": [{"query": "我希望回答按什么顺序组织结论和证据？", "expected": {"order": ["结论在前，证据在后", "先结论后证据", "先给结论，再给证据", "conclusion_then_evidence"]}}],
+      "facts": [{"scope": "user", "pattern": "结论|结果"}]
+    },
+    {
+      "id": "hidden_old_fact", "layer": 2,
+      "project_distractors": 50,
+      "seed": [{"scope": "user", "topic": "个人报告格式", "body": "个人长期报告格式偏好固定为 REPORT_LEGACY_831。"}],
+      "retire_pattern": "REPORT_LEGACY_831",
+      "sessions": ["更新我的个人长期偏好：报告格式正式改为 REPORT_MODERN_942，以前的 REPORT_LEGACY_831 已作废。"],
+      "probes": [{"query": "我个人当前的报告格式偏好是什么？", "expected": {"format": ["REPORT_MODERN_942"]}}],
+      "facts": [{"scope": "user", "pattern": "REPORT_MODERN_942"}]
+    },
+    {
+      "id": "topic_synthesis", "layer": 3,
+      "sessions": [
+        "ORION 发布长期规范：发布负责人固定是 OWNER_LARK。请存为项目记忆。",
+        "ORION 发布长期规范：构建入口固定是 BUILD_COPPER_12。请记住这个项目约定。",
+        "ORION 发布长期规范：测试门禁固定是 GATE_BIRCH_34。请记住这个项目约定。",
+        "ORION 发布长期规范：签名密钥别名固定是 SIGN_PINE_56，这是公开别名而非密钥内容。请记住。",
+        "ORION 发布长期规范：包仓库公开别名固定是 REGISTRY_ASH_78。请记住这个项目约定。",
+        "ORION 发布长期规范：回滚入口固定是 ROLLBACK_ELM_90。请记住这个项目约定。",
+        "ORION 发布长期规范：观察窗口固定是 WINDOW_OAK_21。请记住这个项目约定。",
+        "ORION 发布长期规范：审计清单固定是 AUDIT_FIR_43。请记住这个项目约定。"
+      ],
+      "probes": [{"query": "汇总 ORION 发布规范中的负责人、构建入口、测试门禁、签名别名、包仓库别名、回滚入口、观察窗口和审计清单。", "expected": {"owner": ["OWNER_LARK"], "build": ["BUILD_COPPER_12"], "gate": ["GATE_BIRCH_34"], "sign": ["SIGN_PINE_56"], "registry": ["REGISTRY_ASH_78"], "rollback": ["ROLLBACK_ELM_90"], "window": ["WINDOW_OAK_21"], "audit": ["AUDIT_FIR_43"]}}],
+      "facts": [{"scope": "project", "pattern": "OWNER_LARK"}, {"scope": "project", "pattern": "BUILD_COPPER_12"}, {"scope": "project", "pattern": "GATE_BIRCH_34"}, {"scope": "project", "pattern": "SIGN_PINE_56"}, {"scope": "project", "pattern": "REGISTRY_ASH_78"}, {"scope": "project", "pattern": "ROLLBACK_ELM_90"}, {"scope": "project", "pattern": "WINDOW_OAK_21"}, {"scope": "project", "pattern": "AUDIT_FIR_43"}]
+    },
+    {
+      "id": "semantic_retrieval", "layer": 1,
+      "sessions": ["请长期记住我的个人表达偏好：简短答复，不要长篇解释。"],
+      "probes": [
+        {"query": "我偏好简短答复还是长篇解释？", "expected": {"style": ["简短", "brief", "concise", "short"]}},
+        {"query": "以后给我结论时，信息量和展开程度应该怎么控制？", "expected": {"style": ["简短", "brief", "concise", "short"]}}
+      ],
+      "facts": [{"scope": "user", "pattern": "简短|精简|简洁"}]
+    }
+  ]
+}

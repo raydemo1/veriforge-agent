@@ -6,10 +6,13 @@ from harness_code_agent import config
 
 
 @pytest.fixture(autouse=True)
-def isolate_model_credentials(monkeypatch):
+def isolate_model_credentials(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "API_KEY", "test-key")
     monkeypatch.setattr(config, "BASE_URL", "https://model.example.invalid/v1")
     monkeypatch.setattr(config, "ROUTER_API_KEY", "")
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "")
+    monkeypatch.setenv("SILICONFLOW_BASE_URL", "https://embedding.example.invalid/v1")
+    monkeypatch.setenv("HARNESS_MEMORY_ROOT", str(tmp_path / "isolated-memory"))
 
 
 def pytest_addoption(parser):

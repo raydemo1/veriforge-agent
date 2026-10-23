@@ -27,10 +27,12 @@ from ..attachments import (
     build_model_content,
     model_input_mode,
 )
-from ..memory import MemoryService, MemoryWriteCommand
+from ..memory import EvidenceReference, MemoryService, MemoryWriteCommand
 from ..memory.background import (
     begin_memory_turn,
+    close_memory_session,
     finish_memory_turn,
+    open_memory_session,
     start_memory_worker,
 )
 from ..profiles import get_profile
@@ -154,6 +156,7 @@ class InteractiveSession:
             self.enable_turn_summary = enable_turn_summary
             self.memory_use_enabled = os.environ.get("HARNESS_MEMORY_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
             self.memory_auto_extract_enabled = os.environ.get("HARNESS_MEMORY_GENERATION_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
+            self.memory_service = MemoryService(self.cwd)
             self.recovery = RecoveryService(self.cwd)
             self._report_startup("loading skills")
             self.skill_registry = SkillRegistry()
@@ -194,7 +197,7 @@ class InteractiveSession:
             self._report_startup("connecting tools")
             self._bind_profile(self._pending_profile_name, source=self._profile_source)
             if self.memory_auto_extract_enabled:
-                start_memory_worker(self.cwd)
+                open_memory_session(self.cwd, self.session.id, self.session.journal_path)
             self._report_startup("ready")
         except BaseException:
             for error in self.lifecycle.close():
@@ -254,7 +257,7 @@ class InteractiveSession:
         # it as the variable suffix it is.
         memory_index = None
         if self.memory_use_enabled:
-            block = MemoryService(self.cwd).index_block()
+            block = self.memory_service.index_block()
             if "\n- [" in block:
                 memory_index = block
         return Agent(
@@ -598,6 +601,7 @@ class InteractiveSession:
             session_id=self.session.id,
             memory_use_enabled=self.memory_use_enabled,
             memory_auto_extract_enabled=self.memory_auto_extract_enabled,
+            memory_service=self.memory_service,
             approval_provider=self.approval_provider,
             question_provider=self.question_provider,
             tool_registry=self.tool_registry,
@@ -688,6 +692,10 @@ class InteractiveSession:
         self.profile = profile
         self.agent = slot.agent
         self.conversation = slot.conversation
+        if self.memory_use_enabled:
+            reference = self.memory_service.startup_block()
+            if reference:
+                self.conversation.append_message({"role": "user", "content": reference}, {"kind": "memory_reference"})
         # Profile presets (e.g. review's no-workspace-writes) live on the
         # policy, so switching profiles must re-apply the preset immediately.
         self.tool_context.permission_policy = self._effective_permission_policy()
@@ -724,6 +732,7 @@ class InteractiveSession:
         completed = False
         if tracking:
             try:
+                self.memory_service.extraction.register(session_id, self.session.journal_path)
                 begin_memory_turn(self.cwd, session_id)
             except (OSError, ValueError, sqlite3.Error) as exc:
                 log.debug("Failed to defer memory extraction: %s", exc)
@@ -753,6 +762,7 @@ class InteractiveSession:
             workspace_root=self.cwd,
             session_store=self.session_store,
         )
+        mention_paths = _memory_mention_paths(resolved)
         resolved = [item for item in resolved if item.kind != "file"]
         prompt_for_model = self._externalize_large_turn_text(
             "prompt",
@@ -760,15 +770,7 @@ class InteractiveSession:
             intro="The full user prompt was too large to inline.",
         )
         resolved_for_model = self._externalize_large_mentions(resolved)
-        context_block = self._augment_user_prompt(
-            prompt_for_model,
-            mention_paths=_memory_mention_paths(resolved),
-        )
-        prompt_with_mentions = _format_turn_with_mentions_and_memory(
-            prompt_for_model,
-            resolved_for_model,
-            context_block,
-        )
+        prompt_with_mentions = _format_turn_with_mentions(prompt_for_model, resolved_for_model)
         if turn_instruction:
             prompt_with_mentions = f"{turn_instruction}\n\nUser request:\n{prompt_with_mentions}"
         task = self.format_task(prompt_with_mentions)
@@ -804,11 +806,34 @@ class InteractiveSession:
         # immediately while tools are loading.
         self._ensure_mcp_tools_loaded()
         turn_event_start = len(getattr(self.event_bus, "events", []))
+        if self.memory_auto_extract_enabled:
+            source = self.conversation.journal.append_user_input(
+                user_prompt, turn_id=f"{self.session.id}:{self.turn_count}",
+                memory_generation=self.memory_service.extraction.generation)
+            self.tool_context.memory_journal_path = str(self.session.journal_path)
+            self.tool_context.memory_user_sequence = source.sequence
+        reference = self._augment_user_prompt(user_prompt, mention_paths=mention_paths)
         text = self.conversation.submit(
             model_content,
-            task_text=task,
+            task_text=user_prompt,
             cancellation_token=cancellation_token,
+            reference_context=reference,
         )
+        if self.memory_auto_extract_enabled:
+            verification = getattr(self.conversation.runtime_state, "verification", None)
+            if (verification and verification.get("turn_id") == self.conversation.runtime_state.turn_id
+                    and not getattr(self.conversation.runtime_state, "verification_stale", True)):
+                checks = [c for c in verification.get("checks", []) if c.get("status") in {"passed", "failed"}]
+                if checks:
+                    self.conversation.journal.append_verification(
+                        summary=json.dumps(checks, ensure_ascii=False),
+                        outcome="failed" if any(c["status"] == "failed" for c in checks) else "passed",
+                        tool_call_id=f"native-checks:{self.session.id}:{self.turn_count}",
+                        memory_generation=self.memory_service.extraction.generation,
+                        files=[{"path": path, "fingerprint": fingerprint}
+                               for path, fingerprint in verification.get("fingerprints", {}).items()
+                               if path in verification.get("files", [])],
+                    )
         if cancellation_token is not None and cancellation_token.is_cancelled:
             from ..agent.cancellation import CancelledError
             raise CancelledError("Turn cancelled by user")
@@ -1082,9 +1107,9 @@ class InteractiveSession:
         return "\n".join(lines)
 
     def memory_command(self, args: list[str]) -> str:
-        service = MemoryService(self.cwd)
+        service = self.memory_service
         if not args or args == ["status"]:
-            counts = {scope: len(store.list_documents()) for scope, store in service.stores.items()}
+            counts = {scope: len(store.records()) for scope, store in service.stores.items()}
             return (
                 f"memory use: {'on' if self.memory_use_enabled else 'off'}; "
                 f"generate: {'on' if self.memory_auto_extract_enabled else 'off'}; "
@@ -1101,45 +1126,74 @@ class InteractiveSession:
                 if self.tool_context is not None:
                     self.tool_context.memory_auto_extract_enabled = enabled
                 if enabled:
-                    start_memory_worker(self.cwd)
+                    service.extraction.resume(self.session.id)
+                    open_memory_session(self.cwd, self.session.id, self.session.journal_path)
                 elif self.session is not None:
-                    service.stores["project"].cancel_extraction(self.session.id)
+                    service.extraction.cancel(self.session.id)
             suffix = "；启动索引将在下次新会话刷新" if args[0] == "use" else ""
             return f"memory {args[0]}: {args[1]}{suffix}"
+        if args[0] == "topics":
+            return json.dumps(service.topics(args[1] if len(args) > 1 else "project"), ensure_ascii=False, indent=2)
+        if args[0] == "history" and len(args) == 2:
+            scope, memory_id = _parse_memory_ref(args[1])
+            return json.dumps(service.read(memory_id, scope, history=True), ensure_ascii=False, indent=2)
+        if args[0] == "restore" and len(args) == 4:
+            scope, memory_id = _parse_memory_ref(args[1])
+            record = service.restore(memory_id, int(args[2]), int(args[3]), scope)
+            return f"已恢复 {scope}:{record.id} v{record.version}"
+        if args == ["retry"]:
+            project = service.stores["project"]
+            with project.connect(write=True) as db:
+                for table in ("extraction_tasks", "consolidation_tasks"):
+                    db.execute(f"UPDATE {table} SET status='pending',failures=0,available_at=0,error_type=NULL "
+                               "WHERE namespace=? AND status IN ('failed','blocked')", (project.namespace,))
+                db.execute("UPDATE vector_outbox SET failures=0,available_at=0,error_type=NULL WHERE memory_id IN "
+                           "(SELECT id FROM memories WHERE namespace IN (?, 'user'))", (project.namespace,))
+            start_memory_worker(self.cwd)
+            return "已重新排队失败的记忆任务"
         if args[0] == "search" and len(args) > 1:
             return service.format_hits(service.search(" ".join(args[1:]))) or "没有找到相关记忆"
         if args[0] in {"show", "forget", "validate"} and len(args) >= 2:
             scope, memory_id = _parse_memory_ref(args[1])
             if args[0] == "show":
                 doc = service.read(memory_id, scope=scope)
-                return json.dumps({**doc.metadata(), "body": doc.body}, ensure_ascii=False, indent=2)
+                return json.dumps(doc, ensure_ascii=False, indent=2)
             if len(args) != 3:
                 raise ValueError(f"用法：/memory {args[0]} [project:|user:]<id> <version>")
             version = int(args[2])
             if args[0] == "forget":
                 service.forget(memory_id, version, scope=scope)
                 return f"已遗忘 {scope}:{memory_id}，正文已删除"
-            doc = service.validate(memory_id, version, scope=scope)
-            return f"已验证 {scope}:{doc.id} v{doc.version}"
+            doc = service.validate(memory_id, version, self._memory_command_evidence(args), scope=scope)
+            return f"已确认 {scope}:{doc.id} v{doc.version}"
         if args[0] == "edit" and len(args) >= 4:
             scope, memory_id = _parse_memory_ref(args[1])
             version = int(args[2])
-            current = service.read(memory_id, scope=scope)
+            from dataclasses import asdict
+            current = asdict(service.stores[scope].read(memory_id))
             doc = service.write(MemoryWriteCommand(
-                topic=current.topic,
+                topic=current["topic"], fact_key=current["fact_key"], kind=current["kind"],
+                evidence=self._memory_command_evidence(args),
                 body=" ".join(args[3:]),
                 scope=scope,
-                applicability=current.applicability,
-                source_sessions=current.source_sessions,
-                source_paths=current.source_paths,
-                memory_id=current.id,
+                applicability=current["applicability"],
+                memory_id=current["id"],
                 expected_version=version,
             ))
             return f"已编辑 {scope}:{doc.id} v{doc.version}"
         raise ValueError(
-            "用法：/memory [status|search <query>|show <id>|edit <id> <version> <body>|forget <id> <version>|"
+            "用法：/memory [status|topics [scope]|history <id>|restore <id> <revision> <version>|retry|"
+            "search <query>|show <id>|edit <id> <version> <body>|forget <id> <version>|"
             "validate <id> <version>|use on|off|generate on|off]"
         )
+
+    def _memory_command_evidence(self, args):
+        text = "/memory " + " ".join(args)
+        source = self.conversation.journal.append_user_input(
+            text, turn_id=f"memory-command:{time.time_ns()}",
+            memory_generation=self.memory_service.extraction.generation)
+        return [EvidenceReference(self.session.id, source.sequence, "user_input", hashlib.sha256(text.encode()).hexdigest(),
+                                  end_offset=len(text), source_namespace=self.memory_service.stores["project"].namespace, observed_at=source.timestamp)]
 
     def submit_skill_command(self, line: str) -> TurnResult:
         if self.skill_registry.build_user_invocation(line) is None:
@@ -1587,6 +1641,8 @@ class InteractiveSession:
 
     def _activate_session(self, session: Session) -> None:
         """Rebind every live component onto an already-created session."""
+        if self.session is not None:
+            close_memory_session(self.cwd, self.session.id)
         self.session = session
         self.attachment_manager = AttachmentManager(
             self.cwd,
@@ -1610,6 +1666,10 @@ class InteractiveSession:
         if self.tool_context is not None:
             self.tool_context.session_id = session.id
             self.tool_context.event_bus = self.event_bus
+            self.tool_context.memory_journal_path = str(session.journal_path)
+            self.tool_context.memory_user_sequence = None
+        if self.memory_auto_extract_enabled:
+            open_memory_session(self.cwd, session.id, session.journal_path)
         self._sync_recovery_session_state()
 
     def _externalize_large_turn_text(self, label: str, text: str, *, intro: str) -> str:
@@ -1677,7 +1737,7 @@ class InteractiveSession:
     def _augment_user_prompt(self, user_prompt: str, *, mention_paths: list[str]) -> str:
         if self.agent is None or self.conversation is None or not getattr(self, "memory_use_enabled", True):
             return ""
-        hits = MemoryService(self.cwd).search(user_prompt, scope="both", paths=mention_paths)
+        hits = self.memory_service.search(user_prompt, scope="both", paths=mention_paths)
         return MemoryService.format_hits(hits)
 
 
@@ -1690,6 +1750,7 @@ class InteractiveSession:
             log.warning("Failed to close session resource %s: %s", error.name, error.error)
         if self.session is None or self.event_bus is None:
             return
+        close_memory_session(self.cwd, self.session.id)
         try:
             metadata = self.session_store.read_metadata(self.session.id)
             events = self.session_store.read_events(self.session.id)
@@ -1756,17 +1817,14 @@ def _parse_memory_ref(value: str) -> tuple[str, str]:
     return scope, memory_id
 
 
-def _format_turn_with_mentions_and_memory(
+def _format_turn_with_mentions(
     user_text: str,
     resolved: list[ResolvedMention],
-    memory_block: str,
 ) -> str:
     parts = []
     mention_context = render_mention_context(resolved)
     if mention_context:
         parts.append(mention_context)
-    if memory_block:
-        parts.append(memory_block)
     if not parts:
         return user_text
     parts.append(f"User turn:\n{user_text}")

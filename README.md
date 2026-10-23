@@ -87,7 +87,19 @@ raise SystemExit(result.exit_code)
 
 上下文默认达到窗口的 80% 时压缩，同时预留模型输出空间。压缩只更新当前上下文视图，原始会话日志保留。
 
-长期记忆可由 Agent 通过 `memory_write` 即时保存。自动抽取在完整轮次结束时持久化任务，默认空闲 6 小时后在后台执行；连续轮次合并任务并重新计时，正在执行的会话跳过。通过 `HARNESS_MEMORY_IDLE_SECONDS` 设置空闲秒数，例如 `3600` 表示 1 小时。退出进程不会等待倒计时，待处理任务在后续启动时恢复；正常退出不是抽取的必要条件。`/memory generate off` 会取消当前会话尚未完成的自动抽取。
+长期记忆以 `~/.harness/memory-v3/memory.db` 为唯一数据源，用户偏好与各仓库分区隔离，同仓库的 worktree 共用项目记忆。`views/` 中的 Markdown 是按主题生成的只读视图，直接修改不会写回数据库。六类记忆为：偏好、项目事实、规范、决定、经验和工作流程。
+
+在本机 `.env` 中配置 `SILICONFLOW_API_KEY` 后，检索使用硅基流动 `BAAI/bge-m3`（1024 维）与 SQLite 全文检索，两路独立召回再合并排序。查询不额外调用聊天模型，但会产生 embedding 请求；重复查询在会话内缓存。语义服务失败或索引未齐全会明确标记，不把检索失败解释为没有记忆。可用 `HARNESS_MEMORY_ROOT` 指定独立存储根目录。
+
+新会话先加载有界的主题索引及少量全局偏好、规范；每轮按任务检索相关记忆，再作为独立参考消息追加。模型可以用 `memory_search` 分页、限定路径或类别，用 `memory_read` 展开主题、读取事实或查看历史。不会整份导入当前视图，也不会回写已经发送的历史。
+
+明确保存通过 `memory_write` 即时完成，必须逐字引用当前原始用户输入作为证据；纠正使用原 ID 和版本，保留旧修订。自动提取只读取单独记录的原始用户输入和原生结构化验证，不读取回忆、模型推断或任意工具输出。默认空闲 6 小时后提取，连续轮次合并并重新计时；提取候选、跨会话整理和向量更新分别持久化、分阶段处理。通过 `HARNESS_MEMORY_IDLE_SECONDS` 调整空闲秒数。关闭进程或会话不会等待倒计时，未完成工作在后续启动时恢复；`/memory generate off` 取消当前会话尚未完成的生成任务。
+
+整理只对当前有效视图做逻辑更新，原始候选与修订历史保留。历史事件不反复成为当前事实，未决冲突只返回不确定提示。文件证据变化会使相关事实过期；较旧的后台结果不能覆盖较新的已确认状态。索引失败独立重试，旧向量随事实更新立即失效。
+
+管理命令包括 `/memory status`、`search <query>`、`topics [scope]`、`show <id>`、`history <id>`、`edit <id> <version> <body>`、`validate <id> <version>`、`restore <id> <revision> <version>`、`forget <id> <version>`、`retry`，以及 `use on|off`、`generate on|off`。ID 可带 `project:` 或 `user:` 前缀。遗忘删除长期记忆及其修订并抑制旧来源再次提取，原始会话日志保留；用户明确要求重新记住时，`memory_write(restore_forgotten=true)` 使用新证据重新保存。
+
+独立验证脚本：`eval/scripts/check_memory_consolidation.py`、`check_memory_runtime.py`；真实模型评测必须显式带 `--run`，场景与请求上限写入各次评测产物，不纳入默认测试集。
 
 每轮对话结束后会自动保存回撤点。鼠标悬停到该轮对话，或用键盘聚焦该轮，即可显示「回撤到此处」。确认后保留这一轮，对话和文件一起恢复到该轮结束时的状态；原来的后续历史保留在原会话中。「会话开始」也支持回撤，可撤回第一轮。首次允许修改前保存原始状态，相同内容的快照自动复用。
 
@@ -140,7 +152,7 @@ veriforge --profile review "Review the current branch"
 | `runtime/` | 工具 registry、权限、调度、middleware 和 MCP |
 | `workspace/` | 文件保护、快照、Shell 和后台任务 |
 | `sessions/` | session metadata、事件、逻辑消息手账和报告 |
-| `memory/` | Markdown 记忆正文、BM25 检索、适用性验证和后台提炼 |
+| `memory/` | SQLite 事实与修订、主题视图、向量＋全文检索、分阶段后台整理 |
 | `profiles/` | 不同任务模式的 prompt、工具面和验收策略 |
 | `frontend/opentui/` | Bun + React + TypeScript 终端界面 |
 | `eval/` | 基准任务、运行器和结果账本 |

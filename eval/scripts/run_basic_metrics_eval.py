@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,8 @@ from typing import Any
 PROJECT_ROOT_BOOTSTRAP = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT_BOOTSTRAP) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT_BOOTSTRAP))
+
+from unittest.mock import patch
 
 from eval.scripts.eval_common import (
     PROJECT_ROOT,
@@ -33,7 +36,11 @@ from eval.scripts.eval_common import (
     write_eval_reports,
     write_suite_summary,
 )
-from harness_code_agent.memory.store import MemoryStore, MemoryWriteCommand
+from harness_code_agent.memory import (
+    EvidenceReference,
+    MemoryService,
+    MemoryWriteCommand,
+)
 from harness_code_agent.sessions.observability import build_session_observability
 from harness_code_agent.sessions.store import SessionStore
 
@@ -116,7 +123,7 @@ def run_memory_suite(args: argparse.Namespace) -> Path:
     evidence_root = PROJECT_ROOT / ".harness" / "memory-eval-evidence" / run_dir.name
     evidence_root.mkdir(parents=True, exist_ok=True)
     for task in tasks:
-        for variant in ("disabled", "recall", "checked"):
+        for variant in ("disabled", "enabled"):
             env = base_env()
             memory_root = run_dir / "memory_roots" / str(task["id"]) / variant
             env["HARNESS_MEMORY_ROOT"] = str(memory_root)
@@ -127,7 +134,6 @@ def run_memory_suite(args: argparse.Namespace) -> Path:
                 env["HARNESS_MEMORY_DISABLED"] = "1"
             else:
                 env.pop("HARNESS_MEMORY_DISABLED", None)
-            env["HARNESS_MEMORY_APPLICABILITY_CHECK"] = "0" if variant == "recall" else "1"
             learning = _run_hca_case(
                 suite="memory_lifecycle",
                 case_id=str(task["id"]),
@@ -324,14 +330,16 @@ def _seed_memory(
     *,
     extra_source_path: Path | None = None,
 ) -> None:
-    store = MemoryStore(memory_root, workspace=PROJECT_ROOT)
-    for candidate in task.get("memory_records") or []:
-        store.write(
+    with patch.dict(os.environ, {"HARNESS_MEMORY_ROOT": str(memory_root)}):
+        service = MemoryService(PROJECT_ROOT)
+    for number, candidate in enumerate(task.get("memory_records") or []):
+        service.write(
             MemoryWriteCommand(
+                fact_key=f"eval.{number}", kind="project_fact",
+                evidence=[EvidenceReference("eval_seed", number + 1, "manual", "f" * 64)],
                 topic=str(candidate.get("topic") or candidate.get("title") or "Eval memory"),
                 body=str(candidate.get("stale_summary") or candidate.get("body") or candidate.get("summary") or ""),
                 applicability=str(candidate.get("applicability") or ""),
-                source_sessions=["eval_seed"],
                 source_paths=[
                     *[str(path) for path in candidate.get("source_paths") or []],
                     *([str(extra_source_path)] if extra_source_path is not None else []),
@@ -356,8 +364,7 @@ def _memory_summary(
     learning_results: list[CaseResult] | None = None,
 ) -> dict[str, Any]:
     disabled = _aggregate_case_results([item for item in results if item.variant == "disabled"])
-    recall = _aggregate_case_results([item for item in results if item.variant == "recall"])
-    checked = _aggregate_case_results([item for item in results if item.variant == "checked"])
+    enabled = _aggregate_case_results([item for item in results if item.variant == "enabled"])
     stale_markers = [
         str(marker)
         for task in load_task_list("memory_ab.json")["tasks"]
@@ -369,19 +376,17 @@ def _memory_summary(
         "task_count": len({item.case_id for item in results}),
         "protocol": "two-session: learn, then reuse after evidence changes",
         "disabled": disabled,
-        "recall": recall,
-        "checked": checked,
+        "enabled": enabled,
         "stale_adoption_rate": {
             "disabled": _output_marker_rate(results, "disabled", stale_markers),
-            "recall": _output_marker_rate(results, "recall", stale_markers),
-            "checked": _output_marker_rate(results, "checked", stale_markers),
+            "enabled": _output_marker_rate(results, "enabled", stale_markers),
         },
         "learning_cost": _aggregate_case_results(learning_results or []),
-        "checked_vs_disabled": {
-            "tool_calls_reduction_ratio": reduction(disabled["tool_calls"], checked["tool_calls"]),
-            "elapsed_seconds_reduction_ratio": reduction(disabled["elapsed_seconds"], checked["elapsed_seconds"]),
-            "total_tokens_reduction_ratio": reduction(disabled["total_tokens"], checked["total_tokens"]),
-            "success_delta": checked["success_rate"] - disabled["success_rate"],
+        "enabled_vs_disabled": {
+            "tool_calls_reduction_ratio": reduction(disabled["tool_calls"], enabled["tool_calls"]),
+            "elapsed_seconds_reduction_ratio": reduction(disabled["elapsed_seconds"], enabled["elapsed_seconds"]),
+            "total_tokens_reduction_ratio": reduction(disabled["total_tokens"], enabled["total_tokens"]),
+            "success_delta": enabled["success_rate"] - disabled["success_rate"],
         },
     }
 

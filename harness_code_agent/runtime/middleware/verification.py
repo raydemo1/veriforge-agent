@@ -34,6 +34,8 @@ class StaticVerifierMiddleware(AgentMiddleware):
             runtime_state.verification = {
                 "checks": [check.to_dict() for check in results],
                 "fingerprints": current,
+                "files": files,
+                "turn_id": getattr(runtime_state, "turn_id", None),
                 "sequence": getattr(runtime_state, "observation_sequence", None),
             }
             runtime_state.verification_stale = False

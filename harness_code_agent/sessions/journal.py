@@ -31,6 +31,22 @@ class SessionJournal:
     def append_message(self, message: dict, *, metadata: dict | None = None) -> JournalEntry:
         return self.append("message", {"message": _json_safe(message), "metadata": metadata or {}})
 
+    def append_user_input(self, text: str, *, turn_id: str, memory_generation: str) -> JournalEntry:
+        if not isinstance(text, str) or not text.strip() or not turn_id or not memory_generation:
+            raise ValueError("user input requires text, turn identity and memory generation")
+        return self.append("user_input", {
+            "text": text, "turn_id": turn_id, "memory_generation": memory_generation,
+        })
+
+    def append_verification(self, *, summary: str, outcome: str, tool_call_id: str,
+                            memory_generation: str, files: list[dict] | None = None) -> JournalEntry:
+        if outcome not in {"passed", "failed"} or not summary.strip() or not tool_call_id or not memory_generation:
+            raise ValueError("verification requires a structured outcome, summary, tool call and generation")
+        return self.append("verification", {
+            "text": summary, "outcome": outcome, "tool_call_id": tool_call_id,
+            "memory_generation": memory_generation, "files": _json_safe(files or []),
+        })
+
     def append_compaction(
         self,
         *,

@@ -1,13 +1,5 @@
-"""Auditable long-term memory for VeriForge."""
+"""Evidence-backed SQLite memory with generated topic views."""
+from .database import EvidenceReference, MemoryDatabase, MemoryRecord
+from .service import MemoryService, MemoryWriteCommand
 
-from .service import MemoryHit, MemoryService
-from .store import MemoryDocument, MemoryStore, MemoryWriteCommand, default_memory_root
-
-__all__ = [
-    "MemoryDocument",
-    "MemoryHit",
-    "MemoryService",
-    "MemoryStore",
-    "MemoryWriteCommand",
-    "default_memory_root",
-]
+__all__ = ["EvidenceReference", "MemoryDatabase", "MemoryRecord", "MemoryService", "MemoryWriteCommand"]

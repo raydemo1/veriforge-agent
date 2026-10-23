@@ -25,6 +25,9 @@ class ToolContext:
     session_id: str | None = None
     memory_use_enabled: bool = True
     memory_auto_extract_enabled: bool = True
+    memory_service: object | None = field(default=None, repr=False)
+    memory_journal_path: str | None = None
+    memory_user_sequence: int | None = None
     approval_provider: ApprovalProvider = field(default_factory=NoApprovalProvider)
     question_provider: QuestionProvider = field(default_factory=NoQuestionProvider)
     tool_registry: ToolRegistry | None = None

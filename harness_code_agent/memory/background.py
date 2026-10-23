@@ -1,376 +1,201 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
-import re
 import threading
 import time
 from pathlib import Path
 
-from .. import config
-from ..agent.providers import ProviderAdapter, client_scope
+from .reconciliation import ConsolidationQueue
 from .service import MemoryService
-from .store import MemoryWriteCommand
+from .vectors import BudgetedEmbeddings, VectorIndex
 
 log = logging.getLogger("harness")
-EXTRACTION_TEXT_LIMIT = 60_000
-_worker_lock = threading.Lock()
-#: Maps a workspace to a rerun flag while its kicked one-shot worker runs.
-#: A kick arriving while the worker is running sets the flag so the worker
-#: drains one more pass instead of the kick being lost.
-_running_workspaces: dict[Path, bool] = {}
-_scheduled_workspaces: dict[Path, threading.Timer] = {}
-_active_sessions: dict[Path, set[str]] = {}
+_lock = threading.RLock()
+_running: dict[tuple, bool] = {}
+_timers: dict[tuple, threading.Timer] = {}
+_clients: dict[tuple, set[str]] = {}
+_active: set[tuple] = set()
+_heartbeats: dict[tuple, threading.Timer] = {}
 
 
-def begin_memory_turn(workspace: str | Path, session_id: str) -> None:
-    resolved = Path(workspace).resolve()
-    with _worker_lock:
-        _active_sessions.setdefault(resolved, set()).add(session_id)
-    MemoryService(resolved).stores["project"].defer_extraction(session_id, config.MEMORY_EXTRACTION_IDLE_SECONDS)
+def _key(service):
+    store = service.stores["project"]
+    return str(store.path), store.namespace
 
 
-def finish_memory_turn(workspace: str | Path, session_id: str, journal_path: Path | None = None) -> None:
-    resolved = Path(workspace).resolve()
-    try:
-        store = MemoryService(resolved).stores["project"]
-        if journal_path is not None and journal_path.is_file():
-            store.enqueue_extraction(
-                session_id, journal_path.stat().st_size, journal_path,
-                idle_seconds=config.MEMORY_EXTRACTION_IDLE_SECONDS,
-            )
-        else:
-            store.defer_extraction(session_id, config.MEMORY_EXTRACTION_IDLE_SECONDS)
-    finally:
-        with _worker_lock:
-            active = _active_sessions.get(resolved, set())
-            active.discard(session_id)
-            if not active:
-                _active_sessions.pop(resolved, None)
-        start_memory_worker(resolved)
+def open_memory_session(workspace, session_id, journal_path):
+    service = MemoryService(workspace)
+    service.extraction.register(session_id, Path(journal_path))
+    with _lock:
+        _clients.setdefault(_key(service), set()).add(session_id)
+    start_memory_worker(workspace)
 
 
-def _active_for(workspace: Path) -> set[str]:
-    with _worker_lock:
-        return set(_active_sessions.get(workspace, set()))
+def begin_memory_turn(workspace, session_id):
+    service = MemoryService(workspace)
+    with _lock:
+        _active.add((*_key(service), session_id))
+    _heartbeat(service, (*_key(service), session_id))
 
 
-def _schedule_next_pass(workspace: Path, store) -> None:
-    active = _active_for(workspace)
-    with store.connect() as db:
-        rows = db.execute(
-            "SELECT session_id,available_at,lease_until,status FROM extraction_jobs "
-            "WHERE status IN ('pending','running') AND attempts<3"
-        ).fetchall()
-    deadlines = [
-        max(row["available_at"], row["lease_until"] or 0) if row["status"] == "running" else row["available_at"]
-        for row in rows if row["session_id"] not in active
-    ]
-    with _worker_lock:
-        previous = _scheduled_workspaces.pop(workspace, None)
-        if previous is not None:
+def _heartbeat(service, identity):
+    with _lock:
+        if identity not in _active:
+            return
+        service.extraction.set_active(identity[-1])
+        timer = threading.Timer(30, _heartbeat, args=(service, identity))
+        timer.daemon = True
+        previous = _heartbeats.pop(identity, None)
+        if previous:
             previous.cancel()
-        if deadlines:
-            timer = threading.Timer(max(0.01, min(deadlines) - time.time()), start_memory_worker, args=(workspace,))
-            timer.daemon = True
-            _scheduled_workspaces[workspace] = timer
-            timer.start()
+        _heartbeats[identity] = timer
+        timer.start()
 
 
-def start_memory_worker(workspace: str | Path) -> None:
-    """Drain ready jobs and schedule the next durable idle/retry deadline."""
-    resolved = Path(workspace).resolve()
-    with _worker_lock:
-        if resolved in _running_workspaces:
-            # Missed-wake-up guard: remember the kick; the running worker
-            # re-checks the flag before removing itself.
-            _running_workspaces[resolved] = True
+def finish_memory_turn(workspace, session_id, journal_path=None):
+    service = MemoryService(workspace)
+    with _lock:
+        identity = (*_key(service), session_id)
+        _active.discard(identity)
+        heartbeat = _heartbeats.pop(identity, None)
+        if heartbeat:
+            heartbeat.cancel()
+    service.extraction.finish_activity(session_id)
+    if journal_path is not None:
+        service.extraction.enqueue(session_id, Path(journal_path))
+    start_memory_worker(workspace)
+
+
+def close_memory_session(workspace, session_id):
+    service = MemoryService(workspace)
+    key = _key(service)
+    with _lock:
+        identity = (*key, session_id)
+        _active.discard(identity)
+        heartbeat = _heartbeats.pop(identity, None)
+        if heartbeat:
+            heartbeat.cancel()
+        clients = _clients.get(key, set())
+        clients.discard(session_id)
+        if not clients:
+            _clients.pop(key, None)
+            timer = _timers.pop(key, None)
+            if timer:
+                timer.cancel()
+
+
+def drain_memory_jobs(service, *, max_model_calls=8, max_embedding_requests=16, should_continue=None):
+    if not 1 <= max_model_calls <= 16 or not 0 <= max_embedding_requests <= 32:
+        raise ValueError("Invalid background memory budget")
+    budget = BudgetedEmbeddings(max_embedding_requests)
+    factory = lambda database: VectorIndex(database, embeddings=budget)
+    project = service.stores["project"]
+    consolidation = ConsolidationQueue(project, vector_factory=factory)
+    calls, states = 0, []
+    eligible = should_continue or (lambda: True)
+    while calls < max_model_calls and eligible():
+        extracted = service.extraction.claim()
+        if extracted:
+            result = service.extraction.process(extracted, max_calls=min(8, max_model_calls - calls), should_continue=eligible)
+            calls += result["calls"]
+            states.append(result["state"])
+        if not eligible():
+            break
+        for store in service.stores.values():
+            result = factory(store).sync(max_requests=min(4, budget.remaining), should_continue=eligible)
+            if result.get("budget_exhausted"):
+                break
+        if calls >= max_model_calls or budget.remaining == 0 or not eligible():
+            break
+        task = consolidation.claim()
+        if task:
+            result = consolidation.process(task, should_continue=eligible)
+            calls += result["calls"]
+            states.append(result["state"])
+            if result["state"] == "index_pending":
+                with project.connect(write=True) as db:
+                    failed = db.execute("SELECT 1 FROM vector_outbox o JOIN memories m ON m.id=o.memory_id "
+                                        "WHERE m.namespace IN (?, 'user') AND o.failures>=3 LIMIT 1",
+                                        (project.namespace,)).fetchone()
+                    if failed:
+                        db.execute("UPDATE consolidation_tasks SET status='blocked',error_type='EmbeddingIndexFailed' "
+                                   "WHERE id=? AND status='pending'", (task["id"],))
+                break
+        if not extracted and not task:
+            break
+    service.flush_exports()
+    return {"model_calls": calls, "embedding_requests": budget.used, "states": states}
+
+
+def start_memory_worker(workspace):
+    service = MemoryService(workspace)
+    _start_service_worker(service)
+
+
+def _start_service_worker(service):
+    key = _key(service)
+    with _lock:
+        if key not in _clients:
             return
-        _running_workspaces[resolved] = False
-        timer = _scheduled_workspaces.pop(resolved, None)
-        if timer is not None:
+        if key in _running:
+            _running[key] = True
+            return
+        timer = _timers.pop(key, None)
+        if timer:
             timer.cancel()
-    thread = threading.Thread(target=_run_once, args=(resolved,), daemon=True)
-    thread.start()
+        _running[key] = False
+    threading.Thread(target=_run, args=(service, key), daemon=True).start()
 
 
-def _run_once(workspace: Path) -> None:
-    owns_slot = True
+def _has_clients(key):
+    with _lock:
+        return key in _clients
+
+
+def _run(service, key):
     try:
-        service = MemoryService(workspace)
-        store = service.stores["project"]
-        store.ensure_initialized()
         while True:
-            while True:
-                row = _claim_next_job(store)
-                if row is False:
-                    continue
-                if row is None:
+            with _lock:
+                if key not in _clients:
                     break
-                _process_job(service, store, row)
-            _schedule_next_pass(workspace, store)
-            with _worker_lock:
-                if _running_workspaces.get(workspace):
-                    # A kick landed during the drain; run another pass.
-                    _running_workspaces[workspace] = False
-                else:
-                    # Removal and the exit decision share the lock, closing
-                    # the window where a kick could see a running worker that
-                    # is about to exit.
-                    _running_workspaces.pop(workspace, None)
-                    owns_slot = False
-                    return
+            drain_memory_jobs(service, should_continue=lambda: _has_clients(key))
+            with _lock:
+                if _running[key]:
+                    _running[key] = False
+                    continue
+                break
+    except Exception as exc:  # noqa: BLE001 - durable jobs retain progress; do not log source/provider content
+        log.warning("Memory worker paused: %s", type(exc).__name__)
     finally:
-        with _worker_lock:
-            if owns_slot:
-                _running_workspaces.pop(workspace, None)
+        with _lock:
+            _running.pop(key, None)
+            if key in _clients:
+                _schedule(service, key)
 
 
-def _claim_next_job(store):
+def _schedule(service, key):
+    store = service.stores["project"]
     now = time.time()
-    active = _active_for(store.workspace)
     with store.connect() as db:
-        db.execute(
-            "UPDATE extraction_jobs SET status='pending',lease_until=NULL "
-            "WHERE status='running' AND lease_until<? AND attempts<3",
-            (now,),
-        )
         rows = db.execute(
-            "SELECT * FROM extraction_jobs WHERE status='pending' AND available_at<=? "
-            "AND attempts<3 ORDER BY id",
-            (now,),
+            "SELECT MAX(t.available_at,s.active_until,COALESCE(t.lease_until,0)) AS deadline "
+            "FROM extraction_tasks t JOIN extraction_sessions s ON s.namespace=t.namespace AND s.session_id=t.session_id "
+            "WHERE t.namespace=? AND s.enabled=1 AND t.status IN ('pending','running') "
+            "UNION ALL SELECT MAX(c.available_at,s.active_until,COALESCE(c.lease_until,0)) "
+            "FROM consolidation_tasks c JOIN extraction_tasks t ON t.id=c.extraction_task "
+            "JOIN extraction_sessions s ON s.namespace=t.namespace AND s.session_id=t.session_id "
+            "WHERE c.namespace=? AND s.enabled=1 AND c.status IN ('pending','running') "
+            "UNION ALL SELECT o.available_at FROM vector_outbox o JOIN memories m ON m.id=o.memory_id "
+            "WHERE m.namespace IN (?, 'user') AND m.status<>'expired' AND o.failures<3",
+            (store.namespace, store.namespace, store.namespace),
         ).fetchall()
-        row = next((row for row in rows if row["session_id"] not in active), None)
-        if row is None:
-            return None
-        session_key = "session:" + hashlib.sha256(row["session_id"].encode()).hexdigest()
-        if db.execute("SELECT 1 FROM suppressions WHERE key=?", (session_key,)).fetchone():
-            db.execute("UPDATE extraction_jobs SET status='suppressed' WHERE id=?", (row["id"],))
-            return False
-        claimed = db.execute(
-            "UPDATE extraction_jobs SET status='running',attempts=attempts+1,lease_until=? "
-            "WHERE id=? AND status='pending'",
-            (now + 300, row["id"]),
-        ).rowcount
-        return row if claimed else None
-
-
-def _job_ready(store, row) -> bool:
-    with store.connect() as db:
-        current = db.execute("SELECT status,available_at FROM extraction_jobs WHERE id=?", (row["id"],)).fetchone()
-        if current["status"] != "running":
-            return False
-        if row["session_id"] in _active_for(store.workspace) or current["available_at"] > time.time():
-            db.execute("UPDATE extraction_jobs SET status='pending',lease_until=NULL WHERE id=?", (row["id"],))
-            return False
-    return True
-
-
-def _process_job(service: MemoryService, store, row) -> None:
-    session_key = "session:" + hashlib.sha256(row["session_id"].encode()).hexdigest()
-    for scoped_store in service.stores.values():
-        scoped_store.ensure_initialized()
-        with scoped_store.connect() as db:
-            if db.execute("SELECT 1 FROM suppressions WHERE key=?", (session_key,)).fetchone():
-                with store.connect() as queue_db:
-                    queue_db.execute(
-                        "UPDATE extraction_jobs SET status='suppressed',lease_until=NULL WHERE id=?",
-                        (row["id"],),
-                    )
-                return
-    try:
-        if not _job_ready(store, row):
-            return
-        with store.connect() as db:
-            start = db.execute(
-                "SELECT COALESCE(MAX(boundary),0) FROM extraction_jobs "
-                "WHERE session_id=? AND status='done' AND boundary<?", (row["session_id"], row["boundary"]),
-            ).fetchone()[0]
-        for boundary in _batch_boundaries(Path(row["journal_path"]), start, row["boundary"]):
-            if not _job_ready(store, row):
-                return
-            candidates = _extract_candidates(
-                service, Path(row["journal_path"]), row["session_id"],
-                start_boundary=start, end_boundary=boundary,
-            )
-            if not _job_ready(store, row):
-                return
-            for candidate in candidates:
-                if not _job_ready(store, row):
-                    return
-                for scoped_store in service.stores.values():
-                    with scoped_store.connect() as db:
-                        suppressed = db.execute("SELECT 1 FROM suppressions WHERE key=?", (session_key,)).fetchone()
-                    if suppressed:
-                        with store.connect() as db:
-                            db.execute("UPDATE extraction_jobs SET status='suppressed',lease_until=NULL WHERE id=?", (row["id"],))
-                        return
-                service.write(candidate)
-            if boundary < row["boundary"]:
-                with store.connect() as db:
-                    db.execute(
-                        "INSERT INTO extraction_jobs(session_id,boundary,journal_path,status) VALUES(?,?,?,'done') "
-                        "ON CONFLICT(session_id,boundary) DO UPDATE SET status='done',lease_until=NULL,error=NULL",
-                        (row["session_id"], boundary, row["journal_path"]),
-                    )
-            start = boundary
-        with store.connect() as db:
-            db.execute(
-                "UPDATE extraction_jobs SET status='done',lease_until=NULL,error=NULL WHERE id=? AND status='running'",
-                (row["id"],),
-            )
-    except Exception as exc:  # noqa: BLE001 - failed jobs are leased and retried later
-        log.debug("Memory extraction failed: %s", exc)
-        with store.connect() as db:
-            db.execute(
-                "UPDATE extraction_jobs SET status=CASE WHEN attempts>=3 THEN 'failed' ELSE 'pending' END,"
-                "lease_until=NULL,available_at=MAX(available_at,?),error=? WHERE id=? AND status='running'",
-                (time.time() + 300, str(exc)[:500], row["id"]),
-            )
-
-
-def _batch_boundaries(journal_path: Path, start: int, end: int):
-    from ..agent.context import _messages_to_text
-
-    chars = 0
-    pending = set()
-    with journal_path.open("rb") as handle:
-        handle.seek(start)
-        while handle.tell() < end:
-            boundary = handle.tell()
-            line = handle.readline(end - boundary)
-            if not line:
-                break
-            try:
-                entry = json.loads(line)
-            except (ValueError, UnicodeDecodeError):
-                continue
-            if entry.get("kind") != "message":
-                continue
-            message = entry.get("payload", {}).get("message") or {}
-            size = len(_messages_to_text([message])) if message.get("role") != "system" else 0
-            if chars and not pending and chars + size > EXTRACTION_TEXT_LIMIT:
-                yield boundary
-                chars = 0
-            chars += size
-            pending.update(str(call.get("id")) for call in message.get("tool_calls") or [])
-            if message.get("role") == "tool":
-                pending.discard(str(message.get("tool_call_id")))
-    if start < end:
-        yield end
-
-
-def _evidence_paths(workspace: Path, values) -> list[str]:
-    paths = []
-    for value in values if isinstance(values, list) else []:
-        if not isinstance(value, str):
-            continue
-        try:
-            path = (workspace / value).resolve(strict=True)
-            relative = path.relative_to(workspace).as_posix()
-            if path.is_file() and relative not in paths:
-                paths.append(relative)
-        except (OSError, ValueError, RuntimeError):
-            continue
-    return paths
-
-
-def _extract_candidates(
-    service: MemoryService,
-    journal_path: Path,
-    session_id: str,
-    *,
-    start_boundary: int,
-    end_boundary: int,
-) -> list[MemoryWriteCommand]:
-    if not journal_path.is_file():
-        return []
-    messages = []
-    with journal_path.open("rb") as handle:
-        handle.seek(start_boundary)
-        remaining = end_boundary - start_boundary
-        while remaining > 0:
-            line = handle.readline(remaining)
-            if not line:
-                break
-            remaining -= len(line)
-            try:
-                entry = json.loads(line)
-            except (ValueError, UnicodeDecodeError):
-                continue
-            if entry.get("kind") != "message":
-                continue
-            message = dict(entry.get("payload", {}).get("message") or {})
-            message.pop("reasoning_content", None)
-            if message.get("role") != "system":
-                messages.append(message)
-    if not messages:
-        return []
-    from ..agent.context import _messages_to_text, count_request_tokens
-
-    text = _messages_to_text(messages)
-    existing = [
-        {"id": doc.id, "version": doc.version, "scope": doc.scope, "topic": doc.topic, "body": doc.body[:300]}
-        for store in service.stores.values()
-        for doc in store.list_documents()
-    ][:50]
-    prompt = {
-        "session_id": session_id,
-        "existing_memories": existing,
-        "journal": text,
-        "rules": [
-            "Return a JSON array with at most 4 durable memories.",
-            "Keep only explicit preferences, project conventions, decisions, or verified reusable lessons.",
-            "Exclude one-off state, temporary logs, secrets, hidden reasoning, and likely-to-expire details.",
-            "Fields: topic, body, scope(project|user), applicability, source_paths, supersedes(optional), expected_version(optional).",
-            "Use supersedes with the old id and expected_version only for an evidence-backed correction of the same fact.",
-            "Never merge or supersede memories merely because their paths overlap.",
-            "Do not recreate existing memories or recalled memory text; extract only newly supported durable facts.",
-            "source_paths must contain only existing evidence files inside the workspace, not prose or conversation excerpts. Use [] for conversation-only evidence.",
-        ],
-    }
-    profile = config.resolve_model_profile("fast")
-    adapter = ProviderAdapter(profile.provider)
-    kwargs = adapter.chat_kwargs(
-        profile=profile,
-        messages=[
-            {"role": "system", "content": "Extract auditable coding-agent memories. Output JSON only."},
-            {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-        ],
-        max_tokens=1600,
-    )
-    if count_request_tokens(kwargs["messages"]) + kwargs["max_tokens"] > config.CONTEXT_WINDOW_TOKENS:
-        raise ValueError("Memory extraction batch exceeds context budget")
-    with client_scope() as client:
-        response = client.chat.completions.create(**kwargs)
-    raw = str(response.choices[0].message.content or "").strip()
-    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
-    values = json.loads(raw)
-    if not isinstance(values, list):
-        return []
-    commands = []
-    for value in values[:4]:
-        if not isinstance(value, dict):
-            continue
-        body = str(value.get("body") or "").strip()
-        if not body or _looks_secret(body):
-            continue
-        scope = str(value.get("scope") or "project")
-        if scope not in {"project", "user"}:
-            scope = "project"
-        commands.append(
-            MemoryWriteCommand(
-                topic=str(value.get("topic") or body[:80]), body=body, scope=scope,
-                applicability=str(value.get("applicability") or ""),
-                source_sessions=[session_id],
-                source_paths=_evidence_paths(service.workspace, value.get("source_paths", [])),
-                supersedes=str(value.get("supersedes") or "") or None,
-                expected_version=value.get("expected_version"),
-            )
-        )
-    return commands
-
-
-def _looks_secret(text: str) -> bool:
-    return bool(re.search(r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*\S+", text))
+    deadlines = [row[0] for row in rows if row[0] is not None]
+    if deadlines:
+        delay = max(30, min(deadlines) - now)
+        timer = threading.Timer(delay, _start_service_worker, args=(service,))
+        timer.daemon = True
+        previous = _timers.pop(key, None)
+        if previous:
+            previous.cancel()
+        _timers[key] = timer
+        timer.start()
