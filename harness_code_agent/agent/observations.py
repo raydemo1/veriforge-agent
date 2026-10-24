@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,51 +14,33 @@ from ..runtime.shell_classification import (
     ShellTrait,
     analyze_shell_command,
 )
+from ..runtime.tool_output import (
+    artifact_preview,
+    fits_message,
+    inline_message,
+    output_limit,
+    result_text,
+)
 from ..runtime.tool_result import ToolResult
+from .context import count_text_tokens
 
 log = logging.getLogger("harness")
 
-FRESH_DETAIL_LIMIT = 12_000
-_OBS_ID_PREFIX = "[OBS "
-
-# Preview budget for compact tool-output refs: head + tail chars shown inline
-# when the full output is stored to file.
-PREVIEW_TOTAL_CHARS = 1000
-
-
-def observation_dir_for(root: str | Path, session_id: str | None) -> Path:
+def observation_dir_for(root: str | Path, session_id: str | None, agent_id: str | None = None) -> Path:
     """Directory for observation files and streamed tool-output artifacts."""
     safe_session_id = "".join(
         ch if ch.isalnum() or ch in {"-", "_"} else "_"
         for ch in str(session_id or "default")
     )
-    return Path(root) / ".harness" / "observations" / safe_session_id
-
-
-def _output_preview(output: str) -> str:
-    """Head + tail preview so the agent can see both context and final results
-    without reading the full output file."""
-    if len(output) <= PREVIEW_TOTAL_CHARS:
-        return output
-    head_chars = PREVIEW_TOTAL_CHARS // 2  # 500
-    tail_chars = PREVIEW_TOTAL_CHARS - head_chars  # 500
-    head = output[:head_chars]
-    tail = output[-tail_chars:]
-    omitted = len(output) - head_chars - tail_chars
-    return (
-        f"{head}\n\n"
-        f"...[{omitted} chars omitted — raw observation output is internal; rerun a narrower command if more detail is needed]...\n\n"
-        f"{tail}"
-    )
+    safe_agent_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(agent_id or "main"))
+    return Path(root) / ".harness" / "observations" / safe_session_id / safe_agent_id
 
 
 @dataclass
 class ToolObservation:
     id: str
     tool: str
-    args_summary: str
-    raw_output_path: Path
-    summary: str
+    raw_output_path: Path | None
     resource_keys: list[str]
     observed_file_generations: dict[str, int]
     observed_workspace_generation: int
@@ -65,9 +48,10 @@ class ToolObservation:
     output_hash: str
     created_at: float = field(default_factory=time.time)
     stale: bool = False
-    # True when raw_output_path is a tool-managed artifact adopted by the
-    # store (located inside the store directory, so safe to unlink later).
     artifact_adopted: bool = False
+    message: str = ""
+    artifact_reference: dict | None = None
+    inline_output: str | None = None
 
 
 class FactTracker:
@@ -159,173 +143,103 @@ class FactTracker:
 class ObservationStore:
     MAX_OBSERVATIONS = 300
 
-    def __init__(self, root: str | Path):
-        self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True)
-        self._counter = 0
+    def __init__(self, root: str | Path, workspace_root: str | Path | None = None):
+        self.root = Path(root).resolve()
+        self.workspace_root = Path(workspace_root).resolve() if workspace_root else next(
+            (parent.parent for parent in self.root.parents if parent.name == ".harness"), self.root.parent
+        )
         self.observations: list[ToolObservation] = []
 
-    def create(
-        self,
-        *,
-        tool: str,
-        args: dict[str, Any],
-        result: ToolResult,
-        fact_tracker: FactTracker,
-    ) -> ToolObservation:
-        self._counter += 1
-        obs_id = f"obs_{self._counter:04d}"
-        output = result.to_text()
-        resource_keys = fact_tracker.resource_keys_for(tool, args)
-        artifact_path = result.metadata.get("artifact_path")
-        adopted_path = self._adoptable_artifact(artifact_path)
-        if adopted_path is not None:
-            # The tool (e.g. run_bash) already streamed the full output to an
-            # artifact while it ran.  Adopt it instead of spilling a second
-            # copy; the short ToolResult text is only the preview.
-            raw_path = adopted_path
-            output_chars = int(result.metadata.get("output_chars") or len(output))
-            output_hash = str(
-                result.metadata.get("artifact_sha256")
-                or hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()
-            )[:16]
-        else:
-            if artifact_path:
-                # Untrusted/out-of-tree path: never adopt (the store unlinks
-                # old observations), fall back to the normal spill path.
-                log.warning(
-                    "Ignoring artifact_path outside observation store (%s not under %s)",
-                    artifact_path,
-                    self.root,
+    def create(self, *, tool: str, args: dict[str, Any], result: ToolResult,
+               fact_tracker: FactTracker) -> ToolObservation:
+        obs_id = "obs_" + uuid.uuid4().hex
+        output = result_text(result)
+        raw_path = None
+        adopted = False
+        reference = None
+        inline_output = None
+        artifact = result.metadata.get("artifact_path")
+        try:
+            if artifact:
+                candidate = Path(artifact)
+                if not candidate.is_absolute():
+                    candidate = self.workspace_root / candidate
+                candidate = candidate.resolve()
+                if not candidate.is_relative_to(self.root) or not candidate.is_file():
+                    raise ValueError("tool output artifact is missing or outside its observation directory")
+                hasher = hashlib.sha256()
+                output_chars = 0
+                small = ""
+                oversize = False
+                with candidate.open("r", encoding="utf-8", newline="") as stream:
+                    while chunk := stream.read(4096):
+                        output_chars += len(chunk)
+                        hasher.update(chunk.encode("utf-8"))
+                        if not oversize:
+                            small += chunk
+                            oversize = not fits_message(inline_message(result, small, obs_id))
+                output_hash = hasher.hexdigest()
+                if result.error and result.error not in small and not oversize:
+                    small += f"\nerror: {result.error}"
+                if not oversize and fits_message(inline_message(result, small, obs_id)):
+                    output = small
+                    candidate.unlink()
+                    result.metadata.pop("artifact_path", None)
+                    result.metadata.pop("output_spilled", None)
+                else:
+                    raw_path, adopted = candidate, True
+            else:
+                output_chars = len(output)
+                output_hash = hashlib.sha256(output.encode("utf-8")).hexdigest()
+                if not fits_message(inline_message(result, output, obs_id)):
+                    self.root.mkdir(parents=True, exist_ok=True)
+                    raw_path = self.root / f"{obs_id}.txt"
+                    with raw_path.open("x", encoding="utf-8", newline="") as stream:
+                        stream.write(output)
+            if raw_path:
+                relative = raw_path.relative_to(self.workspace_root).as_posix()
+                reference = {"path": relative, "sha256": output_hash,
+                             "bytes": raw_path.stat().st_size, "chars": output_chars}
+                message = inline_message(result, "", obs_id).rstrip() + (
+                    f"\noutput_chars: {output_chars}\noutput_bytes: {reference['bytes']}"
+                    f"\nraw_output: {relative}"
+                    "\nOutput exceeds the inline budget. Read it with "
+                    + "read_file(" + json.dumps({"path": relative, "start_line": 1, "max_lines": 2000}) + ")."
                 )
-            output_hash = hashlib.sha256(output.encode("utf-8", errors="replace")).hexdigest()[:16]
-            raw_path = self.root / f"{obs_id}.txt"
-            raw_path.write_text(output, encoding="utf-8")
+                edge_tokens = min(500, max(0, (output_limit() - count_text_tokens(message) - 100) // 2))
+                message += "\n\n" + artifact_preview(raw_path, edge_tokens)
+            else:
+                message = inline_message(result, output, obs_id)
+                inline_output = output
+        except (OSError, ValueError) as exc:
+            if raw_path is not None and not adopted:
+                try:
+                    raw_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raw_path, reference = None, None
+            result.metadata.pop("artifact_path", None)
+            result.metadata.pop("output_spilled", None)
             output_chars = len(output)
+            output_hash = hashlib.sha256(output.encode("utf-8")).hexdigest()
+            result.metadata["output_complete"] = False
+            message = inline_message(result, f"[error] Output is incomplete: {type(exc).__name__}; artifact unavailable.", obs_id)
+            log.warning("Could not preserve tool output: %s", exc)
         observation = ToolObservation(
-            id=obs_id,
-            tool=tool,
-            args_summary=_args_summary(args),
-            raw_output_path=raw_path,
-            summary=_summary_for(tool, args, result, output_hash),
-            resource_keys=resource_keys,
-            observed_file_generations=fact_tracker.observed_file_generations(resource_keys),
+            id=obs_id, tool=tool, raw_output_path=raw_path,
+            resource_keys=fact_tracker.resource_keys_for(tool, args),
+            observed_file_generations=fact_tracker.observed_file_generations(fact_tracker.resource_keys_for(tool, args)),
             observed_workspace_generation=fact_tracker.workspace_generation,
-            output_chars=output_chars,
-            output_hash=output_hash,
-            artifact_adopted=adopted_path is not None,
+            output_chars=output_chars, output_hash=output_hash, artifact_adopted=adopted,
+            message=message, artifact_reference=reference,
+            inline_output=inline_output,
         )
         self.observations.append(observation)
-        self._cleanup_old()
+        del self.observations[:-self.MAX_OBSERVATIONS]
         return observation
 
-    def _adoptable_artifact(self, artifact_path: object) -> Path | None:
-        """Return a safe artifact path to adopt, else None.
-
-        Adoption means the store later owns and may unlink the file during
-        observation eviction, so the path must resolve to an existing file
-        inside the store directory — never an arbitrary external path.
-        """
-        if not artifact_path:
-            return None
-        try:
-            candidate = Path(str(artifact_path)).resolve(strict=False)
-            root = self.root.resolve()
-        except (OSError, ValueError):
-            return None
-        if not candidate.is_relative_to(root) or not candidate.is_file():
-            return None
-        return candidate
-
-    def _cleanup_old(self) -> None:
-        excess = len(self.observations) - self.MAX_OBSERVATIONS
-        if excess <= 0:
-            return
-        for obs in self.observations[:excess]:
-            try:
-                obs.raw_output_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        del self.observations[:excess]
-
     def observed_message(self, observation: ToolObservation, result: ToolResult) -> str:
-        output = result.to_text()
-        from .. import config as _cfg
-        inline_limit = getattr(_cfg, "TOOL_OUTPUT_INLINE_LIMIT", 4000)
-
-        if observation.artifact_adopted:
-            # Full output was streamed to the adopted artifact while the
-            # command ran; the ToolResult text is a bounded head+tail preview.
-            total_bytes = result.metadata.get("output_bytes", observation.output_chars)
-            return (
-                f"[OBS {observation.id} observed]\n"
-                f"tool: {observation.tool}\n"
-                f"args: {observation.args_summary}\n"
-                f"output_chars: {observation.output_chars}\n"
-                f"output_sha256: {observation.output_hash}\n"
-                f"resource_keys: {', '.join(observation.resource_keys) or 'none'}\n"
-                f"raw_output: {observation.raw_output_path}\n"
-                f"output_bytes: {total_bytes}\n"
-                f"summary: {observation.summary}\n"
-                "observation: Full output is stored in this artifact and the "
-                "command was not interrupted by its output volume; the "
-                "preview below shows head and tail only. "
-                "Read the artifact path if you need the middle, or rerun a "
-                "narrower command.\n\n"
-                + output
-            )
-
-        if len(output) <= inline_limit:
-            # Small output — full inline (existing path, unchanged)
-            detail = output
-            if len(detail) > FRESH_DETAIL_LIMIT:
-                omitted = len(detail) - FRESH_DETAIL_LIMIT
-                detail = detail[:FRESH_DETAIL_LIMIT] + (
-                    f"\n\n[TRUNCATED observation detail: {omitted} chars omitted]"
-                )
-            return (
-                f"[OBS {observation.id} observed]\n"
-                f"tool: {observation.tool}\n"
-                f"args: {observation.args_summary}\n"
-                f"output_chars: {observation.output_chars}\n"
-                f"output_sha256: {observation.output_hash}\n"
-                f"resource_keys: {', '.join(observation.resource_keys) or 'none'}\n"
-                "observation: This is the tool result as observed when the tool ran.\n\n"
-                + detail
-            )
-
-        # Large output — compact file ref + head+tail preview
-        return (
-            f"[OBS {observation.id} observed]\n"
-            f"tool: {observation.tool}\n"
-            f"args: {observation.args_summary}\n"
-            f"output_chars: {observation.output_chars}\n"
-            f"output_sha256: {observation.output_hash}\n"
-            f"resource_keys: {', '.join(observation.resource_keys) or 'none'}\n"
-            f"raw_output: {observation.raw_output_path}\n"
-            f"summary: {observation.summary}\n"
-            "observation: Full output is stored as an internal artifact. "
-            "Use the preview, or rerun a narrower command if more detail is needed.\n\n"
-            "--- preview ---\n"
-            + _output_preview(output)
-            + "\n--- end preview ---"
-        )
-
-def _args_summary(args: dict[str, Any]) -> str:
-    redacted = dict(args or {})
-    if "content" in redacted:
-        redacted["content"] = f"[{len(str(redacted['content']))} chars]"
-    return json.dumps(redacted, ensure_ascii=False, sort_keys=True)
-
-
-def _summary_for(tool: str, args: dict[str, Any], result: ToolResult, output_hash: str) -> str:
-    if tool == "read_file":
-        return f"read_file observed path={args.get('path', '')!s}; status={result.status}; output hash={output_hash}."
-    if tool == "run_bash":
-        return f"run_bash observed command={args.get('command', '')!s}; status={result.status}; return_code={result.return_code}."
-    if tool in {"write_file", "apply_patch"}:
-        return f"{tool} changed path={args.get('path', '')!s}; status={result.status}."
-    return f"{tool} returned status={result.status}; output hash={output_hash}."
+        return observation.message
 
 
 def _norm_path(path: object) -> str:

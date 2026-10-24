@@ -386,6 +386,7 @@ class PersistentShellSessionTests(unittest.TestCase):
     def test_docker_backend_interrupt_does_not_set_closed(self):
         backend = _DockerShellBackend.__new__(_DockerShellBackend)
         backend._closed = False
+        backend._running = False
         backend.container_name = "hca-test-interrupt"
         backend._container_started = False
         backend._reader = unittest.mock.MagicMock()
@@ -508,7 +509,8 @@ class BoundedPipeSinkTests(unittest.TestCase):
     def test_small_output_stays_buffered(self):
         d = Path(tempfile.mkdtemp())
         sink = _BoundedPipeSink(preview_chars=100, spool_dir=d)
-        sink.feed("hello "); sink.feed("world")
+        sink.feed("hello ")
+        sink.feed("world")
         sink.finish_writing()
         self.assertFalse(sink.spilled)
         self.assertEqual(sink.buffered_text(), "hello world")
@@ -533,8 +535,10 @@ class BoundedPipeSinkTests(unittest.TestCase):
         d = Path(tempfile.mkdtemp())
         out = _BoundedPipeSink(preview_chars=50, spool_dir=d)
         err = _BoundedPipeSink(preview_chars=50, spool_dir=d)
-        out.feed("  out line\n\n"); err.feed("\nerr line  \n")
-        out.finish_writing(); err.finish_writing()
+        out.feed("  out line\n\n")
+        err.feed("\nerr line  \n")
+        out.finish_writing()
+        err.finish_writing()
         path, _preview, total_bytes, total_chars, _sha = _stream_sinks_to_artifact(
             out, err, artifact_dir=d / "art", preview_chars=50
         )
@@ -554,7 +558,8 @@ class BoundedPipeSinkTests(unittest.TestCase):
         for _ in range(40):
             out.feed("x" * 100)
         err.feed("boom")
-        out.finish_writing(); err.finish_writing()
+        out.finish_writing()
+        err.finish_writing()
         path, preview, _total_bytes, _total_chars, sha = _stream_sinks_to_artifact(
             out, err, artifact_dir=d / "art", preview_chars=300
         )

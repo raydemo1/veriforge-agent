@@ -40,7 +40,7 @@ CORE_TOOL_SCHEMAS = [
         "function": {
             "name": "read_file",
             "description": (
-                "Read a workspace file. Prefer bounded reads with start_line and max_lines unless the file is known small. "
+                "Read a workspace file in consecutive token-bounded pages. Follow next_read exactly when present. "
                 f"For sequential scans of large files (>1000 lines), use a larger window up to {READ_FILE_MAX_LINES} lines "
                 "to reduce round trips. Use narrower windows when following search hits, inspecting local context, "
                 "or avoiding the per-call token cap on dense files."
@@ -54,6 +54,10 @@ CORE_TOOL_SCHEMAS = [
                         "type": "integer",
                         "minimum": 1,
                         "description": "1-based starting line for a bounded read.",
+                    },
+                    "start_column": {
+                        "type": "integer", "minimum": 1, "default": 1,
+                        "description": "1-based Unicode character position within start_line; use next_read for continuation.",
                     },
                     "max_lines": {
                         "type": "integer",
@@ -504,15 +508,17 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_shell_output",
-            "description": "Read recent stdout/stderr output from a background shell job.",
+            "description": "Read consecutive stdout/stderr output from a background shell job. Continue with next_offset; offset counts Unicode characters.",
             "parameters": {
                 "type": "object",
                 "required": ["job_id"],
                 "properties": {
                     "job_id": {"type": "string", "description": "Background shell job id returned by run_bash."},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0,
+                               "description": "0-based Unicode character offset, returned as next_offset."},
                     "max_chars": {
                         "type": "integer",
-                        "description": "Maximum recent output characters to return (default 12000, capped at 100000).",
+                        "description": "Maximum consecutive output characters to return from offset (default 12000, capped at 100000).",
                         "default": 12000,
                     },
                 },

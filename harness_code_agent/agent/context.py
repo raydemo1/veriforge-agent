@@ -56,14 +56,14 @@ def count_tokens(messages: list[dict]) -> int:
             total += attachment_tokens
         text = str(content) + str(msg.get("reasoning_content") or "")
         if enc:
-            total += len(enc.encode(text)) + 4
+            total += len(enc.encode(text, disallowed_special=())) + 4
         else:
             # ~4 chars per token is a reasonable approximation
             total += len(text) // 4 + 4
         for tc in msg.get("tool_calls", []):
             args = str(tc.get("function", {}).get("arguments", ""))
             if enc:
-                total += len(enc.encode(args))
+                total += len(enc.encode(args, disallowed_special=()))
             else:
                 total += len(args) // 4
     return total
@@ -75,7 +75,7 @@ def count_text_tokens(text: str) -> int:
     Shared by context accounting and tool-output size limits."""
     enc = _get_encoder()
     if enc:
-        return len(enc.encode(text))
+        return len(enc.encode(text, disallowed_special=()))
     # ~4 chars per token is a reasonable approximation
     return len(text) // 4
 
@@ -88,7 +88,7 @@ def count_request_tokens(messages: list[dict], *, tool_schemas: list[dict] | Non
     schema_text = json.dumps(tool_schemas, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     enc = _get_encoder()
     if enc:
-        return total + len(enc.encode(schema_text))
+        return total + len(enc.encode(schema_text, disallowed_special=()))
     return total + len(schema_text) // 4
 
 

@@ -1269,7 +1269,7 @@ class ProductRuntimeTests(unittest.TestCase):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
 
         cases = [
-            ("long", "SECRET_FULL_CONTENT_UNSAFE" * 700, True),
+            ("long", "SECRET_FULL_CONTENT_UNSAFE" * 700, False),
             ("short", "SHORT_STALE_CONTENT", False),
         ]
 
@@ -1350,9 +1350,10 @@ class ProductRuntimeTests(unittest.TestCase):
                     if label == "long":
                         second_prompt = json.dumps(fake_client.chat.completions.calls[1], ensure_ascii=False)
                         self.assertIn("SECRET_FULL_CONTENT_UNSAFE", second_prompt)
-                        self.assertIn("[OBS obs_0001 observed]", third_prompt)
-                        self.assertNotIn("[OBS obs_0001 stale]", third_prompt)
-                        self.assertIn("Stale observations: obs_0001", third_prompt)
+                        observation = conversation.observation_store.observations[0]
+                        self.assertIn(f"[OBS {observation.id} observed]", third_prompt)
+                        self.assertNotIn(f"[OBS {observation.id} stale]", third_prompt)
+                        self.assertIn(f"Stale observations: {observation.id}", third_prompt)
                     if expect_observation_files:
                         self.assertTrue(list((root / ".harness" / "observations").rglob("*.txt")))
 
@@ -1529,7 +1530,7 @@ class ProductRuntimeTests(unittest.TestCase):
             def list_jobs(self):
                 return [FakeJob()]
 
-            def read_output(self, job_id, max_chars=12000):
+            def read_output(self, job_id, max_chars=12000, *, offset=None):
                 self.read_request = (job_id, max_chars)
                 return "ready"
 
@@ -1882,7 +1883,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 agent_name="main_agent",
             )
 
-        self.assertEqual(output, "2: two\n3: three")
+        self.assertEqual(output, "2: two\n3: three\n")
 
     def test_read_file_rejects_invalid_range_arguments_without_exception(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy
@@ -1917,7 +1918,7 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn("[error]", max_output)
         self.assertIn("max_lines must be an integer", max_output)
 
-    def test_read_file_requires_bounded_ranges_for_files_over_limit_lines(self):
+    def test_read_file_defaults_to_a_bounded_page(self):
         from harness_code_agent.runtime.builtins.filesystem import READ_FILE_MAX_LINES
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
@@ -1943,10 +1944,9 @@ class ProductRuntimeTests(unittest.TestCase):
                 agent_name="main_agent",
             )
 
-        self.assertIn("[error]", output)
-        self.assertIn(f"{READ_FILE_MAX_LINES} lines", output)
-        self.assertIn("start_line", output)
-        self.assertIn("max_lines", output)
+        self.assertNotIn("[error]", output)
+        self.assertIn("line 1", output)
+        self.assertLess(len(output), 30000)
 
     def test_read_file_rejects_ranges_over_limit_lines(self):
         from harness_code_agent.runtime.builtins.filesystem import READ_FILE_MAX_LINES
@@ -1977,12 +1977,11 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn("[error]", output)
         self.assertIn(f"max_lines must be <= {READ_FILE_MAX_LINES}", output)
 
-    def test_read_file_rejects_windows_with_too_much_output(self):
-        from harness_code_agent.runtime.builtins.filesystem import (
-            READ_FILE_MAX_OUTPUT_TOKENS,
-        )
+    def test_read_file_pages_token_dense_windows(self):
+        from harness_code_agent.config import TOOL_OUTPUT_MAX_TOKENS
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
+        from harness_code_agent.runtime.tool_runner import execute_tool_result
         from harness_code_agent.sessions.events import EventBus
         from harness_code_agent.workspace.service import WorkspaceService
 
@@ -1992,7 +1991,7 @@ class ProductRuntimeTests(unittest.TestCase):
             # single repeated character (~6 tokens per 26-char fragment after
             # cl100k encoding; ~4 chars/token for the char-based fallback).
             fragment = "the quick brown fox jumps "
-            repeats = (READ_FILE_MAX_OUTPUT_TOKENS // 5) + 10
+            repeats = (TOOL_OUTPUT_MAX_TOKENS // 5) + 10
             (root / "wide.txt").write_text(fragment * repeats, encoding="utf-8")
             context = ToolContext(
                 workspace=WorkspaceService(root=root, snapshots_dir=root / ".harness" / "snapshots"),
@@ -2000,17 +1999,16 @@ class ProductRuntimeTests(unittest.TestCase):
                 event_bus=EventBus(root / ".harness" / "events.jsonl"),
             )
 
-            output = execute_tool(
+            result = execute_tool_result(
                 "read_file",
                 {"path": "wide.txt", "start_line": 1, "max_lines": 1},
                 tool_context=context,
                 agent_name="main_agent",
             )
 
-        self.assertIn("[error]", output)
-        self.assertIn("too large", output)
-        self.assertIn("tokens", output)
-        self.assertNotIn("[TRUNCATED]", output)
+        self.assertEqual(result.status, "success")
+        self.assertIn("next_read", result.metadata)
+        self.assertNotIn("[TRUNCATED]", result.output)
 
     def test_tool_result_does_not_infer_status_from_raw_tool_text(self):
         from unittest.mock import patch

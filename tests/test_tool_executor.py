@@ -1044,7 +1044,7 @@ class ToolExecutorTests(unittest.TestCase):
                     output_tail="",
                 )
 
-            def read_output(self, job_id, max_chars=12000):
+            def read_output(self, job_id, max_chars=12000, *, offset=None):
                 return "server ready"
 
             def close(self):

@@ -14,6 +14,7 @@ from ... import config
 from ...agent.cancellation import CancelledError
 from ...workspace.shell_jobs import ShellJobNotFound
 from ..shell_classification import is_long_running_shell_command
+from ..tool_output import fitting_prefix, output_limit
 from ..tool_result import ToolResult
 
 
@@ -69,8 +70,11 @@ def run_bash(
         # even though the "long-running" command exited early (often an error
         # the model needs to diagnose). Report it as content, not failure.
         output = f"Long-running command exited immediately as {job.status}."
-        if job.output_tail:
-            output += f"\n\nRecent output:\n{job.output_tail}"
+        if job.output.path is not None:
+            metadata["artifact_path"] = str(job.output.path)
+            metadata["output_spilled"] = True
+        else:
+            output += "\n\n" + job.output.read(0, job.output.total_chars)
         output += _exit_code_footer(job.exit_code)
         return ToolResult(
             tool="run_bash",
@@ -85,7 +89,7 @@ def run_bash(
     artifact_dir = _artifact_dir(tool_context, runtime_state)
     one_shot_powershell = _requires_one_shot_powershell(command)
     shell_session = PersistentShellSession(_workspace_root(tool_context))
-    remove_cancel_callback = lambda: None
+    remove_cancel_callback = None
     if runtime_state is not None and hasattr(runtime_state, "register_shell_session"):
         runtime_state.register_shell_session(shell_session)
     if cancellation_token is not None and not one_shot_powershell:
@@ -105,31 +109,10 @@ def run_bash(
             )
         else:
             shell_result = shell_session.run(command, timeout=timeout, artifact_dir=artifact_dir)
-        if cancellation_token is not None:
-            cancellation_token.check()
-        if shell_result.timed_out:
-            output = (
-                f"[error] Command timed out after {effective_timeout}s. "
-                f"If this command legitimately needs more time (e.g. compilation, training), "
-                f"retry with a larger timeout parameter."
-            )
-            return ToolResult(
-                tool="run_bash",
-                status="failed",
-                output=output,
-                error=f"Command timed out after {effective_timeout}s",
-                return_code=shell_result.exit_code,
-                metadata={
-                    "timed_out": True,
-                    "status_source": "shell",
-                    "requested_timeout": requested_timeout,
-                    "effective_timeout": effective_timeout,
-                },
-            )
         output = _build_shell_output(shell_result.stdout, shell_result.stderr)
         output = output or "(no output)"
         metadata = {
-            "timed_out": False,
+            "timed_out": shell_result.timed_out,
             "status_source": "shell",
             "output_bytes": int(getattr(shell_result, "output_bytes", 0) or 0),
             "requested_timeout": requested_timeout,
@@ -142,21 +125,20 @@ def run_bash(
             metadata["artifact_path"] = shell_result.artifact_path
             metadata["artifact_sha256"] = shell_result.artifact_sha256
             metadata["output_chars"] = getattr(shell_result, "output_chars", 0)
-            output += (
-                f"\n\n[output streamed to artifact after {metadata['output_bytes']} bytes; "
-                f"full output: {shell_result.artifact_path}. "
-                "The preview above shows the head and tail; read the artifact "
-                "or rerun a narrower command for the omitted middle.]"
-            )
         output += _exit_code_footer(shell_result.exit_code)
-        return ToolResult(
-            tool="run_bash",
-            status="success",
-            output=output,
-            error=None,
-            return_code=shell_result.exit_code,
-            metadata=metadata,
-        )
+        error = f"Command timed out after {effective_timeout}s" if shell_result.timed_out else None
+        if error:
+            output += f"\n[error] {error}"
+        result = ToolResult(tool="run_bash", status="failed" if error else "success", output=output,
+                            error=error, return_code=shell_result.exit_code, metadata=metadata)
+        if cancellation_token is not None and cancellation_token.is_cancelled:
+            metadata["cancelled"] = True
+            exc = CancelledError("Turn cancelled by user")
+            exc.tool_result = ToolResult(tool="run_bash", status="failed", output=output,
+                                         error="Execution cancelled", return_code=shell_result.exit_code, metadata=metadata)
+            raise exc
+        return result
+
     except CancelledError:
         raise
     except Exception as e:
@@ -169,7 +151,8 @@ def run_bash(
             metadata=metadata,
         )
     finally:
-        remove_cancel_callback()
+        if remove_cancel_callback is not None:
+            remove_cancel_callback()
         if runtime_state is not None and hasattr(runtime_state, "unregister_shell_session"):
             runtime_state.unregister_shell_session(shell_session)
         shell_session.close()
@@ -241,7 +224,7 @@ def _run_one_shot_powershell(
     ]
     for reader in readers:
         reader.start()
-    remove_cancel_callback = lambda: None
+    remove_cancel_callback = None
     if cancellation_token is not None:
         remove_cancel_callback = cancellation_token.add_callback(
             lambda: _terminate_process_tree(process)
@@ -258,19 +241,12 @@ def _run_one_shot_powershell(
         for reader in readers:
             reader.join(timeout=5)
     finally:
-        remove_cancel_callback()
+        if remove_cancel_callback is not None:
+            remove_cancel_callback()
 
     stdout_sink.finish_writing()
     stderr_sink.finish_writing()
     try:
-        if timed_out:
-            return ShellResult(
-                stdout=stdout_sink.head_text.strip(),
-                stderr=stderr_sink.head_text.strip(),
-                exit_code=130,
-                timed_out=True,
-            )
-
         total_seen = stdout_sink.total_chars + stderr_sink.total_chars
         if total_seen <= preview_chars and not stdout_sink.spilled and not stderr_sink.spilled:
             stdout = stdout_sink.buffered_text().strip()
@@ -281,7 +257,8 @@ def _run_one_shot_powershell(
             return ShellResult(
                 stdout=stdout,
                 stderr=stderr,
-                exit_code=process.returncode,
+                exit_code=130 if timed_out else process.returncode,
+                timed_out=timed_out,
                 output_bytes=len(combined.encode("utf-8", errors="replace")),
                 output_chars=len(combined),
             )
@@ -295,7 +272,8 @@ def _run_one_shot_powershell(
         return ShellResult(
             stdout=preview,
             stderr="",
-            exit_code=process.returncode,
+            exit_code=130 if timed_out else process.returncode,
+            timed_out=timed_out,
             output_spilled=True,
             output_bytes=total_bytes,
             output_chars=total_chars,
@@ -356,7 +334,8 @@ def list_shell_jobs(runtime_state=None) -> ToolResult:
     )
 
 
-def read_shell_output(job_id: str, max_chars: int = 12_000, runtime_state=None) -> ToolResult:
+def read_shell_output(job_id: str, max_chars: int = 12_000, runtime_state=None, offset: int = 0,
+                      tool_context=None) -> ToolResult:
     manager = _shell_job_manager(runtime_state)
     if manager is None:
         return ToolResult(
@@ -368,9 +347,9 @@ def read_shell_output(job_id: str, max_chars: int = 12_000, runtime_state=None) 
         )
     max_chars = _clamp_shell_output_chars(max_chars)
     try:
-        output = manager.read_output(job_id, max_chars=max_chars)
+        output = manager.read_output(job_id, max_chars=max_chars, offset=max(0, int(offset)))
         job = manager.get(job_id) if hasattr(manager, "get") else None
-    except ShellJobNotFound as exc:
+    except (ShellJobNotFound, OSError, ValueError) as exc:
         text = f"[error] {exc}"
         return ToolResult(
             tool="read_shell_output",
@@ -379,11 +358,18 @@ def read_shell_output(job_id: str, max_chars: int = 12_000, runtime_state=None) 
             error=str(exc),
             metadata={"status_source": "shell_job", "job_id": job_id},
         )
+    output = fitting_prefix(output, max(1, output_limit() - 800))
     header = f"Shell job {job_id}"
-    metadata = {"status_source": "shell_job", "job_id": job_id, "max_chars": max_chars}
+    metadata = {"status_source": "shell_job", "job_id": job_id, "max_chars": max_chars,
+                "next_offset": max(0, int(offset)) + len(output)}
     if job is not None:
         header += f" status={job.status} pid={job.pid} exit_code={job.exit_code}"
         metadata.update({"job_status": job.status, "pid": job.pid, "exit_code": job.exit_code})
+        buffer = getattr(job, "output", None)
+        if buffer is not None and buffer.path is not None and tool_context is not None:
+            relative = buffer.path.relative_to(tool_context.workspace.root).as_posix()
+            metadata["source_log"] = relative
+            tool_context.register_output_artifact({"path": relative, "append_only": True})
     body = output or "(no output)"
     return ToolResult(
         tool="read_shell_output",
@@ -465,4 +451,4 @@ def _artifact_dir(tool_context, runtime_state):
 
     root = _workspace_root(tool_context)
     session_id = getattr(runtime_state, "session_id", None) if runtime_state is not None else None
-    return observation_dir_for(root, session_id)
+    return observation_dir_for(root, session_id, getattr(tool_context, "agent_id", None))

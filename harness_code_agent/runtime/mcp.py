@@ -29,7 +29,6 @@ from .tool_result import ToolResult
 MCP_CONFIG_RELATIVE_PATH = Path(".harness") / "mcp.json"
 MCP_TOOL_PREFIX = "mcp__"
 MCP_TOOL_NAME_LIMIT = 64
-MCP_OUTPUT_LIMIT = 60_000
 MCPORTER_CONFIG_ENV = "HARNESS_MCPORTER_CONFIG"
 
 
@@ -817,8 +816,6 @@ def mcp_result_to_tool_result(
     if structured is not None:
         parts.append("structuredContent:\n" + json.dumps(structured, ensure_ascii=False, indent=2, sort_keys=True))
     output = "\n\n".join(part for part in parts if part)
-    if len(output) > MCP_OUTPUT_LIMIT:
-        output = output[:MCP_OUTPUT_LIMIT] + f"\n\n[TRUNCATED: {len(output) - MCP_OUTPUT_LIMIT} chars omitted]"
     is_error = bool(getattr(result, "isError", False))
     metadata: dict[str, Any] = {"status_source": "mcp"}
     if binding is not None:
@@ -908,8 +905,6 @@ def _mcporter_json_to_tool_result(binding: McpToolBinding, payload: Any) -> Tool
     if structured is not None:
         parts.append("structuredContent:\n" + json.dumps(structured, ensure_ascii=False, indent=2, sort_keys=True))
     output = "\n\n".join(part for part in parts if part)
-    if len(output) > MCP_OUTPUT_LIMIT:
-        output = output[:MCP_OUTPUT_LIMIT] + f"\n\n[TRUNCATED: {len(output) - MCP_OUTPUT_LIMIT} chars omitted]"
     is_error = bool(payload.get("isError"))
     return ToolResult(
         tool=binding.exposed_name,
@@ -932,6 +927,13 @@ def _mcporter_content_item_to_text(item: dict[str, Any]) -> str:
         data = str(item.get("data") or "")
         mime = str(item.get("mimeType") or "application/octet-stream")
         return f"[{item_type} {mime}, {len(data)} base64 chars omitted]"
+    if item_type == "resource":
+        resource = item.get("resource") or {}
+        uri = resource.get("uri", "")
+        mime = resource.get("mimeType", "application/octet-stream")
+        if "text" in resource:
+            return f"[resource {uri} {mime}]\n{resource['text']}"
+        return f"[resource {uri} {mime}, {len(str(resource.get('blob') or ''))} base64 chars omitted]"
     if item_type == "resource_link":
         return f"[resource_link {item.get('name') or ''} {item.get('uri') or ''}]"
     return f"[{item_type or 'unknown'} content omitted]"

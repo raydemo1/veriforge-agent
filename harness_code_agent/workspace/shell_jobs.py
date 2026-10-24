@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import contextlib
 import os
 import subprocess
@@ -13,6 +14,8 @@ from typing import Literal
 import psutil
 
 from .. import config
+from ..agent.context import count_text_tokens
+from ..runtime.tool_output import output_limit
 from .shell_session import (
     _docker_resource_args,
     _docker_user_arg,
@@ -64,24 +67,57 @@ class ShellJobNotFound(KeyError):
     pass
 
 
-class RingBuffer:
-    def __init__(self, max_chars: int = 1_000_000):
-        self.max_chars = max(1, int(max_chars))
+class ShellOutputBuffer:
+    def __init__(self, artifact_dir: Path | None = None):
+        self.artifact_dir = artifact_dir
+        self.path: Path | None = None
         self._text = ""
+        self.total_chars = 0
         self._lock = threading.RLock()
+        self.error: str | None = None
 
     def append(self, text: str) -> None:
         if not text:
             return
         with self._lock:
-            self._text += text
-            if len(self._text) > self.max_chars:
-                self._text = self._text[-self.max_chars:]
+            if self.error:
+                return
+            try:
+                if self.path is None:
+                    self._text += text
+                    if count_text_tokens(self._text) <= output_limit():
+                        self.total_chars += len(text)
+                        return
+                    directory = self.artifact_dir or Path.cwd() / ".harness" / "observations" / "default" / "jobs"
+                    directory.mkdir(parents=True, exist_ok=True)
+                    self.path = directory / f"job_{uuid.uuid4().hex}.txt"
+                    with self.path.open("x", encoding="utf-8", newline="") as stream:
+                        stream.write(self._text)
+                    self._text = ""
+                else:
+                    with self.path.open("a", encoding="utf-8", newline="") as stream:
+                        stream.write(text)
+                self.total_chars += len(text)
+            except OSError as exc:
+                self.error = f"Output incomplete: {exc}"
+
+    def read(self, offset: int, max_chars: int) -> str:
+        with self._lock:
+            if self.error:
+                raise OSError(self.error)
+            if self.path is None:
+                return self._text[offset:offset + max_chars]
+            with self.path.open("r", encoding="utf-8", newline="") as stream:
+                remaining = offset
+                while remaining:
+                    chunk = stream.read(min(4096, remaining))
+                    if not chunk:
+                        return ""
+                    remaining -= len(chunk)
+                return stream.read(max_chars)
 
     def read_tail(self, max_chars: int) -> str:
-        max_chars = max(1, int(max_chars))
-        with self._lock:
-            return self._text[-max_chars:]
+        return self.read(max(0, self.total_chars - max_chars), max_chars)
 
 
 @dataclass
@@ -94,7 +130,7 @@ class ShellJob:
     exit_code: int | None = None
     started_at: float = field(default_factory=time.time)
     ended_at: float | None = None
-    output: RingBuffer = field(default_factory=RingBuffer)
+    output: ShellOutputBuffer = field(default_factory=ShellOutputBuffer)
     container_name: str | None = None
     error: str | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
@@ -118,9 +154,9 @@ class ShellJob:
 
 
 class ShellJobManager:
-    def __init__(self, workspace: str | Path, *, ring_buffer_chars: int = 1_000_000):
+    def __init__(self, workspace: str | Path, *, artifact_dir: Path | None = None):
         self.workspace = str(Path(workspace).resolve())
-        self.ring_buffer_chars = ring_buffer_chars
+        self.artifact_dir = artifact_dir or Path(workspace) / ".harness" / "observations" / "default" / "jobs"
         self._jobs: dict[str, ShellJob] = {}
         self._lock = threading.RLock()
         self._closed = False
@@ -128,7 +164,7 @@ class ShellJobManager:
     def start(self, command: str, *, early_exit_seconds: float = 0.0) -> ShellJob:
         command = str(command or "").strip()
         job_id = f"shell-job-{uuid.uuid4().hex[:8]}"
-        output = RingBuffer(self.ring_buffer_chars)
+        output = ShellOutputBuffer(self.artifact_dir)
         if not command:
             job = ShellJob(job_id=job_id, command=command, pid=None, process=None, status="failed", output=output)
             job.mark("failed", error="empty command")
@@ -188,9 +224,10 @@ class ShellJobManager:
     def running_jobs(self) -> list[ShellJob]:
         return [job for job in self.list_jobs() if job.status == "running"]
 
-    def read_output(self, job_id: str, max_chars: int = 12_000) -> str:
+    def read_output(self, job_id: str, max_chars: int = 12_000, *, offset: int | None = None) -> str:
         max_chars = _clamp_int(max_chars, minimum=1, maximum=100_000)
-        return self.get(job_id).output.read_tail(max_chars)
+        output = self.get(job_id).output
+        return output.read_tail(max_chars) if offset is None else output.read(max(0, offset), max_chars)
 
     def stop(self, job_id: str, *, grace_seconds: float = 5.0) -> ShellJob:
         job = self.get(job_id)
@@ -237,9 +274,7 @@ class ShellJobManager:
             cwd=self.workspace,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            text=False,
             start_new_session=True,
             preexec_fn=_apply_posix_rlimits if _posix_rlimits_enabled() else None,
         )
@@ -266,9 +301,7 @@ class ShellJobManager:
             cwd=self.workspace,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            text=False,
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
 
@@ -301,9 +334,7 @@ class ShellJobManager:
             args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            text=False,
         )
         return process, container_name
 
@@ -317,13 +348,11 @@ class ShellJobManager:
 
     def _reader_loop(self, job: ShellJob, pipe, stream_name: str) -> None:
         try:
-            for line in iter(pipe.readline, ""):
-                if not line:
-                    break
-                if stream_name == "stderr":
-                    job.output.append(f"[stderr] {line}")
-                else:
-                    job.output.append(line)
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
+            while chunk := pipe.read1(4096):
+                text = decoder.decode(chunk)
+                job.output.append(("[stderr] " if stream_name == "stderr" else "") + text)
+            job.output.append(decoder.decode(b"", final=True))
         finally:
             with contextlib.suppress(Exception):
                 pipe.close()

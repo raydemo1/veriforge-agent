@@ -6,6 +6,7 @@ import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from typing import Any
 from .. import config
 from ..runtime.execution_planner import acquire_concurrency, workspace_claim
 from ..runtime.middleware.stack import build_subagent_middlewares
+from ..runtime.output_artifacts import copy_artifact, file_digest
 from ..runtime.permissions import PermissionPolicy
 from ..runtime.tool_context import ToolContext
 from ..runtime.tool_registry import (
@@ -63,6 +65,7 @@ class AgentRecord:
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     ended_at: float | None = None
+    output_artifacts: list[dict] = field(default_factory=list)
 
 
 class AgentCoordinator:
@@ -154,6 +157,7 @@ class AgentCoordinator:
         text = str(message or "").strip()
         if not text:
             raise ValueError("message is required")
+        self._materialize_outputs(record, text)
         with self._condition:
             if record.state == "queued" or record.conversation is None:
                 record.followups.append(f"[PARENT MESSAGE]\n{str(message).strip()}")
@@ -185,6 +189,7 @@ class AgentCoordinator:
         if not text:
             raise ValueError("follow-up task is required")
         record = self._record(agent_id)
+        self._materialize_outputs(record, text)
         with self._condition:
             if record.state == "running" and record.conversation is not None:
                 record.conversation.queue_message(text)
@@ -207,9 +212,8 @@ class AgentCoordinator:
     def wait(self, agent_ids: list[str] | None = None, *, timeout_seconds: float = 30) -> dict:
         with self._condition:
             selected = self._select_records(agent_ids)
-            completed = lambda: self._closed or all(
-                record.state in TERMINAL_STATES for record in selected
-            )
+            def completed():
+                return self._closed or all(record.state in TERMINAL_STATES for record in selected)
             finished = completed() or self._condition.wait_for(
                 completed,
                 timeout=max(0.0, float(timeout_seconds)),
@@ -245,6 +249,9 @@ class AgentCoordinator:
             self._changed_locked()
         error: Exception | None = None
         try:
+            if record.conversation is not None:
+                record.conversation.close()
+            self._publish_outputs(record)
             self.changes.close_agent(record.id, discard_changes=discard_changes)
         except Exception as exc:  # noqa: BLE001 - continue closing owned resources
             error = exc
@@ -285,6 +292,7 @@ class AgentCoordinator:
         for record in records:
             if record.conversation is not None:
                 record.conversation.close()
+            self._publish_outputs(record)
         self.changes.close()
 
     def _run_record(self, agent_id: str) -> None:
@@ -367,9 +375,16 @@ class AgentCoordinator:
         )
         sub_context.resource_coordinator = self.context.resource_coordinator
         sub_context.tool_tasks = self.context.tool_tasks
+        parent_messages = self._parent_messages()
+        inherited = _role_prompt(record, parent_messages) + "\n" + _task_prompt(record)
+        for reference in self.context.tool_output_artifacts.copy().values():
+            if reference["path"] in inherited:
+                if workspace.root != self.context.workspace.root:
+                    copy_artifact(self.context.workspace.root, workspace.root, reference)
+                sub_context.tool_output_artifacts[reference["path"]] = dict(reference)
         agent = Agent(
             name=record.name,
-            system_prompt=_role_prompt(record, self._parent_messages()),
+            system_prompt=_role_prompt(record, parent_messages),
             use_tools=True,
             tool_schemas=registry.schemas(),
             middlewares=build_subagent_middlewares(
@@ -384,7 +399,19 @@ class AgentCoordinator:
             pending = list(record.followups)
             record.followups.clear()
         for message in pending:
+            self._materialize_outputs(record, message)
             record.conversation.queue_message(message)
+
+    def _materialize_outputs(self, record: AgentRecord, text: str) -> None:
+        if record.conversation is None or record.role != "worker":
+            return
+        sandbox = self.changes.sandbox_for(record.id)
+        if sandbox is None:
+            return
+        for reference in self.context.tool_output_artifacts.copy().values():
+            if reference["path"] in text:
+                copy_artifact(self.context.workspace.root, sandbox.workspace, reference)
+                record.conversation.agent.tool_context.tool_output_artifacts[reference["path"]] = dict(reference)
 
     def _role_registry(self, role: str) -> ToolRegistry:
         # Depth limit: subagent registries are capability-filtered views of
@@ -403,6 +430,10 @@ class AgentCoordinator:
         return registry
 
     def _finish(self, record: AgentRecord, state: str, *, error: str | None = None) -> None:
+        try:
+            self._publish_outputs(record)
+        except (OSError, ValueError) as exc:
+            state, error = "failed", f"Could not preserve tool output artifacts: {exc}"
         with self._condition:
             previous = record.state
             record.state = state
@@ -416,6 +447,30 @@ class AgentCoordinator:
         if token is not None:
             token.close()
         self._emit(record, "agent_status", previous=previous, status=state)
+
+    def _publish_outputs(self, record: AgentRecord) -> None:
+        if record.conversation is None:
+            return
+        sandbox = self.changes.sandbox_for(record.id)
+        from .observations import observation_dir_for
+
+        source_root = sandbox.workspace if sandbox is not None else self.context.workspace.root
+        directory = observation_dir_for(source_root, self.context.session_id, record.id)
+        if not directory.resolve().is_relative_to(source_root.resolve()):
+            raise ValueError("Tool output directory escapes its workspace")
+        manager = getattr(getattr(record.conversation, "runtime_state", None), "shell_job_manager", None)
+        jobs = manager.list_jobs() if manager is not None else []
+        for path in directory.glob("*.txt"):
+            if path.is_symlink() or not path.resolve().is_relative_to(directory.resolve()):
+                raise ValueError("Tool output artifact escapes its directory")
+            output = next((job.output for job in jobs if job.output.path == path), None)
+            with output._lock if output is not None else nullcontext():
+                reference = {"path": path.relative_to(source_root).as_posix(), "sha256": file_digest(path),
+                             "bytes": path.stat().st_size, "append_only": output is not None}
+                copy_artifact(source_root, self.context.workspace.root, reference)
+                self.context.register_output_artifact(reference)
+        record.output_artifacts = [reference for reference in self.context.tool_output_artifacts.copy().values()
+                                   if Path(reference["path"]).parent == directory.relative_to(source_root)]
 
     def _take_followup(self, record: AgentRecord) -> str | None:
         with self._condition:
@@ -457,6 +512,7 @@ class AgentCoordinator:
             "summary": record.summary,
             "error": record.error,
             "proposal_id": record.proposal_id,
+            "output_artifacts": list(record.output_artifacts),
             "allowed_paths": list(record.allowed_paths),
             "duration_seconds": round(duration, 3) if duration is not None else None,
         }
@@ -510,7 +566,7 @@ def _task_prompt(record: AgentRecord) -> str:
 def _forked_context(messages: list[dict], fork_turns: str | int) -> str:
     if fork_turns == "none":
         return "none"
-    visible = [message for message in messages if message.get("role") in {"user", "assistant"}]
+    visible = [message for message in messages if message.get("role") in {"user", "assistant", "tool"}]
     if isinstance(fork_turns, int):
         visible = visible[-(fork_turns * 2):]
     blocks = [f"{message.get('role')}: {str(message.get('content') or '')[:4000]}" for message in visible]

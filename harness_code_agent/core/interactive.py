@@ -1592,7 +1592,7 @@ class InteractiveSession:
                 self.conversation._cached_prompt_cache_key = None
                 self.conversation._last_prompt_cache_shape = None
                 self.conversation._pending_prompt_cache_shape = None
-                self.conversation.observation_store = type(self.conversation.observation_store)(self.conversation._observation_dir())
+                self.conversation.observation_store = type(self.conversation.observation_store)(self.conversation._observation_dir(), self.conversation._workspace_root())
                 self.turn_count = point["turn"]
                 self.pending_plan_markdown = None
                 self.pending_plan_revision = 0

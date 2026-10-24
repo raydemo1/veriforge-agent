@@ -92,9 +92,6 @@ def web_fetch(url: str) -> ToolResult:
         text = re.sub(r'<[^>]+>', ' ', text)
         text = re.sub(r'\s+', ' ', text).strip()
 
-        if len(text) > 10000:
-            text = text[:10000] + "\n\n[TRUNCATED]"
-
         return ToolResult(
             tool="web_fetch",
             status="success",

@@ -16,6 +16,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+import psutil
+
 from .. import config
 
 log = logging.getLogger("harness")
@@ -84,6 +86,8 @@ class _BaseShellBackend:
         self.cwd = cwd
         self._queue: queue.Queue[bytes] = queue.Queue()
         self._closed = False
+        self._running = False
+        self._cancel_requested = threading.Event()
         self._start()
         self._start_reader()
         self._sync()
@@ -127,21 +131,25 @@ class _BaseShellBackend:
         *,
         spool_dir: Path,
         preview_bytes: int | None = None,
-    ) -> _OutputCapture | None:
+        capture: _OutputCapture | None = None,
+    ) -> _OutputCapture:
         """Drain output until ``token`` (followed by a newline) or deadline.
 
         Draining never stops early because of output volume: the capture
-        keeps memory bounded and streams overflow to a spool file.  Returns
-        None on timeout; the caller owns killing the command in that case.
+        keeps memory bounded and streams overflow to a spool file. The
+        caller owns the capture and checks found before parsing it.
         """
         deadline = time.time() + timeout
-        capture = _OutputCapture(
-            token.encode("utf-8"),
-            preview_bytes=int(config.SHELL_OUTPUT_PREVIEW_CHARS if preview_bytes is None else preview_bytes),
-            spool_dir=spool_dir,
-        )
+        if capture is None:
+            capture = _OutputCapture(
+                token.encode("utf-8"),
+                preview_bytes=int(config.SHELL_OUTPUT_PREVIEW_CHARS if preview_bytes is None else preview_bytes),
+                spool_dir=spool_dir,
+            )
 
         while time.time() < deadline:
+            if getattr(self, "_cancel_requested", None) is not None and self._cancel_requested.is_set():
+                break
             try:
                 chunk = self._queue.get(timeout=min(0.1, max(deadline - time.time(), 0.01)))
             except queue.Empty:
@@ -152,7 +160,7 @@ class _BaseShellBackend:
             if capture.found:
                 return capture
 
-        return None
+        return capture
 
     def _sync(self) -> None:
         marker = f"__CODEX_SYNC_{uuid.uuid4().hex}__"
@@ -164,43 +172,70 @@ class _BaseShellBackend:
             spool_dir=Path(tempfile.gettempdir()),
             preview_bytes=4096,
         )
-        if capture is None:
-            raise RuntimeError("Shell failed to become ready")
-        capture.discard()
+        try:
+            if not capture.found:
+                raise RuntimeError("Shell failed to become ready")
+        finally:
+            capture.discard()
 
     def run(self, command: str, timeout: int = 300, artifact_dir: str | Path | None = None) -> ShellResult:
         marker = uuid.uuid4().hex
         stdout_marker = f"__CODEX_STDOUT_{marker}__"
         stderr_marker = f"__CODEX_STDERR_{marker}__"
         exit_marker = f"__CODEX_EXIT_{marker}__"
-
         spool_dir = Path(artifact_dir) if artifact_dir else Path(tempfile.gettempdir()) / "hca-shell-output"
-        self._drain_queue()
-        self._send(self._build_script(command, marker))
-        capture = self._capture_until(exit_marker, timeout=timeout, spool_dir=spool_dir)
-        if capture is None:
-            # The command exceeded run_bash's own timeout: the backend kills
-            # the process tree on interrupt.  Output keeps draining until
-            # then and is simply discarded.
-            self.interrupt()
-            return ShellResult(stdout="", stderr="", exit_code=130, timed_out=True)
+        self._cancel_requested.clear()
+        self._running = True
+        capture = None
+        timed_out = False
         try:
+            self._drain_queue()
+            self._send(self._build_script(command, marker))
+            capture = self._capture_until(exit_marker, timeout=timeout, spool_dir=spool_dir)
+            if not capture.found:
+                timed_out = True
+                self._cancel_requested.clear()
+                capture = self._recover_capture(marker, exit_marker, capture, spool_dir)
+            if not capture.found:
+                return ShellResult(stdout="", stderr="[output incomplete: shell capture could not be recovered]",
+                                   exit_code=130, timed_out=timed_out)
             if not capture.spilled:
-                return self._parse_result(
-                    capture.buffered_text(), stdout_marker, stderr_marker, exit_marker
-                )
-            capture.finish_writing()
-            return self._parse_spilled_capture(
-                capture,
-                stdout_marker=stdout_marker,
-                stderr_marker=stderr_marker,
-                exit_marker=exit_marker,
-                artifact_dir=spool_dir,
-            )
+                result = self._parse_result(capture.buffered_text(), stdout_marker, stderr_marker, exit_marker)
+            else:
+                capture.finish_writing()
+                result = self._parse_spilled_capture(capture, stdout_marker=stdout_marker, stderr_marker=stderr_marker,
+                                                    exit_marker=exit_marker, artifact_dir=spool_dir)
+            result.timed_out = timed_out
+            if timed_out:
+                result.exit_code = 130
+            return result
         finally:
-            capture.discard()
+            if capture is not None:
+                capture.discard()
+            self._running = False
+
+    def _recover_capture(self, marker: str, exit_marker: str,
+                         capture: _OutputCapture, spool_dir: Path) -> _OutputCapture:
+        capture.discard()
+        self._interrupt_impl()
+        self._sync()
+        self._send(self._recovery_script(marker))
+        return self._capture_until(exit_marker, timeout=5, spool_dir=spool_dir)
+
+    def _recovery_script(self, marker: str) -> str:
+        return (
+            f"printf '%s\\n' '__CODEX_STDOUT_{marker}__'; "
+            f"cat /tmp/hca-{marker}.out 2>/dev/null; "
+            f"printf '\\n%s\\n' '__CODEX_STDERR_{marker}__'; "
+            f"cat /tmp/hca-{marker}.err 2>/dev/null; "
+            f"printf '\\n%s:130\\n' '__CODEX_EXIT_{marker}__'; "
+            f"rm -f /tmp/hca-{marker}.out /tmp/hca-{marker}.err\n"
+        )
 
     def interrupt(self) -> None:
+        if self._running:
+            self._cancel_requested.set()
+            return
         self._interrupt_impl()
         self._sync()
 
@@ -424,54 +459,20 @@ def _stream_capture_to_artifact(
 
     artifact_dir = Path(artifact_dir)
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    out_path = artifact_dir / f"shell_output_{uuid.uuid4().hex}.txt"
     markers = (stdout_marker, stderr_marker, exit_marker)
     state = 0  # 0=before stdout, 1=stdout, 2=stderr, 3=exit line pending/done
-    head_budget = max(128, int(preview_bytes) // 2)
-    tail_budget = max(128, int(preview_bytes) - head_budget)
-    head = bytearray()
-    tail = bytearray()
-    total_bytes = 0
-    hasher = hashlib.sha256()
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    total_chars = 0
-    stdout_has_content = False
-    stderr_header_written = False
+    sinks = {section: _BoundedPipeSink(preview_chars=preview_bytes, spool_dir=artifact_dir)
+             for section in (1, 2)}
+    decoders = {section: codecs.getincrementaldecoder("utf-8")("replace") for section in (1, 2)}
     exit_code: int | None = None
     carry = b""
     exit_carry = b""
-
-    out = out_path.open("wb")
     try:
         with Path(raw_path).open("rb") as src:
 
             def emit(data: bytes, section: int) -> None:
-                nonlocal total_bytes, total_chars, stdout_has_content, stderr_header_written
-                if not data or section not in (1, 2):
-                    return
-                if section == 2:
-                    if not stderr_header_written:
-                        # Match combine_output(): leading whitespace before
-                        # the first real stderr byte is dropped.
-                        data = data.lstrip()
-                        if not data:
-                            return
-                        header = STDERR_SEPARATOR if stdout_has_content else "--- STDERR ---\n"
-                        data = header.encode("utf-8") + data
-                        stderr_header_written = True
-                elif data.strip():
-                    stdout_has_content = True
-                out.write(data)
-                hasher.update(data)
-                total_bytes += len(data)
-                total_chars += len(decoder.decode(data))
-                room = head_budget - len(head)
-                if room > 0:
-                    head.extend(data[:room])
-                tail.extend(data)
-                excess = len(tail) - tail_budget
-                if excess > 0:
-                    del tail[:excess]
+                if data and section in sinks:
+                    sinks[section].feed(decoders[section].decode(data))
 
             while True:
                 if state == 3:
@@ -528,26 +529,17 @@ def _stream_capture_to_artifact(
                 if safe > pos:
                     emit(pending[pos:safe], state)
                 carry = pending[safe:]
+        for section, sink in sinks.items():
+            sink.feed(decoders[section].decode(b"", final=True))
+            sink.finish_writing()
+        path, preview, total_bytes, total_chars, sha = _stream_sinks_to_artifact(
+            sinks[1], sinks[2], artifact_dir=artifact_dir, preview_chars=preview_bytes,
+        )
+        return _BuiltArtifact(path=path, preview=preview, total_bytes=total_bytes,
+                              total_chars=total_chars, sha256=sha, exit_code=exit_code)
     finally:
-        total_chars += len(decoder.decode(b"", final=True))
-        out.close()
-
-    head_text = head.decode("utf-8", errors="replace").strip()
-    tail_text = tail.decode("utf-8", errors="replace").strip()
-    omitted = max(0, total_bytes - len(head) - len(tail))
-    preview = (
-        f"{head_text}\n\n"
-        f"...[{omitted} bytes omitted; full output streamed to artifact]...\n\n"
-        f"{tail_text}"
-    )
-    return _BuiltArtifact(
-        path=str(out_path),
-        preview=preview,
-        total_bytes=total_bytes,
-        total_chars=total_chars,
-        sha256=hasher.hexdigest(),
-        exit_code=exit_code,
-    )
+        for sink in sinks.values():
+            sink.discard()
 
 
 class _BoundedPipeSink:
@@ -700,7 +692,7 @@ def _stream_sinks_to_artifact(
             # Decide whether stderr has non-whitespace content without
             # materialising it: head/tail text is already in memory.
             stderr_has_content = bool(
-                (stderr_sink.head_text + stderr_sink.tail_text).strip()
+                any(chunk.strip() for chunk in stderr_sink.iter_content())
             )
             if stderr_has_content:
                 sep = STDERR_SEPARATOR if saw_out else "--- STDERR ---\n"
@@ -711,26 +703,14 @@ def _stream_sinks_to_artifact(
                 )
     data_total = path.stat().st_size
 
-    head_budget = budget // 2
-    tail_budget = budget - head_budget
-    # Whether the stderr section was emitted, derived from sink content.
-    has_stderr_section = bool(
-        stderr_sink.total_chars
-        and (stderr_sink.head_text + stderr_sink.tail_text).strip()
-    )
-    if has_stderr_section and saw_out:
-        head = stdout_sink.head_text.strip()[:head_budget]
-        tail = stderr_sink.tail_text.strip()[-tail_budget:]
-    else:
-        head = stdout_sink.head_text.strip()[:head_budget]
-        tail = stdout_sink.tail_text.strip()
-        tail = tail[-tail_budget:] if len(tail) > budget else ""
-    omitted = max(0, data_total - len(head.encode("utf-8")) - len(tail.encode("utf-8")))
-    preview = (
-        f"{head}\n\n"
-        f"...[{omitted} bytes omitted; full output streamed to artifact]...\n\n"
-        f"{tail}"
-    )
+    with path.open("rb") as source:
+        head_bytes = source.read(budget // 2)
+        source.seek(max(len(head_bytes), data_total - budget // 2))
+        tail_bytes = source.read(budget // 2)
+    head = head_bytes.decode("utf-8", errors="replace")
+    tail = tail_bytes.decode("utf-8", errors="replace")
+    omitted = max(0, data_total - len(head_bytes) - len(tail_bytes))
+    preview = f"{head}\n\n...[{omitted} bytes omitted; full output streamed to artifact]...\n\n{tail}"
     return str(path), preview, data_total, total_chars, hasher.hexdigest()
 
 
@@ -1136,9 +1116,10 @@ def _posix_capture_script(
     # sink/artifact, so there is no shell-side byte ceiling.
     block_open, block_close = ("(\n", ")") if preamble else ("{\n", "}")
     inner = preamble + f"{command}\n"
+    marker_id = stdout_marker.removeprefix("__CODEX_STDOUT_").removesuffix("__")
     return (
-        f"{prefix}_out=$(mktemp)\n"
-        f"{prefix}_err=$(mktemp)\n"
+        f"{prefix}_out=/tmp/hca-{marker_id}.out\n"
+        f"{prefix}_err=/tmp/hca-{marker_id}.err\n"
         f"{block_open}"
         f"{inner}"
         f"{block_close}"
@@ -1172,9 +1153,13 @@ class _PowerShellBackend(_BaseShellBackend):
             raise RuntimeError("Failed to create persistent Windows shell")
 
     def _reader_loop(self) -> None:
-        assert self._process.stdout is not None
+        pipe = self._process.stdout
+        assert pipe is not None
         while not self._closed:
-            chunk = self._process.stdout.read(1)
+            try:
+                chunk = pipe.read1(4096)
+            except (OSError, ValueError):
+                return
             if not chunk:
                 return
             self._queue.put(chunk)
@@ -1184,9 +1169,29 @@ class _PowerShellBackend(_BaseShellBackend):
         self._process.stdin.write(script.encode("utf-8"))
         self._process.stdin.flush()
 
+    def _recover_capture(self, marker: str, exit_marker: str,
+                         capture: _OutputCapture, spool_dir: Path) -> _OutputCapture:
+        children = []
+        with contextlib.suppress(psutil.Error):
+            children = psutil.Process(self._process.pid).children(recursive=True)
+        if children:
+            for child in reversed(children):
+                with contextlib.suppress(psutil.Error):
+                    child.kill()
+            capture = self._capture_until(exit_marker, timeout=2, spool_dir=spool_dir, capture=capture)
+            if capture.found:
+                return capture
+        return super()._recover_capture(marker, exit_marker, capture, spool_dir)
+
     def _interrupt_impl(self) -> None:
         if self._process.poll() is None:
+            children = []
+            with contextlib.suppress(psutil.NoSuchProcess):
+                children = psutil.Process(self._process.pid).children(recursive=True)
             self._process.terminate()
+            for child in children:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    child.kill()
             try:
                 self._process.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -1213,6 +1218,18 @@ class _PowerShellBackend(_BaseShellBackend):
     def _build_sync_command(self, marker: str) -> str:
         return f"Write-Output '{marker}'\n"
 
+    def _recovery_script(self, marker: str) -> str:
+        return (
+            f"Write-Output '__CODEX_STDOUT_{marker}__'; "
+            f"$o = Join-Path ([IO.Path]::GetTempPath()) '{marker}.out'; "
+            f"$e = Join-Path ([IO.Path]::GetTempPath()) '{marker}.err'; "
+            "if (Test-Path -LiteralPath $o) { [Console]::Out.Write([IO.File]::ReadAllText($o, [Text.Encoding]::UTF8)) }; "
+            f"Write-Output '__CODEX_STDERR_{marker}__'; "
+            "if (Test-Path -LiteralPath $e) { [Console]::Out.Write([IO.File]::ReadAllText($e, [Text.Encoding]::UTF8)) }; "
+            f"Write-Output '__CODEX_EXIT_{marker}__:130'; "
+            "Remove-Item -LiteralPath $o, $e -Force -ErrorAction SilentlyContinue\n"
+        )
+
     def _build_script(self, command: str, marker: str) -> str:
         stdout_marker = f"__CODEX_STDOUT_{marker}__"
         stderr_marker = f"__CODEX_STDERR_{marker}__"
@@ -1222,7 +1239,7 @@ class _PowerShellBackend(_BaseShellBackend):
             f"$__hca_out = Join-Path ([System.IO.Path]::GetTempPath()) '{marker}.out'; "
             f"$__hca_err = Join-Path ([System.IO.Path]::GetTempPath()) '{marker}.err'; "
             "function __hca_Show($p) { "
-            "if (Test-Path -LiteralPath $p) { Get-Content -LiteralPath $p -Raw -Encoding utf8 -ErrorAction SilentlyContinue } }; "
+            "if (Test-Path -LiteralPath $p) { [Console]::Out.Write([IO.File]::ReadAllText($p, [Text.Encoding]::UTF8)) } }; "
             f"$__hca_command = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_command}')); "
             "$global:LASTEXITCODE = $null; "
             "$global:__hca_last_success = $null; "

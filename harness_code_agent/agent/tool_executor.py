@@ -4,7 +4,7 @@ import logging
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ..runtime.execution_planner import (
@@ -64,6 +64,7 @@ class ToolExecutor:
         self._executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
         self._deferred_user_messages: list[str] = []
         self._middleware_activity: dict[str, dict[str, Any]] = {}
+        self._cancelled_results: dict[str, ToolResult] = {}
 
     def execute(self, tool_calls: list) -> bool:
         self._tool_calls = list(tool_calls or [])
@@ -147,11 +148,9 @@ class ToolExecutor:
         log.info("[%s] Answering %d cancelled tool calls", self.agent.name, len(orphans))
         self.conversation.trace.error("cancelled_tool_calls", f"{len(orphans)} unanswered")
         for call in orphans:
-            self.conversation._append_message({
-                "role": "tool",
-                "tool_call_id": call.tool_call_id,
-                "content": "[cancelled] Execution cancelled before this tool produced a result.",
-            })
+            self.conversation.record_tool_result(call.tool_call_id, self._cancelled_results.get(call.tool_call_id) or ToolResult(
+                tool=call.name, status="failed", output="[cancelled] Execution cancelled before this tool produced a result.",
+            ))
 
     def _prepare_calls(self, tool_calls: list) -> list[PreparedToolCall]:
         prepared: list[PreparedToolCall] = []
@@ -362,7 +361,17 @@ class ToolExecutor:
                     token.cancel()
                 future.cancel()
             if pending:
-                wait(pending, timeout=0.25)
+                shell_futures = [future for future in pending if futures[future].name == "run_bash"]
+                wait(shell_futures or pending, timeout=10 if shell_futures else 0.25)
+            for item in executed:
+                self._cancelled_results.setdefault(item.prepared.tool_call_id, item.result)
+            for future, prepared in futures.items():
+                if future.done() and not future.cancelled():
+                    try:
+                        item = future.result()
+                    except Exception:
+                        continue
+                    self._cancelled_results.setdefault(prepared.tool_call_id, item.result)
             raise
         return executed
 
@@ -412,7 +421,12 @@ class ToolExecutor:
         context = self.agent.tool_context
         resource_guard = context.resource_coordinator.acquire(prepared.effect.resources) if context is not None else nullcontext()
         with acquire_concurrency(prepared.effect.concurrency_key), resource_guard:
-            return self._execute_one_unlimited(prepared, cancellation_token)
+            try:
+                return self._execute_one_unlimited(prepared, cancellation_token)
+            except CancelledError as exc:
+                if getattr(exc, "tool_result", None) is not None:
+                    self._cancelled_results[prepared.tool_call_id] = exc.tool_result
+                raise
 
     def _execute_one_unlimited(
         self, prepared: PreparedToolCall, cancellation_token=None
@@ -453,6 +467,10 @@ class ToolExecutor:
         elif tool_result.status == "success":
             self.runtime_state.failures.observe_success(prepared.name)
 
+        observation = self.conversation.record_tool_result(prepared.tool_call_id, tool_result, prepared.args)
+        if observation.inline_output is not None:
+            tool_result = replace(tool_result, output=observation.inline_output)
+
         if item.intercepted:
             if prepared.emit_events:
                 tool_result = finalize_intercepted_tool_result(
@@ -463,11 +481,6 @@ class ToolExecutor:
                 )
             result = tool_result.to_text()
             self.conversation.trace.tool_call(prepared.name, prepared.args, result)
-            self.conversation._append_message({
-                "role": "tool",
-                "tool_call_id": prepared.tool_call_id,
-                "content": result,
-            })
             if failure is not None:
                 self._dispatch_tool_failure(prepared, failure)
             self._emit_middleware_activity(prepared, fallback_outcome="blocked")
@@ -486,17 +499,6 @@ class ToolExecutor:
         result = tool_result.to_text()
         log.debug("[%s] tool result: %s", self.agent.name, result[:200])
         self.conversation.trace.tool_call(prepared.name, prepared.args, result)
-        observation = self.conversation.observation_store.create(
-            tool=prepared.name,
-            args=prepared.args,
-            result=tool_result,
-            fact_tracker=self.conversation.fact_tracker,
-        )
-        self.conversation._append_message({
-            "role": "tool",
-            "tool_call_id": prepared.tool_call_id,
-            "content": self.conversation.observation_store.observed_message(observation, tool_result),
-        })
         invalidation = self.conversation.fact_tracker.apply_mutation(
             tool=prepared.name,
             args=prepared.args,

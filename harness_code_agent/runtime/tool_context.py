@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -39,8 +40,17 @@ class ToolContext:
     agent_coordinator: AgentCoordinator | None = None
     #: Set only on child-agent contexts; identifies the calling subagent.
     agent_id: str | None = None
+    tool_output_artifacts: dict[str, dict] = field(default_factory=dict)
+    tool_output_artifact_sink: Callable[[dict], None] | None = field(default=None, repr=False)
     _language_service: object | None = field(default=None, init=False, repr=False)
     _language_service_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def register_output_artifact(self, reference: dict) -> None:
+        if self.tool_output_artifacts.get(reference["path"]) == reference:
+            return
+        self.tool_output_artifacts[reference["path"]] = dict(reference)
+        if self.tool_output_artifact_sink is not None:
+            self.tool_output_artifact_sink(reference)
 
     def get_language_service(self):
         from .language_service import LanguageService

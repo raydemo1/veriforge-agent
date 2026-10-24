@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -48,13 +47,14 @@ class RepositoryToolPolicyTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_repo_search_uses_bounded_explicit_path_and_excludes_generated_dirs(self) -> None:
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="pkg/target.py:1:VALUE = 'needle'\n", stderr=""
-        )
-        with patch(
-            "harness_code_agent.runtime.builtins.filesystem.subprocess.run",
-            return_value=completed,
-        ) as run:
+        from io import StringIO
+        from unittest.mock import MagicMock
+
+        process = MagicMock()
+        process.stdout = StringIO("pkg/target.py:1:VALUE = 'needle'\n")
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+        with patch("harness_code_agent.runtime.builtins.filesystem.subprocess.Popen", return_value=process) as run:
             result = repo_search("needle", path=".", max_results=5)
 
         self.assertEqual(result.status, "success")

@@ -1,21 +1,24 @@
 """Workspace filesystem tools."""
 from __future__ import annotations
 
+import contextlib
 import difflib
 import os
+import shutil
 import subprocess
+import tempfile
+import threading
+import uuid
 from pathlib import Path
 
 from ... import config
 from ...agent.context import count_text_tokens
 from ...workspace.service import WorkspaceQuotaError
 from ..tool_context import ToolContext
+from ..tool_output import fitting_prefix, output_limit
 from ..tool_result import ToolResult
 
-# Dual limit: lines and tokens, whichever is smaller wins.
-# Aligned with Claude Code (2000 lines / 100K tokens per tool result).
 READ_FILE_MAX_LINES = 2000
-READ_FILE_MAX_OUTPUT_TOKENS = 100_000
 REPO_SEARCH_TIMEOUT_SECONDS = 15
 REPO_SEARCH_MAX_RESULTS = 500
 LIST_FILES_MAX_RESULTS = 1000
@@ -183,68 +186,75 @@ def repo_search(
             args.extend(["--glob", str(item)])
     args.extend(["--", pattern, search_path])
 
+    timed_out = threading.Event()
+    process = None
+    timer = None
     try:
-        completed = subprocess.run(
-            args,
-            cwd=workspace,
-            text=True,
-            capture_output=True,
-            timeout=REPO_SEARCH_TIMEOUT_SECONDS,
-            check=False,
-        )
+        with tempfile.SpooledTemporaryFile(mode="w+t", max_size=65536, encoding="utf-8", newline="") as selected, tempfile.TemporaryFile() as errors:
+            process = subprocess.Popen(args, cwd=workspace, stdout=subprocess.PIPE, stderr=errors,
+                                       text=True, encoding="utf-8", errors="replace")
+            def expire():
+                timed_out.set()
+                with contextlib.suppress(OSError):
+                    process.kill()
+            timer = threading.Timer(REPO_SEARCH_TIMEOUT_SECONDS, expire)
+            timer.start()
+            returned = 0
+            truncated = False
+            while fragment := process.stdout.readline(4096):
+                if returned >= limit:
+                    truncated = True
+                    process.kill()
+                    break
+                selected.write(fragment)
+                if fragment.endswith("\n"):
+                    returned += 1
+            if selected.tell() and returned == 0:
+                returned = 1
+            process.stdout.close()
+            return_code = process.wait()
+            timer.cancel()
+            if timed_out.is_set():
+                return ToolResult(tool="repo_search", status="failed",
+                                  output=f"[error] repo_search timed out after {REPO_SEARCH_TIMEOUT_SECONDS}s. Narrow the path or pattern.",
+                                  metadata={"status_source": "timeout"})
+            failed = not truncated and return_code not in {0, 1}
+            if failed:
+                selected.write(f"\n[error] rg exited with code {return_code}\n")
+                errors.seek(0)
+                while chunk := errors.read(65536):
+                    selected.write(chunk.decode("utf-8", errors="replace"))
+            elif truncated:
+                selected.write(f"\n[truncated] Showing first {limit} result lines. Narrow path/pattern or raise max_results.")
+            metadata = {"path": path, "explicit_path": search_path, "returned_lines": returned,
+                        "truncated": truncated, "status_source": "native"}
+            selected.seek(0)
+            output = selected.read(65537)
+            if len(output) > 65536:
+                from ...agent.observations import observation_dir_for
+                directory = observation_dir_for(workspace, getattr(tool_context, "session_id", None),
+                                                getattr(tool_context, "agent_id", None))
+                directory.mkdir(parents=True, exist_ok=True)
+                artifact = directory / f"search_{uuid.uuid4().hex}.txt"
+                selected.seek(0)
+                with artifact.open("x", encoding="utf-8", newline="") as destination:
+                    shutil.copyfileobj(selected, destination, length=65536)
+                metadata["artifact_path"] = str(artifact)
+                output = ""
+            return ToolResult(tool="repo_search", status="failed" if failed else "success",
+                              output=output or ("" if metadata.get("artifact_path") else "(no matches)"),
+                              return_code=return_code if failed else None, metadata=metadata)
     except FileNotFoundError:
-        return ToolResult(
-            tool="repo_search",
-            status="failed",
-            output="[error] ripgrep (rg) is not installed or not on PATH.",
-            error="ripgrep (rg) is not installed or not on PATH.",
-            metadata={"path": path, "status_source": "native"},
-        )
-    except subprocess.TimeoutExpired:
-        return ToolResult(
-            tool="repo_search",
-            status="failed",
-            output=f"[error] repo_search timed out after {REPO_SEARCH_TIMEOUT_SECONDS}s. Narrow the path or pattern.",
-            error=f"repo_search timed out after {REPO_SEARCH_TIMEOUT_SECONDS}s",
-            metadata={"path": path, "status_source": "timeout"},
-        )
-
-    stdout = completed.stdout or ""
-    stderr = (completed.stderr or "").strip()
-    if completed.returncode not in {0, 1}:
-        output = f"[error] rg exited with code {completed.returncode}"
-        if stderr:
-            output += f"\n{stderr}"
-        return ToolResult(
-            tool="repo_search",
-            status="failed",
-            output=output,
-            error=output.removeprefix("[error] "),
-            metadata={"path": path, "status_source": "native", "returncode": completed.returncode},
-        )
-
-    lines = stdout.splitlines()
-    truncated = len(lines) > limit
-    selected = lines[:limit]
-    if not selected:
-        output = "(no matches)"
-    else:
-        output = "\n".join(selected)
-        if truncated:
-            output += f"\n[truncated] Showing first {limit} result lines. Narrow path/pattern or raise max_results."
-    return ToolResult(
-        tool="repo_search",
-        status="success",
-        output=output,
-        metadata={
-            "path": path,
-            "explicit_path": search_path,
-            "match_lines": len(lines),
-            "returned_lines": len(selected),
-            "truncated": truncated,
-            "status_source": "native",
-        },
-    )
+        return ToolResult(tool="repo_search", status="failed", output="[error] ripgrep (rg) is not installed or not on PATH.",
+                          metadata={"status_source": "native"})
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
 
 
 def read_file(
@@ -253,127 +263,76 @@ def read_file(
     max_lines: int | None = None,
     include_line_numbers: bool = False,
     tool_context: ToolContext | None = None,
+    start_column: int = 1,
 ) -> ToolResult:
     p = _resolve_with_context(path, tool_context)
-    if not p.exists():
-        return ToolResult(
-            tool="read_file",
-            status="failed",
-            output=f"[error] File not found: {path}",
-            error=f"File not found: {path}",
-            metadata={"path": path, "status_source": "native"},
-        )
-    content = p.read_text(encoding="utf-8", errors="replace")
-    lines = content.splitlines()
-    total_lines = len(lines)
-    try:
-        start = max(1, int(start_line or 1))
-    except (TypeError, ValueError):
-        return ToolResult(
-            tool="read_file",
-            status="failed",
-            output="[error] read_file start_line must be an integer >= 1.",
-            error="read_file start_line must be an integer >= 1",
-            metadata={
-                "path": path,
-                "start_line": start_line,
-                "max_lines": max_lines,
-                "total_lines": total_lines,
-                "status_source": "validation",
-            },
-        )
-    try:
-        requested_lines = int(max_lines) if max_lines is not None else max(0, total_lines - start + 1)
-    except (TypeError, ValueError):
-        return ToolResult(
-            tool="read_file",
-            status="failed",
-            output="[error] read_file max_lines must be an integer >= 1.",
-            error="read_file max_lines must be an integer >= 1",
-            metadata={
-                "path": path,
-                "start_line": start,
-                "max_lines": max_lines,
-                "total_lines": total_lines,
-                "status_source": "validation",
-            },
-        )
-    if requested_lines < 1:
-        return ToolResult(
-            tool="read_file",
-            status="failed",
-            output="[error] read_file max_lines must be an integer >= 1.",
-            error="read_file max_lines must be an integer >= 1",
-            metadata={
-                "path": path,
-                "start_line": start,
-                "max_lines": max_lines,
-                "total_lines": total_lines,
-                "status_source": "validation",
-            },
-        )
-    if requested_lines > READ_FILE_MAX_LINES:
-        return ToolResult(
-            tool="read_file",
-            status="failed",
-            output=(
-                f"[error] read_file can read at most {READ_FILE_MAX_LINES} lines per call. "
-                f"max_lines must be <= {READ_FILE_MAX_LINES}. "
-                f"{path} has {total_lines} total lines; requested {requested_lines} lines. "
-                f"For sequential scans of large files, use a larger window up to {READ_FILE_MAX_LINES} "
-                f"lines, then advance start_line by the number of lines read. Use smaller windows when "
-                f"following search hits, inspecting local context, or avoiding the per-call token cap "
-                f"on dense files."
-            ),
-            error=f"read_file max_lines must be <= {READ_FILE_MAX_LINES}",
-            metadata={
-                "path": path,
-                "start_line": start,
-                "max_lines": max_lines,
-                "total_lines": total_lines,
-                "status_source": "validation",
-            },
-        )
-
-    end = len(lines) if max_lines is None else min(len(lines), start + max(0, requested_lines) - 1)
-    selected = lines[start - 1:end]
-    if include_line_numbers:
-        selected = [f"{line_no}: {line}" for line_no, line in enumerate(selected, start=start)]
-    output = "\n".join(selected)
-    output_tokens = count_text_tokens(output)
-    if output_tokens > READ_FILE_MAX_OUTPUT_TOKENS:
-        return ToolResult(
-            tool="read_file",
-            status="failed",
-            output=(
-                f"[error] read_file output window is too large ({output_tokens} tokens). "
-                f"Use a smaller max_lines value or a narrower start_line range. "
-                f"The per-call output limit is {READ_FILE_MAX_OUTPUT_TOKENS} tokens "
-                f"(or {READ_FILE_MAX_LINES} lines, whichever is smaller)."
-            ),
-            error=f"read_file output window is too large: {output_tokens} tokens",
-            metadata={
-                "path": path,
-                "start_line": start,
-                "max_lines": max_lines,
-                "total_lines": total_lines,
-                "output_tokens": output_tokens,
-                "status_source": "validation",
-            },
-        )
-
-    return ToolResult(
-        tool="read_file",
-        status="success",
-        output=output,
-        metadata={
-            "path": path,
-            "start_line": start,
-            "max_lines": max_lines,
-            "total_lines": total_lines,
-            "status_source": "native",
-        },
-    )
+    if not p.is_file():
+        return ToolResult(tool="read_file", status="failed", output=f"[error] File not found: {path}",
+                          error=f"File not found: {path}", metadata={"path": path, "status_source": "native"})
+    references = getattr(tool_context, "tool_output_artifacts", {})
+    reference = references.get(p.relative_to(_workspace_root(tool_context)).as_posix())
+    if reference and reference.get("sha256") and not reference.get("append_only"):
+        from ..output_artifacts import file_digest
+        if file_digest(p) != reference["sha256"]:
+            return ToolResult(tool="read_file", status="failed", output="[error] Tool output artifact is damaged.",
+                              error="Tool output artifact is damaged", metadata={"path": path})
+    for name, value, maximum in (("start_line", start_line if start_line is not None else 1, None),
+                                 ("start_column", start_column, None),
+                                 ("max_lines", max_lines if max_lines is not None else READ_FILE_MAX_LINES, READ_FILE_MAX_LINES)):
+        try:
+            integer = int(value)
+            if integer < 1 or (maximum is not None and integer > maximum):
+                raise ValueError
+        except (TypeError, ValueError):
+            message = f"read_file {name} must be an integer >= 1."
+            if maximum is not None:
+                message = f"read_file {name} must be <= {maximum} and >= 1."
+            return ToolResult(tool="read_file", status="failed", output="[error] " + message,
+                              error=message, metadata={"path": path, "status_source": "validation"})
+    start, column = int(start_line or 1), int(start_column)
+    limit = int(max_lines) if max_lines is not None else READ_FILE_MAX_LINES
+    end_line = start + limit - 1
+    line, col = 1, 1
+    output = ""
+    next_read = None
+    budget = max(1, output_limit() - 800)
+    with p.open("r", encoding="utf-8", errors="replace", newline=None) as stream:
+        while fragment := stream.readline(4096):
+            fragment_line, fragment_col = line, col
+            if fragment.endswith("\n"):
+                line, col = line + 1, 1
+            else:
+                col += len(fragment)
+            if fragment_line < start:
+                continue
+            if fragment_line == start and fragment_col + len(fragment) <= column:
+                continue
+            if fragment_line > end_line:
+                next_read = {"path": path, "start_line": fragment_line, "start_column": fragment_col,
+                             "max_lines": limit, "include_line_numbers": include_line_numbers}
+                break
+            skip = max(0, column - fragment_col) if fragment_line == start else 0
+            fragment = fragment[skip:]
+            fragment_col += skip
+            label = f"{fragment_line}: " if include_line_numbers and (fragment_col == 1 or not output) else ""
+            candidate = output + label + fragment
+            if count_text_tokens(candidate) <= budget:
+                output = candidate
+                continue
+            prefix = fitting_prefix(candidate, budget)
+            consumed = max(0, len(prefix) - len(output) - len(label))
+            if consumed == 0 and not output:
+                return ToolResult(tool="read_file", status="failed", output="[error] File page cannot fit the output budget.")
+            output = prefix if consumed else output
+            next_line, next_column = fragment_line, fragment_col + consumed
+            next_read = {"path": path, "start_line": next_line, "start_column": next_column,
+                         "max_lines": limit, "include_line_numbers": include_line_numbers}
+            break
+    metadata = {"path": path, "start_line": start, "start_column": column, "max_lines": limit,
+                "status_source": "native"}
+    if next_read:
+        metadata["next_read"] = next_read
+    return ToolResult(tool="read_file", status="success", output=output, metadata=metadata)
 
 
 def read_skill_file(path: str) -> ToolResult:
@@ -400,19 +359,14 @@ def read_skill_file(path: str) -> ToolResult:
             metadata={"path": path, "status_source": "native"},
         )
     content = p.read_text(encoding="utf-8", errors="replace")
-    truncated = len(content) > 60_000
-    output = content[:60_000]
-    if truncated:
-        output += "\n\n[truncated] Skill file exceeds 60,000 characters; read a narrower supporting reference."
     return ToolResult(
         tool="read_skill_file",
         status="success",
-        output=output,
+        output=content,
         metadata={
             "path": path,
             "status_source": "native",
             "characters": len(content),
-            "truncated": truncated,
         },
     )
 

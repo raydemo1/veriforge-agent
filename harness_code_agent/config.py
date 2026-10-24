@@ -188,10 +188,7 @@ CONTEXT_WINDOW_TOKENS = int(os.environ.get("HARNESS_CONTEXT_WINDOW_TOKENS", "200
 COMPRESS_THRESHOLD = int(os.environ.get("COMPRESS_THRESHOLD", str(int(CONTEXT_WINDOW_TOKENS * 0.80))))
 MEMORY_EXTRACTION_IDLE_SECONDS = max(0.0, float(os.environ.get("HARNESS_MEMORY_IDLE_SECONDS", "21600")))
 
-# Tool output larger than this (chars) is stored to file; only a compact
-# ref + head+tail preview goes into the message list.  Smaller outputs are
-# inlined as usual.
-TOOL_OUTPUT_INLINE_LIMIT = int(os.environ.get("HARNESS_TOOL_OUTPUT_INLINE_LIMIT", "4000"))
+TOOL_OUTPUT_MAX_TOKENS = max(1000, int(os.environ.get("HARNESS_TOOL_OUTPUT_MAX_TOKENS", "5000")))
 
 # --- Agent limits ---
 MAX_AGENT_TOTAL_TOKENS = int(os.environ.get("MAX_AGENT_TOTAL_TOKENS", "0"))
@@ -217,7 +214,7 @@ TOOL_MAX_TIMEOUT_SECONDS = float(
 # (commands are never interrupted for producing too much output), keeping at
 # most this many characters of head+tail preview in memory.  Output larger
 # than the budget is streamed to an artifact file and the ToolResult carries
-# preview + artifact ref + total size.
+# capture metadata. Final model messages use TOOL_OUTPUT_MAX_TOKENS.
 SHELL_OUTPUT_PREVIEW_CHARS = int(
     os.environ.get("HARNESS_SHELL_OUTPUT_PREVIEW_CHARS", "8192")
 )

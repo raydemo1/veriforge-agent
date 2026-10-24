@@ -46,15 +46,17 @@ class ShellJobManagerTests(unittest.TestCase):
             finally:
                 manager.close()
 
-    def test_ring_buffer_keeps_recent_tail(self):
-        from harness_code_agent.workspace.shell_jobs import RingBuffer
+    def test_output_buffer_keeps_all_content_and_supports_offsets(self):
+        from harness_code_agent.workspace.shell_jobs import ShellOutputBuffer
 
-        buffer = RingBuffer(max_chars=10)
-        buffer.append("abcdef")
-        buffer.append("ghijkl")
-
-        self.assertEqual(buffer.read_tail(100), "cdefghijkl")
-        self.assertEqual(buffer.read_tail(4), "ijkl")
+        with tempfile.TemporaryDirectory() as tmp:
+            buffer = ShellOutputBuffer(Path(tmp))
+            buffer.append("abcdef")
+            buffer.append("ghijkl")
+            self.assertEqual(buffer.read(0, 100), "abcdefghijkl")
+            self.assertEqual(buffer.read(4, 4), "efgh")
+            self.assertEqual(buffer.read_tail(4), "ijkl")
+            self.assertIsNone(buffer.path)
 
     def test_invalid_job_id_is_reported(self):
         from harness_code_agent.workspace.shell_jobs import (

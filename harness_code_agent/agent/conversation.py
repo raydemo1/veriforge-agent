@@ -114,9 +114,12 @@ class Agent:
 
     def _create_runtime_state(self, task: str) -> AgentRuntimeState:
         workspace = self.tool_context.workspace.root if self.tool_context is not None else Path.cwd()
+        from .observations import observation_dir_for
+
         return AgentRuntimeState(
             task_metadata=dict(self.current_task_metadata or {}),
-            shell_job_manager=ShellJobManager(workspace),
+            shell_job_manager=ShellJobManager(workspace, artifact_dir=observation_dir_for(
+                workspace, getattr(self.tool_context, "session_id", None), getattr(self.tool_context, "agent_id", None))),
             agent_config=self,
         )
 
@@ -187,7 +190,7 @@ class AgentConversation:
         self.runtime_state.event_bus = self.event_bus
         self.emitter.event_bus = self.event_bus
         self.fact_tracker = FactTracker()
-        self.observation_store = ObservationStore(self._observation_dir())
+        self.observation_store = ObservationStore(self._observation_dir(), self._workspace_root())
         self._cached_prompt_cache_key: str | None = None
         self._log_rewrite_version = 0
         self._last_prompt_cache_shape = None
@@ -203,6 +206,8 @@ class AgentConversation:
                 session_root / "journal.jsonl"
             )
 
+        if agent.tool_context is not None:
+            agent.tool_context.tool_output_artifact_sink = self._persist_output_artifact
         self.append_message({"role": "system", "content": agent.full_system_prompt})
         self.start_epoch("initial", self.messages)
         self._run_conversation_start_middlewares()
@@ -215,6 +220,7 @@ class AgentConversation:
         return observation_dir_for(
             self._workspace_root(),
             getattr(self.runtime_state, "session_id", None),
+            getattr(self.agent.tool_context, "agent_id", None),
         )
 
     @property
@@ -418,6 +424,23 @@ class AgentConversation:
     def _append_message(self, message: dict) -> None:
         self.append_message(message)
 
+    def record_tool_result(self, tool_call_id: str, result: ToolResult, arguments: dict | None = None):
+        observation = self.observation_store.create(
+            tool=result.tool, args=arguments or {}, result=result, fact_tracker=self.fact_tracker,
+        )
+        if observation.artifact_reference and self.agent.tool_context is not None:
+            reference = observation.artifact_reference
+            self.agent.tool_context.register_output_artifact(reference)
+        self.append_message(
+            {"role": "tool", "tool_call_id": tool_call_id, "content": observation.message},
+            metadata={"tool_output_artifacts": [observation.artifact_reference] if observation.artifact_reference else []},
+        )
+        return observation
+
+    def _persist_output_artifact(self, reference: dict) -> None:
+        if self.journal is not None:
+            self.journal.append("tool_output_artifact", reference)
+
     def _run_conversation_start_middlewares(self) -> None:
         for mw in self.agent.middlewares:
             on_start = getattr(mw, "on_conversation_start", None)
@@ -437,6 +460,13 @@ class AgentConversation:
                 )
 
     def _replace_messages(self, messages: list[dict], *, reason="restore") -> None:
+        if self.journal is not None and self.agent.tool_context is not None:
+            for entry in self.journal.read():
+                if entry.kind == "tool_output_artifact":
+                    self.agent.tool_context.tool_output_artifacts[entry.payload["path"]] = dict(entry.payload)
+                if entry.kind == "message":
+                    for reference in entry.payload.get("metadata", {}).get("tool_output_artifacts", []):
+                        self.agent.tool_context.tool_output_artifacts[reference["path"]] = reference
         if reason in {"restore", "resume", "rewind"}:
             context = self.agent.tool_context
             service = getattr(context, "memory_service", None)
@@ -838,11 +868,7 @@ class AgentConversation:
             )
             result = tool_result.to_text()
             self.trace.tool_call(fn_name, fn_args, result)
-            self._append_message({
-                "role": "tool",
-                "tool_call_id": call.tool_call_id,
-                "content": result,
-            })
+            self.record_tool_result(call.tool_call_id, tool_result, fn_args)
 
     def run_until_idle(self, cancellation_token=None) -> str:
         agent = self.agent
