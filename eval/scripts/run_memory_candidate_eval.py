@@ -63,7 +63,7 @@ def main(argv=None):
             journal = SessionJournal(case_root / "journal.jsonl")
             journal.append_user_input(case["source"], turn_id="turn-1", memory_generation=queue.generation)
             journal.append_message({"role": "user", "content": "RECALLED_UNTRUSTED_MEMORY_NOT_A_SOURCE"})
-            queue.enqueue("synthetic-" + case["id"], journal.path, idle_seconds=0)
+            queue.enqueue("synthetic-" + case["id"], journal.path)
             recorder.label = case["id"]
             outcome = queue.process(queue.claim(), max_calls=1)
             candidates = queue.candidates()

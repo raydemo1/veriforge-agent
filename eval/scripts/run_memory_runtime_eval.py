@@ -65,7 +65,7 @@ def main():
     parser.add_argument("--run", action="store_true")
     args = parser.parse_args()
     protocol = {"model_cap": 6, "embedding_cap": 5, "retries_included": True,
-                "scope": "Native memory_write, cross-session persistence, automatic recall, raw-source separation."}
+                "scope": "Native memory_write, cross-session startup context, raw-source separation."}
     if not args.run:
         print(json.dumps(protocol, indent=2))
         return
@@ -76,12 +76,14 @@ def main():
     (workspace / ".harness").mkdir(parents=True)
     (workspace / ".harness/mcp.json").write_text('{"servers":{}}', encoding="utf-8")
     ledger = HttpLedger(root)
-    send = lambda client, request, **kwargs: ledger.send(client, request, **kwargs)
+    def send(client, request, **kwargs):
+        return ledger.send(client, request, **kwargs)
     fast = config.resolve_model_profile("fast")
     result = {"protocol": protocol, "sessions": []}
-    with (patch.dict(os.environ, {"HARNESS_MEMORY_ROOT": str(root / "memory"), "HARNESS_MEMORY_DISABLED": "0"}),
+    with (patch.dict(os.environ, {"HARNESS_MEMORY_ROOT": str(root / "memory"), "HARNESS_MEMORY_DISABLED": "0",
+                                 "HARNESS_MEMORY_GENERATION_DISABLED": "1"}),
           patch.object(config, "MODEL_INTENSITY", "fast"), patch.object(config, "MODEL", fast.model),
-          patch.object(config, "MODEL_PROFILE", fast), patch.object(config, "MEMORY_EXTRACTION_IDLE_SECONDS", 21600),
+          patch.object(config, "MODEL_PROFILE", fast),
           patch.object(httpx.Client, "send", send)):
         try:
             for turn, task in enumerate([

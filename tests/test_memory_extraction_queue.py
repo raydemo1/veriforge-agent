@@ -14,8 +14,7 @@ from harness_code_agent.sessions.journal import SessionJournal
 
 
 @pytest.fixture
-def runtime(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "MEMORY_EXTRACTION_IDLE_SECONDS", 0)
+def runtime(tmp_path):
     database = MemoryDatabase(tmp_path / "memory", "project:sample")
     queue = ExtractionQueue(database)
     journal = SessionJournal(tmp_path / "journal.jsonl")
@@ -40,7 +39,7 @@ def reply(candidates=None, *, episode="", complete=True, finish_reason="stop", r
 
 
 def enqueue(queue, journal):
-    task_id = queue.enqueue("session-1", journal.path, idle_seconds=0)
+    task_id = queue.enqueue("session-1", journal.path)
     return task_id, queue.claim()
 
 
@@ -195,7 +194,7 @@ def test_long_source_resumes_inside_message_without_truncation(runtime):
     queue = ExtractionQueue(database, chunk_tokens=40)
     text = "EARLY_FACT\n" + "这是临时工作描述。" * 50 + "\nLATE_FACT"
     user(queue, journal, text)
-    queue.enqueue("session-1", journal.path, idle_seconds=0)
+    queue.enqueue("session-1", journal.path)
     seen = []
 
     def invoke(**kwargs):
@@ -243,7 +242,7 @@ def test_old_generation_and_ordinary_messages_never_trigger_extraction(runtime):
 def test_invalid_model_output_never_consumes_source(runtime, raw):
     database, queue, journal = runtime
     user(queue, journal)
-    queue.enqueue("session-1", journal.path, idle_seconds=0)
+    queue.enqueue("session-1", journal.path)
     for _ in range(3):
         ready(database)
         assert queue.process(queue.claim(), invoke=Mock(return_value=reply(raw=raw)))["state"] == "failed_attempt"
@@ -318,7 +317,7 @@ def test_new_snapshot_supersedes_inflight_task(runtime):
 
     def invoke(**kwargs):
         user(queue, journal, "NEW_SOURCE")
-        queue.enqueue("session-1", journal.path, idle_seconds=0)
+        queue.enqueue("session-1", journal.path)
         return reply([candidate()])
 
     assert queue.process(old, invoke=invoke)["state"] == "obsolete"
@@ -404,7 +403,7 @@ def test_secret_redaction_spans_multiple_source_chunks(runtime):
     queue = ExtractionQueue(database, chunk_tokens=30)
     user(queue, journal, "-----BEGIN PRIVATE KEY-----\n" + "SYNTHETIC_PRIVATE_MATERIAL " * 50
          + "\n-----END PRIVATE KEY-----")
-    queue.enqueue("session-1", journal.path, idle_seconds=0)
+    queue.enqueue("session-1", journal.path)
 
     def invoke(**kwargs):
         value = json.loads(kwargs["messages"][-1]["content"])
@@ -439,20 +438,18 @@ def test_namespace_bound_queue_cannot_read_other_project_candidates(runtime):
     assert other.generation == queue.generation
 
 
-def test_idle_deadline_is_persisted_and_new_snapshot_coalesces_pending_work(runtime):
+def test_new_snapshot_coalesces_pending_work_and_is_immediately_available(runtime):
     database, queue, journal = runtime
     user(queue, journal)
     with patch("harness_code_agent.memory.extraction.time.time", return_value=1000):
-        first = queue.enqueue("session-1", journal.path, idle_seconds=60)
+        first = queue.enqueue("session-1", journal.path)
     user(queue, journal, "新一轮真实输入。")
     with patch("harness_code_agent.memory.extraction.time.time", return_value=1030):
-        latest = queue.enqueue("session-1", journal.path, idle_seconds=60)
+        latest = queue.enqueue("session-1", journal.path)
     assert first != latest
     assert [row["status"] for row in rows(database, "extraction_tasks")] == ["superseded", "pending"]
     reloaded = ExtractionQueue(MemoryDatabase(database.root, database.namespace))
-    with patch("harness_code_agent.memory.extraction.time.time", return_value=1089):
-        assert reloaded.claim() is None
-    with patch("harness_code_agent.memory.extraction.time.time", return_value=1090):
+    with patch("harness_code_agent.memory.extraction.time.time", return_value=1030):
         assert reloaded.claim()["id"] == latest
 
 
@@ -472,7 +469,7 @@ def test_forget_removes_already_buffered_candidates_and_episode(runtime):
 def test_repeated_process_crashes_stop_after_three_expired_leases(runtime):
     database, queue, journal = runtime
     user(queue, journal)
-    queue.enqueue("session-1", journal.path, idle_seconds=0)
+    queue.enqueue("session-1", journal.path)
     for _ in range(3):
         assert queue.claim() is not None
         with database.connect(write=True) as db:

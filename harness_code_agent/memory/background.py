@@ -88,9 +88,10 @@ def drain_memory_jobs(service, *, max_model_calls=8, max_embedding_requests=16, 
     if not 1 <= max_model_calls <= 16 or not 0 <= max_embedding_requests <= 32:
         raise ValueError("Invalid background memory budget")
     budget = BudgetedEmbeddings(max_embedding_requests)
-    factory = lambda database: VectorIndex(database, embeddings=budget)
+    def factory(database):
+        return VectorIndex(database, embeddings=budget)
     project = service.stores["project"]
-    consolidation = ConsolidationQueue(project, vector_factory=factory)
+    consolidation = ConsolidationQueue(project)
     calls, states = 0, []
     eligible = should_continue or (lambda: True)
     while calls < max_model_calls and eligible():
@@ -101,25 +102,16 @@ def drain_memory_jobs(service, *, max_model_calls=8, max_embedding_requests=16, 
             states.append(result["state"])
         if not eligible():
             break
-        for store in service.stores.values():
-            result = factory(store).sync(max_requests=min(4, budget.remaining), should_continue=eligible)
-            if result.get("budget_exhausted"):
-                break
-        if calls >= max_model_calls or budget.remaining == 0 or not eligible():
-            break
-        task = consolidation.claim()
+        task = consolidation.claim() if calls < max_model_calls else None
         if task:
             result = consolidation.process(task, should_continue=eligible)
             calls += result["calls"]
             states.append(result["state"])
-            if result["state"] == "index_pending":
-                with project.connect(write=True) as db:
-                    failed = db.execute("SELECT 1 FROM vector_outbox o JOIN memories m ON m.id=o.memory_id "
-                                        "WHERE m.namespace IN (?, 'user') AND o.failures>=3 LIMIT 1",
-                                        (project.namespace,)).fetchone()
-                    if failed:
-                        db.execute("UPDATE consolidation_tasks SET status='blocked',error_type='EmbeddingIndexFailed' "
-                                   "WHERE id=? AND status='pending'", (task["id"],))
+        for store in service.stores.values():
+            if budget.remaining == 0 or not eligible():
+                break
+            result = factory(store).sync(max_requests=min(4, budget.remaining), should_continue=eligible)
+            if result.get("budget_exhausted"):
                 break
         if not extracted and not task:
             break

@@ -407,7 +407,8 @@ def test_worker_copies_only_referenced_artifacts_and_publishes_before_cleanup(tm
     (tmp_path / 'note.txt').write_text('code', encoding='utf-8')
     context = make_context(tmp_path, 'session')
     parent = make_conversation(context)
-    coordinator = AgentCoordinator(context, parent_messages=lambda: parent.messages)
+    coordinator = AgentCoordinator(context, parent_messages=lambda: parent.messages,
+                                   parent_system_prompt=lambda: parent.agent.system_prompt)
     try:
         inherited = record_large_result(parent)
         unused = '.harness/observations/session/main/missing.txt'

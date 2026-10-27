@@ -18,7 +18,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from eval.scripts.check_memory_consolidation import LocalVectors, response
-from harness_code_agent import config
 from harness_code_agent.core.interactive import InteractiveSession
 from harness_code_agent.memory import (
     MemoryService,
@@ -64,8 +63,8 @@ def checks(root):
         return replies.pop(0)
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)), close=lambda: None)
     with (patch.dict(os.environ, {"HARNESS_MEMORY_ROOT": str(root / "memory"), "HARNESS_MEMORY_DISABLED": "0"}),
-          patch.object(config, "MEMORY_EXTRACTION_IDLE_SECONDS", 3600),
           patch("harness_code_agent.agent.conversation.get_client", return_value=client),
+          patch.object(extraction, "_call_model", return_value=response({"complete": True, "candidates": [], "episode": ""})),
           patch.object(SiliconFlowEmbeddings, "embed", lambda self, texts: LocalVectors().embed(texts))):
         first = InteractiveSession(cwd=workspace, profile_name="general", profile_explicit=True,
                                    approval_provider=NoApprovalProvider(), enable_turn_summary=False)
@@ -81,16 +80,19 @@ def checks(root):
             assert first.tool_context.memory_user_sequence == source[0].sequence
             first.memory_command(["generate", "on"])
             old = deepcopy(first.conversation.messages)
-            first.submit("用哪种语言回复我？")
+            with patch.object(first.memory_service, "search", side_effect=AssertionError("automatic recall")):
+                first.submit("用哪种语言回复我？")
             assert first.conversation.messages[:len(old)] == old
-            assert any("[HARNESS_MEMORY_REFERENCE]" in str(m.get("content")) for m in requests[-1]["messages"])
+            assert not any("[HARNESS_MEMORY_REFERENCE]" in str(m.get("content")) for m in requests[-1]["messages"])
+            assert "用户偏好简体中文交流。" in first.memory_command(["show", "user:" + stored[0].id])
         finally:
             first.close()
         wait_workers()
         second = InteractiveSession(cwd=workspace, profile_name="general", profile_explicit=True,
                                     approval_provider=NoApprovalProvider(), enable_turn_summary=False)
         try:
-            assert any("[HARNESS_MEMORY_CURRENT]" in str(m.get("content")) for m in second.conversation.messages)
+            assert "用户偏好简体中文交流。" in str(second.conversation.messages[0]["content"])
+            assert str(second.conversation.messages[0]["content"]).count("[HARNESS_MEMORY_INDEX]") == 1
             assert second.memory_service.read(stored[0].id, "user")["body"] == "用户偏好简体中文交流。"
         finally:
             second.close()
@@ -101,7 +103,7 @@ def checks(root):
         service.extraction.register("background", journal.path)
         text = "已确认的长期构建约定：使用 BUILD_RUNTIME_1。"
         journal.append_user_input(text, turn_id="new", memory_generation=service.extraction.generation)
-        service.extraction.enqueue("background", journal.path, idle_seconds=0)
+        service.extraction.enqueue("background", journal.path)
         item = {"topic": "构建", "fact_key": "build.command", "kind": "convention", "body": "使用 BUILD_RUNTIME_1。",
                 "scope": "project", "quotes": [text]}
         def consolidate(**kwargs):
@@ -114,7 +116,7 @@ def checks(root):
             result = drain_memory_jobs(service, max_model_calls=4, max_embedding_requests=8)
         assert result["model_calls"] == 2, result
         assert service.stores["project"].records()[0].body == "使用 BUILD_RUNTIME_1。"
-    return ["source isolation and native tool execution", "append-only references and bounded automatic recall",
+    return ["source isolation and native tool execution", "append-only history without automatic recall",
             "explicit native save with automatic generation disabled",
             "cross-session pinned preference", "session close stops future background scheduling",
             "independent extraction/consolidation/index queues through the runtime worker"]

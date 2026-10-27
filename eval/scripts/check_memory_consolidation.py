@@ -51,7 +51,7 @@ def seed(root):
     journal = SessionJournal(root / "journal.jsonl")
     text = "已经确认：项目数据库使用 SQLite。"
     entry = journal.append_user_input(text, turn_id="old", memory_generation=extraction.generation)
-    extraction.enqueue("session", journal.path, idle_seconds=0)
+    extraction.enqueue("session", journal.path)
     with db.connect(write=True) as sql:
         sql.execute("UPDATE extraction_tasks SET status='done'")
         sql.execute("INSERT INTO extraction_checkpoints VALUES(?,?,?,0)",
@@ -67,7 +67,7 @@ def seed(root):
 def candidate(db, extraction, journal, text="迁移已经完成，后续统一使用 PostgreSQL。", *, key="database.engine",
               body="项目使用 PostgreSQL。", applicability=""):
     journal.append_user_input(text, turn_id="new", memory_generation=extraction.generation)
-    extraction.enqueue("session", journal.path, idle_seconds=0)
+    extraction.enqueue("session", journal.path)
     item = {"topic": "数据库", "fact_key": key, "kind": "project_fact", "body": body,
             "scope": "project", "quotes": [text], "applicability": applicability}
     outcome = extraction.process(extraction.claim(), max_calls=1,
@@ -101,7 +101,7 @@ def checks(root):
     db.flush_exports()
     assert not (db.export_root / f"{old.topic_id}.md").exists()
     passed.append("pending update excludes definite old value")
-    worker = ConsolidationQueue(db, vector_factory=factory)
+    worker = ConsolidationQueue(db)
     for attempt in range(3):
         retry_now(db)
         result = worker.process(worker.claim(), invoke=lambda **kw: (_ for _ in ()).throw(TimeoutError()))
@@ -139,7 +139,7 @@ def checks(root):
 
     db, extraction, journal, old = seed(root / "stale")
     candidate(db, extraction, journal)
-    worker = ConsolidationQueue(db, vector_factory=factory)
+    worker = ConsolidationQueue(db)
     def concurrent(**kwargs):
         db.write(topic=old.topic, fact_key=old.fact_key, kind=old.kind, body="最新人工确认值",
                  evidence=[EvidenceReference("manual", 1, "manual", "f" * 64)],
@@ -151,7 +151,7 @@ def checks(root):
 
     db, extraction, journal, old = seed(root / "review")
     candidate(db, extraction, journal, "数据库似乎也有 PostgreSQL，是否迁移不确定。")
-    worker = ConsolidationQueue(db, vector_factory=factory)
+    worker = ConsolidationQueue(db)
     assert worker.process(worker.claim(), invoke=decide("review", old))["state"] == "done"
     page = CurrentMemoryView(db, vectors=factory(db)).search("数据库")
     assert page["items"][0]["status"] == "review_required" and "body" not in page["items"][0]
@@ -160,7 +160,7 @@ def checks(root):
 
     db, extraction, journal, old = seed(root / "scope")
     candidate(db, extraction, journal, applicability="tools/")
-    worker = ConsolidationQueue(db, vector_factory=factory)
+    worker = ConsolidationQueue(db)
     assert worker.process(worker.claim(), invoke=decide("add"))["state"] == "done"
     assert len(db.records()) == 2
     passed.append("different applicability coexists without replacing project-wide fact")
@@ -171,7 +171,7 @@ def checks(root):
     foreign = other.write(topic="数据库", fact_key=old.fact_key, kind=old.kind, body="FOREIGN",
                           evidence=[EvidenceReference("manual", 1, "manual", "f" * 64)]).record
     factory(other).sync()
-    worker = ConsolidationQueue(db, vector_factory=factory)
+    worker = ConsolidationQueue(db)
     assert worker.process(worker.claim(), invoke=decide("update", foreign))["state"] == "failed_attempt"
     assert other.read(foreign.id).body == "FOREIGN" and db.read(old.id).version == 1
     assert not any(i["id"] == foreign.id for i in CurrentMemoryView(db, vectors=factory(db)).search("数据库")["items"])
@@ -180,7 +180,7 @@ def checks(root):
     db, extraction, journal, old = seed(root / "tamper")
     candidate(db, extraction, journal)
     journal.path.write_text(journal.path.read_text(encoding="utf-8").replace("迁移已经完成", "内容已经篡改"), encoding="utf-8")
-    worker = ConsolidationQueue(db, vector_factory=factory)
+    worker = ConsolidationQueue(db)
     result = worker.process(worker.claim(), invoke=lambda **kw: (_ for _ in ()).throw(AssertionError("no model call")))
     assert result["calls"] == 0 and result["state"] == "failed_attempt"
     passed.append("changed journal evidence rejected before model call")
@@ -215,7 +215,7 @@ def checks(root):
                               end_offset=len(text), source_namespace=db.namespace, observed_at=entry.timestamp)
     confirmed = db.write(topic=old.topic, fact_key=old.fact_key, kind=old.kind, body=old.body,
                          evidence=[fresh], memory_id=old.id, expected_version=1).record
-    worker = ConsolidationQueue(db, vector_factory=factory)
+    worker = ConsolidationQueue(db)
     outcome = worker.process(worker.claim(), invoke=lambda **kw: (_ for _ in ()).throw(AssertionError("no model call")))
     assert outcome["state"] == "done" and outcome["calls"] == 0
     assert db.records()[0].id == confirmed.id
@@ -249,7 +249,7 @@ def checks(root):
     latest = db.write(topic=old.topic, fact_key=old.fact_key, kind=old.kind, body="CURRENT_FINAL",
                       evidence=[fresh], memory_id=old.id, expected_version=1).record
     factory(db).sync()
-    worker = ConsolidationQueue(db, vector_factory=factory)
+    worker = ConsolidationQueue(db)
     result = worker.process(worker.claim(), invoke=decide("update", latest))
     assert result["actions"] == ["history"] and db.read(old.id).body == "CURRENT_FINAL"
     passed.append("a delayed older correction cannot overwrite a later confirmed value")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from harness_code_agent import config
+from harness_code_agent.memory import extraction, reconciliation
 
 
 @pytest.fixture(autouse=True)
@@ -13,6 +14,10 @@ def isolate_model_credentials(monkeypatch, tmp_path):
     monkeypatch.setenv("SILICONFLOW_API_KEY", "")
     monkeypatch.setenv("SILICONFLOW_BASE_URL", "https://embedding.example.invalid/v1")
     monkeypatch.setenv("HARNESS_MEMORY_ROOT", str(tmp_path / "isolated-memory"))
+    def reject_memory_request(**kwargs):
+        raise AssertionError("Background memory model calls require an explicit offline fixture")
+    monkeypatch.setattr(extraction, "_call_model", reject_memory_request)
+    monkeypatch.setattr(reconciliation, "_call_model", reject_memory_request)
 
 
 def pytest_addoption(parser):

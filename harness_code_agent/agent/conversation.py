@@ -195,6 +195,9 @@ class AgentConversation:
         self._log_rewrite_version = 0
         self._last_prompt_cache_shape = None
         self._pending_prompt_cache_shape = None
+        self._memory_snapshot_key = None
+        self._memory_snapshot = None
+        self._memory_index = agent.memory_index
         session_id = getattr(self.runtime_state, "session_id", "default")
         self.journal = None
         if session_id and session_id != "default":
@@ -208,7 +211,8 @@ class AgentConversation:
 
         if agent.tool_context is not None:
             agent.tool_context.tool_output_artifact_sink = self._persist_output_artifact
-        self.append_message({"role": "system", "content": agent.full_system_prompt})
+        self._load_memory_snapshot(agent)
+        self.append_message(self._system_message())
         self.start_epoch("initial", self.messages)
         self._run_conversation_start_middlewares()
         if initial_task is not None:
@@ -222,6 +226,30 @@ class AgentConversation:
             getattr(self.runtime_state, "session_id", None),
             getattr(self.agent.tool_context, "agent_id", None),
         )
+
+    def _load_memory_snapshot(self, agent: Agent, *, refresh: bool = False) -> None:
+        context = agent.tool_context
+        service = getattr(context, "memory_service", None)
+        if not getattr(context, "memory_use_enabled", True):
+            self._memory_index = None
+            return
+        if service is None:
+            self._memory_index = agent.memory_index
+            self._memory_snapshot_key = None
+            return
+        project = service.stores["project"]
+        key = (str(project.path), project.namespace)
+        if refresh or key != self._memory_snapshot_key:
+            self._memory_snapshot = service.startup_block() or None
+            self._memory_snapshot_key = key
+        self._memory_index = self._memory_snapshot
+
+    def _system_message(self, agent: Agent | None = None) -> dict:
+        selected = agent or self.agent
+        text = selected.system_prompt
+        if self._memory_index:
+            text += "\n\n" + self._memory_index
+        return {"role": "system", "content": text}
 
     @property
     def messages(self) -> list[dict]:
@@ -239,7 +267,7 @@ class AgentConversation:
             "profile": self.agent.name, "provider": profile.provider, "model": profile.model,
             "thinking": profile.thinking, "reasoning_effort": profile.reasoning_effort,
             "input_mode": profile.input_mode,
-            "system": self.agent.full_system_prompt,
+            "system": self._system_message()["content"],
             "tools": _tool_schemas_for_agent(self.agent),
             "permission_mode": self.runtime_state.permission_mode,
             "blocked_tools": sorted(getattr(self.agent.tool_context, "blocked_tool_names", set())),
@@ -267,7 +295,7 @@ class AgentConversation:
         contract = self._request_contract()
         if self.history.epoch.contract != fingerprint(contract):
             messages = self.messages
-            messages[0] = {"role": "system", "content": self.agent.full_system_prompt}
+            messages[0] = self._system_message()
             self.start_epoch("request_contract_changed", messages, contract)
 
     def _outbound_messages(self, messages: list[dict], model: str) -> list[dict]:
@@ -279,7 +307,7 @@ class AgentConversation:
         changes do not invalidate the cached stable prefix. Other providers
         keep the plain-string form.
         """
-        memory_index = self.agent.memory_index
+        memory_index = self._memory_index
         if not memory_index or not messages:
             return messages
         if not supports_system_cache_breakpoint(self.provider, model):
@@ -306,15 +334,18 @@ class AgentConversation:
         """
         if agent is self.agent:
             return
-        messages = self.messages
-        if messages and messages[0].get("role") == "system":
-            messages[0] = {"role": "system", "content": agent.full_system_prompt}
         previous = self.agent
-        self.agent = agent
+        memory = (self._memory_snapshot_key, self._memory_snapshot, self._memory_index)
         try:
+            self._load_memory_snapshot(agent)
+            messages = self.messages
+            if messages and messages[0].get("role") == "system":
+                messages[0] = self._system_message(agent)
+            self.agent = agent
             self.start_epoch("profile_changed", messages)
         except BaseException:
             self.agent = previous
+            self._memory_snapshot_key, self._memory_snapshot, self._memory_index = memory
             raise
         self.runtime_state.agent_config = agent
         previous._conversations.discard(self)
@@ -467,14 +498,16 @@ class AgentConversation:
                 if entry.kind == "message":
                     for reference in entry.payload.get("metadata", {}).get("tool_output_artifacts", []):
                         self.agent.tool_context.tool_output_artifacts[reference["path"]] = reference
-        if reason in {"restore", "resume", "rewind"}:
-            context = self.agent.tool_context
-            service = getattr(context, "memory_service", None)
-            if service is not None and getattr(context, "memory_use_enabled", True):
-                reference = service.startup_block()
-                if reference:
-                    messages = [*messages, {"role": "user", "content": reference}]
-        self.start_epoch(reason, messages)
+        memory = (self._memory_snapshot_key, self._memory_snapshot, self._memory_index)
+        try:
+            if reason in {"restore", "resume", "rewind"}:
+                self._load_memory_snapshot(self.agent, refresh=True)
+            if messages and messages[0].get("role") == "system":
+                messages = [self._system_message(), *messages[1:]]
+            self.start_epoch(reason, messages)
+        except BaseException:
+            self._memory_snapshot_key, self._memory_snapshot, self._memory_index = memory
+            raise
         if reason in {"restore", "resume", "rewind"} and self.journal is not None:
             users = [entry for entry in self.journal.read() if entry.kind == "message"
                      and entry.payload.get("metadata", {}).get("kind") == "user_input"]
@@ -499,12 +532,8 @@ class AgentConversation:
         messages = [message for message in messages
                     if not _safe_message_content(message).startswith(DYNAMIC_CONTEXT_MARKER)]
         injected = []
-        tool_context = self.agent.tool_context
-        service = getattr(tool_context, "memory_service", None)
-        if service is not None and getattr(tool_context, "memory_use_enabled", True):
-            reference = service.startup_block()
-            if reference:
-                injected.append({"role": "user", "content": reference})
+        if messages and messages[0].get("role") == "system":
+            messages[0] = self._system_message()
         for mw in self.agent.middlewares:
             injected.extend(mw.on_context_compacted(
                 copy.deepcopy(messages), runtime_state=self.runtime_state,
@@ -657,11 +686,8 @@ class AgentConversation:
         cancellation_token=None,
         *,
         task_text: str | None = None,
-        reference_context: str = "",
     ) -> str:
         self.add_user_turn(task, task_text=task_text)
-        if reference_context:
-            self.append_message({"role": "user", "content": reference_context}, {"kind": "memory_reference"})
         return self.run_until_idle(cancellation_token=cancellation_token)
 
     def next_call_id(self) -> str:
@@ -708,6 +734,7 @@ class AgentConversation:
             self.agent,
             _tool_schemas_for_agent(self.agent),
             log_rewrite_version=self._log_rewrite_version,
+            memory_index=self._memory_index or "",
         )
         cache_diagnostics = compare_prompt_cache_shapes(
             self._last_prompt_cache_shape,
@@ -963,6 +990,7 @@ class AgentConversation:
                 agent,
                 tool_schemas,
                 log_rewrite_version=self._log_rewrite_version,
+                memory_index=self._memory_index or "",
             )
             chat_args["messages"] = self._outbound_messages(prompt_messages, profile.model)
             if self.provider.supports_prompt_cache_key:

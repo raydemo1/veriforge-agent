@@ -66,6 +66,7 @@ def capture_prompt_cache_shape(
     tool_schemas: list[dict] | None,
     *,
     log_rewrite_version: int = 0,
+    memory_index: str | None = None,
 ) -> PromptCacheShape:
     """Snapshot the stable request prefix inputs used for cache diagnostics."""
     tool_text = json.dumps(
@@ -75,7 +76,8 @@ def capture_prompt_cache_shape(
         separators=(",", ":"),
     )
     system_prompt = getattr(agent, "system_prompt", "")
-    memory_index = getattr(agent, "memory_index", None) or ""
+    if memory_index is None:
+        memory_index = getattr(agent, "memory_index", None) or ""
     return PromptCacheShape(
         system_hash=_short_hash(system_prompt),
         memory_index_hash=_short_hash(memory_index),

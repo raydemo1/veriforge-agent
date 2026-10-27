@@ -93,12 +93,13 @@ def run_case(case, root, model_recorder, embeddings):
     user = project.scoped("user")
     extraction_queue = ExtractionQueue(project)
     journal = SessionJournal(folder / "journal.jsonl")
-    factory = lambda db: VectorIndex(db, embeddings=embeddings)
-    worker = ConsolidationQueue(project, vector_factory=factory)
+    def factory(db):
+        return VectorIndex(db, embeddings=embeddings)
+    worker = ConsolidationQueue(project)
     stages = []
     for turn, text in enumerate(case["turns"]):
         journal.append_user_input(text, turn_id=f"turn-{turn}", memory_generation=extraction_queue.generation)
-        extraction_queue.enqueue(case["id"], journal.path, idle_seconds=0)
+        extraction_queue.enqueue(case["id"], journal.path)
         model_recorder.label = f"extract:{case['id']}:{turn}"
         result = extraction_queue.process(extraction_queue.claim(), max_calls=1)
         stages.append({"extract": result})

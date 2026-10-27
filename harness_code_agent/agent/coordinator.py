@@ -76,11 +76,13 @@ class AgentCoordinator:
         tool_context: ToolContext,
         *,
         parent_messages: Callable[[], list[dict]] | None = None,
+        parent_system_prompt: Callable[[], str] | None = None,
         parent_message_sink: Callable[[str, str], None] | None = None,
         max_concurrent: int = MAX_CONCURRENT_AGENTS,
     ) -> None:
         self.context = tool_context
         self._parent_messages = parent_messages or list
+        self._parent_system_prompt = parent_system_prompt or (lambda: "")
         # Delivers (text, tag) into the main agent conversation queue. The
         # topology is fixed Main <-> Child: this is the only upward path,
         # there is no child-to-child addressing.
@@ -368,6 +370,7 @@ class AgentCoordinator:
             session_id=self.context.session_id,
             memory_use_enabled=self.context.memory_use_enabled,
             memory_auto_extract_enabled=self.context.memory_auto_extract_enabled,
+            memory_service=self.context.memory_service,
             tool_registry=registry,
             allowed_tool_permissions={"read", "network_read", "edit", "shell"},
             agent_id=record.id,
@@ -376,7 +379,8 @@ class AgentCoordinator:
         sub_context.resource_coordinator = self.context.resource_coordinator
         sub_context.tool_tasks = self.context.tool_tasks
         parent_messages = self._parent_messages()
-        inherited = _role_prompt(record, parent_messages) + "\n" + _task_prompt(record)
+        role_prompt = _role_prompt(record, parent_messages, self._parent_system_prompt())
+        inherited = role_prompt + "\n" + _task_prompt(record)
         for reference in self.context.tool_output_artifacts.copy().values():
             if reference["path"] in inherited:
                 if workspace.root != self.context.workspace.root:
@@ -384,7 +388,7 @@ class AgentCoordinator:
                 sub_context.tool_output_artifacts[reference["path"]] = dict(reference)
         agent = Agent(
             name=record.name,
-            system_prompt=_role_prompt(record, parent_messages),
+            system_prompt=role_prompt,
             use_tools=True,
             tool_schemas=registry.schemas(),
             middlewares=build_subagent_middlewares(
@@ -531,7 +535,7 @@ class AgentCoordinator:
             raise RuntimeError("agent coordinator is closed")
 
 
-def _role_prompt(record: AgentRecord, parent_messages: list[dict]) -> str:
+def _role_prompt(record: AgentRecord, parent_messages: list[dict], system: str) -> str:
     role_text = {
         "explorer": "Investigate code and return evidence. Do not modify files.",
         "test_designer": "Design focused tests and failure cases. Do not modify files.",
@@ -539,9 +543,6 @@ def _role_prompt(record: AgentRecord, parent_messages: list[dict]) -> str:
         "verifier": "Run focused verification and interpret results. Do not modify source files.",
         "worker": "Implement the assigned change in your isolated workspace and verify it.",
     }[record.role]
-    system = ""
-    if parent_messages and parent_messages[0].get("role") == "system":
-        system = str(parent_messages[0].get("content") or "")
     inherited = _forked_context(parent_messages, record.fork_turns)
     return (
         f"You are the {record.name} subagent with role {record.role}. {role_text}\n"

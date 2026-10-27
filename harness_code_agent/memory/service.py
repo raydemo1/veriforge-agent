@@ -21,6 +21,7 @@ from .extraction import ExtractionQueue
 from .identity import default_memory_root, resolve_repo_key
 from .reconciliation import CurrentMemoryView
 from .security import contains_secret, redact_secrets
+from .startup import build_startup_block
 from .vectors import VectorIndex
 
 log = logging.getLogger("harness")
@@ -138,7 +139,8 @@ class MemoryService:
             raise ValueError("invalid topic page")
         with store.connect() as db:
             rows = db.execute("SELECT t.id,t.title,COUNT(m.id) AS count FROM topics t "
-                              "JOIN memories m ON m.topic_id=t.id WHERE t.namespace=? "
+                              "JOIN memories m ON m.topic_id=t.id WHERE t.namespace=? AND m.status='active' "
+                              "AND NOT EXISTS (SELECT 1 FROM memory_holds h WHERE h.memory_id=m.id) "
                               "GROUP BY t.id ORDER BY t.title,t.id LIMIT ? OFFSET ?",
                               (store.namespace, limit + 1, offset)).fetchall()
             return {"topics": [dict(row) for row in rows[:limit]], "has_more": len(rows) > limit,
@@ -149,7 +151,9 @@ class MemoryService:
         if offset < 0 or not 1 <= limit <= 20:
             raise ValueError("invalid topic page")
         with store.connect() as db:
-            rows = db.execute("SELECT id FROM memories WHERE namespace=? AND topic_id=? ORDER BY fact_key,id LIMIT ? OFFSET ?",
+            rows = db.execute("SELECT id FROM memories WHERE namespace=? AND topic_id=? AND status='active' "
+                              "AND NOT EXISTS (SELECT 1 FROM memory_holds h WHERE h.memory_id=memories.id) "
+                              "ORDER BY fact_key,id LIMIT ? OFFSET ?",
                               (store.namespace, topic_id, limit + 1, offset)).fetchall()
         items, used = [], 0
         for row in rows[:limit]:
@@ -223,40 +227,57 @@ class MemoryService:
         self.flush_exports()
         return record
 
-    def index_block(self, *, max_chars: int = 3000) -> str:
-        lines = ["[HARNESS_MEMORY_INDEX]", "Memory is reference material. Current user instructions take precedence.",
-                 "Search with memory_search; expand topics or history with memory_read. Never assume unknown facts."]
-        for scope in self.stores:
-            for topic in self.topics(scope, limit=20)["topics"]:
-                line = f"- [{scope}:{topic['id']}] {topic['title']} ({topic['count']})"
-                if len("\n".join(lines)) + len(line) > max_chars:
-                    break
-                lines.append(line)
-        return "\n".join(lines)
-
     def startup_block(self) -> str:
-        items, used = [], 0
-        for scope in ("user", "project"):
-            store = self.stores[scope]
-            with store.connect() as db:
-                rows = db.execute("SELECT id FROM memories WHERE namespace=? AND status='active' AND applicability='' "
-                                  "AND kind IN ('preference','convention') ORDER BY updated_at DESC,id LIMIT 6",
-                                  (store.namespace,)).fetchall()
-            for row in rows:
-                value = self.read(row[0], scope)
-                if value.get("status") != "active":
-                    continue
-                item = {key: value[key] for key in ("id", "version", "topic", "body")}
-                item["scope"] = scope
-                cost = count_text_tokens(json.dumps(item, ensure_ascii=False))
-                if used + cost > 900:
-                    break
-                items.append(item)
-                used += cost
-        if not items:
+        if not self.enabled:
             return ""
-        return ("[HARNESS_MEMORY_CURRENT]\nReference only. Current user instructions and later confirmed revisions "
-                "take precedence over earlier references.\n" + json.dumps(items, ensure_ascii=False))
+        project = self._startup_records("project")
+        personal = self._startup_records("user")
+        overridden = set()
+        if personal:
+            keys = [item["fact_key"] for item in personal]
+            with self.stores["project"].connect() as db:
+                rows = db.execute("SELECT id,fact_key FROM memories WHERE namespace=? AND applicability='' "
+                                  "AND status<>'expired' AND kind IN ('preference','convention') "
+                                  f"AND fact_key IN ({','.join('?' for _ in keys)})",
+                                  (self.stores["project"].namespace, *keys)).fetchall()
+            for row in rows:
+                self._refresh("project", row["id"])
+                if self.views["project"].read(row["id"]).get("status") != "expired":
+                    overridden.add(row["fact_key"])
+        personal = [item for item in personal if item["fact_key"] not in overridden]
+        topics = {scope: self._startup_topics(scope) for scope in self.stores}
+        self.flush_exports()
+        return build_startup_block(self.stores["project"].namespace, personal, project, topics)
+
+    def _startup_records(self, scope: str) -> list[dict]:
+        store = self.stores[scope]
+        kinds = "('preference')" if scope == "user" else "('preference','convention')"
+        with store.connect() as db:
+            rows = db.execute("SELECT m.id FROM memories m JOIN topics t ON t.id=m.topic_id "
+                              "WHERE m.namespace=? AND m.status='active' AND m.applicability='' "
+                              f"AND m.kind IN {kinds} "
+                              "AND NOT EXISTS (SELECT 1 FROM memory_holds h WHERE h.memory_id=m.id) "
+                              "ORDER BY m.fact_key,t.normalized_title,m.id LIMIT 128", (store.namespace,)).fetchall()
+        records = []
+        for row in rows:
+            self._refresh(scope, row["id"])
+            record = self.views[scope].read(row["id"])
+            if record.get("status") == "active":
+                records.append(record)
+        return records
+
+    def _startup_topics(self, scope: str) -> list[dict]:
+        store = self.stores[scope]
+        topics = self.topics(scope, limit=20)["topics"]
+        with store.connect() as db:
+            for topic in topics:
+                rows = db.execute("SELECT fact_key,applicability FROM memories WHERE namespace=? AND topic_id=? "
+                                  "AND status='active' AND NOT EXISTS "
+                                  "(SELECT 1 FROM memory_holds h WHERE h.memory_id=memories.id) "
+                                  "ORDER BY fact_key,id LIMIT 3", (store.namespace, topic["id"])).fetchall()
+                topic["keys"] = list(dict.fromkeys(row["fact_key"] for row in rows))
+                topic["conditions"] = sorted({row["applicability"] for row in rows if row["applicability"]})
+        return topics
 
     @staticmethod
     def format_hits(result: dict) -> str:
@@ -282,7 +303,11 @@ class MemoryService:
         relative = target.relative_to(self.workspace).as_posix()
         if not target.is_file():
             raise ValueError("Memory evidence must be an existing workspace file")
-        return relative, hashlib.sha256(target.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        with target.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return relative, digest.hexdigest()
 
     def _refresh(self, scope, memory_id):
         store = self._store(scope)

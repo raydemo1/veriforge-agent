@@ -170,11 +170,9 @@ class MemoryDatabase:
 
     def _topic(self, db, title: str) -> str:
         normalized = " ".join(title.split()).casefold()
-        row = db.execute(
-            "SELECT id FROM topics WHERE namespace=? AND normalized_title=?", (self.namespace, normalized),
-        ).fetchone()
-        if row:
-            return row[0]
+        existing = _find_topic(db, self.namespace, title)
+        if existing is not None:
+            return existing
         topic_id = "topic_" + uuid.uuid4().hex
         db.execute("INSERT INTO topics(id,namespace,title,normalized_title) VALUES(?,?,?,?)",
                    (topic_id, self.namespace, title.strip(), normalized))
@@ -233,8 +231,12 @@ class MemoryDatabase:
         if kind not in KINDS or not all(isinstance(v, str) and v.strip() for v in (topic, fact_key, body)):
             raise ValueError("kind, topic, fact_key and body must be valid")
         refs = _evidence(evidence)
+        if self.namespace == "user" and (kind != "preference" or applicability.strip().startswith("path:")
+                                         or any(ref["kind"] == "verification" or ref.get("role") == "validity" for ref in refs)):
+            raise ValueError("User memory requires personal preferences independent of project files or verification")
         topic, fact_key, body, applicability = (v.strip() for v in (topic, fact_key, body, applicability))
         topic_id = self._topic(db, topic)
+        topic = db.execute("SELECT title FROM topics WHERE id=?", (topic_id,)).fetchone()[0]
         key = _hash(self.namespace, " ".join(topic.split()).casefold(), fact_key, applicability)
         if restore_forgotten:
             db.execute("DELETE FROM suppressions WHERE namespace=? AND key_hash=?", (self.namespace, key))
@@ -437,6 +439,21 @@ class MemoryDatabase:
             lines.extend(f"- [{row['title']}]({row['id']}.md)" for row in topics)
             _atomic_write(self.export_root / "MEMORY.md", "\n".join(lines) + "\n")
             db.execute("DELETE FROM export_outbox WHERE namespace=?", (self.namespace,))
+
+
+def _find_topic(db, namespace: str, title: str) -> str | None:
+    normalized = " ".join(title.split()).casefold()
+    row = db.execute("SELECT id FROM topics WHERE namespace=? AND normalized_title=?",
+                     (namespace, normalized)).fetchone()
+    if row:
+        return row[0]
+    topic_id = None
+    for alias in db.execute("SELECT t.id,a.value FROM topics t,json_each(t.aliases) a WHERE t.namespace=?", (namespace,)):
+        if " ".join(str(alias["value"]).split()).casefold() == normalized:
+            if topic_id is not None and topic_id != alias["id"]:
+                raise ValueError("Topic alias is ambiguous; use a canonical topic title")
+            topic_id = alias["id"]
+    return topic_id
 
 
 def _evidence(values: list[EvidenceReference]) -> list[dict]:

@@ -13,18 +13,18 @@ from .. import config
 from ..agent.context import count_request_tokens, count_text_tokens
 from ..agent.providers import ProviderAdapter, client_scope
 from ..agent.utils import _usage_to_dict
-from .database import EvidenceReference, MemoryDatabase, _hash, _now
+from .database import EvidenceReference, MemoryDatabase, _find_topic, _hash, _now
 from .search_index import search_terms
 from .security import contains_secret, redact_secrets
-from .vectors import EmbeddingBudgetExceeded, VectorIndex
+from .vectors import VectorIndex
 
 
 def hold_matching_facts(db, namespace: str, candidate_id: str, value: dict) -> None:
     rows = db.execute(
-        "SELECT m.id,m.topic_id FROM memories m JOIN topics t ON t.id=m.topic_id "
-        "WHERE m.namespace=? AND t.normalized_title=? AND m.fact_key=? AND m.applicability=? "
+        "SELECT m.id,m.topic_id FROM memories m "
+        "WHERE m.namespace=? AND m.topic_id=? AND m.fact_key=? AND m.applicability=? "
         "AND (m.body<>? OR m.kind<>?)",
-        (namespace, " ".join(value["topic"].split()).casefold(), value["fact_key"].strip(),
+        (namespace, _find_topic(db, namespace, value["topic"]), value["fact_key"].strip(),
          value.get("applicability", "").strip(), value["body"].strip(), value["kind"]),
     ).fetchall()
     for row in rows:
@@ -155,9 +155,8 @@ class IncompleteConsolidation(ValueError):
 
 
 class ConsolidationQueue:
-    def __init__(self, database: MemoryDatabase, *, vector_factory=VectorIndex):
+    def __init__(self, database: MemoryDatabase):
         self.database = database
-        self.vector_factory = vector_factory
 
     def claim(self) -> dict | None:
         now = time.time()
@@ -281,28 +280,9 @@ class ConsolidationQueue:
             if not candidates:
                 self._commit(task, revision, [], [], records)
                 return {"state": "done", "calls": 0}
-            extra_ids = set()
-            for namespace in {c["target_namespace"] for c in candidates}:
-                index = self.vector_factory(self.database.scoped(namespace))
-                if index.pending():
-                    self._release(task, failed=False)
-                    return {"state": "index_pending", "calls": 0}
-                with self.database.connect() as db:
-                    has_records = db.execute("SELECT 1 FROM memories WHERE namespace=? LIMIT 1", (namespace,)).fetchone()
-                if has_records:
-                    for candidate in candidates:
-                        if candidate["target_namespace"] == namespace:
-                            if should_continue is not None and not should_continue():
-                                raise ObsoleteConsolidation("Memory worker stopped")
-                            query = candidate["payload"]["body"]
-                            extra_ids.update((namespace, memory_id) for memory_id, _score in index.search(query, limit=30))
             with self.database.connect() as db:
                 if db.execute("SELECT revision FROM state WHERE id=1").fetchone()[0] != revision:
                     raise ObsoleteConsolidation("Memory snapshot changed during retrieval")
-                for namespace, memory_id in sorted(extra_ids):
-                    if not any(r["id"] == memory_id for r in records):
-                        records.append(asdict(self.database.scoped(namespace)._read(db, memory_id)))
-            with self.database.connect() as db:
                 sources = {c["id"]: self._sources(db, c) for c in candidates}
             if should_continue is not None and not should_continue():
                 raise ObsoleteConsolidation("Memory worker stopped")
@@ -332,6 +312,9 @@ class ConsolidationQueue:
                                (_hash(content) if isinstance(content, str) else None,
                                 json.dumps(_usage_to_dict(getattr(response, "usage", None))),
                                 round((time.monotonic() - started) * 1000), error, call_id))
+            if should_continue is not None and not should_continue():
+                self._release(task, failed=False)
+                return {"state": "pending", "calls": calls}
             if response.choices[0].finish_reason != "stop":
                 raise IncompleteConsolidation("Incomplete consolidation response")
             value = json.loads(response.choices[0].message.content)
@@ -344,9 +327,6 @@ class ConsolidationQueue:
             applied = self._commit(task, revision, candidates, decisions, records)
             return {"state": "done" if not self._has_pending(task) else "pending", "calls": calls,
                     "actions": applied}
-        except EmbeddingBudgetExceeded:
-            self._release(task, failed=False)
-            return {"state": "budget_exhausted", "calls": calls}
         except ObsoleteConsolidation:
             self._release(task, failed=False)
             return {"state": "obsolete", "calls": calls}
@@ -494,6 +474,7 @@ def _request(candidates, records, sources):
                    "相同范围的不同措辞应统一为已有目标的 applicability；局部例外不得扩大成全局替代。"),
                    ("topic 按对象领域聚合，例如数据库、发布规范；路径归入 applicability，不为每个目录另建主题。"
                    "fact_key 使用稳定属性名；不能将不同属性强行合并。"),
+                   "topic 与 kind 独立；同领域的规范、流程、决定和经验共用主题，不按 kind 拆分主题。",
                    ("来源明确给定的代码、标签、符号配置值按原样接受，不能因为像占位符或缺少外部验证就判冲突。"
                    "没有旧事实时，review 仅用于来源本身明确不确定，不能无根据质疑已确认的陈述。"),
                    ("若当前正文需要同一来源的多个候选共同支持，supporting_candidates 列出其 ID，保留对应证据。"

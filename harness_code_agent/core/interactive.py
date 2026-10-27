@@ -252,14 +252,6 @@ class InteractiveSession:
             workspace=self.cwd,
             recovery=self.recovery,
         )
-        # The memory index is dynamic reference material: it stays separate
-        # from the stable prefix so cache boundaries (and diagnostics) treat
-        # it as the variable suffix it is.
-        memory_index = None
-        if self.memory_use_enabled:
-            block = self.memory_service.index_block()
-            if "\n- [" in block:
-                memory_index = block
         return Agent(
             "main_agent",
             prefix.content,
@@ -270,7 +262,6 @@ class InteractiveSession:
             tool_context=self.tool_context,
             stream_callback=self.stream_sink,
             prompt_cache_identity=prefix.cache_identity,
-            memory_index=memory_index,
         )
 
     def _load_mcp_tools(self) -> None:
@@ -616,6 +607,7 @@ class InteractiveSession:
             parent_messages=lambda: (
                 list(self.conversation.messages) if self.conversation is not None else []
             ),
+            parent_system_prompt=lambda: self.conversation.agent.system_prompt if self.conversation is not None else "",
             parent_message_sink=self._queue_parent_message,
         )
         self.lifecycle.register(
@@ -692,10 +684,6 @@ class InteractiveSession:
         self.profile = profile
         self.agent = slot.agent
         self.conversation = slot.conversation
-        if self.memory_use_enabled:
-            reference = self.memory_service.startup_block()
-            if reference:
-                self.conversation.append_message({"role": "user", "content": reference}, {"kind": "memory_reference"})
         # Profile presets (e.g. review's no-workspace-writes) live on the
         # policy, so switching profiles must re-apply the preset immediately.
         self.tool_context.permission_policy = self._effective_permission_policy()
@@ -762,7 +750,6 @@ class InteractiveSession:
             workspace_root=self.cwd,
             session_store=self.session_store,
         )
-        mention_paths = _memory_mention_paths(resolved)
         resolved = [item for item in resolved if item.kind != "file"]
         prompt_for_model = self._externalize_large_turn_text(
             "prompt",
@@ -812,12 +799,10 @@ class InteractiveSession:
             auto_extract=self.memory_auto_extract_enabled)
         self.tool_context.memory_journal_path = str(self.session.journal_path)
         self.tool_context.memory_user_sequence = source.sequence
-        reference = self._augment_user_prompt(user_prompt, mention_paths=mention_paths)
         text = self.conversation.submit(
             model_content,
             task_text=user_prompt,
             cancellation_token=cancellation_token,
-            reference_context=reference,
         )
         if self.memory_auto_extract_enabled:
             verification = getattr(self.conversation.runtime_state, "verification", None)
@@ -1570,6 +1555,7 @@ class InteractiveSession:
             new_coordinator = AgentCoordinator(
                 self.tool_context,
                 parent_messages=lambda: list(self.conversation.messages),
+                parent_system_prompt=lambda: self.conversation.agent.system_prompt,
                 parent_message_sink=self._queue_parent_message,
             )
             try:
@@ -1734,13 +1720,6 @@ class InteractiveSession:
     def _append_conversation_message(self, message: dict) -> None:
         self.conversation._append_message(message)
 
-    def _augment_user_prompt(self, user_prompt: str, *, mention_paths: list[str]) -> str:
-        if self.agent is None or self.conversation is None or not getattr(self, "memory_use_enabled", True):
-            return ""
-        hits = self.memory_service.search(user_prompt, scope="both", paths=mention_paths)
-        return MemoryService.format_hits(hits)
-
-
     def close(self) -> None:
         with self._close_lock:
             if self._closed:
@@ -1795,17 +1774,6 @@ def _head_tail(text: str, chars: int) -> tuple[str, str]:
     if len(text) <= chars * 2:
         return text, ""
     return text[:chars], text[-chars:]
-
-
-def _memory_mention_paths(resolved: list[ResolvedMention]) -> list[str]:
-    paths: list[str] = []
-    for item in resolved:
-        if item.kind not in {"file", "directory"}:
-            continue
-        value = item.metadata.get("path") or item.resolved or item.target
-        if value:
-            paths.append(str(value))
-    return paths
 
 
 def _parse_memory_ref(value: str) -> tuple[str, str]:
