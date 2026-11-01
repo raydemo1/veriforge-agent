@@ -15,6 +15,7 @@ from .database import (
     MemoryKind,
     MemoryRecord,
     _check_version,
+    _find_topic,
     _now,
 )
 from .extraction import ExtractionQueue
@@ -167,6 +168,16 @@ class MemoryService:
             used += min(cost, 1800)
         return {"items": items, "scope": scope, "has_more": len(rows) > len(items), "next_offset": offset + len(items)}
 
+    def topic_by_name(self, name: str, scope: str = "project", *, offset: int = 0, limit: int = 10) -> dict:
+        store = self._store(scope)
+        if not name.strip():
+            raise ValueError("topic name is required")
+        with store.connect() as db:
+            topic_id = _find_topic(db, store.namespace, name)
+        if topic_id is None:
+            raise ValueError("Unknown topic in the selected scope")
+        return self.topic(topic_id, scope=scope, offset=offset, limit=limit)
+
     def write(self, command: MemoryWriteCommand) -> MemoryRecord:
         if len(command.body) > 4096 or len(command.topic) > 160 or len(command.fact_key) > 160 or len(command.applicability) > 512:
             raise ValueError("Memory content exceeds its bounded field size")
@@ -266,10 +277,18 @@ class MemoryService:
                 records.append(record)
         return records
 
-    def _startup_topics(self, scope: str) -> list[dict]:
+    def _startup_topics(self, scope: str) -> dict:
         store = self.stores[scope]
-        topics = self.topics(scope, limit=20)["topics"]
         with store.connect() as db:
+            total = db.execute("SELECT COUNT(DISTINCT m.topic_id) FROM memories m "
+                               "WHERE m.namespace=? AND m.status='active' AND NOT EXISTS "
+                               "(SELECT 1 FROM memory_holds h WHERE h.memory_id=m.id)",
+                               (store.namespace,)).fetchone()[0]
+            rows = db.execute("SELECT t.id,t.title,COUNT(m.id) AS count FROM topics t "
+                              "JOIN memories m ON m.topic_id=t.id WHERE t.namespace=? AND m.status='active' "
+                              "AND NOT EXISTS (SELECT 1 FROM memory_holds h WHERE h.memory_id=m.id) "
+                              "GROUP BY t.id ORDER BY t.title,t.id LIMIT 128", (store.namespace,)).fetchall()
+            topics = [dict(row) for row in rows]
             for topic in topics:
                 rows = db.execute("SELECT fact_key,applicability FROM memories WHERE namespace=? AND topic_id=? "
                                   "AND status='active' AND NOT EXISTS "
@@ -277,7 +296,7 @@ class MemoryService:
                                   "ORDER BY fact_key,id LIMIT 3", (store.namespace, topic["id"])).fetchall()
                 topic["keys"] = list(dict.fromkeys(row["fact_key"] for row in rows))
                 topic["conditions"] = sorted({row["applicability"] for row in rows if row["applicability"]})
-        return topics
+        return {"items": topics, "total": total}
 
     @staticmethod
     def format_hits(result: dict) -> str:

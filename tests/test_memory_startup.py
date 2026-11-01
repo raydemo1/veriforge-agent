@@ -26,7 +26,7 @@ def test_startup_separates_defaults_and_topic_navigation(tmp_path):
     save(service, "research.sources", "CONDITIONAL_PERSONAL_BODY", scope="user", kind="preference",
          topic="研究偏好", applicability="research")
     project = save(service, "test.policy", "PROJECT_DEFAULT")
-    fact = save(service, "test.entry", "ON_DEMAND_FACT", kind="project_fact")
+    save(service, "test.entry", "ON_DEMAND_FACT", kind="project_fact")
     save(service, "test.steps", "ON_DEMAND_WORKFLOW", kind="workflow")
     save(service, "docs.policy", "PATH_SPECIFIC_BODY", topic="文档", applicability="path:docs/")
     snapshot = service.startup_block()
@@ -36,7 +36,7 @@ def test_startup_separates_defaults_and_topic_navigation(tmp_path):
     assert user.id in snapshot and project.id in snapshot
     assert all(body not in snapshot for body in ("ON_DEMAND_FACT", "ON_DEMAND_WORKFLOW",
                                                 "PATH_SPECIFIC_BODY", "CONDITIONAL_PERSONAL_BODY"))
-    assert fact.topic_id in snapshot and "test.entry" in snapshot and "path:docs/" in snapshot
+    assert '"构建与测试"' in snapshot and "test.entry" in snapshot and "path:docs/" in snapshot
     assert count_text_tokens(snapshot) <= 1200
 
 
@@ -110,10 +110,10 @@ def test_topic_navigation_reserves_room_for_both_scopes(tmp_path):
     service = MemoryService(tmp_path)
     for index in range(20):
         save(service, f"entry.{index}", "FACT_BODY", kind="project_fact", topic=f"Project {index:02}")
-    user = save(service, "research.citations", "CONDITIONAL_PREF", scope="user", kind="preference",
-                topic="研究引用", applicability="research")
+    save(service, "research.citations", "CONDITIONAL_PREF", scope="user", kind="preference",
+         topic="研究引用", applicability="research")
     snapshot = service.startup_block()
-    assert f"user:{user.topic_id}" in snapshot and "project:topic_" in snapshot
+    assert '[user] "研究引用"' in snapshot and '[project]' in snapshot
     assert "FACT_BODY" not in snapshot and "CONDITIONAL_PREF" not in snapshot
     assert count_text_tokens(snapshot) <= 1200
 

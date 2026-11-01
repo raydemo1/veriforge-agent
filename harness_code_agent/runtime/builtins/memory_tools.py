@@ -65,13 +65,18 @@ def memory_search(query: str, scope: str = "both", paths: list[str] | None = Non
 
 
 def memory_read(memory_id: str = "", scope: str = "project", topic_id: str = "", history: bool = False,
-                offset: int = 0, limit: int = 10, tool_context: ToolContext | None = None) -> ToolResult:
+                offset: int = 0, limit: int = 10, tool_context: ToolContext | None = None,
+                topic: str = "") -> ToolResult:
     def read():
         service = _service(tool_context)
+        if sum(bool(value) for value in (memory_id, topic_id, topic)) > 1:
+            raise ValueError("Select only one of memory_id, topic_id, or topic")
         if memory_id:
             return service.read(memory_id, scope=scope, history=history, offset=offset, limit=limit)
         if topic_id:
             return service.topic(topic_id, scope=scope, offset=offset, limit=limit)
+        if topic:
+            return service.topic_by_name(topic, scope=scope, offset=offset, limit=limit)
         return service.topics(scope=scope, offset=offset, limit=limit)
     return _result("memory_read", read)
 
