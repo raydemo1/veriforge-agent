@@ -60,8 +60,8 @@ class ProductRuntimeTests(unittest.TestCase):
 
             self.assertEqual(config.MODEL, "deepseek-v4-pro")
             self.assertEqual(config.MODEL_INTENSITY, "hard")
-            self.assertEqual((fast.model, fast.thinking, fast.reasoning_effort), ("deepseek-v4-flash", False, None))
-            self.assertEqual((normal.model, normal.thinking, normal.reasoning_effort), ("deepseek-v4-flash", True, "high"))
+            self.assertEqual((fast.model, fast.thinking, fast.reasoning_effort), ("deepseek-flash", False, None))
+            self.assertEqual((normal.model, normal.thinking, normal.reasoning_effort), ("deepseek-flash", True, "high"))
             self.assertEqual((hard.model, hard.thinking, hard.reasoning_effort), ("deepseek-v4-pro", True, "high"))
             self.assertEqual((max_profile.model, max_profile.thinking, max_profile.reasoning_effort), ("deepseek-v4-pro", True, "max"))
         finally:
@@ -103,11 +103,11 @@ class ProductRuntimeTests(unittest.TestCase):
             ):
                 importlib.reload(config)
 
-            config.set_model_override(model="deepseek-v4-flash-vision-exp", reasoning_effort="max")
+            config.set_model_override(model="deepseek-flash", reasoning_effort="max")
             profile = config.resolve_model_profile("normal")
-            self.assertEqual((profile.model, profile.thinking, profile.reasoning_effort), ("deepseek-v4-flash-vision-exp", True, "max"))
+            self.assertEqual((profile.model, profile.thinking, profile.reasoning_effort), ("deepseek-flash", True, "max"))
             fast = config.resolve_model_profile("fast")
-            self.assertEqual((fast.model, fast.thinking, fast.reasoning_effort), ("deepseek-v4-flash", False, None))
+            self.assertEqual((fast.model, fast.thinking, fast.reasoning_effort), ("deepseek-flash", False, None))
 
             config.set_model_override(reasoning_effort="low")
             profile = config.resolve_model_profile("hard")
@@ -564,6 +564,7 @@ class ProductRuntimeTests(unittest.TestCase):
         with (
             patch("harness_code_agent.agent.conversation.config.BASE_URL", "https://api.deepseek.com"),
             patch("harness_code_agent.agent.conversation.config.MODEL_INTENSITY", "hard"),
+            patch.dict("harness_code_agent.agent.conversation.config.MODEL_OVERRIDES", {"hard": None}),
             patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
         ):
             conversation.run_until_idle()
@@ -591,11 +592,12 @@ class ProductRuntimeTests(unittest.TestCase):
         with (
             patch("harness_code_agent.agent.providers.get_client", return_value=fake_client),
             patch.object(loop.config, "BASE_URL", "https://api.deepseek.com"),
+            patch.dict(loop.config.MODEL_OVERRIDES, {"fast": None}),
         ):
             result = loop.llm_call_simple([{"role": "user", "content": "summarize"}])
 
         self.assertEqual(result, "summary")
-        self.assertEqual(completions.calls[0]["model"], "deepseek-v4-flash")
+        self.assertEqual(completions.calls[0]["model"], "deepseek-flash")
         self.assertNotIn("reasoning_effort", completions.calls[0])
         self.assertEqual(completions.calls[0]["extra_body"], {"thinking": {"type": "disabled"}})
 

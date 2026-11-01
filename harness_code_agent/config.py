@@ -16,20 +16,33 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def _load_dotenv():
     """Load .env file if it exists. No third-party dependency needed."""
-    env_path = PROJECT_ROOT / ".env"
-    if not env_path.exists():
-        return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
+    profile = os.environ.get("HARNESS_EVAL_PROFILE", "").strip().lower()
+    if profile not in {"", "ab"}:
+        raise ValueError("HARNESS_EVAL_PROFILE must be empty or 'ab'")
+    paths = [PROJECT_ROOT / ".env"]
+    if profile == "ab":
+        overlay = PROJECT_ROOT / ".env.ab"
+        if not overlay.is_file():
+            raise FileNotFoundError("A/B profile requires .env.ab")
+        paths.append(overlay)
+    for env_path in paths:
+        if not env_path.exists():
             continue
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key, value = key.strip(), value.strip()
-        # .env takes priority over shell env vars
-        if key:
-            os.environ[key] = value
+        entries = {}
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if key:
+                entries[key] = value
+        if profile == "ab" and env_path.name == ".env.ab":
+            required = {"OPENAI_API_KEY", "OPENAI_BASE_URL", "HARNESS_PROVIDER", "HARNESS_MODEL"}
+            required.update(f"HARNESS_MODEL_{intensity}" for intensity in ("FAST", "NORMAL", "HARD", "MAX"))
+            if any(not entries.get(key) for key in required):
+                raise ValueError("A/B profile must provide a key, base URL, provider, model, and all intensity models")
+        os.environ.update(entries)
 
 
 _load_dotenv()
@@ -69,7 +82,7 @@ MODEL_OVERRIDES = {
 
 # Models and reasoning efforts selectable from the TUI.  Values follow the
 # DeepSeek API: reasoning_effort accepts low/high/max (default high).
-AVAILABLE_MODELS = ("deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro")
+AVAILABLE_MODELS = ("deepseek-flash", "deepseek-v4-pro")
 REASONING_EFFORTS = ("low", "high", "max")
 
 # Runtime selection made from the TUI; None means "use the intensity preset".
@@ -115,10 +128,10 @@ def _model_override_for_intensity(intensity: str) -> str | None:
 def _default_model_profile(provider: str, intensity: str) -> ModelProfile:
     if provider == "deepseek":
         defaults = {
-            "fast": ModelProfile(provider=provider, model="deepseek-v4-flash", thinking=False),
+            "fast": ModelProfile(provider=provider, model="deepseek-flash", thinking=False),
             "normal": ModelProfile(
                 provider=provider,
-                model="deepseek-v4-flash",
+                model="deepseek-flash",
                 thinking=True,
                 reasoning_effort="high",
             ),
