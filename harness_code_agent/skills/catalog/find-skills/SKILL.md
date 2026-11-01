@@ -1,6 +1,6 @@
 ---
 name: find-skills
-description: 审查 VeriForge 当前的技能目录，并为缺失能力推荐少量外部技能
+description: Audit the current skill catalog and recommend a few external skills for capability gaps. Use when a capability or workflow gap needs an outside skill.
 argument-hint: "<capability or workflow gap>"
 disable-model-invocation: true
 ---

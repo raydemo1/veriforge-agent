@@ -1,6 +1,6 @@
 ---
 name: pdf
-description: "Read, inspect, extract, create, edit, merge, split, render, or verify PDF files. Use whenever a task includes a .pdf path or application/pdf attachment; load this skill before opening or transforming the document."
+description: Read, inspect, extract, create, edit, merge, split, render, and verify PDF files. Use when a task includes a .pdf path or an application/pdf attachment.
 ---
 
 # PDF

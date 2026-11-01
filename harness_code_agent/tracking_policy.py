@@ -1,4 +1,4 @@
-"""Shared todo policy for runtime profiles and skill routing."""
+"""Shared todo policy for runtime profiles."""
 
 TASK_TRACKING_POLICY = """\
 ## Todo Management
@@ -16,11 +16,3 @@ Keep the todo list aligned with actual work: update it when a meaningful item
 is completed, added, abandoned, or materially changed. Do not update it after
 every tool call.
 """
-
-TASK_TRACKING_CATALOG_POLICY = (
-    "Use the built-in update_todo tool to track concrete multi-step execution: "
-    "create a short checklist for work with several items or a distinct "
-    "verification stage, and skip it for simple one- or two-action tasks. "
-    "Todo state is session state written through update_todo; formal plan.md "
-    "files and approval belong to interactive planning flows, not todo items."
-)

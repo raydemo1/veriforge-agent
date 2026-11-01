@@ -1,6 +1,6 @@
 ---
 name: docx
-description: "Read, inspect, create, edit, convert, or verify Microsoft Word .docx files. Use whenever a task includes a .docx path or Word attachment; load this skill before opening or transforming the document."
+description: Read, inspect, create, edit, convert, and verify Microsoft Word .docx files. Use when a task includes a .docx path or a Word attachment.
 ---
 
 # DOCX

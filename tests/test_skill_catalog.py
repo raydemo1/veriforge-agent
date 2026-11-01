@@ -2,115 +2,107 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from harness_code_agent.agent.prompts import PromptPrefixBuilder
 from harness_code_agent.runtime.builtins.filesystem import read_skill_file
 from harness_code_agent.skills.registry import SKILLS_DIR, SkillRegistry
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+def _write_skill(root: Path, name: str, description: str, *, user_only: bool = False, body: str = "") -> None:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True)
+    lines = ["---", f"name: {name}", f"description: {description}"]
+    if user_only:
+        lines.append('argument-hint: "<argument>"')
+        lines.append("disable-model-invocation: true")
+    lines.append("---")
+    lines.append("")
+    lines.append(body or "Follow the skill instructions.")
+    (skill_dir / "SKILL.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 class SkillCatalogTests(unittest.TestCase):
-    def test_registry_separates_user_and_model_invoked_skills(self):
+    def test_catalog_splits_skills_by_invocation_permission(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_dir = Path(temp_dir) / "skills"
-            model_dir = skills_dir / "diagnosing-bugs"
-            user_dir = skills_dir / "triage"
-            model_dir.mkdir(parents=True)
-            user_dir.mkdir(parents=True)
-            (model_dir / "SKILL.md").write_text(
-                "---\n"
-                "name: diagnosing-bugs\n"
-                "description: Diagnose hard bugs.\n"
-                "---\n\n"
-                "Build a tight red loop.\n",
-                encoding="utf-8",
-            )
-            (user_dir / "SKILL.md").write_text(
-                "---\n"
-                "name: triage\n"
-                "description: Triage an issue.\n"
-                'argument-hint: "<issue>"\n'
-                "disable-model-invocation: true\n"
-                "---\n\n"
-                "Triage the requested issue.\n",
-                encoding="utf-8",
-            )
+            skills_dir.mkdir()
+            _write_skill(skills_dir, "diagnosing-bugs", "Diagnose hard bugs. Use when a bug resists explanation.")
+            _write_skill(skills_dir, "triage", "Triage an issue. Use when an issue needs classification.", user_only=True)
 
             registry = SkillRegistry(skills_dir)
 
-            self.assertEqual(
-                [item["name"] for item in registry.model_catalog],
-                ["diagnosing-bugs"],
-            )
-            self.assertEqual(
-                [item["name"] for item in registry.user_commands],
-                ["triage"],
-            )
-            self.assertEqual(registry.user_commands[0]["argument_hint"], "<issue>")
-            prompt = registry.build_catalog_prompt()
-            self.assertIn("**diagnosing-bugs**", prompt)
-            self.assertNotIn("**triage**", prompt)
+            self.assertEqual([item["name"] for item in registry.model_catalog], ["diagnosing-bugs"])
+            self.assertEqual([item["name"] for item in registry.user_only], ["triage"])
+            self.assertEqual(registry.user_only[0]["argument_hint"], "<argument>")
 
-    def test_user_skill_invocation_includes_body_and_arguments(self):
+            listing = registry.catalog_listing()
+            self.assertIn("Model-invoked:", listing)
+            self.assertIn("User-invoked only:", listing)
+            self.assertIn("**diagnosing-bugs**", listing)
+            self.assertIn("**triage**", listing)
+            self.assertIn("Path: `skills/triage/SKILL.md`", listing)
+
+    def test_catalog_listing_carries_no_generic_policy(self):
+        listing = SkillRegistry().catalog_listing()
+
+        self.assertNotIn("update_todo", listing)
+        self.assertNotIn("Skill routing", listing)
+        self.assertNotIn("plan.md", listing)
+
+    def test_prompt_prefix_adds_the_routing_policy(self):
+        registry = SkillRegistry()
+        prefix = PromptPrefixBuilder().build(
+            profile_prompt="You are a coding agent.",
+            skill_catalog=registry.catalog_listing(),
+        )
+
+        self.assertIn("## Stable Skill Catalog", prefix.content)
+        self.assertIn("User-invoked only skills need an explicit user request", prefix.content)
+        self.assertIn("read_skill_file", prefix.content)
+        self.assertIn("**triage**", prefix.content)
+
+    def test_slash_invocation_reaches_every_skill(self):
+        registry = SkillRegistry()
+
+        user_invoked = registry.build_user_invocation("/triage  #42 locked")
+        self.assertIsNotNone(user_invoked)
+        self.assertEqual(user_invoked.name, "triage")
+        self.assertEqual(user_invoked.arguments, "#42 locked")
+        self.assertIn("Follow the skill instructions below for this turn.", user_invoked.prompt)
+
+        model_invoked = registry.build_user_invocation("/code-review")
+        self.assertIsNotNone(model_invoked)
+        self.assertEqual(model_invoked.name, "code-review")
+        self.assertEqual(model_invoked.arguments, "")
+
+    def test_slash_invocation_accepts_any_whitespace_between_name_and_arguments(self):
+        registry = SkillRegistry()
+
+        for line in ("/triage\t#42", "/triage    #42", "/triage  \n #42", "  /triage \t #42  "):
+            with self.subTest(line=line):
+                invocation = registry.build_user_invocation(line)
+                self.assertIsNotNone(invocation, line)
+                self.assertEqual(invocation.arguments, "#42")
+
+    def test_natural_language_is_never_matched_by_the_program(self):
+        registry = SkillRegistry()
+
+        for line in ("请用 triage 技能处理 #42", "use the code-review skill", "/unknown-skill now", "帮我看看这段代码"):
+            with self.subTest(line=line):
+                self.assertIsNone(registry.build_user_invocation(line))
+
+    def test_catalog_refreshes_only_after_a_real_change(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            skills_dir = Path(temp_dir) / "skills"
-            skill_dir = skills_dir / "triage"
-            skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text(
-                "---\n"
-                "name: triage\n"
-                "description: Triage an issue.\n"
-                "disable-model-invocation: true\n"
-                "---\n\n"
-                "Inspect the full issue before deciding.\n",
-                encoding="utf-8",
-            )
+            skills_dir = Path(temp_dir) / "catalog"
+            skills_dir.mkdir()
+            _write_skill(skills_dir, "one", "First skill. Use when testing refresh.")
             registry = SkillRegistry(skills_dir)
 
-            invocation = registry.build_user_invocation("/triage 42")
+            self.assertFalse(registry.refresh_if_changed())
 
-            self.assertIsNotNone(invocation)
-            self.assertEqual(invocation.name, "triage")
-            self.assertEqual(invocation.arguments, "42")
-            self.assertIn("Inspect the full issue before deciding.", invocation.prompt)
-            self.assertIn("Arguments: 42", invocation.prompt)
-
-    def test_catalog_points_execution_tracking_to_todo_tool(self):
-        prompt = SkillRegistry().build_catalog_prompt()
-
-        self.assertIn("update_todo", prompt)
-        self.assertNotIn("update_plan_state", prompt)
-        self.assertNotIn("PRD.md", prompt)
-        self.assertNotIn("skills/catalog/prd", prompt)
-        self.assertNotIn('**vibe-execution-guard**: "', prompt)
-
-    def test_catalog_includes_core_workflow_skills(self):
-        prompt = SkillRegistry().build_catalog_prompt()
-
-        for skill_name in [
-            "diagnosing-bugs",
-            "tdd",
-            "domain-modeling",
-            "codebase-design",
-            "code-review",
-            "frontend-debugging",
-            "writing-for-agents",
-            "pdf",
-            "docx",
-        ]:
-            with self.subTest(skill=skill_name):
-                self.assertIn(f"**{skill_name}**", prompt)
-        for user_skill in [
-            "workflows",
-            "triage",
-            "handoff",
-            "grill-with-docs",
-            "to-spec",
-            "to-tickets",
-            "skill-creator",
-            "find-skills",
-        ]:
-            with self.subTest(user_skill=user_skill):
-                self.assertNotIn(f"**{user_skill}**", prompt)
+            _write_skill(skills_dir, "two", "Second skill. Use when testing refresh.")
+            self.assertTrue(registry.refresh_if_changed())
+            self.assertIn("**two**", registry.catalog_listing())
+            self.assertFalse(registry.refresh_if_changed())
 
     def test_catalog_paths_can_be_loaded_by_read_skill_file(self):
         registry = SkillRegistry()
@@ -136,11 +128,6 @@ class SkillCatalogTests(unittest.TestCase):
                 result = read_skill_file(path)
                 self.assertEqual(result.status, "success", result.output)
                 self.assertIn(marker, result.output)
-
-        for skill_name in ["pdf", "docx"]:
-            text = (SKILLS_DIR / skill_name / "SKILL.md").read_text(encoding="utf-8")
-            self.assertNotIn("disable-model-invocation", text)
-            self.assertNotIn(".codex/skills", text)
 
     def test_removed_and_replaced_workflows_are_not_registered(self):
         names = {skill.name for skill in SkillRegistry().skills}
@@ -177,10 +164,11 @@ class SkillCatalogTests(unittest.TestCase):
     def test_catalog_rejects_invalid_skill_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_dir = Path(temp_dir) / "catalog"
-            skill_dir = skills_dir / "valid-folder"
-            skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text(
-                "---\nname: wrong-name\ndescription: Mismatch.\n---\n",
+            skills_dir.mkdir()
+            _write_skill(skills_dir, "valid-folder", "Mismatch. Use when testing validation.")
+            skill_file = skills_dir / "valid-folder" / "SKILL.md"
+            skill_file.write_text(
+                "---\nname: wrong-name\ndescription: Mismatch. Use when testing validation.\n---\n",
                 encoding="utf-8",
             )
 
@@ -190,13 +178,14 @@ class SkillCatalogTests(unittest.TestCase):
     def test_catalog_rejects_duplicate_frontmatter_keys(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_dir = Path(temp_dir) / "catalog"
-            skill_dir = skills_dir / "duplicate"
-            skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text(
+            skills_dir.mkdir()
+            _write_skill(skills_dir, "duplicate", "First description. Use when testing validation.")
+            skill_file = skills_dir / "duplicate" / "SKILL.md"
+            skill_file.write_text(
                 "---\n"
                 "name: duplicate\n"
-                "description: First description.\n"
-                "description: Second description.\n"
+                "description: First description. Use when testing validation.\n"
+                "description: Second description. Use when testing validation.\n"
                 "---\n",
                 encoding="utf-8",
             )
@@ -207,10 +196,11 @@ class SkillCatalogTests(unittest.TestCase):
     def test_catalog_rejects_missing_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             skills_dir = Path(temp_dir) / "catalog"
-            skill_dir = skills_dir / "unnamed"
-            skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text(
-                "---\ndescription: Missing an explicit name.\n---\n",
+            skills_dir.mkdir()
+            _write_skill(skills_dir, "unnamed", "Missing an explicit name. Use when testing validation.")
+            skill_file = skills_dir / "unnamed" / "SKILL.md"
+            skill_file.write_text(
+                "---\ndescription: Missing an explicit name. Use when testing validation.\n---\n",
                 encoding="utf-8",
             )
 

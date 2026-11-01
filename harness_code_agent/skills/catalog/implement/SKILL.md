@@ -1,6 +1,6 @@
 ---
 name: implement
-description: 根据用户请求、规格或工单完成范围明确的实现
+description: Implement a clearly scoped request, spec, or ticket. Use when the scope is settled and code changes should be made.
 argument-hint: "<request, spec path, or ticket>"
 disable-model-invocation: true
 ---

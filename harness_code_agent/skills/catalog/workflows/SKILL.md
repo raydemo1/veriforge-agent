@@ -1,6 +1,6 @@
 ---
 name: workflows
-description: 根据当前场景选择合适的工程工作流
+description: Route a situation to the right workflow. Use when the goal is clear but the matching command is not.
 argument-hint: "<situation>"
 disable-model-invocation: true
 ---

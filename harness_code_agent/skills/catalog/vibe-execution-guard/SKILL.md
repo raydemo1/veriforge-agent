@@ -1,6 +1,6 @@
 ---
 name: vibe-execution-guard
-description: Guarded execution. Use for explicit only-change-this boundaries, auth/secrets/payment/privacy, destructive data, migrations, production incidents, rollback, or bugs that survived repeated fixes.
+description: Boundary-first execution for high-risk or tightly scoped changes. Use when the request limits exactly what may change, or touches auth, secrets, payments, privacy, destructive data, migrations, incidents, or repeatedly broken fixes.
 ---
 
 # Guarded Execution

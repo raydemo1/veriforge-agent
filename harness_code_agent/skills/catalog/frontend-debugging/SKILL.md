@@ -1,6 +1,6 @@
 ---
 name: frontend-debugging
-description: Frontend diagnosis. Use when a bug depends on rendering, browser state, CSS, timing, hydration, animation, browser APIs, or UI automation; pair with diagnosing-bugs.
+description: Browser-specific probes for frontend bugs. Use when a bug depends on rendering, CSS, browser state, timing, hydration, or UI automation.
 ---
 
 # Frontend Diagnosis

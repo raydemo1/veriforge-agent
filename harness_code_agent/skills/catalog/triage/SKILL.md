@@ -1,6 +1,6 @@
 ---
 name: triage
-description: 按分流角色状态机处理 Issue 和外部 PR，完成分类、核验与可执行简报
+description: Move issues and external PRs through triage states with classification, verification, and an actionable brief. Use when triaging a reported issue or pull request.
 disable-model-invocation: true
 ---
 

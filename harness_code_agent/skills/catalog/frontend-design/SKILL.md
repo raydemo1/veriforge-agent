@@ -1,6 +1,6 @@
 ---
 name: frontend-design
-description: Frontend design and implementation. Use when creating or substantially restyling a web page, application, component, dashboard, landing page, or visual artifact.
+description: Design and implement a distinctive web interface. Use when creating or substantially restyling a page, component, dashboard, landing page, or visual artifact.
 license: Complete terms in LICENSE.txt
 ---
 

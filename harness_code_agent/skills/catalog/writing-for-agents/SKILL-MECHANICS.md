@@ -6,12 +6,12 @@ The skill-specific branch of [`writing-for-agents`](SKILL.md): what changes when
 
 Two choices, trading the two loads:
 
-- A **model-invoked** skill keeps a `description`, so the agent can fire it autonomously, and other skills can reach it. You can still type its name: model-invocation always _includes_ user reach; a description only ever adds agent discovery, never removes the human's. The description is the skill's top-level context pointer, forced to stay loaded at all times: permanent context load in exchange for discoverability. A model-invoked skill whose content is all reference is also one home for shared reference: another skill can invoke it, so reference needed by several skills lives in one place. Mechanics: omit `disable-model-invocation`, and write a model-facing description carrying the trigger branches (the pointer-writing rules in `SKILL.md` apply in full).
-- A **user-invoked** skill strips the description from the agent's reach: only the human typing its name can invoke it, and no other skill can. Zero context load, but it spends cognitive load: you are the index that must remember it exists. Mechanics: set `disable-model-invocation: true`; the `description` becomes human-facing: a one-line summary, trigger lists stripped.
+- A **model-invoked** skill keeps a model-facing `description`, so the agent can select it autonomously and other skills can reach it. You can still type its name: model-invocation always _includes_ user reach; a description only ever adds agent selection, never removes the human's. Mechanics: omit `disable-model-invocation`, and write a description carrying the trigger branches (the pointer-writing rules in `SKILL.md` apply in full).
+- A **user-invoked** skill sets `disable-model-invocation: true`. Its name, description, and path still sit in the catalog, because the model must be able to recognize an explicit request for it; what it may not do is select the skill on its own. Mechanics: set the flag, and write a description that states the skill's purpose plainly so an explicit user request is still matched to it.
 
-Pick model-invocation only when the agent must reach the skill on its own, or another skill must. If it only ever fires by hand, make it user-invoked and pay no context load.
+Pick user-invocation when autonomous selection would be wrong: a workflow the human should choose, a destructive step, or a sequence whose timing is the user's to decide.
 
-Shared reference that two user-invoked skills both need can live in neither: with no descriptions, neither can fire the other. Push it to a plain file outside the skill system: external reference any skill can point at.
+Descriptions of shared reference stay in the catalog whichever permission owns the skill. Two user-invoked skills that both need the same reference can each point at it; the pointer wording in each `SKILL.md` decides when it loads.
 
 ## Splitting by invocation
 
@@ -19,4 +19,4 @@ The invocation cut of splitting (the sequence cut lives in `SKILL.md`): split of
 
 ## Router skills
 
-When user-invoked skills multiply past what you can remember, that piled-up cognitive load is cured by a **router skill**: one user-invoked skill that names the others and when to reach for each, so the human has one skill to remember instead of many. It can only hint, never fire them: user-invoked skills have no description, so nothing but the human can reach them.
+When user-invoked skills multiply past what you can remember, that piled-up cognitive load is cured by a **router skill**: one user-invoked skill that names the others and when to reach for each, so the human has one skill to remember instead of many. It can only hint, never select them: a user-invoked skill's routing policy keeps the model from choosing its targets on its own.

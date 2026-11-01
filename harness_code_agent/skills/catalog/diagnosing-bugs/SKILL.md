@@ -1,6 +1,6 @@
 ---
 name: diagnosing-bugs
-description: Diagnosis loop for hard, intermittent, recurrent, unexplained bugs and performance regressions. Use for failures that resist a direct explanation or need a reliable reproduction loop. Do not auto-trigger the full workflow for an obvious localized error with direct evidence and a low-risk fix.
+description: Diagnosis loop for hard, intermittent, or unexplained bugs and performance regressions. Use when a failure resists direct explanation or needs a reliable reproduction loop.
 ---
 
 # Diagnosing Bugs

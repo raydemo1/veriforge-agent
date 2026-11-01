@@ -36,6 +36,15 @@ completion, or small obvious one-file changes.
 """
 
 
+SKILL_ROUTING_POLICY = """\
+Skill routing:
+- Model-invoked skills may be selected when the task makes them relevant.
+- User-invoked only skills need an explicit user request: a `/name` command or a
+  request that names the skill. Never select them on your own.
+- Load a skill's SKILL.md with read_skill_file before following it.
+- Load a skill's referenced files only when the loaded SKILL.md tells you to."""
+
+
 @dataclass(frozen=True)
 class GlobalRulesDoc:
     source: str
@@ -76,10 +85,14 @@ class PromptPrefixBuilder:
             ("Agent Identity and Judgment", SHARED_AGENT_IDENTITY.strip()),
             ("Profile Contract", profile_prompt.strip()),
         ]
+        skill_catalog_section = ""
+        if skill_catalog.strip():
+            skill_catalog_section = f"{SKILL_ROUTING_POLICY}\n\n{skill_catalog.strip()}"
+
         if global_rules_content:
             sections.append(("Global Rules Bundle", global_rules_content))
-        if skill_catalog.strip():
-            sections.append(("Stable Skill Catalog", skill_catalog.strip()))
+        if skill_catalog_section:
+            sections.append(("Stable Skill Catalog", skill_catalog_section))
 
         content = "\n\n".join(f"## {title}\n{body}" for title, body in sections if body)
         global_hash_payload = "\n\n".join(
@@ -89,7 +102,7 @@ class PromptPrefixBuilder:
             "shared_identity_hash": _hash_text(SHARED_AGENT_IDENTITY),
             "profile_prompt_hash": _hash_text(profile_prompt),
             "global_rules_hash": _hash_text(global_hash_payload),
-            "skill_catalog_hash": _hash_text(skill_catalog),
+            "skill_catalog_hash": _hash_text(skill_catalog_section),
             "stable_prefix_hash": _hash_text(content),
         }
         return StablePromptPrefix(content=content, hashes=hashes)

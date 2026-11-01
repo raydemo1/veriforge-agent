@@ -1,6 +1,6 @@
 ---
 name: skill-creator
-description: 创建、更新或精简 VeriForge 仓库技能，不修改全局 Codex 技能
+description: Create, update, or trim repository skills. Use when a capability gap needs a new or revised skill.
 argument-hint: "<skill name or capability>"
 disable-model-invocation: true
 ---
@@ -13,10 +13,12 @@ Create the smallest repository skill that adds reusable judgment or procedure. T
 
 Read the request, search the current catalog, and inspect adjacent skills. Prefer updating or composing an existing skill when the proposed capability overlaps. Do not create a skill for one-off facts, generic advice, or behavior already enforced by code or tests.
 
-Choose the invocation surface deliberately:
+Choose the invocation permission deliberately:
 
-- **Model-invoked:** omit `disable-model-invocation`; the concise description enters the stable prompt and the body is loaded on demand.
-- **User-invoked:** set `disable-model-invocation: true`; the registry exposes `/name` dynamically and inlines the body only when invoked.
+- **Model-invoked:** omit `disable-model-invocation`; the concise description enters the L1 catalog and the model may select the skill when a task makes it relevant.
+- **User-invoked:** set `disable-model-invocation: true`; the skill keeps its catalog entry but the model may only load it after an explicit user request through `/name` or by naming it.
+
+Write the description as one function sentence followed by `Use when <condition>.`
 
 ## 2. Design the skill
 
@@ -31,7 +33,7 @@ Do not add provider-specific agent metadata. Do not copy an upstream skill blind
 After editing:
 
 1. Instantiate `SkillRegistry` and confirm discovery succeeds with no duplicate or invalid metadata.
-2. Confirm the skill appears on the intended model or user invocation surface.
+2. Confirm the skill is listed under the intended catalog group and that `/name` resolves.
 3. Load its body and required sibling files through `read_skill_file`.
 4. Add or update focused catalog tests, including a negative or boundary case when behavior changed.
 5. Search for stale names and incompatible invocation instructions.

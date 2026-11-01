@@ -1,6 +1,6 @@
 ---
 name: to-spec
-description: 将已明确的对话和仓库上下文整理为可审查、可持续维护的规格
+description: Turn settled conversation and repository context into a reviewable spec. Use when a request is understood and needs a written specification.
 argument-hint: "<request, conversation, or source reference>"
 disable-model-invocation: true
 ---

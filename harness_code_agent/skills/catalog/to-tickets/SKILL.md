@@ -1,6 +1,6 @@
 ---
 name: to-tickets
-description: 将计划、规格或当前对话拆分为标明依赖关系的纵向工单
+description: Split a plan, spec, or conversation into dependency-ordered tickets. Use when work should be tracked as vertical slices.
 disable-model-invocation: true
 ---
 

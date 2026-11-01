@@ -1,6 +1,6 @@
 ---
 name: grill-with-docs
-description: 通过连续追问完善计划或设计，并同步沉淀 ADR 和术语表
+description: Stress-test a plan or design while keeping ADRs and glossary current. Use when the interview should also record decisions as they settle.
 disable-model-invocation: true
 ---
 

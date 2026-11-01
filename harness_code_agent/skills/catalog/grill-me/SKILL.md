@@ -1,6 +1,6 @@
 ---
 name: grill-me
-description: 通过连续追问梳理并强化计划或设计
+description: Interview the user to stress-test a plan or design. Use when the user wants their thinking challenged by relentless questions.
 disable-model-invocation: true
 ---
 

@@ -1,6 +1,6 @@
 ---
 name: setup-workflows
-description: 配置工程工作流所需的问题跟踪、分流标签和领域文档约定
+description: Configure the issue tracker, triage labels, and domain document conventions. Use when a repository has no workflow contract yet.
 disable-model-invocation: true
 ---
 

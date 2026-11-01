@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: "Review a branch, PR, work-in-progress diff, uncommitted changes, or a requested file range. Check correctness and repository standards, and check spec conformance when a real spec exists. Use parallel reviewers only when the scope benefits from independent passes."
+description: Review code changes for correctness, repository standards, and spec conformance. Use when reviewing a branch, PR, diff, uncommitted change, or file range.
 ---
 
 Review the change scope the user supplies. A commit, branch, tag, or merge-base is one valid scope; staged, unstaged, untracked, or path-scoped changes are equally valid.
