@@ -650,7 +650,7 @@ class ToolExecutor:
             self.conversation._append_message({"role": "user", "content": content})
 
     def _reveal_tool_schemas_from_result(self, tool_result: ToolResult) -> None:
-        if tool_result.tool != "tool_search":
+        if tool_result.tool != "search_tools":
             return
         raw_names = tool_result.metadata.get("revealed_tool_names")
         if not isinstance(raw_names, list) or self.agent.tool_context is None:

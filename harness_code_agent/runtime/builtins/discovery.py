@@ -1,29 +1,46 @@
-"""Deferred tool search and progressive disclosure."""
+"""Server-scoped tool discovery with confidence tiers."""
 from __future__ import annotations
 
+from ..mcp import MCP_TOOL_PREFIX
 from ..permissions import VALID_TOOL_PERMISSIONS
 from ..tool_context import ToolContext
 from ..tool_registry import ToolSpec
 from ..tool_result import ToolResult
-from ..tool_search import SearchDocument, expand_search_text, search_bm25
+from ..tool_search import SearchDocument, search_bm25
+
+SEARCH_TOOLS_NAME = "search_tools"
+HIGH_CONFIDENCE = 0.60
+MEDIUM_CONFIDENCE = 0.30
+NO_PROGRESS_LIMIT = 3
+DEFAULT_LIMIT = 5
+MAX_LIMIT = 20
+
+_DESCRIPTION_LIMIT = 180
 
 
-def tool_search(query: str, max_results: int = 8, tool_context: ToolContext | None = None) -> ToolResult:
-    """Search currently hidden deferred tools and reveal matching schemas."""
+def search_tools(
+    query: str,
+    server: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+    tool_context: ToolContext | None = None,
+) -> ToolResult:
+    """Search the deferred tool catalog and mount matching tool schemas.
+
+    ``server`` narrows the search to one MCP server.  Zero-score results never
+    mount a schema: they return that server's tool names and descriptions so
+    the model can retry with better keywords or switch servers.
+    """
     query = str(query or "").strip()
+    server_name = str(server or "").strip() or None
     try:
-        max_results = max(1, min(int(max_results or 8), 20))
+        limit = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
     except (TypeError, ValueError):
-        max_results = 8
+        limit = DEFAULT_LIMIT
 
     if tool_context is None or tool_context.tool_registry is None:
-        return ToolResult(
-            tool="tool_search",
-            status="failed",
-            output="[error] tool_search requires a tool registry in the current tool context.",
-            error="tool_search requires tool context",
-            metadata={"status_source": "validation"},
-        )
+        return _failure("no_tool_registry", "search_tools requires a tool registry in the current tool context.")
+    if not query:
+        return _failure("missing_query", "search_tools requires a non-empty query.")
 
     registry = tool_context.tool_registry
     allowed_permissions = (
@@ -32,101 +49,185 @@ def tool_search(query: str, max_results: int = 8, tool_context: ToolContext | No
         else set(VALID_TOOL_PERMISSIONS)
     )
     blocked_names = set(tool_context.blocked_tool_names or set())
-    already_revealed = set(tool_context.revealed_tool_names or set())
+    revealed = set(tool_context.revealed_tool_names or set())
 
-    documents: list[SearchDocument] = []
-    for spec in registry.specs():
-        if spec.disclosure != "deferred":
-            continue
-        if spec.name in blocked_names or spec.name in already_revealed:
-            continue
-        if spec.permission not in allowed_permissions:
-            continue
-        documents.append(_tool_search_document(spec))
-
-    if not query:
-        return ToolResult(
-            tool="tool_search",
-            status="failed",
-            output="[error] tool_search requires a non-empty query.",
-            error="tool_search requires query",
-            metadata={"status_source": "validation"},
+    deferred = [spec for spec in registry.specs() if spec.disclosure == "deferred"]
+    servers = sorted({_server_of(spec.name) for spec in deferred if _server_of(spec.name)})
+    if server_name is not None and server_name not in servers:
+        valid = ", ".join(servers) if servers else "none"
+        return _failure(
+            "unknown_server",
+            f"Unknown MCP server: {server_name}. Valid server ids: {valid}.",
+            metadata={"query": query, "server": server_name},
         )
+
+    catalog = [
+        spec for spec in deferred if spec.name not in blocked_names and spec.permission in allowed_permissions
+    ]
+    documents = [
+        _document(spec)
+        for spec in catalog
+        if spec.name not in revealed and (server_name is None or _server_of(spec.name) == server_name)
+    ]
+
+    query_key = (server_name or "", " ".join(query.lower().split()))
+    if query_key in tool_context.search_tools_queries:
+        tool_context.search_tools_no_progress += 1
+        return _result(
+            f"You already searched '{query}' in {_scope_label(server_name)}. Do not repeat it: "
+            "use different English keywords, or search another server.\n"
+            + _directory(catalog, server_name)
+            + _no_progress_block(tool_context),
+            metadata={
+                "query": query,
+                "server": server_name,
+                "level": "repeated",
+                "revealed_tool_names": [],
+                "no_progress": tool_context.search_tools_no_progress,
+            },
+        )
+    tool_context.search_tools_queries.add(query_key)
+
     if not documents:
-        return ToolResult(
-            tool="tool_search",
-            status="success",
-            output="No hidden deferred tools are available for the current profile.",
-            metadata={"revealed_tool_names": [], "status_source": "native"},
+        tool_context.search_tools_no_progress += 1
+        return _result(
+            f"No unmounted tools remain in {_scope_label(server_name)}. Proceed with the mounted tools, "
+            "or search another server.\n"
+            + _directory(catalog, server_name)
+            + _no_progress_block(tool_context),
+            metadata={
+                "query": query,
+                "server": server_name,
+                "level": "none",
+                "revealed_tool_names": [],
+                "no_progress": tool_context.search_tools_no_progress,
+            },
         )
 
-    hits = search_bm25(documents, query, limit=max_results)
-    revealed = [hit.key for hit in hits]
+    hits = search_bm25(documents, query, limit=limit)
     if not hits:
-        return ToolResult(
-            tool="tool_search",
-            status="success",
-            output=f"No deferred tools matched query: {query}",
-            metadata={"query": query, "revealed_tool_names": [], "status_source": "native"},
+        tool_context.search_tools_no_progress += 1
+        return _result(
+            f"No match for '{query}' in {_scope_label(server_name)} (coverage 0.00). "
+            "No tool schema was mounted, so calling an unmounted tool will fail.\n"
+            + _directory(catalog, server_name)
+            + "\nRetry with different English keywords, or search another server if the capability "
+            "lives elsewhere. If no server has it, tell the user you cannot do it."
+            + _no_progress_block(tool_context),
+            metadata={
+                "query": query,
+                "server": server_name,
+                "coverage": 0.0,
+                "level": "none",
+                "revealed_tool_names": [],
+                "no_progress": tool_context.search_tools_no_progress,
+            },
         )
 
-    lines = [f"Tool search results for: {query}"]
-    for index, hit in enumerate(hits, start=1):
-        description = str(hit.metadata.get("description") or "").strip()
-        if len(description) > 180:
-            description = description[:177] + "..."
-        reason = str(hit.metadata.get("match_text") or "").strip()
-        if len(reason) > 160:
-            reason = reason[:157] + "..."
-        lines.append(
-            f"{index}. {hit.key} score={hit.score:.3f} revealed=yes"
-            + (f"\n   {description}" if description else "")
-            + (f"\n   matched: {reason}" if reason else "")
+    coverage = hits[0].coverage
+    level = _confidence_level(coverage)
+    note = {
+        "high": "",
+        "medium": " (medium confidence: verify before using)",
+        "low": " (LOW confidence: mounted anyway for inspection; verify it really fits this step before calling)",
+    }[level]
+    mounted = [hit.key for hit in hits]
+    new_names = {name for name in mounted if name not in revealed}
+    if new_names:
+        tool_context.search_tools_no_progress = 0
+
+    listing = "\n".join(
+        f"- {_tool_of(hit.key)}: {_one_line(hit.metadata.get('description'))}" for hit in hits
+    )
+    if new_names:
+        heading = f"Mounted {len(new_names)} new tool(s) from {_scope_label(server_name)}{note}:"
+    else:
+        heading = (
+            f"No new tools: all {len(mounted)} match(es) from {_scope_label(server_name)} were "
+            "already mounted. Change the query, or proceed with the mounted tools."
         )
 
-    return ToolResult(
-        tool="tool_search",
-        status="success",
-        output="\n".join(lines),
+    return _result(
+        f"{heading}\n{listing}" + _no_progress_block(tool_context),
         metadata={
             "query": query,
-            "revealed_tool_names": revealed,
-            "status_source": "native",
+            "server": server_name,
+            "coverage": coverage,
+            "level": level,
+            "revealed_tool_names": mounted,
+            "no_progress": tool_context.search_tools_no_progress,
         },
     )
 
 
-def _tool_search_document(spec: ToolSpec) -> SearchDocument:
-    function = spec.schema.get("function", {}) if isinstance(spec.schema, dict) else {}
-    description = str(function.get("description") or "")
-    parameters = function.get("parameters") if isinstance(function.get("parameters"), dict) else {}
-    parameter_text = _schema_parameter_text(parameters)
-    server_tool_text = ""
-    if spec.name.startswith("mcp__"):
-        server_tool_text = spec.name.removeprefix("mcp__").replace("__", " ")
-    text = "\n".join(
+def _confidence_level(coverage: float) -> str:
+    if coverage >= HIGH_CONFIDENCE:
+        return "high"
+    if coverage >= MEDIUM_CONFIDENCE:
+        return "medium"
+    return "low"
+
+
+def _no_progress_block(context: ToolContext) -> str:
+    if context.search_tools_no_progress < NO_PROGRESS_LIMIT:
+        return ""
+    return (
+        f"\n\nNo usable tool has been found in the last {context.search_tools_no_progress} searches. "
+        "Consider a different approach, or tell the user this step is not supported. "
+        "You may still search again later for other steps of the task."
+    )
+
+
+def _scope_label(server_name: str | None) -> str:
+    return f"server '{server_name}'" if server_name else "the catalog"
+
+
+def _directory(catalog: list[ToolSpec], server_name: str | None) -> str:
+    selected = [
+        spec for spec in catalog if server_name is None or _server_of(spec.name) == server_name
+    ]
+    if not selected:
+        return "No tools are available in this catalog."
+    lines = ["Available tools (names and descriptions only):"]
+    grouped: dict[str, list[ToolSpec]] = {}
+    for spec in selected:
+        grouped.setdefault(_server_of(spec.name) or "", []).append(spec)
+    for name in sorted(grouped):
+        if name and server_name is None:
+            lines.append(f"[{name}]")
+        for spec in grouped[name]:
+            description = _one_line(_description_of(spec))
+            lines.append(f"- {_tool_of(spec.name)}: {description}")
+    return "\n".join(lines)
+
+
+def _document(spec: ToolSpec) -> SearchDocument:
+    description = _description_of(spec)
+    parameters = spec.schema.get("function", {}).get("parameters") if isinstance(spec.schema, dict) else {}
+    text = " ".join(
         part
         for part in [
-            expand_search_text(spec.name),
-            expand_search_text(server_tool_text),
+            spec.name.replace("_", " "),
             description,
-            parameter_text,
-            spec.permission,
+            _schema_parameter_text(parameters if isinstance(parameters, dict) else {}),
         ]
         if part
-    )
-    match_text = " ".join(
-        part for part in [expand_search_text(spec.name), description, parameter_text] if part
     )
     return SearchDocument(
         key=spec.name,
         text=text,
         metadata={
             "description": description,
+            "server": _server_of(spec.name),
+            "tool": _tool_of(spec.name),
             "permission": spec.permission,
-            "match_text": match_text,
         },
     )
+
+
+def _description_of(spec: ToolSpec) -> str:
+    function = spec.schema.get("function", {}) if isinstance(spec.schema, dict) else {}
+    return str(function.get("description") or "")
 
 
 def _schema_parameter_text(schema: dict) -> str:
@@ -134,12 +235,54 @@ def _schema_parameter_text(schema: dict) -> str:
     properties = schema.get("properties")
     if isinstance(properties, dict):
         for name, raw in properties.items():
-            parts.append(expand_search_text(str(name)))
+            parts.append(str(name).replace("_", " "))
             if isinstance(raw, dict):
                 description = raw.get("description")
                 if description:
                     parts.append(str(description))
-                nested = raw.get("items") if isinstance(raw.get("items"), dict) else raw
-                if isinstance(nested, dict) and nested is not raw:
+                nested = raw.get("items")
+                if isinstance(nested, dict):
                     parts.append(_schema_parameter_text(nested))
     return " ".join(part for part in parts if part)
+
+
+def _server_of(name: str) -> str | None:
+    if not name.startswith(MCP_TOOL_PREFIX):
+        return None
+    remainder = name[len(MCP_TOOL_PREFIX):]
+    if "__" not in remainder:
+        return None
+    return remainder.split("__", 1)[0] or None
+
+
+def _tool_of(name: str) -> str:
+    if not name.startswith(MCP_TOOL_PREFIX):
+        return name
+    remainder = name[len(MCP_TOOL_PREFIX):]
+    return remainder.split("__", 1)[1] if "__" in remainder else remainder
+
+
+def _one_line(value: object) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) > _DESCRIPTION_LIMIT:
+        text = text[: _DESCRIPTION_LIMIT - 3] + "..."
+    return text
+
+
+def _failure(reason: str, message: str, *, metadata: dict | None = None) -> ToolResult:
+    return ToolResult(
+        tool=SEARCH_TOOLS_NAME,
+        status="failed",
+        output=f"[error] {message}",
+        error=reason,
+        metadata={"status_source": "validation", **(metadata or {})},
+    )
+
+
+def _result(output: str, *, metadata: dict) -> ToolResult:
+    return ToolResult(
+        tool=SEARCH_TOOLS_NAME,
+        status="success",
+        output=output,
+        metadata={"status_source": "native", **metadata},
+    )

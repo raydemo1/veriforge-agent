@@ -90,6 +90,7 @@ class Agent:
         # index is dynamic reference material and stays a separate suffix so
         # it never pollutes the stable prompt-cache boundary.
         self.system_prompt = system_prompt
+        self.mcp_catalog = None
         self.memory_index = (
             memory_index.strip() if isinstance(memory_index, str) and memory_index.strip() else None
         )
@@ -106,11 +107,27 @@ class Agent:
         self._conversations: weakref.WeakSet[AgentConversation] = weakref.WeakSet()
 
     @property
+    def stable_system_prompt(self) -> str:
+        """Stable prefix plus the MCP server catalog (no tool schemas)."""
+        if self.mcp_catalog:
+            return f"{self.system_prompt}\n\n{self.mcp_catalog}"
+        return self.system_prompt
+
+    @property
     def full_system_prompt(self) -> str:
         """Stable prefix plus the dynamic memory index, as one plain string."""
         if self.memory_index:
-            return f"{self.system_prompt}\n\n{self.memory_index}"
-        return self.system_prompt
+            return f"{self.stable_system_prompt}\n\n{self.memory_index}"
+        return self.stable_system_prompt
+
+    def set_mcp_catalog(self, catalog: str | None) -> None:
+        """Set the MCP server directory shown to the model."""
+        catalog = catalog.strip() if isinstance(catalog, str) and catalog.strip() else None
+        if catalog == self.mcp_catalog:
+            return
+        self.mcp_catalog = catalog
+        for conversation in list(self._conversations):
+            conversation._cached_prompt_cache_key = None
 
     def _create_runtime_state(self, task: str) -> AgentRuntimeState:
         workspace = self.tool_context.workspace.root if self.tool_context is not None else Path.cwd()
@@ -246,7 +263,7 @@ class AgentConversation:
 
     def _system_message(self, agent: Agent | None = None) -> dict:
         selected = agent or self.agent
-        text = selected.system_prompt
+        text = selected.stable_system_prompt
         if self._memory_index:
             text += "\n\n" + self._memory_index
         return {"role": "system", "content": text}
@@ -319,7 +336,7 @@ class AgentConversation:
         outbound[0] = {
             "role": "system",
             "content": build_system_cache_breakpoint_content(
-                self.agent.system_prompt,
+                self.agent.stable_system_prompt,
                 memory_index,
             ),
         }

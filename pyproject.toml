@@ -17,7 +17,6 @@ dependencies = [
     "playwright>=1.40.0",
     "psutil>=5.9.8,<8",
     "mcp>=1.0.0",
-    "BM25>=0.3,<1",
     "pygls>=2.1,<3",
     "watchfiles>=1.1,<2",
 ]

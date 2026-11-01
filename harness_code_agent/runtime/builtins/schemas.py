@@ -94,22 +94,32 @@ CORE_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "tool_search",
-            "description": "Search hidden deferred tools available to the current profile. Matching tools are revealed for future tool calls in this conversation.",
+            "name": "search_tools",
+            "description": (
+                "Search the MCP tool catalog when a needed capability is not in your mounted tools. "
+                "Pass the MCP server id and short English keywords. Matching tools are mounted as "
+                "native functions for later turns; mounted tools stay available. A zero-score search "
+                "mounts nothing and returns that server's tool names and descriptions only, so retry "
+                "with different keywords or another server instead of repeating the same query."
+            ),
             "parameters": {
                 "type": "object",
                 "required": ["query"],
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Natural-language description of the tool capability needed.",
+                        "description": "Short English keywords naming the capability needed.",
                     },
-                    "max_results": {
+                    "server": {
+                        "type": "string",
+                        "description": "MCP server id from the system prompt; limits the search to that server.",
+                    },
+                    "limit": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 20,
-                        "default": 8,
-                        "description": "Maximum number of matching hidden tools to reveal.",
+                        "default": 5,
+                        "description": "Maximum number of matching tools to mount.",
                     },
                 },
             },
@@ -420,7 +430,7 @@ CORE_TOOL_SCHEMAS = [
     {'type': 'function',
      'function': {'name': 'memory_read',
                   'description': 'Read a current fact, or set history=true for previous revisions. Supply '
-                                 'topic_id to expand a topic, or neither id to list topics.',
+                                 'topic or topic_id to expand a topic, or omit all identifiers to list topics.',
                   'parameters': {'type': 'object',
                                  'required': ['scope'],
                                  'properties': {'scope': {'type': 'string',
@@ -428,6 +438,8 @@ CORE_TOOL_SCHEMAS = [
                                                           'default': 'project'},
                                                 'memory_id': {'type': 'string', 'default': ''},
                                                 'topic_id': {'type': 'string', 'default': ''},
+                                                'topic': {'type': 'string', 'default': '',
+                                                          'description': 'Exact topic name or known alias in the selected scope.'},
                                                 'history': {'type': 'boolean', 'default': False},
                                                 'offset': {'type': 'integer', 'minimum': 0, 'default': 0},
                                                 'limit': {'type': 'integer',

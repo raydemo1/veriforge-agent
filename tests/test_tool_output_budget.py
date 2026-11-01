@@ -131,11 +131,7 @@ def test_long_arguments_are_not_repeated_in_result(tmp_path):
 
 
 def test_mcp_text_and_resource_tail_survive_budgeting(tmp_path):
-    from harness_code_agent.runtime.mcp import (
-        McpToolBinding,
-        _mcporter_json_to_tool_result,
-        mcp_result_to_tool_result,
-    )
+    from harness_code_agent.runtime.mcp import mcp_result_to_tool_result
 
     text = 'the quick brown fox jumps ' * 4000 + 'MCP_TAIL_SENTINEL'
     incoming = SimpleNamespace(content=[SimpleNamespace(type='text', text=text)], structuredContent=None, isError=False)
@@ -143,9 +139,14 @@ def test_mcp_text_and_resource_tail_survive_budgeting(tmp_path):
     observation, message = observe(tmp_path, '', result=result)
     assert 'MCP_TAIL_SENTINEL' in message
     assert 'MCP_TAIL_SENTINEL' in observation.raw_output_path.read_text(encoding='utf-8')
-    binding = McpToolBinding('mcp_test', 'server', 'tool', 'description', {}, 'read')
-    resource = _mcporter_json_to_tool_result(binding, {'content': [{'type': 'resource', 'resource': {
-        'uri': 'file:///example', 'mimeType': 'text/plain', 'text': text}}]})
+    resource_item = SimpleNamespace(
+        type='resource',
+        resource=SimpleNamespace(uri='file:///example', mimeType='text/plain', text=text),
+    )
+    resource = mcp_result_to_tool_result(
+        'mcp_test',
+        SimpleNamespace(content=[resource_item], structuredContent=None, isError=False),
+    )
     assert text in resource.output
 
 

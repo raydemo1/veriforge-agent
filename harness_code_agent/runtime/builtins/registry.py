@@ -41,7 +41,7 @@ from .agents import (
 )
 from .browser import browser_test, stop_dev_server
 from .code_intelligence import code_intelligence
-from .discovery import tool_search
+from .discovery import search_tools
 from .filesystem import (
     apply_patch,
     list_files,
@@ -166,8 +166,8 @@ def _build_builtin_tool_registry() -> ToolRegistry:
     )
 
     add(
-        "tool_search",
-        tool_search,
+        "search_tools",
+        search_tools,
         TOOL_PERMISSION_READ,
         CallEffect.global_exclusive(kind="control"),
     )

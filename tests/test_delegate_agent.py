@@ -386,7 +386,7 @@ class AgentCoordinatorTests(unittest.TestCase):
         self.assertIsNotNone(explorer.get("read_file"))
         self.assertIsNone(explorer.get("write_file"))
         self.assertIsNone(explorer.get("spawn_agent"))
-        self.assertIsNone(explorer.get("tool_search"))
+        self.assertIsNone(explorer.get("search_tools"))
         self.assertIsNotNone(worker.get("read_file"))
         self.assertIsNotNone(worker.get("write_file"))
         self.assertIsNone(worker.get("spawn_agent"))

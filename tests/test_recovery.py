@@ -308,7 +308,7 @@ class RewindTests(unittest.TestCase):
     def test_control_inspection_and_verification_do_not_capture(self):
         middleware = RecoveryMiddleware(self.session.recovery, self.session.tool_context, BUILTIN_TOOL_REGISTRY)
         calls = [
-            ("update_todo", {}), ("ask_user", {}), ("tool_search", {}),
+            ("update_todo", {}), ("ask_user", {}), ("search_tools", {}),
             ("list_shell_jobs", {}), ("read_shell_output", {}), ("stop_shell_job", {}),
             ("run_bash", {"command": "git status"}),
             ("run_bash", {"command": "rg function ."}),

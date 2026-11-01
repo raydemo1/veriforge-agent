@@ -72,8 +72,7 @@ _PERMISSION_COPY = {
 }
 
 _MODEL_COPY = {
-    "deepseek-v4-flash": ("DeepSeek V4 Flash", "通用快速模型，适合日常任务"),
-    "deepseek-v4-flash-vision-exp": ("DeepSeek V4 Flash Vision", "实验性多模态模型，额外支持图片输入"),
+    "deepseek-flash": ("DeepSeek V4.1 Flash", "通用快速模型，支持图片输入"),
     "deepseek-v4-pro": ("DeepSeek V4 Pro", "旗舰模型，适合复杂推理与编码"),
 }
 
@@ -878,11 +877,22 @@ class BridgeServer:
             statuses = getattr(manager, "statuses", {})
             names = set(manager.configured_server_names())
             names.update(name for name in statuses if name != "config")
-            options = [{"id": "reload", "label": "重新加载全部 MCP 服务"}]
+            options = [
+                {
+                    "id": "add",
+                    "label": "新增 MCP 服务",
+                    "description": "/mcp add <名称> <URL> 或 /mcp add <名称> --command <命令>",
+                },
+                {"id": "reload", "label": "重新加载全部 MCP 服务"},
+            ]
             for name in sorted(names):
                 status = statuses.get(name)
                 state = "已停用" if status is None else ("已连接" if status.state == "connected" else "连接失败")
+                server = manager.config.servers.get(name)
+                description = (server.description if server is not None else "") or state
                 options.append({"id": f"reconnect:{name}", "label": f"重新连接 {name}", "description": state})
+                options.append({"id": f"describe:{name}", "label": f"重新生成描述 {name}", "description": description})
+                options.append({"id": f"remove:{name}", "label": f"移除 {name}"})
                 options.append({"id": f"toggle:{name}", "label": f"切换启用 {name}"})
             options.append({"id": "open_config", "label": "显示 MCP 配置路径"})
             connected = sum(getattr(status, "state", "") == "connected" for status in statuses.values())
@@ -945,10 +955,16 @@ class BridgeServer:
 
         elif panel == "mcp":
             name = action.split(":", 1)[1] if ":" in action else ""
-            if action == "reload":
+            if action == "add":
+                message = "在输入框执行 /mcp add <名称> <URL> 或 /mcp add <名称> --command <命令>"
+            elif action == "reload":
                 message = session.reload_mcp()
             elif action.startswith("reconnect:"):
                 message = session.reload_mcp_server(name)
+            elif action.startswith("describe:"):
+                message = session.refresh_mcp_server_description(name, refresh=True)
+            elif action.startswith("remove:"):
+                message = session.remove_mcp_server(name)
             elif action.startswith("toggle:"):
                 message = session.toggle_mcp_server(name)
             elif action == "open_config":

@@ -35,6 +35,8 @@ class ToolContext:
     allowed_tool_permissions: set[str] | None = None
     blocked_tool_names: set[str] = field(default_factory=set)
     revealed_tool_names: set[str] = field(default_factory=set)
+    search_tools_queries: set[tuple[str, str]] = field(default_factory=set)
+    search_tools_no_progress: int = 0
     resource_coordinator: ResourceCoordinator = field(default_factory=ResourceCoordinator)
     tool_tasks: ToolTaskSupervisor = field(default_factory=ToolTaskSupervisor)
     agent_coordinator: AgentCoordinator | None = None

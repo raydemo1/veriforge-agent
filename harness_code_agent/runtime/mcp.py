@@ -4,16 +4,15 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import re
-import shutil
-import subprocess
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -24,12 +23,15 @@ from .permissions import (
     TOOL_PERMISSION_READ,
     VALID_TOOL_PERMISSIONS,
 )
+from .recovery import atomic_bytes
 from .tool_result import ToolResult
 
 MCP_CONFIG_RELATIVE_PATH = Path(".harness") / "mcp.json"
 MCP_TOOL_PREFIX = "mcp__"
 MCP_TOOL_NAME_LIMIT = 64
-MCPORTER_CONFIG_ENV = "HARNESS_MCPORTER_CONFIG"
+MCP_TRANSPORTS = ("stdio", "streamable_http")
+
+log = logging.getLogger(__name__)
 
 
 class McpConfigError(ValueError):
@@ -48,6 +50,8 @@ class McpServerConfig:
     url: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
     tool_permissions: dict[str, str] = field(default_factory=dict)
+    title: str = ""
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -71,8 +75,6 @@ class McpToolBinding:
         if parameters.get("type") != "object":
             parameters = {"type": "object", "properties": {}, "additionalProperties": True}
         description = self.description or f"MCP tool {self.server_name}/{self.tool_name}"
-        if _is_exa_search_tool(self):
-            description += "\n\nPreferred search tool for web research."
         return {
             "type": "function",
             "function": {
@@ -92,6 +94,15 @@ class McpServerStatus:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class McpRegistration:
+    server: McpServerConfig
+    state: str
+    tool_count: int = 0
+    error: str | None = None
+    replaced: bool = False
+
+
 @dataclass
 class _McpConnection:
     config: McpServerConfig
@@ -103,10 +114,7 @@ def load_mcp_config(workspace: str | Path) -> McpConfig:
     root = Path(workspace).resolve()
     path = root / MCP_CONFIG_RELATIVE_PATH
     if not path.exists():
-        mcporter_path = _find_mcporter_config(root)
-        if mcporter_path is None:
-            return McpConfig(path=path)
-        path = mcporter_path
+        return McpConfig(path=path)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
@@ -114,35 +122,25 @@ def load_mcp_config(workspace: str | Path) -> McpConfig:
     if not isinstance(data, dict):
         raise McpConfigError("MCP config must be a JSON object")
     raw_servers = data.get("servers")
-    if raw_servers is None and path.name == "mcporter.json":
-        raw_servers = data.get("mcpServers", {})
     if not isinstance(raw_servers, dict):
         raise McpConfigError("MCP config field 'servers' must be an object")
 
     servers: dict[str, McpServerConfig] = {}
     for name, raw in raw_servers.items():
-        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
-            raise McpConfigError(f"Invalid MCP server name: {name!r}")
+        _validate_server_name(name)
         if not isinstance(raw, dict):
             raise McpConfigError(f"MCP server {name!r} must be an object")
         if raw.get("enabled", True) is False:
             continue
-        if path.name == "mcporter.json" and name.lower() == "exa" and not _mcporter_exa_has_credentials(raw):
-            continue
 
         expanded = _expand_env(raw)
         transport = str(expanded.get("transport") or "").strip()
-        if not transport and path.name == "mcporter.json":
-            transport = _mcporter_transport(expanded)
         if transport == "streamable-http":
             transport = "streamable_http"
-        if transport not in {"stdio", "streamable_http"}:
+        if transport not in MCP_TRANSPORTS:
             raise McpConfigError(f"MCP server {name!r} has unsupported transport: {transport!r}")
 
-        default_permission = TOOL_PERMISSION_DANGEROUS
-        if path.name == "mcporter.json" and name.lower() == "exa":
-            default_permission = TOOL_PERMISSION_NETWORK_READ
-        permission = str(expanded.get("permission") or default_permission)
+        permission = str(expanded.get("permission") or TOOL_PERMISSION_DANGEROUS)
         _validate_permission(permission, f"server {name!r}")
         tool_permissions = _string_dict(expanded.get("tool_permissions") or {}, f"server {name!r} tool_permissions")
         for tool_name, tool_permission in tool_permissions.items():
@@ -165,9 +163,11 @@ def load_mcp_config(workspace: str | Path) -> McpConfig:
                 env=_string_dict(expanded.get("env") or {}, f"server {name!r} env"),
                 cwd=str(expanded.get("cwd")) if expanded.get("cwd") else None,
                 tool_permissions=tool_permissions,
+                title=str(expanded.get("title") or "").strip(),
+                description=str(expanded.get("description") or "").strip(),
             )
         else:
-            url = str(expanded.get("url") or expanded.get("baseUrl") or "").strip()
+            url = str(expanded.get("url") or "").strip()
             if not url:
                 raise McpConfigError(f"MCP streamable_http server {name!r} requires url")
             servers[name] = McpServerConfig(
@@ -177,58 +177,55 @@ def load_mcp_config(workspace: str | Path) -> McpConfig:
                 url=url,
                 headers=_string_dict(expanded.get("headers") or {}, f"server {name!r} headers"),
                 tool_permissions=tool_permissions,
+                title=str(expanded.get("title") or "").strip(),
+                description=str(expanded.get("description") or "").strip(),
             )
 
     return McpConfig(path=path, servers=servers)
 
 
-def _find_mcporter_config(workspace: Path) -> Path | None:
-    """Find an existing MC Porter config without creating a second API config.
-
-    A workspace-local VeriForge config always wins.  The global MC Porter config
-    is intentionally considered only for the active process workspace, so unit
-    tests and programmatic sessions pointed at another directory do not
-    unexpectedly connect to the user's personal MCP servers.
-    """
-    configured = os.environ.get(MCPORTER_CONFIG_ENV, "").strip()
-    candidates: list[Path] = []
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    candidates.append(workspace / ".mcporter" / "mcporter.json")
-    if workspace == Path.cwd().resolve():
-        candidates.append(Path.home() / ".mcporter" / "mcporter.json")
-    for candidate in candidates:
-        resolved = candidate.resolve()
-        if resolved.is_file():
-            return resolved
-    return None
-
-
-def _mcporter_transport(server: dict[str, Any]) -> str:
-    if server.get("command"):
-        return "stdio"
-    if server.get("baseUrl") or server.get("url"):
-        return "streamable_http"
-    return ""
-
-
-def _mcporter_exa_has_credentials(server: dict[str, Any]) -> bool:
-    """Allow Exa when its MC Porter entry contains a literal credential.
-
-    MC Porter may still use an environment placeholder in other setups, so
-    that form remains supported.  This check only prevents registering an Exa
-    server whose configured Authorization header is empty or unresolved.
-    """
-    headers = server.get("headers")
-    if not isinstance(headers, dict):
-        return False
-    authorization = headers.get("Authorization") or headers.get("authorization")
-    if not isinstance(authorization, str):
-        return False
-    value = authorization.strip()
-    if not value or "${EXA_API_KEY}" in value:
-        return bool(os.environ.get("EXA_API_KEY", "").strip())
-    return True
+def build_server_config(
+    *,
+    name: str,
+    url: str | None = None,
+    command: str | None = None,
+    args: list[str] | None = None,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+    headers: dict[str, str] | None = None,
+    permission: str | None = None,
+    title: str = "",
+    description: str = "",
+) -> McpServerConfig:
+    """Validate one user-supplied MCP server definition for registration."""
+    _validate_server_name(name)
+    url = (url or "").strip()
+    command = (command or "").strip()
+    if bool(url) == bool(command):
+        raise McpConfigError("MCP server requires exactly one of url or command")
+    permission = (permission or TOOL_PERMISSION_DANGEROUS).strip()
+    _validate_permission(permission, f"server {name!r}")
+    if command:
+        return McpServerConfig(
+            name=name,
+            transport="stdio",
+            permission=permission,
+            command=command,
+            args=list(args or []),
+            env=dict(env or {}),
+            cwd=(cwd or "").strip() or None,
+            title=title.strip(),
+            description=description.strip(),
+        )
+    return McpServerConfig(
+        name=name,
+        transport="streamable_http",
+        permission=permission,
+        url=url,
+        headers=dict(headers or {}),
+        title=title.strip(),
+        description=description.strip(),
+    )
 
 
 class McpClientManager:
@@ -348,7 +345,7 @@ class McpClientManager:
                 self._handler_for(binding),
                 permission=binding.permission,
                 effect=effect,
-                disclosure="core" if _is_exa_search_tool(binding) else "deferred",
+                disclosure="deferred",
                 capabilities=(
                     {
                         TOOL_CAPABILITY_MAIN,
@@ -376,12 +373,6 @@ class McpClientManager:
                 error=f"Unknown MCP tool: {exposed_name}",
                 metadata={"status_source": "mcp"},
             )
-        if self._uses_mcporter_cli(binding):
-            return self._call_via_mcporter(
-                binding,
-                arguments,
-                cancellation_token=cancellation_token,
-            )
         connection = self._connections.get(binding.server_name)
         if connection is None:
             return ToolResult(
@@ -407,115 +398,6 @@ class McpClientManager:
                 error=error,
                 metadata={"status_source": "mcp", "server": binding.server_name, "tool": binding.tool_name},
             )
-
-    def _uses_mcporter_cli(self, binding: McpToolBinding) -> bool:
-        return self.config.path.name == "mcporter.json" and binding.server_name in self.config.servers
-
-    def _call_via_mcporter(
-        self,
-        binding: McpToolBinding,
-        arguments: dict[str, Any],
-        *,
-        cancellation_token=None,
-    ) -> ToolResult:
-        command = _mcporter_cli_command()
-        if command is None:
-            return ToolResult(
-                tool=binding.exposed_name,
-                status="failed",
-                output="[error] mcporter command not found",
-                error="mcporter command not found",
-                metadata={"status_source": "mcporter", "server": binding.server_name, "tool": binding.tool_name},
-            )
-        argv = command + [
-            "--config",
-            str(self.config.path),
-            "call",
-            f"{binding.server_name}.{binding.tool_name}",
-            "--args",
-            json.dumps(dict(arguments or {}), ensure_ascii=False, separators=(",", ":")),
-            "--output",
-            "json",
-        ]
-        environment = os.environ.copy()
-        server = self.config.servers.get(binding.server_name)
-        if server is not None and _has_literal_authorization(server.headers):
-            environment.pop("EXA_API_KEY", None)
-        try:
-            process = subprocess.Popen(
-                argv,
-                cwd=str(self.workspace),
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=(
-                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                    if os.name == "nt"
-                    else 0
-                ),
-                start_new_session=os.name != "nt",
-            )
-        except OSError as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            return ToolResult(
-                tool=binding.exposed_name,
-                status="failed",
-                output=f"[error] mcporter call failed: {error}",
-                error=error,
-                metadata={"status_source": "mcporter", "server": binding.server_name, "tool": binding.tool_name},
-            )
-
-        deadline = time.monotonic() + self.timeout_seconds
-        while True:
-            if cancellation_token is not None and cancellation_token.is_cancelled:
-                _terminate_process_tree(process)
-                raise CancelledError("Turn cancelled by user")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _terminate_process_tree(process)
-                return ToolResult(
-                    tool=binding.exposed_name,
-                    status="failed",
-                    output="[error] mcporter call timed out",
-                    error="mcporter call timed out",
-                    metadata={"status_source": "mcporter", "server": binding.server_name, "tool": binding.tool_name},
-                )
-            try:
-                stdout, stderr = process.communicate(timeout=min(0.05, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                continue
-
-        raw_output = stdout.strip()
-        if process.returncode != 0:
-            error = stderr.strip() or raw_output or f"mcporter exited with code {process.returncode}"
-            return ToolResult(
-                tool=binding.exposed_name,
-                status="failed",
-                output=f"[error] {error}",
-                error=error,
-                metadata={
-                    "status_source": "mcporter",
-                    "server": binding.server_name,
-                    "tool": binding.tool_name,
-                    "return_code": process.returncode,
-                },
-            )
-        try:
-            payload = json.loads(raw_output)
-        except json.JSONDecodeError as exc:
-            error = f"mcporter returned invalid JSON: {exc}"
-            return ToolResult(
-                tool=binding.exposed_name,
-                status="failed",
-                output=f"[error] {error}",
-                error=error,
-                metadata={"status_source": "mcporter", "server": binding.server_name, "tool": binding.tool_name},
-            )
-        return _mcporter_json_to_tool_result(binding, payload)
 
     def status_report(self) -> str:
         lines = ["MCP status"]
@@ -550,6 +432,41 @@ class McpClientManager:
             )
         return "\n".join(lines)
 
+    def catalog_prompt(self) -> str:
+        """Describe connected MCP servers without listing their tools.
+
+        The model picks a server id from this catalog and calls ``search_tools``
+        to mount the tools it needs; tool schemas stay out of the prompt.
+        """
+        if self.config_error or not self.config.servers:
+            return ""
+        lines = [
+            "## MCP Servers",
+            "",
+            (
+                "Connected MCP servers. Their tools are not mounted up front; use the id when "
+                "calling search_tools:"
+            ),
+        ]
+        for name in sorted(self.config.servers):
+            server = self.config.servers[name]
+            description = server.description or _MISSING_DESCRIPTION_TEXT
+            label = f"{name} ({server.title})" if server.title else name
+            lines.append(f"- {label}: {description}")
+        lines.extend(
+            [
+                "",
+                (
+                    "When a needed capability is not in your mounted tools, call search_tools with the "
+                    "MCP server id and short English keywords. Matching tools are mounted for later turns "
+                    "and stay available. Never repeat the same server and query; if nothing is mounted, "
+                    "try different English keywords or another server, and if no server can do it, tell "
+                    "the user instead of substituting a similar tool."
+                ),
+            ]
+        )
+        return "\n".join(lines)
+
     def configured_server_names(self) -> list[str]:
         """Return server names from the raw config, including disabled ones."""
         if not self.config.path.exists():
@@ -557,27 +474,204 @@ class McpClientManager:
         try:
             data = json.loads(self.config.path.read_text(encoding="utf-8"))
             servers = data.get("servers") if isinstance(data, dict) else None
-            if servers is None and self.config.path.name == "mcporter.json":
-                servers = data.get("mcpServers", {}) if isinstance(data, dict) else {}
             return sorted(str(name) for name in servers if isinstance(name, str))
         except (OSError, json.JSONDecodeError, AttributeError):
             return sorted(self.config.servers)
 
-    def reload_server(self, server_name: str) -> str:
-        """Reconnect the requested MCP server without requiring a new TUI session.
+    def registered_report(self) -> str:
+        """List registered servers from the config file without connecting."""
+        lines = [f"MCP config: {self.config.path}"]
+        if not self.config.path.exists():
+            lines.append("no MCP servers registered")
+            return "\n".join(lines)
+        try:
+            data = json.loads(self.config.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            lines.append(f"config: failed - {exc}")
+            return "\n".join(lines)
+        servers = data.get("servers") if isinstance(data, dict) else None
+        if not isinstance(servers, dict) or not servers:
+            lines.append("no MCP servers registered")
+            return "\n".join(lines)
+        for name in sorted(str(item) for item in servers):
+            entry = servers[name]
+            if not isinstance(entry, dict):
+                lines.append(f"- {name}: invalid entry")
+                continue
+            disabled = " (disabled)" if entry.get("enabled", True) is False else ""
+            transport = str(entry.get("transport") or ("stdio" if entry.get("command") else "streamable_http"))
+            permission = str(entry.get("permission") or TOOL_PERMISSION_DANGEROUS)
+            description = str(entry.get("description") or "").strip() or "(no description)"
+            lines.append(f"- {name}{disabled} [{transport}, permission={permission}]: {description}")
+        return "\n".join(lines)
 
-        The connection loop is deliberately rebuilt as a small, deterministic
-        operation. This keeps tool bindings in sync and avoids leaving stale
-        handlers behind after a failed reconnect.
+    def _raw_server_entry(self, server_name: str) -> dict[str, Any]:
+        """Return the raw config entry for one server, including disabled ones."""
+        if not self.config.path.exists():
+            return {}
+        try:
+            data = json.loads(self.config.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        servers = data.get("servers") if isinstance(data, dict) else None
+        entry = servers.get(server_name) if isinstance(servers, dict) else None
+        return entry if isinstance(entry, dict) else {}
+
+    def _merge_previous_metadata(self, server: McpServerConfig) -> McpServerConfig:
+        """Keep description/title/tool permissions when re-registering a server."""
+        previous = self._raw_server_entry(server.name)
+        updates: dict[str, Any] = {}
+        if not server.description and isinstance(previous.get("description"), str):
+            description = previous["description"].strip()
+            if description:
+                updates["description"] = description
+        if not server.title and isinstance(previous.get("title"), str):
+            title = previous["title"].strip()
+            if title:
+                updates["title"] = title
+        if not server.tool_permissions and isinstance(previous.get("tool_permissions"), dict):
+            permissions = {
+                str(name): value
+                for name, value in previous["tool_permissions"].items()
+                if isinstance(name, str) and value in VALID_TOOL_PERMISSIONS
+            }
+            if permissions:
+                updates["tool_permissions"] = permissions
+        return replace(server, **updates) if updates else server
+
+    def register_server(self, server: McpServerConfig) -> McpRegistration:
+        """Add or replace one server: probe connection, persist config, bind tools.
+
+        The config entry is written even when the connection probe fails, so the
+        user keeps a registration to retry later.  A write failure raises
+        ``McpConfigError`` and leaves no in-memory state behind.
         """
-        if server_name not in self.config.servers:
+        if self.config_error:
+            raise McpConfigError(f"现有 MCP 配置无法解析，无法注册服务：{self.config_error}")
+        existed = server.name in set(self.configured_server_names()) or server.name in self.config.servers
+        if existed:
+            server = self._merge_previous_metadata(server)
+        connection: _McpConnection | None = None
+        bindings: list[McpToolBinding] = []
+        error: str | None = None
+        try:
+            self._ensure_loop()
+            connection, bindings = self._run(self._connect_one(server))
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        try:
+            self._update_config_document(lambda servers: servers.__setitem__(server.name, _server_entry(server)))
+        except McpConfigError:
+            if connection is not None:
+                with contextlib.suppress(Exception):
+                    self._run(self._close_connections([connection]))
+            raise
+        self._drop_server(server.name)
+        self.config.servers[server.name] = server
+        if connection is not None:
+            self._store_connection(server, connection, bindings)
+            state = "connected"
+        else:
+            self.statuses[server.name] = McpServerStatus(
+                name=server.name,
+                transport=server.transport,
+                state="failed",
+                error=error,
+            )
+            state = "failed"
+        return McpRegistration(
+            server=server,
+            state=state,
+            tool_count=len(bindings),
+            error=error,
+            replaced=existed,
+        )
+
+    def remove_server(self, server_name: str) -> str:
+        """Remove one registered server from the config and drop its runtime state."""
+        if self.config_error:
+            raise McpConfigError(f"现有 MCP 配置无法解析，无法移除服务：{self.config_error}")
+        if server_name not in set(self.configured_server_names()):
+            raise McpConfigError(f"MCP 服务不存在：{server_name}")
+        self._update_config_document(lambda servers: servers.pop(server_name, None))
+        self._drop_server(server_name)
+        self.config.servers.pop(server_name, None)
+        return f"MCP 服务已移除：{server_name}"
+
+    def generate_server_description(
+        self,
+        server_name: str,
+        *,
+        refresh: bool = False,
+        llm_create: Callable[..., Any] | None = None,
+    ) -> str:
+        """Generate one server description from its discovered tool catalog."""
+        server = self.config.servers.get(server_name)
+        if server is None:
+            raise McpConfigError(f"MCP 服务不存在或未启用：{server_name}")
+        if server.description and not refresh:
+            return f"MCP 服务已有描述：{server_name} — {server.description}"
+        tools = [
+            (binding.tool_name, binding.description)
+            for binding in self.tool_bindings
+            if binding.server_name == server_name
+        ]
+        if not tools:
+            status = self.statuses.get(server_name)
+            detail = status.error if status is not None and status.error else "服务未连接"
+            raise McpConfigError(f"无法生成描述：{server_name} 尚未发现工具（{detail}）")
+        descriptions = describe_mcp_servers({server_name: tools}, llm_create=llm_create)
+        text = descriptions.get(server_name, "").strip()
+        if not text:
+            raise McpConfigError(f"描述生成失败：{server_name}（服务本身仍可正常使用）")
+        self.persist_server_descriptions({server_name: text}, overwrite=refresh)
+        return f"MCP 服务描述已{'刷新' if refresh else '生成'}：{server_name} — {text}"
+
+    def reload_server(self, server_name: str) -> str:
+        """Reconnect exactly one server, leaving other servers untouched."""
+        server = self.config.servers.get(server_name)
+        if server is None:
             return f"MCP 服务不存在或未启用：{server_name}"
-        self.close()
-        self.statuses.clear()
-        self.tool_bindings.clear()
-        self._bindings_by_exposed_name.clear()
-        self.connect_all()
-        return f"MCP 服务已重新连接：{server_name}"
+        self._drop_server(server_name)
+        try:
+            self._ensure_loop()
+            self._run(self._connect_one_and_store(server))
+        except Exception as exc:
+            return f"MCP 服务连接失败：{server_name}（{type(exc).__name__}: {exc}）"
+        status = self.statuses.get(server_name)
+        tool_count = status.tool_count if status is not None else 0
+        return f"MCP 服务已重新连接：{server_name}（{tool_count} 个工具）"
+
+    def _store_connection(
+        self,
+        server: McpServerConfig,
+        connection: _McpConnection,
+        bindings: list[McpToolBinding],
+    ) -> None:
+        self._connections[server.name] = connection
+        self.statuses[server.name] = McpServerStatus(
+            name=server.name,
+            transport=server.transport,
+            state="connected",
+            tool_count=len(bindings),
+        )
+        self.tool_bindings.extend(bindings)
+        self._bindings_by_exposed_name.update({item.exposed_name: item for item in bindings})
+
+    def _drop_server(self, server_name: str) -> None:
+        connection = self._connections.pop(server_name, None)
+        if connection is not None:
+            try:
+                self._run(self._close_connections([connection]))
+            except Exception as exc:
+                log.warning("Failed to close MCP server %s: %s", server_name, exc)
+        self.statuses.pop(server_name, None)
+        self.tool_bindings = [
+            binding for binding in self.tool_bindings if binding.server_name != server_name
+        ]
+        self._bindings_by_exposed_name = {
+            binding.exposed_name: binding for binding in self.tool_bindings
+        }
 
     async def _connect_one_and_store(self, server: McpServerConfig) -> None:
         try:
@@ -590,39 +684,69 @@ class McpClientManager:
                 error=f"{type(exc).__name__}: {exc}",
             )
             raise
-        self._connections[server.name] = connection
-        self.statuses[server.name] = McpServerStatus(
-            name=server.name,
-            transport=server.transport,
-            state="connected",
-            tool_count=len(bindings),
-        )
-        self.tool_bindings.extend(bindings)
-        self._bindings_by_exposed_name.update({item.exposed_name: item for item in bindings})
+        self._store_connection(server, connection, bindings)
 
     def set_server_enabled(self, server_name: str, enabled: bool) -> str:
         """Toggle one raw config entry while preserving environment placeholders."""
-        path = self.config.path
-        if not path.exists():
-            return f"MCP 配置不存在：{path}"
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise McpConfigError(f"无法读取 MCP 配置：{exc}") from exc
-        servers = data.get("servers") if isinstance(data, dict) else None
-        if servers is None and self.config.path.name == "mcporter.json":
-            servers = data.get("mcpServers") if isinstance(data, dict) else None
-        if not isinstance(servers, dict) or server_name not in servers:
+        if server_name not in set(self.configured_server_names()):
             return f"MCP 服务不存在：{server_name}"
-        entry = servers[server_name]
-        if not isinstance(entry, dict):
-            return f"MCP 服务配置无效：{server_name}"
-        if enabled:
-            entry.pop("enabled", None)
-        else:
-            entry["enabled"] = False
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        def mutate(servers: dict[str, Any]) -> None:
+            entry = servers.get(server_name)
+            if not isinstance(entry, dict):
+                raise McpConfigError(f"MCP 服务配置无效：{server_name}")
+            if enabled:
+                entry.pop("enabled", None)
+            else:
+                entry["enabled"] = False
+
+        self._update_config_document(mutate)
         return f"MCP 服务已{'启用' if enabled else '停用'}：{server_name}"
+
+    def persist_server_descriptions(self, descriptions: dict[str, str], *, overwrite: bool = False) -> None:
+        """Write generated descriptions into the config file."""
+        if not descriptions:
+            return
+        written: dict[str, str] = {}
+
+        def mutate(servers: dict[str, Any]) -> None:
+            for name, description in descriptions.items():
+                entry = servers.get(name)
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("description") and not overwrite:
+                    continue
+                entry["description"] = description
+                written[name] = description
+
+        self._update_config_document(mutate)
+        for name, description in written.items():
+            server = self.config.servers.get(name)
+            if server is not None:
+                self.config.servers[name] = replace(server, description=description)
+
+    def _update_config_document(self, mutate: Callable[[dict[str, Any]], None]) -> None:
+        """Apply a mutation to the raw config document with an atomic write."""
+        path = self.config.path
+        data: dict[str, Any] = {}
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise McpConfigError(f"无法读取 MCP 配置：{exc}") from exc
+            if not isinstance(data, dict):
+                raise McpConfigError("MCP 配置必须是 JSON 对象")
+        servers = data.get("servers")
+        if servers is None:
+            servers = {}
+            data["servers"] = servers
+        if not isinstance(servers, dict):
+            raise McpConfigError("MCP 配置字段 'servers' 必须是对象")
+        mutate(servers)
+        try:
+            atomic_bytes(path, (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+        except OSError as exc:
+            raise McpConfigError(f"无法写入 MCP 配置（{path}）：{exc}") from exc
 
     def doctor_status(self) -> tuple[bool, str]:
         if self.config_error:
@@ -767,6 +891,9 @@ class McpClientManager:
     async def _close_async(self) -> None:
         connections = list(self._connections.values())
         self._connections.clear()
+        await self._close_connections(connections)
+
+    async def _close_connections(self, connections: list[_McpConnection]) -> None:
         for connection in reversed(connections):
             response = asyncio.get_running_loop().create_future()
             await connection.request_queue.put(("close", None, response))
@@ -862,81 +989,106 @@ def _bindings_for_server(server: McpServerConfig, mcp_tools: list[Any]) -> list[
     return bindings
 
 
-def _is_exa_search_tool(binding: McpToolBinding) -> bool:
-    identity = f"{binding.server_name} {binding.tool_name}".lower()
-    return "exa" in identity and "search" in identity
+_MISSING_DESCRIPTION_TEXT = (
+    "description unavailable; call search_tools with this server id to inspect its tools"
+)
 
 
-def _mcporter_cli_command() -> list[str] | None:
-    executable = shutil.which("mcporter")
-    if not executable:
-        return None
-    path = Path(executable)
-    suffix = path.suffix.lower()
-    if suffix == ".ps1":
-        shell = shutil.which("pwsh") or shutil.which("powershell")
-        return [shell, "-NoProfile", "-NonInteractive", "-File", str(path)] if shell else None
-    if suffix in {".cmd", ".bat"}:
-        shell = shutil.which("cmd.exe") or shutil.which("cmd")
-        return [shell, "/d", "/c", str(path)] if shell else None
-    return [str(path)]
+def describe_mcp_servers(
+    servers: dict[str, list[tuple[str, str]]],
+    *,
+    llm_create: Callable[..., Any] | None = None,
+) -> dict[str, str]:
+    """Ask the fast model for one-sentence descriptions of newly registered servers.
 
-
-def _has_literal_authorization(headers: dict[str, str]) -> bool:
-    authorization = headers.get("Authorization") or headers.get("authorization") or ""
-    return bool(authorization.strip()) and "${" not in authorization
-
-
-def _mcporter_json_to_tool_result(binding: McpToolBinding, payload: Any) -> ToolResult:
-    if not isinstance(payload, dict):
-        output = str(payload)
-        return ToolResult(
-            tool=binding.exposed_name,
-            status="success",
-            output=output,
-            metadata={"status_source": "mcporter", "server": binding.server_name, "tool": binding.tool_name},
-        )
-    parts = [
-        _mcporter_content_item_to_text(item)
-        for item in list(payload.get("content") or [])
-        if isinstance(item, dict)
-    ]
-    structured = payload.get("structuredContent")
-    if structured is not None:
-        parts.append("structuredContent:\n" + json.dumps(structured, ensure_ascii=False, indent=2, sort_keys=True))
-    output = "\n\n".join(part for part in parts if part)
-    is_error = bool(payload.get("isError"))
-    return ToolResult(
-        tool=binding.exposed_name,
-        status="failed" if is_error else "success",
-        output=output,
-        error="mcporter tool returned isError=true" if is_error else None,
-        metadata={
-            "status_source": "mcporter",
-            "server": binding.server_name,
-            "tool": binding.tool_name,
+    ``servers`` maps a server id to its ``(tool name, description)`` pairs.  The
+    result is persisted by the caller so later runs reuse it instead of calling
+    the model again.
+    """
+    if not servers:
+        return {}
+    payload = {
+        name: [{"name": tool, "description": description} for tool, description in tools]
+        for name, tools in servers.items()
+    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You write directory entries for MCP servers used by a coding agent. "
+                "For each server id in the user's JSON, reply with one short English sentence "
+                "(max 140 characters) describing what that server is useful for, based on its tools. "
+                "Do not list tool names, do not mention JSON, and do not use markdown. "
+                'Reply with a JSON object mapping every server id to its sentence, for example '
+                '{"market": "..."}'
+            ),
         },
-    )
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+    try:
+        if llm_create is not None:
+            response = llm_create(messages)
+        else:
+            from .. import config
+            from ..agent.providers import ProviderAdapter, client_scope
+
+            profile = config.resolve_model_profile("fast")
+            adapter = ProviderAdapter(profile.provider)
+            kwargs = adapter.chat_kwargs(profile=profile, messages=messages, max_tokens=400)
+            with client_scope() as client:
+                response = client.chat.completions.create(**kwargs)
+        content = str(response.choices[0].message.content or "")
+    except Exception as exc:
+        log.warning("Failed to generate MCP server descriptions: %s", exc)
+        return {}
+
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if match is None:
+        log.warning("MCP server description response was not JSON: %s", content[:200])
+        return {}
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError as exc:
+        log.warning("Failed to parse MCP server descriptions: %s", exc)
+        return {}
+    descriptions: dict[str, str] = {}
+    for name, value in data.items() if isinstance(data, dict) else []:
+        if name not in servers or not isinstance(value, str):
+            continue
+        text = " ".join(value.split())
+        if text:
+            descriptions[name] = text[:200]
+    return descriptions
 
 
-def _mcporter_content_item_to_text(item: dict[str, Any]) -> str:
-    item_type = str(item.get("type") or "")
-    if item_type == "text":
-        return str(item.get("text") or "")
-    if item_type in {"image", "audio"}:
-        data = str(item.get("data") or "")
-        mime = str(item.get("mimeType") or "application/octet-stream")
-        return f"[{item_type} {mime}, {len(data)} base64 chars omitted]"
-    if item_type == "resource":
-        resource = item.get("resource") or {}
-        uri = resource.get("uri", "")
-        mime = resource.get("mimeType", "application/octet-stream")
-        if "text" in resource:
-            return f"[resource {uri} {mime}]\n{resource['text']}"
-        return f"[resource {uri} {mime}, {len(str(resource.get('blob') or ''))} base64 chars omitted]"
-    if item_type == "resource_link":
-        return f"[resource_link {item.get('name') or ''} {item.get('uri') or ''}]"
-    return f"[{item_type or 'unknown'} content omitted]"
+def _server_entry(server: McpServerConfig) -> dict[str, Any]:
+    """Serialize one server back to its config-file representation."""
+    entry: dict[str, Any] = {"transport": server.transport}
+    if server.transport == "stdio":
+        entry["command"] = server.command or ""
+        if server.args:
+            entry["args"] = list(server.args)
+        if server.env:
+            entry["env"] = dict(server.env)
+        if server.cwd:
+            entry["cwd"] = server.cwd
+    else:
+        entry["url"] = server.url or ""
+        if server.headers:
+            entry["headers"] = dict(server.headers)
+    entry["permission"] = server.permission
+    if server.tool_permissions:
+        entry["tool_permissions"] = dict(server.tool_permissions)
+    if server.title:
+        entry["title"] = server.title
+    if server.description:
+        entry["description"] = server.description
+    return entry
+
+
+def _validate_server_name(name: str) -> None:
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise McpConfigError(f"Invalid MCP server name: {name!r}")
 
 
 def _content_item_to_text(item: Any) -> str:
@@ -1021,31 +1173,6 @@ def _safe_name_segment(value: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", value.strip())
     safe = re.sub(r"_+", "_", safe).strip("_")
     return safe or "tool"
-
-
-def _terminate_process_tree(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
-    if os.name == "nt":
-        with contextlib.suppress(Exception):
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-                check=False,
-            )
-    else:
-        with contextlib.suppress(Exception):
-            os.killpg(process.pid, 15)
-    if process.poll() is None:
-        with contextlib.suppress(Exception):
-            process.terminate()
-    try:
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(Exception):
-            process.kill()
 
 
 def _model_to_dict(value: Any) -> dict[str, Any]:

@@ -295,7 +295,6 @@ _SOURCE_DEFAULT_KIND = {
     "shell": FailureKind.PROCESS_FAILED,
     "shell_job": FailureKind.EXECUTION_FAILED,
     "mcp": FailureKind.EXECUTION_FAILED,
-    "mcporter": FailureKind.EXECUTION_FAILED,
     "browser": FailureKind.EXECUTION_FAILED,
     "unstructured": FailureKind.EXECUTION_FAILED,
     "": FailureKind.EXECUTION_FAILED,
@@ -318,7 +317,6 @@ _TEXT_REFINABLE_SOURCES = frozenset(
         "shell",
         "shell_job",
         "mcp",
-        "mcporter",
         "browser",
         "unstructured",
     }

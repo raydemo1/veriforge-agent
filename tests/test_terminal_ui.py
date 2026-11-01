@@ -27,7 +27,7 @@ from harness_code_agent.tui.state import (
 
 class TerminalUiTests(unittest.TestCase):
     def test_command_registry_exposes_structured_panel_actions(self):
-        registry = default_command_registry(skill_registry=SimpleNamespace(user_commands=[]))
+        registry = default_command_registry(skill_registry=SimpleNamespace(skills=[]))
         self.assertEqual(registry.execute("/observe", SimpleNamespace()).action, "observe")
         self.assertNotIn("/checkpoint", registry.command_names())
         self.assertNotIn("/profile", registry.command_names())

@@ -27,7 +27,6 @@ def model(monkeypatch, tmp_path):
     harness_root = tmp_path / ".harness"
     harness_root.mkdir()
     (harness_root / "mcp.json").write_text('{"servers": {}}', encoding="utf-8")
-    monkeypatch.delenv("HARNESS_MCPORTER_CONFIG", raising=False)
     response = SimpleNamespace(
         choices=[SimpleNamespace(
             message=SimpleNamespace(content="Task response", tool_calls=None),

@@ -434,7 +434,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("[SYSTEM] first guidance", injected)
         self.assertIn("[SYSTEM] second guidance", injected)
 
-    def test_tool_search_reveals_deferred_schema_for_next_iteration(self):
+    def test_search_tools_reveals_deferred_schema_for_next_iteration(self):
         registry = BUILTIN_TOOL_REGISTRY.copy()
         registry.register(
             {
@@ -455,7 +455,7 @@ class ToolExecutorTests(unittest.TestCase):
             disclosure="deferred",
         )
         tool_calls = [
-            _tool_call("tc_search", "tool_search", {"query": "product documentation"}),
+            _tool_call("tc_search", "search_tools", {"query": "product documentation", "server": "docs"}),
         ]
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -492,13 +492,13 @@ class ToolExecutorTests(unittest.TestCase):
                 conversation.run_until_idle()
 
         names = {schema["function"]["name"] for schema in agent.tool_schemas}
-        self.assertIn("tool_search", names)
+        self.assertIn("search_tools", names)
         self.assertIn("mcp__docs__search", names)
         self.assertIn("mcp__docs__search", agent.allowed_tool_names)
         self.assertEqual(context.revealed_tool_names, {"mcp__docs__search"})
         self.assertNotEqual(conversation._cached_prompt_cache_key, "old-cache-key")
 
-    def test_repeated_tool_search_reveal_preserves_prompt_cache_when_unchanged(self):
+    def test_repeated_search_tools_reveal_preserves_prompt_cache_when_unchanged(self):
         from harness_code_agent.agent.tool_executor import ToolExecutor
 
         registry = BUILTIN_TOOL_REGISTRY.copy()
@@ -546,7 +546,7 @@ class ToolExecutorTests(unittest.TestCase):
             conversation._cached_prompt_cache_key = "old-cache-key"
             executor = ToolExecutor(conversation)
             result = ToolResult(
-                tool="tool_search",
+                tool="search_tools",
                 status="success",
                 output="already revealed",
                 metadata={"revealed_tool_names": ["mcp__docs__search"]},

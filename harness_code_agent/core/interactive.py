@@ -54,7 +54,7 @@ from ..runtime.approvals import (
 )
 from ..runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
 from ..runtime.lifecycle import LifecycleScope
-from ..runtime.mcp import McpClientManager
+from ..runtime.mcp import McpClientManager, McpConfigError, build_server_config
 from ..runtime.middleware.loader import load_user_middlewares
 from ..runtime.middleware.stack import build_main_agent_middlewares
 from ..runtime.permissions import PermissionPolicy
@@ -239,7 +239,7 @@ class InteractiveSession:
         self.tool_context.allowed_tool_permissions = set(cfg.allowed_tool_permissions)
         self.tool_context.blocked_tool_names = set(cfg.blocked_tool_names)
         harness_rules = _load_harness_rules(self.cwd)
-        catalog = self.skill_registry.build_catalog_prompt()
+        catalog = self.skill_registry.catalog_listing()
         prefix = PromptPrefixBuilder().build(
             profile_prompt=cfg.system_prompt,
             global_rules_docs=[harness_rules] if harness_rules is not None else [],
@@ -287,6 +287,7 @@ class InteractiveSession:
             self._report_startup("connecting external tools")
             self._load_mcp_tools()
             self._refresh_agent_tool_schemas()
+            self._refresh_mcp_catalog()
             self._report_startup("external tools ready")
 
     def warm_mcp_tools(self) -> None:
@@ -335,6 +336,13 @@ class InteractiveSession:
                 update_context=slot.profile.name() == active_name,
             )
             slot.agent.update_tool_schemas(schemas)
+
+    def _refresh_mcp_catalog(self) -> None:
+        if self.mcp_manager is None:
+            return
+        catalog = self.mcp_manager.catalog_prompt()
+        for slot in self.profile_runtimes.values():
+            slot.agent.set_mcp_catalog(catalog)
 
     def _apply_profile_task_timeout(self, user_prompt: str) -> None:
         if self.agent is None:
@@ -467,6 +475,7 @@ class InteractiveSession:
 
     def submit_prepared(self, prepared: PreparedTurn, cancellation_token=None) -> TurnResult:
         user_prompt = prepared.text
+        self._refresh_skill_catalog()
         self.ensure_profile_bound_for_first_task(user_prompt)
         skill_invocation = self.skill_registry.build_user_invocation(user_prompt)
         if skill_invocation is not None:
@@ -502,6 +511,14 @@ class InteractiveSession:
         if self.is_bound:
             return
         self._bind_profile(self._pending_profile_name, source=self._profile_source)
+
+    def _refresh_skill_catalog(self) -> None:
+        """Rebuild the prompt and Slash registry when the catalog changed on disk."""
+        if not self.skill_registry.refresh_if_changed():
+            return
+        self._slash_registry = None
+        if self.is_bound and self.profile is not None:
+            self._activate_profile_runtime(self.profile.name())
 
     def _maybe_auto_route_profile(self, user_prompt: str) -> RouteDecision | None:
         if (
@@ -683,6 +700,8 @@ class InteractiveSession:
         self._active_profile_name = profile.name()
         self.profile = profile
         self.agent = slot.agent
+        if self.mcp_manager is not None:
+            self.agent.set_mcp_catalog(self.mcp_manager.catalog_prompt())
         self.conversation = slot.conversation
         # Profile presets (e.g. review's no-workspace-writes) live on the
         # policy, so switching profiles must re-apply the preset immediately.
@@ -759,6 +778,11 @@ class InteractiveSession:
         resolved_for_model = self._externalize_large_mentions(resolved)
         prompt_with_mentions = _format_turn_with_mentions(prompt_for_model, resolved_for_model)
         if turn_instruction:
+            turn_instruction = self._externalize_large_turn_text(
+                "turn-instruction",
+                turn_instruction,
+                intro="The turn instruction was too large to inline.",
+            )
             prompt_with_mentions = f"{turn_instruction}\n\nUser request:\n{prompt_with_mentions}"
         task = self.format_task(prompt_with_mentions)
         model_content = build_model_content(
@@ -1285,6 +1309,7 @@ class InteractiveSession:
         if self.tool_context is not None:
             self.tool_context.tool_registry = self.tool_registry
         self._refresh_agent_tool_schemas()
+        self._refresh_mcp_catalog()
         if self.event_bus is not None:
             self.event_bus.emit(
                 "mcp_reloaded",
@@ -1297,13 +1322,79 @@ class InteractiveSession:
         """Reconnect one configured MCP server and refresh active tool schemas."""
         self._ensure_mcp_tools_loaded()
         result = self.mcp_manager.reload_server(server_name)
-        if self.tool_registry is not None:
+        self._rebuild_mcp_state()
+        return result
+
+    def register_mcp_server(
+        self,
+        *,
+        name: str,
+        url: str | None = None,
+        command: str | None = None,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        headers: dict[str, str] | None = None,
+        permission: str | None = None,
+        title: str = "",
+        description: str = "",
+    ) -> str:
+        """Register one MCP server, connect it, and generate a missing description."""
+        self._ensure_mcp_tools_loaded()
+        server = build_server_config(
+            name=name,
+            url=url,
+            command=command,
+            args=args,
+            env=env,
+            cwd=cwd,
+            headers=headers,
+            permission=permission,
+            title=title,
+            description=description,
+        )
+        registration = self.mcp_manager.register_server(server)
+        self._rebuild_mcp_state()
+        verb = "已更新" if registration.replaced else "已注册"
+        if registration.state == "connected":
+            lines = [f"MCP 服务{verb}：{name}（{registration.tool_count} 个工具，权限 {server.permission}）"]
+            if not registration.server.description:
+                try:
+                    lines.append(self.mcp_manager.generate_server_description(name))
+                except McpConfigError as exc:
+                    lines.append(str(exc))
+                else:
+                    self._refresh_mcp_catalog()
+            return "\n".join(lines)
+        lines = [
+            f"MCP 服务{verb}但连接失败：{name}",
+            registration.error or "未知错误",
+            "记录已保存；修复配置后可重新连接并生成描述",
+        ]
+        return "\n".join(lines)
+
+    def remove_mcp_server(self, server_name: str) -> str:
+        """Remove one registered MCP server and refresh active tool schemas."""
+        self._ensure_mcp_tools_loaded()
+        result = self.mcp_manager.remove_server(server_name)
+        self._rebuild_mcp_state()
+        return result
+
+    def refresh_mcp_server_description(self, server_name: str, *, refresh: bool = True) -> str:
+        """Regenerate one server description from its current tool catalog."""
+        self._ensure_mcp_tools_loaded()
+        result = self.mcp_manager.generate_server_description(server_name, refresh=refresh)
+        self._refresh_mcp_catalog()
+        return result
+
+    def _rebuild_mcp_state(self) -> None:
+        if self.tool_registry is not None and self.mcp_manager is not None:
             self.tool_registry = BUILTIN_TOOL_REGISTRY.copy()
             self.mcp_manager.register_tools(self.tool_registry)
         if self.tool_context is not None:
             self.tool_context.tool_registry = self.tool_registry
         self._refresh_agent_tool_schemas()
-        return result
+        self._refresh_mcp_catalog()
 
     def toggle_mcp_server(self, server_name: str) -> str:
         """Toggle one MCP config entry and rebuild the active manager."""
