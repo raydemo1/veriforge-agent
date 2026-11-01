@@ -54,6 +54,13 @@ eval/report_resume.md
 tmp/
 temp/
 docs/
+VeriForge-Wiki.pdf
+
+# Local evaluation probes and real-model experiment scripts
+eval/scripts/deepseek_tool_api_probe.py
+eval/scripts/run_with_ab_model.py
+tests/test_eval_model_profile.py
+tests/test_skill_model_behavior.py
 
 # Local/editor state
 .idea/
