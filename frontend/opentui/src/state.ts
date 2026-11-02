@@ -1,4 +1,4 @@
-import type { CommandItem, Interaction, Snapshot, TranscriptItem, UiEvent, WorkState } from "./protocol.ts";
+import type { CommandItem, Interaction, Snapshot, TranscriptItem, SessionEvent, UiEvent, WorkState, SessionDescriptor, AttachmentItem, PanelSpec } from "./protocol.ts";
 import { DEFAULT_COMMANDS, initialWorkState } from "./protocol.ts";
 import { formatUserError } from "./errors.ts";
 
@@ -6,12 +6,12 @@ export const initialSnapshot: Snapshot = {
   profile: "general", permissionMode: "workspace-write", model: "starting", reasoningEffort: "high", provider: "auto",
   contextPercent: 100, status: "starting", cwd: "工作区", inputMode: "text",
 };
-export type AppState = {
+export type SessionViewState = {
   snapshot: Snapshot; items: TranscriptItem[]; commands: CommandItem[];
   turnState: "idle" | "running" | "queued" | "cancelling" | "cancelled"; queueDepth: number; interaction: Interaction | null;
   work: WorkState;
 };
-export const initialState: AppState = {
+export const initialSessionState: SessionViewState = {
   snapshot: initialSnapshot,
   items: [{ id: "welcome", kind: "status", title: "VeriForge", body: "准备工作区…", state: "running" }],
   commands: DEFAULT_COMMANDS, turnState: "idle", queueDepth: 0, interaction: null,
@@ -30,7 +30,7 @@ const READY_HINT = "今天想造点什么？";
 // warm-up also finished, i.e. the whole startup is done.
 const READY_STATUSES = new Set(["ready", "external tools ready"]);
 
-export function reduceEvent(state: AppState, event: UiEvent): AppState {
+export function reduceSessionEvent(state: SessionViewState, event: SessionEvent): SessionViewState {
   if (event.type === "snapshot") return { ...state, snapshot: event.snapshot };
   if (event.type === "session_reset") return { ...state, snapshot: event.snapshot, items: event.items ?? [], turnState: "idle", queueDepth: 0, interaction: null, work: initialWorkState };
   if (event.type === "commands") return { ...state, commands: event.commands };
@@ -92,6 +92,58 @@ export function reduceEvent(state: AppState, event: UiEvent): AppState {
   return state;
 }
 
-export function withOptimisticUserMessage(state: AppState, text: string): AppState {
-  return { ...state, items: [...state.items, { id: `user-${Date.now()}`, kind: "user", title: "你", body: text }] };
+export type SessionUI = {
+  draft: string; attachments: AttachmentItem[]; workbenchOpen: boolean;
+  workbenchTab: "plan" | "tasks" | "agents" | "changes" | "checks" | "artifacts";
+  scrollTop: number | null; panel: PanelSpec | null;
+};
+export const initialSessionUI: SessionUI = {
+  draft: "", attachments: [], workbenchOpen: false, workbenchTab: "plan", scrollTop: null, panel: null,
+};
+export type SessionState = {
+  view: SessionViewState; ui: SessionUI; sequence: number; unreadCount: number;
+};
+export type AppState = {
+  activeSessionId: string | null; sessionOrder: string[];
+  descriptors: Record<string, SessionDescriptor>; sessions: Record<string, SessionState>;
+};
+export const initialState: AppState = { activeSessionId: null, sessionOrder: [], descriptors: {}, sessions: {} };
+export type AppAction = UiEvent | {
+  type: "session_ui"; sessionId: string; field: keyof SessionUI;
+  value: SessionUI[keyof SessionUI] | ((current: any) => any);
+} | { type: "local_event"; sessionId: string; event: SessionEvent };
+const emptySession = (): SessionState => ({ view: structuredClone(initialSessionState), ui: structuredClone(initialSessionUI), sequence: 0, unreadCount: 0 });
+export function reduceEvent(state: AppState, action: AppAction): AppState {
+  if (action.type === "sessions") {
+    const sessions = { ...state.sessions };
+    for (const descriptor of action.sessions) sessions[descriptor.id] ??= emptySession();
+    if (action.activeSessionId && sessions[action.activeSessionId])
+      sessions[action.activeSessionId] = { ...sessions[action.activeSessionId]!, unreadCount: 0 };
+    return { ...state, sessions, activeSessionId: action.activeSessionId,
+      sessionOrder: action.sessions.filter((s) => s.visible).map((s) => s.id),
+      descriptors: Object.fromEntries(action.sessions.map((s) => [s.id, s])) };
+  }
+  if (!("sessionId" in action)) return state;
+  const sessionId = action.sessionId;
+  const session = state.sessions[sessionId] ?? emptySession();
+  let updated: SessionState;
+  if (action.type === "session_ui") {
+    const value = typeof action.value === "function" ? action.value(session.ui[action.field]) : action.value;
+    updated = { ...session, ui: { ...session.ui, [action.field]: value } };
+  } else if (action.type === "local_event") {
+    updated = { ...session, view: reduceSessionEvent(session.view, action.event) };
+  } else if (action.type === "session_view") {
+    if (action.view.sequence < session.sequence) return state;
+    updated = { ...session, sequence: action.view.sequence,
+      view: { ...session.view, ...action.view, snapshot: { ...initialSnapshot, ...action.view.snapshot }, work: { ...initialWorkState, ...action.view.work } } };
+  } else {
+    if (action.sequence <= session.sequence) return state;
+    const unread = state.activeSessionId !== sessionId &&
+      (action.type === "interaction" || (action.type === "turn_state" && action.state === "idle"));
+    updated = { ...session, sequence: action.sequence, view: reduceSessionEvent(session.view, action),
+      unreadCount: session.unreadCount + (unread ? 1 : 0),
+      ui: action.type === "panel" ? { ...session.ui, panel: action.panel }
+        : action.type === "interaction" ? { ...session.ui, panel: null } : session.ui };
+  }
+  return { ...state, sessions: { ...state.sessions, [sessionId]: updated } };
 }

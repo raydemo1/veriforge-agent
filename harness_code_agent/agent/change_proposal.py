@@ -188,9 +188,12 @@ class ChangeProposalStore:
         merged: dict[str, str] = {}
         conflicts: dict[str, ConflictFile] = {}
         observed: dict[str, str | None] = {}
+        expected = {}
         for entry in proposal.entries:
             current_path = workspace.resolve(entry.path)
-            current_content = current_path.read_text(encoding="utf-8") if current_path.exists() else None
+            data = current_path.read_bytes() if current_path.exists() else None
+            expected[entry.path] = data
+            current_content = data.decode("utf-8").replace("\r\n", "\n") if data is not None else None
             current_hash = _sha_text(current_content) if current_content is not None else None
             observed[entry.path] = current_hash
             result, conflict = _merge_entry(entry, current_content)
@@ -216,7 +219,7 @@ class ChangeProposalStore:
                 "conflict_paths": sorted(conflicts),
                 "message": "No workspace files were changed.",
             }
-        results = workspace.write_text_batch(merged)
+        results = workspace.write_text_batch(merged, expected=expected)
         proposal.status = "applied"
         return _applied_payload(proposal.id, results, merged, workspace.root)
 
@@ -267,9 +270,12 @@ class ChangeProposalStore:
             missing = sorted(expected_paths - supplied_paths)
             extra = sorted(supplied_paths - expected_paths)
             raise ValueError(f"resolutions must exactly match conflict paths; missing={missing}, extra={extra}")
+        expected = {}
         for path, expected_hash in conflict_set.observed_hashes.items():
             current_path = workspace.resolve(path)
-            current = current_path.read_text(encoding="utf-8") if current_path.exists() else None
+            data = current_path.read_bytes() if current_path.exists() else None
+            expected[path] = data
+            current = data.decode("utf-8").replace("\r\n", "\n") if data is not None else None
             current_hash = _sha_text(current) if current is not None else None
             if current_hash != expected_hash:
                 conflict_set.status = "stale"
@@ -277,7 +283,7 @@ class ChangeProposalStore:
                 raise ValueError(f"workspace changed after conflict creation: {path}")
         changes = dict(conflict_set.merged_changes)
         changes.update({str(path): str(content) for path, content in resolutions.items()})
-        results = workspace.write_text_batch(changes)
+        results = workspace.write_text_batch(changes, expected=expected)
         conflict_set.status = "resolved"
         proposal = self.get(conflict_set.proposal_id)
         proposal.status = "applied"

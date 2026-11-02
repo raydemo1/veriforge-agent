@@ -72,8 +72,6 @@ def format_session_summary(
     ]
     if metadata.get("forked_from"):
         lines.append(f"forked_from: {metadata.get('forked_from')}")
-    if metadata.get("resumed_from"):
-        lines.append(f"resumed_from: {metadata.get('resumed_from')}")
 
     lines.extend([
         f"events: {len(events)}",

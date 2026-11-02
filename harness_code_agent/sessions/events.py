@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -526,6 +527,7 @@ class EventBus:
         self.listener = listener
         self.events: list[SessionEvent] = []
         self._sequence = 0
+        self._lock = threading.RLock()
         if self.events_path is not None:
             self.events_path.parent.mkdir(parents=True, exist_ok=True)
             if self.events_path.exists():
@@ -541,25 +543,26 @@ class EventBus:
         agent: str | None = None,
         payload: dict[str, Any] | None = None,
     ) -> SessionEvent:
-        self._sequence += 1
-        event = SessionEvent(
-            sequence=self._sequence,
-            timestamp=time.time(),
-            type=event_type,
-            agent=agent,
-            payload=payload or {},
-        )
-        self.events.append(event)
-        if self.events_path is not None:
-            with self.events_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
-        if self.listener is not None:
-            try:
-                self.listener(event)
-            except Exception as exc:
-                log.debug("EventBus listener error: %s", exc)
+        with self._lock:
+            self._sequence += 1
+            event = SessionEvent(
+                sequence=self._sequence,
+                timestamp=time.time(),
+                type=event_type,
+                agent=agent,
+                payload=payload or {},
+            )
+            self.events.append(event)
+            if self.events_path is not None:
+                with self.events_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+            if self.listener is not None:
+                try:
+                    self.listener(event)
+                except Exception as exc:
+                    log.debug("EventBus listener error: %s", exc)
 
-        return event
+            return event
 
     def emit_event(self, structured_event: StructuredEvent) -> SessionEvent:
         event = structured_event.to_event()

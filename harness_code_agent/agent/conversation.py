@@ -107,6 +107,10 @@ class Agent:
         self._conversations: weakref.WeakSet[AgentConversation] = weakref.WeakSet()
 
     @property
+    def model_selection(self):
+        return self.tool_context.model_selection if self.tool_context is not None else None
+
+    @property
     def stable_system_prompt(self) -> str:
         """Stable prefix plus the MCP server catalog (no tool schemas)."""
         if self.mcp_catalog:
@@ -219,7 +223,7 @@ class AgentConversation:
         self.journal = None
         if session_id and session_id != "default":
             child_id = getattr(agent.tool_context, "agent_id", None)
-            session_root = self._workspace_root() / ".harness" / "sessions" / session_id
+            session_root = agent.tool_context.session_root or self._workspace_root() / ".harness" / "sessions" / session_id
             if child_id:
                 session_root = session_root / "agents" / child_id
             self.journal = SessionJournal(
@@ -279,7 +283,7 @@ class AgentConversation:
         return self.history.snapshot()
 
     def _request_contract(self) -> dict:
-        profile = config.resolve_model_profile(self.agent.model_intensity or config.MODEL_INTENSITY)
+        profile = config.resolve_model_profile(self.agent.model_intensity or config.MODEL_INTENSITY, self.agent.model_selection)
         return {
             "profile": self.agent.name, "provider": profile.provider, "model": profile.model,
             "thinking": profile.thinking, "reasoning_effort": profile.reasoning_effort,
@@ -420,7 +424,10 @@ class AgentConversation:
         previous_messages = self.messages
         sequence = self.history.append({"role": "user", "content": task}, journal=self.journal,
                                        metadata={"kind": "user_input", "turn_id": turn_id})
+        self.runtime_state.workspace_conflict_attempts.clear()
         self.runtime_state.turn_id = turn_id
+        if self.agent.tool_context is not None:
+            self.agent.tool_context.workspace.turn_id = turn_id
         self.runtime_state.current_user_task = logical_task
         self.runtime_state.observation_sequence = sequence
         self.runtime_state.pending_budget_warnings.clear()
@@ -963,7 +970,7 @@ class AgentConversation:
             self._flush_runtime_events()
             tool_schemas = _tool_schemas_for_agent(agent)
             accounting_messages = self.messages
-            profile = config.resolve_model_profile(agent.model_intensity or config.MODEL_INTENSITY)
+            profile = config.resolve_model_profile(agent.model_intensity or config.MODEL_INTENSITY, agent.model_selection)
             if profile.provider != "deepseek":
                 for message in accounting_messages:
                     message.pop("reasoning_content", None)
@@ -989,7 +996,7 @@ class AgentConversation:
 
             # --- Build prompt and LLM call ---
             prompt_messages = self._build_prompt()
-            profile = config.resolve_model_profile(agent.model_intensity or config.MODEL_INTENSITY)
+            profile = config.resolve_model_profile(agent.model_intensity or config.MODEL_INTENSITY, agent.model_selection)
             if isinstance(self.provider, ProviderAdapter):
                 self.provider = ProviderAdapter(profile.provider)
             self._active_model = profile.model

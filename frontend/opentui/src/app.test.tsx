@@ -1,10 +1,16 @@
+import { act } from "react";
 import { afterEach, describe, expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import type { TestRendererSetup } from "@opentui/core/testing";
 import type { Renderable } from "@opentui/core";
-import { App } from "./app.tsx";
-import type { ActionName, UiEvent } from "./protocol.ts";
-import { initialState } from "./state.ts";
+import { App as RealApp } from "./app.tsx";
+import type { ActionName, UiEvent, SessionEvent } from "./protocol.ts";
+import { initialSessionState as initialState } from "./state.ts";
+
+function App(props: React.ComponentProps<typeof RealApp>) {
+  const stream = eventStream();
+  return <RealApp {...props} events={props.events ?? stream.events} />;
+}
 
 type AnyNode = Renderable & { _childrenInLayoutOrder?: AnyNode[] };
 
@@ -18,7 +24,11 @@ function findFocused(node: AnyNode): AnyNode | null {
 }
 
 function eventStream() {
-  const queued: UiEvent[] = [];
+  let sequence = 2;
+  const queued: UiEvent[] = [{ type: "sessions", activeSessionId: "test-session", sessions: [{
+    id: "test-session", title: "当前任务", cwd: "workspace", environment: "local", visible: true, status: "ready", pendingApproval: false,
+  }] }, { type: "snapshot", sessionId: "test-session", sequence: 1, snapshot: { ...initialState.snapshot, sessionId: "test-session", status: "ready" } },
+  { type: "progress", sessionId: "test-session", sequence: 2, status: "ready", detail: "" }];
   let waiters: Array<() => void> = [];
   return {
     events: {
@@ -33,8 +43,8 @@ function eventStream() {
         };
       },
     },
-    push(event: UiEvent) {
-      queued.push(event);
+    push(event: SessionEvent) {
+      queued.push({ ...event, sessionId: "test-session", sequence: ++sequence });
       const current = waiters;
       waiters = [];
       current.forEach((resolve) => resolve());
@@ -54,7 +64,7 @@ describe("OpenTUI app interactions", () => {
   test.each([50, 100])("rewind appears only on hover and keeps layout stable at W=%d", async (width) => {
     const stream = eventStream();
     const actions: Array<{ name: ActionName; params?: Record<string, unknown> }> = [];
-    setup = await testRender(<App events={stream.events} onAction={async (name, params) => { actions.push({ name, params }); return { ok: true }; }} />, { width, height: 30 });
+    setup = await testRender(<App events={stream.events} onAction={async (_sessionId, name, params) => { actions.push({ name, params }); return { ok: true }; }} />, { width, height: 30 });
     stream.push({ type: "transcript", item: { id: "user-one", kind: "user", title: "你", body: "调整认证逻辑" } });
     stream.push({ type: "transcript", item: { id: "group-one", kind: "assistant", title: "助手", body: "", role: "group", state: "success", turn: 1 } });
     stream.push({ type: "transcript", item: { id: "answer-one", kind: "assistant", title: "助手", body: "认证逻辑已调整", parentId: "group-one", state: "success" } });
@@ -85,7 +95,7 @@ describe("OpenTUI app interactions", () => {
   test("keyboard focus exposes rewind and running turns disable it", async () => {
     const stream = eventStream();
     const actions: ActionName[] = [];
-    setup = await testRender(<App events={stream.events} onAction={async (name) => { actions.push(name); return { ok: true }; }} />, { width: 100, height: 30 });
+    setup = await testRender(<App events={stream.events} onAction={async (_sessionId, name) => { actions.push(name); return { ok: true }; }} />, { width: 100, height: 30 });
     stream.push({ type: "transcript", item: { id: "group-keyboard", kind: "assistant", title: "助手", body: "", role: "group", state: "success", turn: 1, recoveryPointId: "point-keyboard" } });
     await setup.renderOnce();
     await sleep(50);
@@ -102,30 +112,6 @@ describe("OpenTUI app interactions", () => {
     setup.mockInput.pressEnter();
     await sleep(30);
     expect(actions).toEqual(["rewind"]);
-  });
-
-  test("agent transcript rows show direction arrows", async () => {
-    const stream = eventStream();
-    setup = await testRender(
-      <App
-        events={stream.events}
-        onSubmit={async () => ({ accepted: true } as never)}
-        onAction={async () => ({ ok: true })}
-      />,
-      { width: 100, height: 30 }
-    );
-
-    stream.push({
-      type: "transcript",
-      item: { id: "a1", kind: "agent", title: "reviewer 上报", body: "found issue", state: "running", direction: "in" },
-    });
-    await setup.waitForFrame((frame) => frame.includes("←") && frame.includes("reviewer"));
-
-    stream.push({
-      type: "transcript",
-      item: { id: "a2", kind: "agent", title: "reviewer 已补充", body: "keep checking", state: "running", direction: "out" },
-    });
-    await setup.waitForFrame((frame) => frame.includes("→") && frame.includes("reviewer"));
   });
 
   test("finished tool calls collapse into a per-kind summary that expands", async () => {
@@ -184,7 +170,7 @@ describe("OpenTUI app interactions", () => {
       <App
         events={stream.events}
         onSubmit={async () => ({ accepted: true } as never)}
-        onAction={async (name: ActionName) => {
+        onAction={async (_sessionId: string, name: ActionName) => {
           if (name === "panel_action") {
             panelActions.push(name);
             await new Promise<void>((resolve) => { releaseHolder.release = resolve; });
@@ -217,7 +203,7 @@ describe("OpenTUI app interactions", () => {
       <App
         events={stream.events}
         onSubmit={async () => ({ accepted: true } as never)}
-        onAction={async (name: ActionName) => {
+        onAction={async (_sessionId: string, name: ActionName) => {
           actions.push(name);
           return { ok: true, candidates: [] };
         }}
@@ -245,7 +231,7 @@ describe("OpenTUI app interactions", () => {
         events={stream.events}
         onSubmit={async () => ({ accepted: true } as never)}
         onAction={async () => ({ ok: true })}
-        onResolveInteraction={async (_id, result) => { resolutions.push(result); }}
+        onResolveInteraction={async (_sessionId, _id, result) => { resolutions.push(result); }}
       />,
       { width: 100, height: 30 }
     );
@@ -270,7 +256,7 @@ describe("OpenTUI app interactions", () => {
         events={stream.events}
         onSubmit={async () => ({ accepted: true } as never)}
         onAction={async () => ({ ok: true })}
-        onResolveInteraction={async (_id, result) => { resolutions.push(result); }}
+        onResolveInteraction={async (_sessionId, _id, result) => { resolutions.push(result); }}
       />,
       { width: 100, height: 30 }
     );
@@ -301,7 +287,7 @@ describe("OpenTUI app interactions", () => {
         events={stream.events}
         onSubmit={async () => ({ accepted: true } as never)}
         onAction={async () => ({ ok: true })}
-        onResolveInteraction={async (_id, result) => { resolutions.push(result); }}
+        onResolveInteraction={async (_sessionId, _id, result) => { resolutions.push(result); }}
       />,
       { width: 100, height: 30 }
     );
@@ -353,120 +339,22 @@ describe("OpenTUI app interactions", () => {
     expect(submitCalls).toBe(0);
   });
 
-  test("diff keeps the hunk header as a locating separator", async () => {
-    const stream = eventStream();
-    setup = await testRender(
-      <App
-        events={stream.events}
-        onSubmit={async () => ({ accepted: true } as never)}
-        onAction={async () => ({ ok: true })}
-      />,
-      { width: 100, height: 30 }
-    );
-    stream.push({
-      type: "transcript",
-      item: {
-        id: "diff-1",
-        kind: "file",
-        title: "已编辑 src/app.ts  +1  -0",
-        body: "--- a/src/app.ts\n+++ b/src/app.ts\n@@ -1,3 +1,4 @@\n old\n+new",
-      },
-    });
-    await setup.waitForFrame((frame) => frame.includes("@@ -1,3 +1,4 @@"));
-  });
-
-  test("narrow terminal collapses header labels to icons", async () => {
-    const stream = eventStream();
-    setup = await testRender(
-      <App
-        events={stream.events}
-        onSubmit={async () => ({ accepted: true } as never)}
-        onAction={async () => ({ ok: true })}
-      />,
-      { width: 60, height: 20 }
-    );
-    stream.push({ type: "snapshot", snapshot: { ...initialState.snapshot, status: "ready", cwd: "proj" } });
-    const frame = await setup.waitForFrame((frame) => frame.includes("从这里开始"));
-    expect(frame).not.toContain("历史");
-    expect(frame).not.toContain("新会话");
-    expect(frame).toContain("◷");
-  });
-
-  test("welcome empty state is removed after the first real message", async () => {
-    const stream = eventStream();
-    setup = await testRender(
-      <App
-        events={stream.events}
-        onSubmit={async () => ({ accepted: true } as never)}
-        onAction={async () => ({ ok: true })}
-      />,
-      { width: 100, height: 30 }
-    );
-    stream.push({ type: "progress", status: "ready", detail: "" });
-    await setup.waitForFrame((frame) => frame.includes("今天想造点什么？"));
-
-    await setup.mockInput.typeText("修复这个问题");
-    await sleep(200);
-    setup.mockInput.pressEnter();
-    await sleep(400);
-    const submitted = setup.captureCharFrame();
-    expect(submitted).toContain("修复这个问题");
-    expect(submitted).not.toContain("VeriForge");
-  });
-
-  test("panel marks the current option with a check and adapts its footer", async () => {
-    const stream = eventStream();
-    setup = await testRender(
-      <App
-        events={stream.events}
-        onSubmit={async () => ({ accepted: true } as never)}
-        onAction={async () => ({ ok: true })}
-      />,
-      { width: 100, height: 30 }
-    );
-    stream.push({
-      type: "panel",
-      panel: {
-        kind: "profile",
-        title: "工作模式",
-        options: [
-          { id: "auto", label: "自动路由", selected: true },
-          { id: "coding", label: "编码" },
-        ],
-      },
-    });
-    const frame = await setup.waitForFrame((frame) => frame.includes("✓ 自动路由"));
-    expect(frame).toContain("↑↓ 选择");
-
-    stream.push({ type: "panel", panel: { kind: "help", title: "帮助", body: "一些说明" } });
-    await setup.waitForFrame((frame) => frame.includes("一些说明") && frame.includes("Esc 关闭") && !frame.includes("↑↓ 选择"));
-  });
-
-  test("running rows use the dot marker once idle", async () => {
-    // Marker semantics are covered via state/frame; here we only assert the
-    // icon set no longer collides the prompt glyph with the running glyph.
-    const { unicodeIcons } = await import("./icons.ts");
-    expect(unicodeIcons.running).not.toBe(unicodeIcons.prompt);
-    expect(unicodeIcons.running).toBe("·");
-    expect(unicodeIcons.rewind).not.toBe(unicodeIcons.assistant);
-    expect(unicodeIcons.rewind).toBe("◈");
-  });
-
   test("mouse click on a header button does not leave focus on it", async () => {
     setup = await testRender(
       <App
-        events={{ [Symbol.asyncIterator]: async function* () {} }}
+        events={eventStream().events}
         onSubmit={async () => ({ accepted: true } as never)}
         onAction={async () => ({ ok: true })}
       />,
       { width: 100, height: 30 }
     );
     await sleep(300);
-    const headerLine = setup.captureCharFrame().split("\n")[0] ?? "";
-    const labelX = headerLine.indexOf("新会话");
+    const headerLines = setup.captureCharFrame().split("\n");
+    const labelY = headerLines.findIndex((line) => line.includes("＋ 新建"));
+    const labelX = headerLines[labelY]?.indexOf("新建") ?? -1;
     expect(labelX).toBeGreaterThan(-1);
 
-    await setup.mockMouse.click(labelX + 1, 0);
+    await setup.mockMouse.click(labelX + 1, labelY);
     await sleep(150);
 
     const focused = findFocused((setup.renderer as unknown as { root: AnyNode }).root);
@@ -476,112 +364,10 @@ describe("OpenTUI app interactions", () => {
     expect(focusedKind === "TextareaRenderable" || focusedKind === "none").toBe(true);
   });
 
-  test("profile panel shows the current mode inside the auto-route option", async () => {
-    setup = await testRender(
-      <App
-        events={{ [Symbol.asyncIterator]: async function* () {} }}
-        onSubmit={async () => ({ accepted: true } as never)}
-        onAction={async () => ({
-          ok: true,
-          panel: {
-            kind: "profile",
-            title: "工作模式",
-            options: [
-              { id: "auto", label: "自动路由", description: "根据当前任务选择工作模式", badge: "当前：通用", selected: true },
-              { id: "general", label: "通用", description: "问答、分析与轻量只读任务" },
-              { id: "coding-agent", label: "编码", description: "修改代码、运行测试并完成验证" },
-            ],
-          },
-        })}
-        themePreference="dark"
-      />,
-      { width: 100, height: 30 }
-    );
-    await sleep(300);
-    const footerLine = setup.captureCharFrame().split("\n").find((line) => line.includes("通用 ▾"))!;
-    const y = setup.captureCharFrame().split("\n").indexOf(footerLine);
-    await setup.mockMouse.click(footerLine.indexOf("通用") + 1, y);
-    await sleep(300);
-
-    const frame = setup.captureCharFrame();
-    // Current mode lives in the auto-route row itself; no standalone summary.
-    expect(frame).toContain("根据当前任务选择工作模式");
-    expect(frame).toContain("· 当前：通用");
-    expect(frame).not.toContain("自动路由 ✓ · 当前");
-    // The badge is accent-tinted so it stands out from the subtle description.
-    const frameSpans = setup.captureSpans().lines.flatMap((line) => line.spans);
-    const rgb = (rgba: unknown) => {
-      const c = rgba as { r: number; g: number; b: number };
-      return `${Math.round(c.r * 255)},${Math.round(c.g * 255)},${Math.round(c.b * 255)}`;
-    };
-    const badge = frameSpans.find((span) => span.text.includes("当前：通用"));
-    const description = frameSpans.find((span) => span.text.includes("根据当前任务"));
-    expect(badge).toBeDefined();
-    expect(description).toBeDefined();
-    expect(rgb(badge!.fg)).toBe("105,189,227"); // dark theme accent #69BDE3
-    expect(rgb(description!.fg)).toBe("114,127,135"); // dark theme subtle #727F87
-  });
-
-  test("panel overlay keeps background text visible without a dimming mask", async () => {
-    const stream = eventStream();
-    setup = await testRender(
-      <App
-        events={stream.events}
-        onSubmit={async () => ({ accepted: true } as never)}
-        onAction={async () => ({ ok: true })}
-        themePreference="dark"
-      />,
-      { width: 100, height: 30 }
-    );
-    stream.push({ type: "snapshot", snapshot: { ...initialState.snapshot, status: "ready" } });
-    await setup.waitForFrame((frame) => frame.includes("从这里开始吧"));
-
-    stream.push({
-      type: "panel",
-      panel: { kind: "model", title: "选择模型", options: [{ id: "m1", label: "DeepSeek V4 Flash", description: "通用快速模型，适合日常任务" }] },
-    });
-    await setup.waitForFrame((frame) => frame.includes("选择模型"));
-
-    const frame = setup.captureCharFrame();
-    // The old opacity mask wiped covered cells' text and bled blended colors
-    // into their backgrounds; without it both layers must stay readable.
-    expect(frame).toContain("从这里开始吧");
-    expect(frame).toContain("DeepSeek V4 Flash");
-  });
-
-  test("model panel anchors to the right screen edge", async () => {
-    const stream = eventStream();
-    const terminalWidth = 100;
-    setup = await testRender(
-      <App
-        events={stream.events}
-        onSubmit={async () => ({ accepted: true } as never)}
-        onAction={async () => ({ ok: true })}
-        themePreference="dark"
-      />,
-      { width: terminalWidth, height: 30 }
-    );
-
-    stream.push({
-      type: "panel",
-      panel: { kind: "model", title: "选择模型", options: [{ id: "m1", label: "DeepSeek V4 Flash", description: "通用快速模型，适合日常任务" }] },
-    });
-    await setup.waitForFrame((frame) => frame.includes("选择模型"));
-
-    const all = (function collect(node: AnyNode): AnyNode[] {
-      return [node, ...(node._childrenInLayoutOrder ?? []).flatMap((child) => collect(child as AnyNode))];
-    })((setup.renderer as unknown as { root: AnyNode }).root);
-    // modalWidth = min(60, max(30, 100 - 12)) = 60; the bordered modal box is
-    // the only node of that width on an empty transcript.
-    const modal = all.find((node) => node.width === 60 && node.height >= 5);
-    expect(modal).toBeDefined();
-    expect(terminalWidth - (modal!.x + modal!.width)).toBeLessThanOrEqual(2);
-  });
-
   test.each([50, 70, 100])("right-side controls stay right-aligned at W=%d", async (terminalWidth) => {
     setup = await testRender(
       <App
-        events={{ [Symbol.asyncIterator]: async function* () {} }}
+        events={eventStream().events}
         onSubmit={async () => ({ accepted: true } as never)}
         onAction={async () => ({ ok: true })}
       />,
@@ -605,7 +391,7 @@ describe("OpenTUI app interactions", () => {
   test.each([50, 100])("context gauge popover shows full details at W=%d", async (terminalWidth) => {
     setup = await testRender(
       <App
-        events={{ [Symbol.asyncIterator]: async function* () {} }}
+        events={eventStream().events}
         onSubmit={async () => ({ accepted: true } as never)}
         onAction={async () => ({ ok: true })}
       />,

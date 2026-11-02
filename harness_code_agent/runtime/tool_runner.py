@@ -1,6 +1,8 @@
 """Tool execution and event finalization."""
 from __future__ import annotations
 
+from ..workspace.access import WorkspaceConflict
+
 import inspect
 from collections.abc import Callable
 from typing import Any
@@ -116,7 +118,7 @@ def execute_tool_result(
             status="failed",
             output=f"[error] {error}",
             error=error,
-            metadata={"status_source": "exception"},
+            metadata={"status_source": "workspace_conflict" if isinstance(e, WorkspaceConflict) else "exception"},
         )
     else:
         tool_result = _coerce_tool_result(name, result)

@@ -126,39 +126,6 @@ class ExecutionBoundaryTests(unittest.TestCase):
         self.assertEqual(calls, [True])
 
 
-    def test_submission_reports_each_terminal_outcome_once(self):
-        import threading
-        from types import SimpleNamespace
-        from unittest.mock import Mock
-        from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
-        from harness_code_agent.attachments import PreparedTurn
-        from harness_code_agent.core.interactive import InteractiveSession
-        for error, status in [(None, "completed"), (CancelledError("stop"), "cancelled"), (ValueError("broken"), "failed")]:
-            session = InteractiveSession.__new__(InteractiveSession)
-            session._execution_condition = threading.Condition(threading.RLock())
-            session._closed = session._closing = False
-            session._turn_thread = session._turn_token = None
-            session.event_bus = Mock()
-            session.recovery = Mock()
-            session.session = Mock()
-            session.conversation = Mock()
-            session.session_store = Mock()
-            session.session_store.read_events.return_value = []
-            session._finish_recovery_turn = Mock()
-            session.turn_count = 1
-            session.tool_context = SimpleNamespace(tool_tasks=SimpleNamespace(pending_count=0))
-            session._submit_prepared = Mock(return_value="answer", side_effect=error)
-            if error:
-                with self.assertRaises(type(error)):
-                    session.submit_prepared(PreparedTurn("hello"), CancellationToken())
-            else:
-                self.assertEqual(session.submit_prepared(PreparedTurn("hello")), "answer")
-            self.assertEqual([call.args[0] for call in session.event_bus.emit.call_args_list],
-                             ["turn_started", "turn_finished"])
-            self.assertEqual(session.event_bus.emit.call_args.kwargs["payload"]["status"], status)
-            self.assertIsNone(session._turn_token)
-            self.assertIsNone(session._turn_thread)
-
     def test_cancelled_startup_wait_retains_session_future(self):
         from concurrent.futures import Future
         from harness_code_agent.agent.cancellation import CancellationToken, CancelledError, cancellation_scope

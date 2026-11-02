@@ -387,6 +387,10 @@ def test_fork_resume_restores_structured_reference_and_detects_damage(tmp_path):
     recovered = None
     try:
         observation = record_large_result(original)
+        from harness_code_agent.runtime.recovery import atomic_json
+        metadata = sessions.read_metadata(source.id)
+        metadata["history_boundary"] = dict(turn=1, journal_sequence=original.journal.sequence, event_count=0, change_cursor=0)
+        atomic_json(source.metadata_path, metadata)
         branch = sessions.fork(source.id)
         context = make_context(tmp_path, branch.id)
         recovered = make_conversation(context)

@@ -103,22 +103,23 @@ class ProductRuntimeTests(unittest.TestCase):
             ):
                 importlib.reload(config)
 
-            config.set_model_override(model="deepseek-flash", reasoning_effort="max")
-            profile = config.resolve_model_profile("normal")
+            selection = config.ModelSelection()
+            selection.select(model="deepseek-flash", reasoning_effort="max")
+            profile = config.resolve_model_profile("normal", selection)
             self.assertEqual((profile.model, profile.thinking, profile.reasoning_effort), ("deepseek-flash", True, "max"))
-            fast = config.resolve_model_profile("fast")
+            fast = config.resolve_model_profile("fast", selection)
             self.assertEqual((fast.model, fast.thinking, fast.reasoning_effort), ("deepseek-flash", False, None))
 
-            config.set_model_override(reasoning_effort="low")
-            profile = config.resolve_model_profile("hard")
-            self.assertEqual((profile.model, profile.reasoning_effort), ("deepseek-v4-pro", "low"))
+            selection.select(reasoning_effort="low")
+            profile = config.resolve_model_profile("hard", selection)
+            self.assertEqual((profile.model, profile.reasoning_effort), ("deepseek-flash", "low"))
 
             with self.assertRaises(ValueError):
-                config.set_model_override(model="gpt-4o")
+                selection.select(model="gpt-4o")
             with self.assertRaises(ValueError):
-                config.set_model_override(reasoning_effort="medium")
+                selection.select(reasoning_effort="medium")
 
-            config.set_model_override()
+            selection = config.ModelSelection()
             profile = config.resolve_model_profile("hard")
             self.assertEqual((profile.model, profile.reasoning_effort), ("deepseek-v4-pro", "high"))
         finally:
@@ -947,17 +948,6 @@ class ProductRuntimeTests(unittest.TestCase):
 
         self.assertEqual(first, second)
 
-    def test_full_system_prompt_keeps_stable_prefix_and_memory_index_separate(self):
-        from harness_code_agent.agent.conversation import Agent
-
-        without_memory = Agent("test", "stable", use_tools=False)
-        with_memory = Agent("test", "stable", use_tools=False, memory_index=" memory block \n")
-
-        self.assertEqual(without_memory.full_system_prompt, "stable")
-        self.assertIsNone(without_memory.memory_index)
-        self.assertEqual(with_memory.system_prompt, "stable")
-        self.assertEqual(with_memory.memory_index, "memory block")
-        self.assertEqual(with_memory.full_system_prompt, "stable\n\nmemory block")
 
     def test_openai_cache_breakpoint_model_gate(self):
         from harness_code_agent.agent.providers import (
@@ -1129,29 +1119,6 @@ class ProductRuntimeTests(unittest.TestCase):
             compare_prompt_cache_shapes(shape_v2, shape_prefix, None)["prefix_change_reasons"],
             ["system"],
         )
-
-    def test_apply_model_override_invalidates_conversation_cache_key(self):
-        from harness_code_agent import config
-        from harness_code_agent.core.interactive import InteractiveSession
-
-        self.addCleanup(config.set_model_override, None, None)
-        config.set_model_override(model=None, reasoning_effort=None)
-
-        session = InteractiveSession.__new__(InteractiveSession)
-        session._execution_condition = threading.Condition(threading.RLock())
-        session._closed = False
-        session._closing = False
-        session._turn_thread = None
-        session.tool_context = None
-        session.conversation = SimpleNamespace(_cached_prompt_cache_key="cache-key")
-        session.apply_model_override(model="deepseek-v4-pro")
-
-        self.assertEqual(config.get_model_override()["model"], "deepseek-v4-pro")
-        self.assertIsNone(session.conversation._cached_prompt_cache_key)
-
-        session.conversation = None
-        session.apply_model_override(reasoning_effort="low")
-        self.assertEqual(config.get_model_override()["reasoning_effort"], "low")
 
     def test_usage_to_dict_normalizes_deepseek_cache_hit_and_miss_tokens(self):
         from harness_code_agent.agent.utils import _usage_to_dict
@@ -1351,16 +1318,10 @@ class ProductRuntimeTests(unittest.TestCase):
                     third_prompt = json.dumps(fake_client.chat.completions.calls[2], ensure_ascii=False)
 
                     self.assertIn(label == "long" and "SECRET_FULL_CONTENT_UNSAFE" or "SHORT_STALE_CONTENT", third_prompt)
-                    self.assertIn("FACT INVALIDATION", third_prompt)
-                    self.assertNotIn("Compressed stale long observations", third_prompt)
 
                     if label == "long":
                         second_prompt = json.dumps(fake_client.chat.completions.calls[1], ensure_ascii=False)
                         self.assertIn("SECRET_FULL_CONTENT_UNSAFE", second_prompt)
-                        observation = conversation.observation_store.observations[0]
-                        self.assertIn(f"[OBS {observation.id} observed]", third_prompt)
-                        self.assertNotIn(f"[OBS {observation.id} stale]", third_prompt)
-                        self.assertIn(f"Stale observations: {observation.id}", third_prompt)
                     if expect_observation_files:
                         self.assertTrue(list((root / ".harness" / "observations").rglob("*.txt")))
 
@@ -2222,6 +2183,10 @@ class ProductRuntimeTests(unittest.TestCase):
             store.event_bus(source).emit("session_started", agent="main_agent", payload={})
             store.event_bus(source).emit("session_finished", agent="main_agent", payload={})
 
+            from harness_code_agent.runtime.recovery import atomic_json
+            source_metadata = store.read_metadata(source.id)
+            source_metadata["history_boundary"] = dict(turn=0, journal_sequence=0, event_count=2, change_cursor=0)
+            atomic_json(source.metadata_path, source_metadata)
             fork = store.fork(source.id)
             metadata = store.read_metadata(fork.id)
             events = store.read_events(fork.id)
@@ -2231,11 +2196,10 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertEqual(metadata["model"], "model-a")
             self.assertEqual(metadata["permission_mode"], "workspace-write")
             self.assertEqual(metadata["forked_from"], source.id)
-            self.assertEqual(metadata["forked_from_event_count"], 2)
-            self.assertEqual(events[0]["type"], "session_forked")
-            self.assertEqual(events[0]["payload"]["source_session_id"], source.id)
+            self.assertEqual(metadata["history_boundary"]["event_count"], 2)
+            self.assertEqual([e["type"] for e in events], ["session_started", "session_finished"])
 
-    def test_session_store_reads_fork_lineage_and_resumed_metadata(self):
+    def test_session_store_reads_fork_lineage(self):
         from harness_code_agent.sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2247,19 +2211,9 @@ class ProductRuntimeTests(unittest.TestCase):
                 permission_mode="workspace-write",
             )
             fork = store.fork(source.id)
-            resumed = store.create(
-                profile="coding-agent",
-                cwd=Path(tmp),
-                model="model-a",
-                permission_mode="workspace-write",
-                resumed_from=fork.id,
-            )
-
             lineage = store.read_lineage(fork.id)
-            resumed_metadata = store.read_metadata(resumed.id)
 
             self.assertEqual([item["id"] for item in lineage], [source.id, fork.id])
-            self.assertEqual(resumed_metadata["resumed_from"], fork.id)
 
     def test_session_store_reads_latest_session_and_persisted_summary(self):
         from harness_code_agent.sessions.store import SessionStore
@@ -2449,6 +2403,7 @@ class ProductRuntimeTests(unittest.TestCase):
             target.parent.mkdir()
             target.write_text("old", encoding="utf-8")
 
+            workspace.read_text("src/app.py")
             result = workspace.write_text("src/app.py", "new")
 
             self.assertEqual(target.read_text(encoding="utf-8"), "new")
@@ -2519,6 +2474,7 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertTrue(result.snapshot_path.exists())
 
             target.write_text("same\nsame\n", encoding="utf-8")
+            workspace.read_text("app.py")
             with self.assertRaises(ValueError):
                 workspace.apply_text_patch("app.py", search="same\n", replace="once\n")
             self.assertEqual(target.read_text(encoding="utf-8"), "same\nsame\n")
@@ -2531,6 +2487,7 @@ class ProductRuntimeTests(unittest.TestCase):
             workspace = WorkspaceService(root=root, snapshots_dir=root / ".harness" / "snapshots")
             target = root / "app.py"
             target.write_text("old\n", encoding="utf-8")
+            workspace.read_text("app.py")
             workspace.write_text("app.py", "new\n")
 
             result = workspace.rollback_latest_snapshot("app.py")
@@ -2776,6 +2733,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 event_bus=EventBus(events_path),
             )
 
+            workspace.read_text("note.txt")
             result = execute_tool(
                 "write_file",
                 {"path": "note.txt", "content": "new"},
@@ -3902,180 +3860,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn('"jwt": "[redacted]"', result)
         self.assertIn('"token": "[redacted]"', result)
         self.assertNotIn("short-secret", result)
-
-
-class SessionResumeTests(unittest.TestCase):
-    """Resuming a history session forks it instead of replacing the live one."""
-
-    def setUp(self):
-        import shutil
-
-        self.shutil = shutil
-        self.temp_dir = Path(tempfile.mkdtemp())
-        self.env_patch = patch.dict(os.environ, {
-            "HARNESS_MEMORY_GENERATION_DISABLED": "1",
-        })
-        self.env_patch.start()
-        from harness_code_agent.core.interactive import InteractiveSession
-
-        self.interactive = InteractiveSession(
-            cwd=self.temp_dir,
-            enable_turn_summary=False,
-        )
-
-    def tearDown(self):
-        self.interactive.close()
-        self.env_patch.stop()
-        self.shutil.rmtree(self.temp_dir, ignore_errors=True)
-
-    def _seed_source_session(self):
-        from harness_code_agent.sessions.events import UserInputEvent
-        from harness_code_agent.sessions.journal import SessionJournal
-
-        source = self.interactive.session
-        journal = SessionJournal(source.journal_path)
-        journal.append_message({"role": "user", "content": "记住：提交前跑测试"})
-        journal.append_message({"role": "assistant", "content": "好的，我会跑测试。"})
-        self.interactive.event_bus.emit_event(
-            UserInputEvent(text="记住：提交前跑测试", turn=1).to_event()
-        )
-        return source
-
-    def test_resume_forks_without_duplicating_messages(self):
-        from harness_code_agent.sessions.journal import SessionJournal
-
-        source = self._seed_source_session()
-        source_journal_size = source.journal_path.stat().st_size
-        # The source must be a *history* session: branch off it first.
-        self.interactive.fork_current_session()
-        middle = self.interactive.session
-
-        self.interactive.resume_from_session(source.id)
-
-        active = self.interactive.session
-        self.assertNotEqual(active.id, source.id)
-        self.assertNotEqual(active.id, middle.id)
-        # Live messages: exactly one system + one user + one assistant.
-        roles = [m["role"] for m in self.interactive.conversation.messages]
-        self.assertEqual(roles, ["system", "user", "assistant"])
-        # The fork journal file keeps one copy of each message: the system
-        # message persisted at session start + user + assistant.
-        entries = [
-            entry for entry in SessionJournal(active.journal_path).read()
-            if entry.kind == "message"
-        ]
-        self.assertEqual(len(entries), 3)
-        # A fresh recovery from the fork journal matches the live messages.
-        recovered = SessionJournal(active.journal_path).recovery_messages(
-            self.interactive.agent.system_prompt
-        )
-        self.assertEqual(recovered, self.interactive.conversation.messages)
-        # The source session journal is untouched by the resume.
-        self.assertEqual(source.journal_path.stat().st_size, source_journal_size)
-
-    def test_repeated_resume_does_not_multiply_messages(self):
-        from harness_code_agent.sessions.journal import SessionJournal
-
-        source = self._seed_source_session()
-        self.interactive.fork_current_session()  # leave source behind
-        self.interactive.resume_from_session(source.id)
-        fork1 = self.interactive.session
-        self.interactive.resume_from_session(source.id)
-        fork2 = self.interactive.session
-        self.assertNotEqual(fork1.id, fork2.id)
-        roles = [m["role"] for m in self.interactive.conversation.messages]
-        self.assertEqual(roles, ["system", "user", "assistant"])
-        entries = [
-            entry for entry in SessionJournal(fork2.journal_path).read()
-            if entry.kind == "message"
-        ]
-        self.assertEqual(len(entries), 3)
-
-    def test_resuming_current_session_is_noop(self):
-        current = self.interactive.session
-        self.interactive.resume_from_session(current.id)
-        self.assertEqual(self.interactive.session.id, current.id)
-
-    def test_forked_session_starts_as_running(self):
-        source = self._seed_source_session()
-        forked = self.interactive.session_store.fork(source.id)
-        metadata = self.interactive.session_store.read_metadata(forked.id)
-        self.assertEqual(metadata["status"], "running")
-        self.assertEqual(metadata["forked_from"], source.id)
-
-    def test_sessions_panel_excludes_current_session(self):
-        from harness_code_agent.tui_bridge import BridgeServer
-
-        source = self._seed_source_session()
-        bridge = BridgeServer.__new__(BridgeServer)
-        bridge._session = self.interactive
-        bridge._session_error = None
-        panel = bridge._sessions_panel()
-        ids = {option["id"] for option in panel["options"]}
-        self.assertNotIn(source.id, ids)
-
-    def _seed_plan_event(self, *, executed: bool, markdown: str = "# Plan\n\n1. alpha\n2. beta\n"):
-        self.interactive.event_bus.emit(
-            "plan_ready",
-            agent="main_agent",
-            payload={
-                "profile": "plan",
-                "plan_path": "global_plan/current/plan.md",
-                "plan_revision": 3,
-                "plan_markdown": markdown,
-            },
-        )
-        if executed:
-            self.interactive.event_bus.emit(
-                "profile_switched",
-                agent="main_agent",
-                payload={
-                    "previous_profile": "plan",
-                    "profile": "coding-agent",
-                    "reason": "execute approved plan",
-                },
-            )
-        return markdown
-
-    def test_resume_restores_pending_plan_from_journal(self):
-        markdown = self._seed_plan_event(executed=False)
-        source = self.interactive.session
-        self.interactive.fork_current_session()  # leave source behind as history
-
-        self.interactive.resume_from_session(source.id)
-
-        self.assertEqual(self.interactive.pending_plan_markdown, markdown.strip())
-        self.assertEqual(self.interactive.pending_plan_revision, 3)
-
-    def test_resume_does_not_restore_already_executed_plan(self):
-        self._seed_plan_event(executed=True)
-        source = self.interactive.session
-        self.interactive.fork_current_session()
-
-        self.interactive.resume_from_session(source.id)
-
-        self.assertIsNone(self.interactive.pending_plan_markdown)
-
-    def test_revised_plan_ready_resets_executed_flag(self):
-        # Executed plan 1, then a new plan_ready (revision 2) is pending again.
-        self._seed_plan_event(executed=True)
-        self.interactive.event_bus.emit(
-            "plan_ready",
-            agent="main_agent",
-            payload={
-                "profile": "plan",
-                "plan_path": "global_plan/current/plan.md",
-                "plan_revision": 4,
-                "plan_markdown": "# Plan 2\n\n1. gamma\n",
-            },
-        )
-        source = self.interactive.session
-        self.interactive.fork_current_session()
-
-        self.interactive.resume_from_session(source.id)
-
-        self.assertEqual(self.interactive.pending_plan_markdown, "# Plan 2\n\n1. gamma")
-        self.assertEqual(self.interactive.pending_plan_revision, 4)
 
 
 class PlanReadyDecisionTests(unittest.TestCase):

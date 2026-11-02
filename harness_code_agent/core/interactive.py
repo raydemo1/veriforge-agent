@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from functools import wraps
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -13,6 +12,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -119,13 +119,6 @@ class ProfileSwitchEvent:
     reason: str
 
 
-@dataclass
-class ProfileRuntime:
-    profile: BaseProfile
-    agent: object
-    conversation: AgentConversation
-
-
 def runtime_change(method):
     @wraps(method)
     def guarded(self, *args, **kwargs):
@@ -155,8 +148,15 @@ class InteractiveSession:
         profile_explicit: bool | None = None,
         enable_turn_summary: bool = True,
         startup_sink: Callable[[str], None] | None = None,
+        session_id: str | None = None,
+        state_root: str | Path | None = None,
+        environment: str = "local",
     ):
         self.cwd = Path(cwd).resolve()
+        self._requested_session_id = session_id
+        self.environment = environment
+        self.state_root = Path(state_root).resolve() if state_root else self.cwd / ".harness"
+        self.model_selection = config.ModelSelection()
         self.lifecycle = LifecycleScope()
         self._execution_condition = threading.Condition(threading.RLock())
         self._closing = False
@@ -188,8 +188,16 @@ class InteractiveSession:
             self.skill_registry = SkillRegistry()
             self._slash_registry = None
             self.last_command_result = None
-            self.session_store = SessionStore(self.cwd / ".harness")
+            self.session_store = SessionStore(self.state_root)
             self.session_store.root.mkdir(parents=True, exist_ok=True)
+            saved = None
+            if session_id and (self.session_store.sessions_dir / session_id / "session.json").exists():
+                saved = self.session_store.read_metadata(session_id)
+                profile_name = saved["profile"]
+                profile_explicit = saved["routing_mode"] == "pinned"
+                self.permission_mode = saved["permission_mode"]
+                self.approval_provider = self._approval_provider_for_mode(self.permission_mode)
+                self.model_selection.select(**saved.get("model_selection", {}))
             inferred_explicit = profile_name != PRODUCT_DEFAULT_PROFILE
             self.profile_explicit = inferred_explicit if profile_explicit is None else profile_explicit
             self.routing_mode = ROUTING_MODE_PINNED if self.profile_explicit else ROUTING_MODE_AUTO
@@ -207,8 +215,6 @@ class InteractiveSession:
             self._mcp_connection_revision = 0
             self.agent = None
             self.conversation: AgentConversation | None = None
-            self.profile_runtimes: dict[str, ProfileRuntime] = {}
-            self._active_profile_name: str | None = None
             self.turn_count = 0
             self.pending_plan_markdown: str | None = None
             self.pending_plan_revision = 0
@@ -223,6 +229,8 @@ class InteractiveSession:
             self.user_middlewares = load_user_middlewares()
             self._report_startup("connecting tools")
             self._bind_profile(self._pending_profile_name, source=self._profile_source)
+            if saved:
+                self._restore_history()
             if self.memory_auto_extract_enabled:
                 open_memory_session(self.cwd, self.session.id, self.session.journal_path)
             self._report_startup("ready")
@@ -257,14 +265,15 @@ class InteractiveSession:
     def display_routing_mode(self) -> str:
         return self.routing_mode
 
-    def _build_agent(self, profile: BaseProfile):
+    def _build_agent(self, profile: BaseProfile, tool_context=None):
         from ..agent.conversation import Agent
 
-        if self.tool_context is None:
+        context = tool_context or self.tool_context
+        if context is None:
             raise RuntimeError("Cannot build agent before the session is bound.")
         cfg = profile.main_agent()
-        self.tool_context.allowed_tool_permissions = set(cfg.allowed_tool_permissions)
-        self.tool_context.blocked_tool_names = set(cfg.blocked_tool_names)
+        context.allowed_tool_permissions = set(cfg.allowed_tool_permissions)
+        context.blocked_tool_names = set(cfg.blocked_tool_names)
         harness_rules = _load_harness_rules(self.cwd)
         catalog = self.skill_registry.catalog_listing()
         prefix = PromptPrefixBuilder().build(
@@ -274,19 +283,18 @@ class InteractiveSession:
         )
         middlewares = build_main_agent_middlewares(
             user_middlewares=self.user_middlewares,
-            tool_context=self.tool_context,
+            tool_context=context,
             tool_registry=self.tool_registry,
             workspace=self.cwd,
-            recovery=self.recovery,
         )
         return Agent(
             "main_agent",
             prefix.content,
             use_tools=True,
-            tool_schemas=self._tool_schemas_for_agent_config(cfg),
+            tool_schemas=self._tool_schemas_for_agent_config(cfg, tool_context=context),
             middlewares=middlewares,
             time_budget=cfg.time_budget,
-            tool_context=self.tool_context,
+            tool_context=context,
             stream_callback=self.stream_sink,
             prompt_cache_identity=prefix.cache_identity,
         )
@@ -325,7 +333,7 @@ class InteractiveSession:
                 raise RuntimeError("会话正在关闭")
             if self._mcp_future is None:
                 self._mcp_future = self._startup_executor.submit(self._initialize_mcp_tools)
-                self.tool_context.tool_tasks.track(self._mcp_future)
+                self.tool_context.tool_tasks.track(self._mcp_future, foreground=False)
             future = self._mcp_future
         self._wait_session_future(future)
 
@@ -345,22 +353,23 @@ class InteractiveSession:
         """Connect configured MCP servers after the core session is usable."""
         self._ensure_mcp_tools_loaded()
 
-    def _tool_schemas_for_agent_config(self, cfg, *, update_context: bool = True) -> list[dict]:
+    def _tool_schemas_for_agent_config(self, cfg, *, update_context: bool = True, tool_context=None) -> list[dict]:
+        context = tool_context or self.tool_context
         core_schemas = tool_schemas_for_profile(
             allowed_permissions=cfg.allowed_tool_permissions,
             exclude_names=cfg.blocked_tool_names,
             registry=self.tool_registry,
         )
         discovered = set()
-        if self.tool_context is not None and update_context:
-            self.tool_context.allowed_tool_permissions = set(cfg.allowed_tool_permissions)
-            self.tool_context.blocked_tool_names = set(cfg.blocked_tool_names)
-            discovered = set(self.tool_context.discovered_tool_names)
+        if context is not None and update_context:
+            context.allowed_tool_permissions = set(cfg.allowed_tool_permissions)
+            context.blocked_tool_names = set(cfg.blocked_tool_names)
+            discovered = set(context.discovered_tool_names)
         if not discovered:
-            if update_context and self.tool_context is not None:
+            if update_context and context is not None:
                 # The callable view must not outlive the discovery it came
                 # from; recompute it even when nothing is discovered.
-                self.tool_context.revealed_tool_names = set()
+                context.revealed_tool_names = set()
             return core_schemas
         revealed_schemas = tool_schemas_for_profile(
             allowed_permissions=cfg.allowed_tool_permissions,
@@ -369,11 +378,11 @@ class InteractiveSession:
             registry=self.tool_registry,
             disclosure={"deferred"},
         )
-        if update_context and self.tool_context is not None:
+        if update_context and context is not None:
             # A profile switch only recomputes the callable view; discovery is
             # history and must survive, otherwise switching away and back would
             # make the repeat-query guard permanently block remounting.
-            self.tool_context.revealed_tool_names = {
+            context.revealed_tool_names = {
                 schema.get("function", {}).get("name")
                 for schema in revealed_schemas
                 if isinstance(schema, dict)
@@ -390,23 +399,12 @@ class InteractiveSession:
         ]
 
     def _refresh_agent_tool_schemas(self) -> None:
-        if not self.profile_runtimes:
-            return
-        active_name = self.profile.name() if self.profile is not None else None
-        for slot in self.profile_runtimes.values():
-            cfg = slot.profile.main_agent()
-            schemas = self._tool_schemas_for_agent_config(
-                cfg,
-                update_context=slot.profile.name() == active_name,
-            )
-            slot.agent.update_tool_schemas(schemas)
+        if self.agent is not None:
+            self.agent.update_tool_schemas(self._tool_schemas_for_agent_config(self.profile.main_agent()))
 
     def _refresh_mcp_catalog(self) -> None:
-        if self.mcp_manager is None:
-            return
-        catalog = self.mcp_manager.catalog_prompt()
-        for slot in self.profile_runtimes.values():
-            slot.agent.set_mcp_catalog(catalog)
+        if self.mcp_manager is not None and self.agent is not None:
+            self.agent.set_mcp_catalog(self.mcp_manager.catalog_prompt())
 
     def _apply_profile_task_timeout(self, user_prompt: str) -> None:
         if self.agent is None:
@@ -547,28 +545,35 @@ class InteractiveSession:
         with self._execution_condition:
             if self._closed or self._closing or self._turn_thread is not None:
                 raise RuntimeError("会话正在执行或关闭")
+            if self.tool_context.tool_tasks.pending_foreground_count:
+                raise RuntimeError("前台工具尚未退出，暂时无法启动新回合")
             self._turn_thread = threading.get_ident()
             self._turn_token = token
-            self.turn_count += 1
-        started = time.monotonic()
-        status, reason = "completed", None
         try:
-            self.recovery.begin_turn(
-                session_id=self.session.id, turn=self.turn_count - 1,
-                journal_sequence=self.conversation.journal.sequence,
-                event_count=len(self.session_store.read_events(self.session.id)),
-            )
-            self.event_bus.emit("turn_started", agent="main_agent", payload={"turn": self.turn_count})
-            with cancellation_scope(token):
-                token.check()
-                yield token
-                token.check()
-        except BaseException as exc:
-            status = "cancelled" if isinstance(exc, CancelledError) else "failed"
-            reason = str(exc)
-            raise
-        finally:
+            token.check()
+            self.turn_count += 1
+            started = time.monotonic()
+            status, reason = "completed", None
             try:
+                self.recovery.begin_turn(
+                    session_id=self.session.id, turn=self.turn_count - 1,
+                    journal_sequence=self.conversation.journal.sequence,
+                    event_count=len(self.session_store.read_events(self.session.id)),
+                    profile=self.profile.name(), permission_mode=self.permission_mode,
+                    routing_mode=self.routing_mode,
+                    model_selection=dict(model=self.model_selection.model, reasoning_effort=self.model_selection.reasoning_effort),
+                )
+                self._announce_recovery_origin()
+                self.event_bus.emit("turn_started", agent="main_agent", payload={"turn": self.turn_count})
+                with cancellation_scope(token):
+                    token.check()
+                    yield token
+                    token.check()
+            except BaseException as exc:
+                status = "cancelled" if isinstance(exc, CancelledError) else "failed"
+                reason = str(exc)
+                raise
+            finally:
                 self.event_bus.emit("turn_finished", agent="main_agent", payload={
                     "turn": self.turn_count, "status": status, "reason": reason,
                     "duration_seconds": time.monotonic() - started,
@@ -576,11 +581,19 @@ class InteractiveSession:
                 })
                 if status == "completed":
                     self._finish_recovery_turn()
-            finally:
-                with self._execution_condition:
-                    self._turn_thread = None
-                    self._turn_token = None
-                    self._execution_condition.notify_all()
+                metadata = self.session_store.read_metadata(self.session.id)
+                metadata["title"] = metadata.get("title") or (self.last_user_task.splitlines()[0][:48] if self.last_user_task else "新会话")
+                metadata["history_boundary"] = {
+                    "turn": self.turn_count, "journal_sequence": self.conversation.journal.sequence,
+                    "event_count": len(self.session_store.read_events(self.session.id)),
+                    "change_cursor": self.tool_context.workspace.access.cursor(),
+                }
+                atomic_json(self.session.metadata_path, metadata)
+        finally:
+            with self._execution_condition:
+                self._turn_thread = None
+                self._turn_token = None
+                self._execution_condition.notify_all()
 
     def submit_prepared(self, prepared: PreparedTurn, cancellation_token=None) -> TurnResult:
         with self._turn_scope(cancellation_token) as token:
@@ -596,7 +609,7 @@ class InteractiveSession:
         cancellation_token.check()
         skill_invocation = self.skill_registry.build_user_invocation(user_prompt)
         if skill_invocation is not None:
-            result = self._submit_to_current_agent(
+            result = self._run_turn(
                 user_prompt,
                 cancellation_token=cancellation_token,
                 turn_instruction=skill_invocation.prompt,
@@ -613,7 +626,7 @@ class InteractiveSession:
         else:
             route_decision = self._maybe_auto_route_profile(user_prompt)
             turn_instruction = _turn_instruction_for_route(route_decision)
-            result = self._submit_to_current_agent(
+            result = self._run_turn(
                 user_prompt,
                 cancellation_token=cancellation_token,
                 turn_instruction=turn_instruction,
@@ -635,7 +648,7 @@ class InteractiveSession:
             return
         self._slash_registry = None
         if self.is_bound and self.profile is not None:
-            self._activate_profile_runtime(self.profile.name())
+            self._activate_profile(self.profile.name())
 
     def _maybe_auto_route_profile(self, user_prompt: str) -> RouteDecision | None:
         if (
@@ -698,13 +711,17 @@ class InteractiveSession:
         self.profile = get_profile(profile_name)
         self._pending_profile_name = self.profile.name()
         self._profile_source = source
-        self.session = self.session_store.create(
-            profile=self.profile.name(),
-            cwd=self.cwd,
-            model=config.MODEL,
-            permission_mode=self.permission_mode,
-            profile_source=source,
-        )
+        if self._requested_session_id and (self.session_store.sessions_dir / self._requested_session_id / "session.json").exists():
+            self.session = self.session_store.load(self._requested_session_id)
+        else:
+            self.session = self.session_store.create(
+                profile=self.profile.name(),
+                cwd=self.cwd,
+                model=config.MODEL,
+                permission_mode=self.permission_mode,
+                profile_source=source,
+                session_id=self._requested_session_id,
+            )
         self.attachment_manager = AttachmentManager(
             self.cwd,
             self.session.root,
@@ -712,6 +729,7 @@ class InteractiveSession:
         )
         metadata = self.session_store.read_metadata(self.session.id)
         metadata["routing_mode"] = self.routing_mode
+        metadata["environment"] = self.environment
         self.session.metadata_path.write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
@@ -722,10 +740,13 @@ class InteractiveSession:
             workspace=WorkspaceService(
                 root=self.cwd,
                 snapshots_dir=self.session.snapshots_dir,
+                session_id=self.session.id,
             ),
             permission_policy=self._effective_permission_policy(),
             event_bus=self.event_bus,
             session_id=self.session.id,
+            session_root=self.session.root,
+            model_selection=self.model_selection,
             memory_use_enabled=self.memory_use_enabled,
             memory_auto_extract_enabled=self.memory_auto_extract_enabled,
             memory_service=self.memory_service,
@@ -748,10 +769,10 @@ class InteractiveSession:
         )
         self.lifecycle.register(
             "agent_coordinator",
-            self.tool_context.agent_coordinator.close,
+            lambda: self.tool_context.agent_coordinator.close(),
             order=30,
         )
-        self._activate_profile_runtime(self.profile.name())
+        self._activate_profile(self.profile.name())
         self.event_bus.emit(
             "session_started",
             agent="main_agent",
@@ -777,60 +798,19 @@ class InteractiveSession:
             raise RuntimeError("main conversation is unavailable")
         conversation.queue_message(text, tag=tag)
 
-    def _activate_profile_runtime(
-        self,
-        profile_name: str,
-    ) -> bool:
-        if self.session is None or self.event_bus is None or self.tool_context is None:
-            raise RuntimeError("Cannot activate a profile runtime before the session is bound.")
-        created = False
+    def _activate_profile(self, profile_name: str) -> bool:
         profile = get_profile(profile_name)
-        slot = self.profile_runtimes.get(profile_name)
-        if slot is None:
-            agent = self._build_agent(profile)
-            if self.conversation is None:
-                conversation = agent.start_conversation()
-                self.lifecycle.register("conversation", conversation.close, order=40)
-                conversation._event_bus = self.event_bus
-                self.conversation = conversation
-            else:
-                conversation = self.conversation
-                rebind_agent = getattr(conversation, "rebind_agent", None)
-                if callable(rebind_agent):
-                    rebind_agent(agent)
-                else:
-                    # Lightweight test doubles may only expose ``agent``.
-                    # Keep one conversation object and update its active
-                    # runtime instead of creating a second history lane.
-                    if hasattr(conversation, "agent"):
-                        conversation.agent = agent
-            slot = ProfileRuntime(profile=profile, agent=agent, conversation=conversation)
-            self.profile_runtimes[profile.name()] = slot
-            created = True
+        agent = self._build_agent(profile)
+        created = self.conversation is None
+        if created:
+            self.conversation = agent.start_conversation()
+            self.lifecycle.register("conversation", lambda: self.conversation.close(), order=40)
         else:
-            slot.agent = self._build_agent(profile)
-            slot.conversation = self.conversation
-            if self.conversation is not None:
-                rebind_agent = getattr(self.conversation, "rebind_agent", None)
-                if callable(rebind_agent):
-                    rebind_agent(slot.agent)
-                elif hasattr(self.conversation, "agent"):
-                    self.conversation.agent = slot.agent
-        self._active_profile_name = profile.name()
-        self.profile = profile
-        self.agent = slot.agent
-        if self.mcp_manager is not None:
-            self.agent.set_mcp_catalog(self.mcp_manager.catalog_prompt())
-        self.conversation = slot.conversation
-        # Profile presets (e.g. review's no-workspace-writes) live on the
-        # policy, so switching profiles must re-apply the preset immediately.
+            self.conversation.rebind_agent(agent)
+        self.profile, self.agent = profile, agent
+        self._refresh_mcp_catalog()
         self.tool_context.permission_policy = self._effective_permission_policy()
-        # Profile handoff messages used to split the conversation and hide
-        # history. Approved plans are now carried by the execution turn itself.
         return created
-
-    def _submit_to_current_agent(self, user_prompt: str, cancellation_token=None, turn_instruction: str | None = None, attachments: tuple[Attachment, ...] = ()) -> TurnResult:
-        return self._run_turn(user_prompt, cancellation_token, turn_instruction, attachments)
 
     def _run_turn(self, user_prompt: str, cancellation_token=None,
                   turn_instruction: str | None = None, attachments: tuple[Attachment, ...] = ()) -> TurnResult:
@@ -961,8 +941,6 @@ class InteractiveSession:
         )
         self.last_user_task = user_prompt
         self.last_assistant_text = text
-        if self.profile.name() == "plan":
-            self.recovery.protect()
         notice = self._capture_plan_handoff(text)
         duration_seconds = time.time() - turn_started_at
         self._maybe_emit_turn_summary(
@@ -975,9 +953,10 @@ class InteractiveSession:
 
     def _finish_recovery_turn(self) -> None:
         manager = self.conversation.runtime_state.shell_job_manager
-        unstable = (self.tool_context.tool_tasks.pending_count
+        unstable = (self.tool_context.workspace.unattributed_changes
+                    or self.tool_context.tool_tasks.pending_count
                     or self.tool_context.agent_coordinator.has_active_agents()
-                    or (manager is not None and any(job.status == "running" for job in manager.list_jobs())))
+                    or (manager is not None and manager.running_jobs()))
         if unstable:
             self.event_bus.emit("recovery_point_skipped", agent="main_agent",
                                 payload={"turn": self.turn_count, "reason": "active_workspace_tasks"})
@@ -988,6 +967,13 @@ class InteractiveSession:
             journal_sequence=self.conversation.journal.sequence,
             event_count=len(self.session_store.read_events(self.session.id)),
         )
+        metadata = self.session_store.read_metadata(self.session.id)
+        point.update(profile=self.profile.name(), permission_mode=self.permission_mode,
+                     routing_mode=self.routing_mode,
+                     model_selection=dict(model=self.model_selection.model, reasoning_effort=self.model_selection.reasoning_effort))
+        atomic_json(self.recovery.store.root / "points" / f"{point['id']}.json", point)
+        metadata["checkpoint"] = point
+        atomic_json(self.session.metadata_path, metadata)
         self._announce_recovery_origin()
         self.event_bus.emit("recovery_point_created", agent="main_agent", payload={"turn": self.turn_count, "point_id": point["id"]})
 
@@ -1045,7 +1031,7 @@ class InteractiveSession:
             "make the smallest appropriate code/test changes, and run verification before stopping.\n\n"
             f"Approved plan:\n{plan_markdown}"
         )
-        return self._submit_to_current_agent(task, attachments=attachments)
+        return self._run_turn(task, attachments=attachments)
 
     def revise_pending_plan(
         self,
@@ -1060,7 +1046,7 @@ class InteractiveSession:
             feedback = "Revise the plan using the attached files as additional feedback and context."
         elif not feedback:
             raise ValueError("Provide feedback for the pending plan, or say 'continue' to execute it.")
-        return self._submit_to_current_agent(
+        return self._run_turn(
             "Revise the previous Markdown plan using this user feedback. "
             "Return the complete updated plan in the required structured Markdown format.\n\n"
             f"User feedback:\n{feedback}",
@@ -1127,20 +1113,17 @@ class InteractiveSession:
                 "profile": self.profile.name(),
                 "plan_path": str(plan_path.relative_to(self.cwd)),
                 "plan_revision": self.pending_plan_revision,
-                # Immutable snapshot: the journal is historical truth;
-                # plan.md on disk is only a convenience artifact and may be
-                # overwritten by later sessions, so replay must not read it.
                 "plan_markdown": self.pending_plan_markdown,
                 "approval_source": "/plan",
             },
         )
         return (
-            "计划已写入 `global_plan/current/plan.md`，请选择下一步。"
+            f"计划已写入 `{plan_path.relative_to(self.cwd)}`，请选择下一步。"
             "非交互入口可回复 continue/继续 执行，或直接发送修改意见。"
         )
 
     def _write_pending_plan_artifact(self, plan_markdown: str) -> Path:
-        plan_path = self.cwd / "global_plan" / "current" / "plan.md"
+        plan_path = self.cwd / ".harness" / "sessions" / self.session.id / "plan.md"
         plan_path.parent.mkdir(parents=True, exist_ok=True)
         plan_path.write_text(plan_markdown.rstrip() + "\n", encoding="utf-8")
         return plan_path
@@ -1160,7 +1143,7 @@ class InteractiveSession:
             self._pending_profile_name = self.profile.name()
             self._profile_source = "explicit"
             return
-        self._activate_profile_runtime(
+        self._activate_profile(
             profile_name,
         )
         self.profile_history.append(ProfileSwitchEvent(
@@ -1368,7 +1351,11 @@ class InteractiveSession:
         must invalidate the conversation-level key; effort-only changes also
         invalidate, and the key is simply rebuilt identically next turn.
         """
-        config.set_model_override(model=model, reasoning_effort=reasoning_effort)
+        self.model_selection.select(model=model, reasoning_effort=reasoning_effort)
+        metadata = self.session_store.read_metadata(self.session.id)
+        metadata["model_selection"] = dict(model=self.model_selection.model, reasoning_effort=self.model_selection.reasoning_effort)
+        metadata["model"] = config.resolve_model_profile(config.MODEL_INTENSITY, self.model_selection).model
+        atomic_json(self.session.metadata_path, metadata)
         if self.conversation is not None:
             self.conversation._cached_prompt_cache_key = None
 
@@ -1527,6 +1514,7 @@ class InteractiveSession:
             return
         self._rebuild_mcp_state()
 
+    @runtime_change
     def toggle_mcp_server(self, server_name: str) -> str:
         """Toggle one MCP config entry and rebuild the active manager."""
         self._ensure_mcp_tools_loaded()
@@ -1547,59 +1535,37 @@ class InteractiveSession:
         return self.conversation.compact_now()
 
     @runtime_change
-    def fork_current_session(self) -> str:
-        """Create a durable branch and continue with the same live context."""
-        if self.session is None or self.conversation is None:
-            return "当前还没有可分支的会话"
-        source = self.session
-        branched = self.session_store.fork(source.id)
-        self._activate_session(branched)
-        self.session_store.update_profile(
-            branched.id,
-            self.profile.name(),
-            profile_source=self._profile_source,
-        )
-        self.session_store.update_routing_mode(branched.id, self.routing_mode)
-        self.event_bus.emit(
-            "session_forked_active",
-            agent="main_agent",
-            payload={"source_session_id": source.id, "session_id": branched.id},
-        )
-        return f"已进入会话分支：{branched.id}"
+    def _restore_history(self) -> None:
+        session_id = self.session.id
+        metadata = self.session_store.read_metadata(session_id)
+        point = metadata.get("history_boundary") or metadata.get("checkpoint")
+        sequence = point["journal_sequence"] if point else 0
+        events = self.session_store.read_history_events(session_id, event_count=point["event_count"] if point else 0)
+        messages = SessionJournal(self.session.journal_path).recovery_messages(
+            self.agent.full_system_prompt, through_sequence=sequence)
+        self.conversation._replace_messages(messages, reason="resume")
+        self.turn_count = point["turn"] if point else 0
+        self.last_user_task = next((e["payload"].get("text", "") for e in reversed(events) if e["type"] == "user_input"), "")
+        self.last_assistant_text = next((e["payload"].get("text", "") for e in reversed(events) if e["type"] == "assistant_message"), "")
+        self._restore_pending_plan(events)
+        todo = self._restore_todo(self.conversation.runtime_state, events)
+        if todo is not None:
+            atomic_json(self.session.root / "todo" / "state.json", todo)
+        self.conversation.last_text = self.last_assistant_text
+        self.recovery.origin = next((p for p in self.recovery_points().values() if p["turn"] == 0), None)
+        self.event_bus.emit("session_resumed", payload={"session_id": session_id})
 
-    @runtime_change
-    def resume_from_session(self, session_id: str) -> None:
-        """Fork a history session and activate the fork.
-
-        Resuming session X is exactly "fork X + make the new fork the active
-        session". The current conversation is never mutated in place: the fork
-        already carries a copy of the source journal, so recovered messages are
-        not appended a second time.
-        """
-        if self.session is not None and session_id == self.session.id:
-            return
-        # The fork copies the journal (conversation messages) but not the
-        # event stream, which stays per-session; replay reads source events,
-        # so pending-plan recovery must read the source events as well.
-        source_events = self.session_store.read_history_events(session_id)
-        branched = self.session_store.fork(session_id)
-        recovered = SessionJournal(branched.journal_path).recovery_messages(
-            self.agent.full_system_prompt
-        )
-        self._activate_session(branched)
-        self.conversation._replace_messages(recovered, reason="resume")
-        self.turn_count = next((event["payload"]["turn"] for event in reversed(source_events) if isinstance((event.get("payload") or {}).get("turn"), int)), 0)
-        self.last_user_task = next((event["payload"].get("text", "") for event in reversed(source_events) if event["type"] == "user_input"), "")
-        self.last_assistant_text = next((event["payload"].get("text", "") for event in reversed(source_events) if event["type"] == "assistant_message"), "")
-        self._restore_pending_plan(source_events)
-        # The fork inherits the source session's profile in metadata; bring it
-        # in line with the profile the live runtime is actually using.
-        self.session_store.update_profile(
-            branched.id,
-            self.profile.name(),
-            profile_source=self._profile_source,
-        )
-        self.session_store.update_routing_mode(branched.id, self.routing_mode)
+    @staticmethod
+    def _restore_todo(runtime_state, events):
+        from ..agent.runtime_state import TodoItem, TodoList
+        payload = next(((event.get("payload", {}).get("metadata") or {})["todo_state"]
+                        for event in reversed(events) if event["type"] == "tool_result"
+                        and event.get("agent") == "main_agent"
+                        and "todo_state" in (event.get("payload", {}).get("metadata") or {})), None)
+        runtime_state.todo = TodoList(items=[TodoItem(**item) for item in payload["items"]],
+            revision=payload.get("revision", 0), updated_at=payload.get("updated_at", ""),
+            next_seq=payload.get("next_seq", 0)) if payload is not None else None
+        return payload
 
     def _restore_pending_plan(self, events: list[dict[str, Any]]) -> None:
         """Rebuild in-memory pending plan state from the forked journal.
@@ -1630,12 +1596,7 @@ class InteractiveSession:
             return
         markdown = latest.get("plan_markdown")
         if not isinstance(markdown, str) or not markdown.strip():
-            # Events recorded before protocol v5: best-effort disk fallback.
-            rel_path = str(latest.get("plan_path") or "global_plan/current/plan.md")
-            try:
-                markdown = (self.cwd / rel_path).read_text(encoding="utf-8")
-            except OSError:
-                markdown = ""
+            raise ValueError("保存的计划缺少正文")
         if markdown.strip():
             self.pending_plan_markdown = markdown.strip()
             revision = latest.get("plan_revision")
@@ -1649,240 +1610,113 @@ class InteractiveSession:
             atomic_json(self.session.metadata_path, metadata)
             self.event_bus.emit("recovery_point_created", agent="main_agent", payload={"turn": 0, "point_id": origin["id"]})
 
-    def _sync_recovery_session_state(self) -> None:
-        self.recovery.origin = next((point for point in self.recovery_points().values() if point["turn"] == 0), None)
-        self.recovery.observed = self.recovery.store.capture()
-        self.recovery.begin_turn()
-
-    def _profile_at_history(self, session_id: str, events: list[dict[str, Any]]) -> tuple[str, str]:
-        metadata = self.session_store.read_metadata(session_id)
-        profile = metadata["initial_profile"]
-        source = metadata["profile_source"]
-        for event in events:
-            payload = event.get("payload") or {}
-            if event["type"] == "session_started":
-                profile = payload["profile"]
-                source = payload["profile_source"]
-            elif event["type"] == "profile_switched":
-                profile = payload["profile"]
-                source = payload["reason"]
-        return profile, source
-
     def recovery_points(self) -> dict[str, dict]:
+        metadata = self.session_store.read_metadata(self.session.id)
         points = {}
-        current = self.session.id
-        limit = None
-        seen = set()
-        while current:
-            if current in seen:
-                raise ValueError("会话历史存在循环")
-            seen.add(current)
-            metadata = self.session_store.read_metadata(current)
-            events = self.session_store.read_events(current)
-            for event in events if limit is None else events[:limit]:
-                if event.get("type") == "recovery_point_created":
-                    point_id = event["payload"]["point_id"]
-                    points[point_id] = self.recovery.store.read_point(point_id)
-            if metadata.get("recovery_base_point"):
-                point_id = metadata["recovery_base_point"]
-                points[point_id] = self.recovery.store.read_point(point_id)
-            if metadata.get("recovery_origin_point"):
-                point_id = metadata["recovery_origin_point"]
-                points[point_id] = self.recovery.store.read_point(point_id)
-            current = metadata.get("forked_from")
-            limit = metadata.get("forked_from_event_count")
-        return {point_id: point for point_id, point in points.items() if point["session_id"] in seen}
+        for key in ("checkpoint", "branch_origin"):
+            point = metadata.get(key)
+            if point and point["session_id"] == self.session.id:
+                points[point["id"]] = point
+        for event in self.session_store.read_history_events(self.session.id):
+            if event["type"] in {"recovery_point_created", "session_rewound"}:
+                point_id = event["payload"]["point_id"]
+                if not (self.recovery.store.root / "points" / f"{point_id}.json").is_file():
+                    continue
+                point = self.recovery.store.read_point(point_id)
+                if point["session_id"] == self.session.id:
+                    points[point["id"]] = point
+        return points
 
     @runtime_change
     def rewind_to_point(self, point_id: str) -> bool:
-        from ..agent.runtime_state import AgentRuntimeState, TodoItem, TodoList
-        from ..workspace.change_journal import WorkspaceChangeJournal
-        from ..workspace.shell_jobs import ShellJobManager
-
-        coordinator = self.tool_context.agent_coordinator
-        if coordinator.has_active_agents():
-            raise ValueError("请先停止运行中的子代理，再回撤")
-        jobs = self.conversation.runtime_state.shell_job_manager
-        if jobs is not None and jobs.running_jobs():
-            raise ValueError("请先停止后台命令，再回撤")
-        if self.tool_context.tool_tasks.pending_count:
-            raise ValueError("请等待工具操作结束，再回撤")
-        with self.recovery.store.exclusive():
-            point = self.recovery_points().get(point_id)
-            if point is None:
-                raise ValueError("此回撤点不属于当前对话")
-            store = self.recovery.store
-            current = store.capture()
-            target = point["snapshot"]
-            changed = store.changed(current, target)
-            target_manifest, current_manifest = store.manifest(target), store.manifest(current)
-            files = [name for name in changed if any(manifest.get(name, {}).get("kind") in {"file", "link"} for manifest in (target_manifest, current_manifest))]
-            observed = self.recovery.observed
-            if observed is None:
-                latest = max(self.recovery_points().values(), key=lambda p: p["turn"], default=None)
-                observed = latest["snapshot"] if latest else current
-            conflicts = set(store.changed(current, observed)) & set(changed)
-            detail = f"保留前 {point['turn']} 轮对话，撤回后续 {max(0, self.turn_count - point['turn'])} 轮，恢复 {len(files)} 个文件。"
-            if conflicts:
-                detail += "\n以下路径在最近一次记录后发生了修改，将被覆盖：\n" + "\n".join(sorted(conflicts))
-            destination = "会话开始时" if point["turn"] == 0 else f"第 {point['turn']} 轮结束时"
-            answer = self.question_provider.ask(QuestionRequest(
-                question=f"回撤到{destination}？\n{detail}",
-                options=[QuestionOption("取消", "cancel"), QuestionOption("确认回撤", "rewind")],
-                agent_name="main_agent", session_id=self.session.id,
-            ))
-            if answer.cancelled or answer.value != "rewind":
-                return False
-            if store.capture() != current:
-                raise ValueError("确认期间工作区发生变化，请重新发起回撤")
-            source = self.session
-            events = self.session_store.read_history_events(point["session_id"], event_count=point["event_count"])
-            target_profile, target_profile_source = self._profile_at_history(point["session_id"], events)
-            messages = SessionJournal(self.session_store._session_root(point["session_id"]) / "journal.jsonl").recovery_messages(
-                self.agent.full_system_prompt, through_sequence=point["journal_sequence"],
-            )
-            todo_payload = None
-            for event in events:
-                payload = event.get("payload") or {}
-                if event.get("type") == "tool_result" and event.get("agent") == "main_agent":
-                    state = (payload.get("metadata") or {}).get("todo_state")
-                    if state is not None:
-                        todo_payload = state
-            todo = None
-            if todo_payload:
-                todo = TodoList(
-                    items=[TodoItem(**item) for item in todo_payload["items"]],
-                    revision=todo_payload.get("revision", 0),
-                    updated_at=todo_payload.get("updated_at", ""),
-                    next_seq=todo_payload.get("next_seq", 0),
-                )
-            branched = self.session_store.fork_at(
-                point["session_id"], journal_sequence=point["journal_sequence"],
-                event_count=point["event_count"], recovery_point_id=point_id,
-            )
-            runtime = AgentRuntimeState(
-                shell_job_manager=ShellJobManager(self.cwd), todo=todo,
-                session_id=branched.id, permission_mode=self.permission_mode,
-                current_turn_start_index=len(messages),
-            )
-            transaction = {"status": "prepared", "before": current, "target": target, "source_session": source.id, "target_session": branched.id}
-            transaction_path = store.root / "transactions" / f"{branched.id}.json"
-            atomic_json(transaction_path, transaction)
-            old_conversation = dict(self.conversation.__dict__)
-            old_conversation["history"] = copy.copy(self.conversation.history)
-            old_conversation["runtime_state"] = copy.copy(self.conversation.runtime_state)
-            old_task_metadata = self.agent.current_task_metadata
-            old_profile = (self.profile, self.agent, self._active_profile_name, self._profile_source)
-            old_slots = {name: ProfileRuntime(slot.profile, slot.agent, slot.conversation) for name, slot in self.profile_runtimes.items()}
-            old_policy = (self.tool_context.permission_policy, self.tool_context.allowed_tool_permissions, self.tool_context.blocked_tool_names)
-            old_recovery = (self.recovery.origin, self.recovery.observed, self.recovery.before, self.recovery._start_location)
-            old_state = (self.turn_count, self.pending_plan_markdown, self.pending_plan_revision, self.last_user_task, self.last_assistant_text)
-            old_changes = self.tool_context.workspace.change_journal
-            new_coordinator = AgentCoordinator(
-                self.tool_context,
-                parent_messages=lambda: list(self.conversation.messages),
-                parent_system_prompt=lambda: self.conversation.agent.system_prompt,
-                parent_message_sink=self._queue_parent_message,
-            )
-            try:
-                store.restore(current, target)
-                if store.capture() != target:
-                    raise RuntimeError("恢复期间工作区发生变化，已取消回撤")
-                self._activate_session(branched)
-                self._activate_profile_runtime(target_profile)
-                self._profile_source = target_profile_source
-                messages[0] = {"role": "system", "content": self.agent.full_system_prompt}
-                self.conversation.runtime_state = runtime
-                runtime.event_bus = self.event_bus
-                runtime.agent_config = self.agent
-                self.conversation._replace_messages(messages, reason="rewind")
-                self.conversation.fact_tracker = type(self.conversation.fact_tracker)()
-                self.conversation.compaction_gate = type(self.conversation.compaction_gate)()
-                self.conversation.context_manager = type(self.conversation.context_manager)()
-                self.conversation._queued_messages = []
-                self.conversation._iteration_offset = 0
-                self.conversation._cached_prompt_cache_key = None
-                self.conversation._last_prompt_cache_shape = None
-                self.conversation._pending_prompt_cache_shape = None
-                self.conversation.observation_store = type(self.conversation.observation_store)(self.conversation._observation_dir(), self.conversation._workspace_root())
-                self.turn_count = point["turn"]
-                self.pending_plan_markdown = None
-                self.pending_plan_revision = 0
-                self._restore_pending_plan(events)
-                self.last_user_task = next((e["payload"].get("text", "") for e in reversed(events) if e["type"] == "user_input"), "")
-                self.last_assistant_text = next((e["payload"].get("text", "") for e in reversed(events) if e["type"] == "assistant_message"), "")
-                self.conversation.last_text = self.last_assistant_text
-                self.agent.current_task_metadata = {}
+        point = self.recovery_points().get(point_id)
+        if point is None:
+            raise ValueError("回撤点不属于当前会话")
+        if self.tool_context.workspace.unattributed_changes:
+            raise RuntimeError("存在无法安全归属的文件系统变更，请先处理后再回撤")
+        if self.tool_context.agent_coordinator.has_active_agents() or self.conversation.runtime_state.shell_job_manager.running_jobs():
+            raise RuntimeError("请先停止当前会话的后台任务，再执行回撤")
+        answer = self.question_provider.ask(QuestionRequest(
+            question=f"回撤到第 {point['turn']} 轮？仅撤销本会话之后可安全恢复的修改。",
+            options=[QuestionOption("取消", "cancel"), QuestionOption("确认回撤", "rewind")],
+            session_id=self.session.id, agent_name="main_agent"))
+        if answer.cancelled or answer.value != "rewind":
+            return False
+        from ..runtime.recovery import atomic_bytes
+        from ..agent.history import ContextHistory
+        staged_root = self.state_root / "staging" / ("rewind-" + uuid.uuid4().hex)
+        target_profile = get_profile(point["profile"])
+        context = replace(self.tool_context, session_root=staged_root,
+                          model_selection=config.ModelSelection(**point["model_selection"]),
+                          approval_provider=self._approval_provider_for_mode(point["permission_mode"]))
+        context.permission_policy = PermissionPolicy(mode=point["permission_mode"]).restricted_by(target_profile.main_agent().permission_preset)
+        agent = self._build_agent(target_profile, tool_context=context)
+        replacement = agent.start_conversation()
+        events = self.session_store.read_history_events(self.session.id, event_count=point["event_count"])
+        messages = SessionJournal(self.session.journal_path).recovery_messages(
+            agent.full_system_prompt, through_sequence=point["journal_sequence"])
+        replacement._replace_messages(messages, reason="rewind_prepared")
+        old = self.conversation
+        previous_context = self.tool_context
+        todo_path = self.session.root / "todo" / "state.json"
+        paths = [self.session.journal_path, self.session.events_path, self.session.metadata_path, todo_path]
+        saved = {path: path.read_bytes() if path.exists() else None for path in paths}
+        todo_payload = self._restore_todo(replacement.runtime_state, events)
+        previous_sequence = self.event_bus._sequence
+        previous_events_length = len(self.event_bus.events)
+        coordinator = AgentCoordinator(context, parent_messages=lambda: self.conversation.messages,
+                                       parent_system_prompt=lambda: self.agent.system_prompt,
+                                       parent_message_sink=self._queue_parent_message)
+        context.agent_coordinator = coordinator
+        try:
+            with self.event_bus._lock, context.workspace.access.rewind_transaction(self.session.id, point["change_cursor"], participants=paths):
+                replacement.journal = SessionJournal(self.session.journal_path)
+                replacement.history = ContextHistory()
+                replacement._replace_messages(messages, reason="rewind")
+                self.event_bus.emit("session_rewound", payload={"point_id": point_id, "turn": point["turn"],
+                                   "event_count": point["event_count"], "journal_sequence": replacement.journal.sequence})
+                metadata = self.session_store.read_metadata(self.session.id)
+                metadata.update(checkpoint=point, profile=target_profile.name(),
+                                routing_mode=point["routing_mode"],
+                                permission_mode=point["permission_mode"], model_selection=point["model_selection"],
+                                history_boundary=dict(turn=point["turn"], journal_sequence=replacement.journal.sequence,
+                                                      event_count=len(self.session_store.read_events(self.session.id)),
+                                                      change_cursor=point["change_cursor"]))
+                atomic_json(self.session.metadata_path, metadata)
                 if todo_payload is not None:
-                    atomic_json(branched.root / "todo" / "state.json", todo_payload)
-                self.tool_context.workspace.change_journal = WorkspaceChangeJournal()
-                self.tool_context.agent_coordinator = new_coordinator
-                self.session_store.update_status(branched.id, "running")
-                self.session_store.update_permission_mode(branched.id, self.permission_mode)
-                self.session_store.update_profile(branched.id, self.profile.name(), self._profile_source)
-                self.session_store.update_routing_mode(branched.id, self.routing_mode)
-                transaction["status"] = "committed"
-                atomic_json(transaction_path, transaction)
-            except BaseException:
-                self._activate_session(source)
-                self.conversation.agent._conversations.discard(self.conversation)
-                self.conversation.__dict__.update(old_conversation)
-                self.conversation.agent._conversations.add(self.conversation)
-                self.profile, self.agent, self._active_profile_name, self._profile_source = old_profile
-                self.profile_runtimes = old_slots
-                self.tool_context.permission_policy, self.tool_context.allowed_tool_permissions, self.tool_context.blocked_tool_names = old_policy
-                self.agent.current_task_metadata = old_task_metadata
-                self.turn_count, self.pending_plan_markdown, self.pending_plan_revision, self.last_user_task, self.last_assistant_text = old_state
-                self.tool_context.workspace.change_journal = old_changes
-                self.tool_context.agent_coordinator = coordinator
-                new_coordinator.close()
-                runtime.shell_job_manager.close()
-                store.restore(store.capture(), current)
-                self.recovery.origin, self.recovery.observed, self.recovery.before, self.recovery._start_location = old_recovery
-                transaction["status"] = "rolled_back"
-                atomic_json(transaction_path, transaction)
-                self.session_store.update_status(branched.id, "discarded")
-                raise
-            self.recovery.observed = target
-            self.lifecycle.register("agent_coordinator", new_coordinator.close, order=30)
+                    atomic_json(todo_path, todo_payload)
+                else:
+                    todo_path.unlink(missing_ok=True)
+        except BaseException:
+            with self.event_bus._lock:
+                for path, data in saved.items():
+                    if data is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        atomic_bytes(path, data)
+                self.event_bus._sequence = previous_sequence
+                del self.event_bus.events[previous_events_length:]
+            replacement.close()
             coordinator.close()
-            old_conversation["runtime_state"].close_shell_sessions()
-            if jobs is not None:
-                jobs.close()
-            return True
-
-    def _activate_session(self, session: Session) -> None:
-        """Rebind every live component onto an already-created session."""
-        if self.session is not None:
-            close_memory_session(self.cwd, self.session.id)
-        self.session = session
-        self.attachment_manager = AttachmentManager(
-            self.cwd,
-            session.root,
-            model_input_mode(),
-        )
-        self.event_bus = self.session_store.event_bus(
-            session,
-            listener=self.event_listener,
-        )
-        self.conversation.event_bus = self.event_bus
-        self.conversation._event_bus = self.event_bus
-        self.conversation.journal = SessionJournal(session.journal_path)
-        emitter = getattr(self.conversation, "emitter", None)
-        if emitter is not None:
-            emitter.event_bus = self.event_bus
-        runtime_state = getattr(self.conversation, "runtime_state", None)
-        if runtime_state is not None:
-            runtime_state.session_id = session.id
-            runtime_state.event_bus = self.event_bus
-        if self.tool_context is not None:
-            self.tool_context.session_id = session.id
-            self.tool_context.event_bus = self.event_bus
-            self.tool_context.memory_journal_path = str(session.journal_path)
-            self.tool_context.memory_user_sequence = None
-        if self.memory_auto_extract_enabled:
-            open_memory_session(self.cwd, session.id, session.journal_path)
-        self._sync_recovery_session_state()
+            raise
+        context.session_root = self.session.root
+        self.conversation, self.agent, self.tool_context = replacement, agent, context
+        self.profile = target_profile
+        self.routing_mode = point["routing_mode"]
+        self.model_selection = context.model_selection
+        self.permission_mode = point["permission_mode"]
+        self.approval_provider = context.approval_provider
+        self.turn_count = point["turn"]
+        if point["turn"] == 0:
+            self.recovery.origin = point
+        self._restore_pending_plan(events)
+        self.last_user_task = next((e["payload"].get("text", "") for e in reversed(events) if e["type"] == "user_input"), "")
+        self.last_assistant_text = next((e["payload"].get("text", "") for e in reversed(events) if e["type"] == "assistant_message"), "")
+        self.conversation.last_text = self.last_assistant_text
+        context.workspace._versions.clear()
+        previous_context.agent_coordinator.close()
+        old.close()
+        return True
 
     def _externalize_large_turn_text(self, label: str, text: str, *, intro: str) -> str:
         limit = _env_int("HARNESS_TURN_INLINE_CHAR_LIMIT", TURN_INLINE_CHAR_LIMIT)
@@ -1933,7 +1767,7 @@ class InteractiveSession:
         if self.session is None:
             raise RuntimeError("Cannot externalize turn input before the session is bound.")
         safe_label = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in label) or "input"
-        inputs_dir = self.session.root / "inputs"
+        inputs_dir = self.cwd / ".harness" / "sessions" / self.session.id / "inputs"
         inputs_dir.mkdir(parents=True, exist_ok=True)
         path = inputs_dir / f"turn-{self.turn_count + 1:04d}-{safe_label}.txt"
         suffix = 1

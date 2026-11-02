@@ -37,11 +37,11 @@ class SessionStore:
         cwd: str | Path,
         model: str,
         permission_mode: str,
-        resumed_from: str | None = None,
         profile_source: str | None = None,
+        session_id: str | None = None,
     ) -> Session:
-        session_id = self._new_session_id()
-        session_root = self.sessions_dir / session_id
+        session_id = session_id or self._new_session_id()
+        session_root = self._session_root(session_id)
         snapshots_dir = session_root / "snapshots"
         compacted_dir = session_root / "compacted"
         session_root.mkdir(parents=True, exist_ok=False)
@@ -70,8 +70,6 @@ class SessionStore:
             "permission_mode": permission_mode,
             "status": "running",
         }
-        if resumed_from:
-            metadata["resumed_from"] = resumed_from
         session.metadata_path.write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
@@ -80,69 +78,47 @@ class SessionStore:
         session.journal_path.write_text("", encoding="utf-8")
         return session
 
+    def load(self, session_id: str) -> Session:
+        self.read_metadata(session_id)
+        root = self._session_root(session_id)
+        return Session(session_id, root, root / "session.json", root / "events.jsonl",
+                       root / "snapshots", root / "summary.md", root / "compacted", root / "journal.jsonl")
+
     def fork(self, source_session_id: str) -> Session:
-        source_metadata = self.read_metadata(source_session_id)
-        source_events = self.read_events(source_session_id)
-        session = self.create(
-            profile=source_metadata["profile"],
-            cwd=source_metadata["cwd"],
-            model=source_metadata["model"],
-            permission_mode=source_metadata["permission_mode"],
-        )
-        source_journal = self._session_root(source_session_id) / "journal.jsonl"
-        if source_journal.exists():
-            session.journal_path.write_text(
-                source_journal.read_text(encoding="utf-8", errors="replace"),
-                encoding="utf-8",
-            )
-
-        metadata = json.loads(session.metadata_path.read_text(encoding="utf-8"))
-        metadata.update(
-            {
-                # Lineage lives in forked_from; status follows the lifecycle,
-                # and a fresh branch starts as a running session.
-                "status": "running",
-                "forked_from": source_metadata.get("id", source_session_id),
-                "forked_from_event_count": len(source_events),
-                "forked_at": metadata["created_at"],
-            }
-        )
-        session.metadata_path.write_text(
-            json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        self.event_bus(session).emit(
-            "session_forked",
-            agent=None,
-            payload={
-                "source_session_id": source_metadata.get("id", source_session_id),
-                "source_event_count": len(source_events),
-            },
-        )
-        return session
-
-    def fork_at(self, source_session_id: str, *, journal_sequence: int, event_count: int, recovery_point_id: str) -> Session:
-        from ..runtime.recovery import atomic_bytes, atomic_json
-        from .journal import SessionJournal
-
-        entries = SessionJournal(self._session_root(source_session_id) / "journal.jsonl").read()
-        events = self.read_events(source_session_id)
-        if (journal_sequence != 0 and not any(entry.sequence == journal_sequence for entry in entries)) or not 0 <= event_count <= len(events):
-            raise ValueError("回撤点的对话位置无效")
-        branched = self.fork(source_session_id)
-        history = self.read_history_events(source_session_id, event_count=event_count)
-        atomic_bytes(
-            branched.journal_path,
-            "".join(json.dumps(entry.__dict__, ensure_ascii=False) + "\n" for entry in entries if entry.sequence <= journal_sequence).encode("utf-8"),
-        )
-        atomic_bytes(
-            branched.events_path,
-            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in history).encode("utf-8"),
-        )
-        metadata = self.read_metadata(branched.id)
-        metadata.update(status="restoring", forked_from_event_count=event_count, forked_from_journal_sequence=journal_sequence, recovery_base_point=recovery_point_id, events_include_lineage=True)
-        atomic_json(branched.metadata_path, metadata)
-        return branched
+        from ..runtime.recovery import atomic_json, atomic_bytes
+        source = self.read_metadata(source_session_id)
+        boundary = source.get("history_boundary") or source.get("checkpoint") or {
+            "turn": 0, "journal_sequence": 0, "event_count": 0, "change_cursor": 0,
+        }
+        fork = self.create(profile=source["profile"], cwd=source["cwd"], model=source["model"],
+                           permission_mode=source["permission_mode"], profile_source=source["profile_source"])
+        journal = []
+        source_path = self._session_root(source_session_id) / "journal.jsonl"
+        with source_path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                if entry["sequence"] > boundary["journal_sequence"]:
+                    break
+                journal.append(line)
+        atomic_bytes(fork.journal_path, "".join(journal).encode("utf-8"))
+        events = []
+        with (self._session_root(source_session_id) / "events.jsonl").open(encoding="utf-8") as handle:
+            for line in handle:
+                if len(events) >= boundary["event_count"]:
+                    break
+                if line.strip():
+                    events.append(line)
+        atomic_bytes(fork.events_path, "".join(events).encode("utf-8"))
+        metadata = self.read_metadata(fork.id)
+        for key in ("model_selection", "routing_mode", "environment"):
+            if key in source:
+                metadata[key] = source[key]
+        metadata.update(forked_from=source_session_id,
+                        history_boundary=dict(boundary), title=source.get("title", "新会话"))
+        atomic_json(fork.metadata_path, metadata)
+        return fork
 
     def event_bus(
         self,
@@ -238,22 +214,18 @@ class SessionStore:
         return events
 
     def read_history_events(self, session_id: str, *, event_count: int | None = None) -> list[dict[str, Any]]:
-        seen = set()
-
-        def read(current: str, limit: int | None):
-            if current in seen:
-                raise ValueError(f"Session lineage cycle detected: {current}")
-            seen.add(current)
-            metadata = self.read_metadata(current)
-            events = self.read_events(current)
-            if limit is not None:
-                events = events[:limit]
-            source = metadata.get("forked_from")
-            if source and not metadata.get("events_include_lineage"):
-                return read(source, metadata.get("forked_from_event_count")) + events
-            return events
-
-        return read(session_id, event_count)
+        events = self.read_events(session_id)
+        if event_count is not None:
+            events = events[:event_count]
+        kept = []
+        for index, event in enumerate(events):
+            if event["type"] == "session_rewound":
+                boundary = event["payload"]["event_count"]
+                if not 0 <= boundary <= index:
+                    raise ValueError("回撤历史边界无效")
+                kept = [(i, item) for i, item in kept if i < boundary]
+            kept.append((index, event))
+        return [event for _, event in kept]
 
     def write_summary(self, session_id: str) -> str:
         from .summary import format_session_summary

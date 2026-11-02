@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -280,7 +280,8 @@ class AgentCoordinator:
     def conflict_paths(self, conflict_id: str) -> list[str]:
         return self.changes.conflict_paths(conflict_id)
 
-    def close(self) -> None:
+    def close(self, *, timeout: float = 10.0) -> None:
+        deadline = time.monotonic() + max(0.0, timeout)
         with self._condition:
             self._closed = True
             records = list(self._records.values())
@@ -288,8 +289,14 @@ class AgentCoordinator:
                 if record.token is not None:
                     record.token.cancel()
             self._changed_locked()
-        self._executor.shutdown(wait=True, cancel_futures=True)
-        if not self.context.tool_tasks.wait_idle(timeout=10):
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        futures = [record.future for record in records
+                   if record.future is not None and not record.future.done()]
+        if futures:
+            wait(futures, timeout=max(0.0, deadline - time.monotonic()))
+        if any(not future.done() for future in futures):
+            raise RuntimeError("Agent executions are still running; agent resources retained")
+        if not self.context.tool_tasks.wait_idle(timeout=max(0.0, deadline - time.monotonic())):
             raise RuntimeError("Foreground tools are still running; agent resources retained")
         for record in records:
             if record.conversation is not None:
@@ -365,6 +372,8 @@ class AgentCoordinator:
             permission_policy=policy,
             event_bus=self.context.event_bus,
             session_id=self.context.session_id,
+            session_root=self.context.session_root,
+            model_selection=config.ModelSelection(model=self.context.model_selection.model, reasoning_effort=self.context.model_selection.reasoning_effort),
             memory_use_enabled=self.context.memory_use_enabled,
             memory_auto_extract_enabled=self.context.memory_auto_extract_enabled,
             memory_service=self.context.memory_service,

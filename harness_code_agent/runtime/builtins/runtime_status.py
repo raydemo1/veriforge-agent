@@ -87,7 +87,8 @@ def get_runtime_status(
     elif section == "environment":
         agent_config = state.agent_config
         profile = config.resolve_model_profile(
-            getattr(agent_config, "model_intensity", None) or config.MODEL_INTENSITY
+            getattr(agent_config, "model_intensity", None) or config.MODEL_INTENSITY,
+            tool_context.model_selection if tool_context else None
         )
         result.update(
             profile=getattr(agent_config, "name", None),

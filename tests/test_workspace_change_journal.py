@@ -41,23 +41,23 @@ class WorkspaceChangeJournalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = WorkspaceService(root=tmp)
             binary_path = Path(tmp) / "payload.bin"
-            failing_path = (Path(tmp) / "later.txt").resolve()
+            failing_path = (Path(tmp) / "zlater.txt").resolve()
             original_bytes = b"\xff\xfe\x00original"
             binary_path.write_bytes(original_bytes)
-            original_write_text = Path.write_text
+            from harness_code_agent.runtime.recovery import atomic_bytes
 
-            def fail_second_write(path: Path, data: str, *args, **kwargs):
+            def fail_second_write(path: Path, data: bytes):
                 if path == failing_path:
                     raise OSError("injected write failure")
-                return original_write_text(path, data, *args, **kwargs)
+                return atomic_bytes(path, data)
 
             with (
-                patch.object(Path, "write_text", fail_second_write),
+                patch("harness_code_agent.runtime.recovery.atomic_bytes", side_effect=fail_second_write),
                 self.assertRaisesRegex(OSError, "injected write failure"),
             ):
                 workspace.write_text_batch({
                     "payload.bin": "replacement",
-                    "later.txt": "never committed",
+                    "zlater.txt": "never committed",
                 })
 
             self.assertEqual(binary_path.read_bytes(), original_bytes)

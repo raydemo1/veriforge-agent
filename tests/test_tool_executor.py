@@ -311,7 +311,7 @@ class ToolExecutorTests(unittest.TestCase):
             return ToolResult(tool="write_probe", status="success", output=path)
 
         def effect(args, _context):
-            return CallEffect((ResourceClaim("workspace", args["path"], "exact", "write"),))
+            return CallEffect((_context.workspace.access.write_claim(_context.workspace.resolve(args["path"])),))
 
         registry.register(_schema("write_probe"), write_probe, permission="edit", effect=effect)
         calls = [
@@ -1057,6 +1057,7 @@ class ToolExecutorTests(unittest.TestCase):
                     status="running",
                     exit_code=None,
                     output_tail="",
+                    add_done_callback=lambda callback: None,
                 )
 
             def read_output(self, job_id, max_chars=12000, *, offset=None):

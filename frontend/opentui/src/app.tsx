@@ -1,19 +1,21 @@
-import React, { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { stringWidth } from "bun";
-import { CliRenderEvents, SyntaxStyle } from "@opentui/core";
-import type { BoxRenderable, ClipboardReadResult, InputRenderable, ScrollBoxRenderable, TextareaRenderable } from "@opentui/core";
+import { CliRenderEvents, SyntaxStyle, CodeRenderable } from "@opentui/core";
+import type { MarkdownOptions, BoxRenderable, ClipboardReadResult, InputRenderable, ScrollBoxRenderable, TextareaRenderable } from "@opentui/core";
 import { useKeyboard, useRenderer, useTerminalDimensions } from "@opentui/react";
 import { resolveIcons } from "./icons.ts";
 import type { IconSet } from "./icons.ts";
 import { formatUserError } from "./errors.ts";
 import { clipboardFilePaths, formatBytes } from "./attachment-utils.ts";
-import type { ActionName, ActionResult, AttachmentItem, CommandItem, IconPreference, Interaction, PanelOption, PanelSpec, SubmitResult, ThemePreference, TranscriptItem, TurnSubmission, UiEvent, WorkbenchParams } from "./protocol.ts";
-import { initialState, reduceEvent, withOptimisticUserMessage } from "./state.ts";
+import type { ActionName, ActionResult, AttachmentItem, CommandItem, IconPreference, Interaction, PanelOption, PanelSpec, SubmitResult, ThemePreference, TranscriptItem, TurnSubmission, UiEvent, SessionEvent, WorkbenchParams } from "./protocol.ts";
+import { initialState as initialAppState, initialSessionState as initialState, reduceEvent } from "./state.ts";
 import { resolveTheme } from "./theme.ts";
 import type { Theme, ThemeMode } from "./theme.ts";
 import { WorkStrip } from "./workbench/WorkStrip.tsx";
 import { Workbench } from "./workbench/Workbench.tsx";
+import type { SessionUI, SessionViewState } from "./state.ts";
+import { SessionTabs } from "./SessionTabs.tsx";
 import type { WorkbenchTab } from "./workbench/strip.ts";
 
 type AppProps = {
@@ -89,6 +91,12 @@ const MARKDOWN_SYNTAX_STYLE = SyntaxStyle.fromStyles({
   "markup.link.url": { underline: true },
 });
 
+const renderMarkdownNode: MarkdownOptions["renderNode"] = (_token, context) => {
+  const node = context.defaultRender();
+  if (node instanceof CodeRenderable) node.drawUnstyledText = true;
+  return node;
+};
+
 function MarkdownText({ text, color, streaming = false }: { text: string; color: string; streaming?: boolean }) {
   return (
     <markdown
@@ -99,6 +107,7 @@ function MarkdownText({ text, color, streaming = false }: { text: string; color:
       concealCode
       streaming={streaming}
       internalBlockMode="coalesced"
+      renderNode={renderMarkdownNode}
       style={{ flexGrow: 0, flexShrink: 1 }}
     />
   );
@@ -361,7 +370,23 @@ function RecoverableTurn({ item, theme, children, onRewind }: { item: Transcript
   );
 }
 
-function Transcript({ items, theme, icons, narrow, onRewind }: { items: TranscriptItem[]; theme: Theme; icons: IconSet; narrow: boolean; onRewind?: (pointId: string) => void }) {
+function Transcript({ items, theme, icons, narrow, onRewind, scrollTop, onSaveScroll }: { items: TranscriptItem[]; theme: Theme; icons: IconSet; narrow: boolean; onRewind?: (pointId: string) => void; scrollTop: number | null; onSaveScroll: (value: number | null) => void }) {
+  const scrollRef = useRef<ScrollBoxRenderable | null>(null);
+  const saveRef = useRef(onSaveScroll);
+  saveRef.current = onSaveScroll;
+  useEffect(() => {
+    let restored = scrollTop === null;
+    let last = scrollTop;
+    const save = () => {
+      const node = scrollRef.current;
+      if (!node || !node.scrollHeight) return;
+      if (!restored) { node.scrollTop = scrollTop ?? 0; restored = true; }
+      const position = node.scrollTop >= node.scrollHeight - node.height - 1 ? null : node.scrollTop;
+      if (position !== last) { last = position; saveRef.current(position); }
+    };
+    const timer = setInterval(save, 80);
+    return () => { save(); clearInterval(timer); };
+  }, []);
   const childrenByGroup = new Map<string, TranscriptItem[]>();
   for (const item of items) {
     if (item.parentId) {
@@ -452,7 +477,7 @@ function Transcript({ items, theme, icons, narrow, onRewind }: { items: Transcri
     } else rendered.push(renderItem(item));
   }
   return (
-    <scrollbox stickyScroll focused style={{ height: 1, flexGrow: 1, flexShrink: 1, minHeight: 0, paddingLeft: narrow ? 1 : 2, paddingRight: narrow ? 1 : 2 }}>
+    <scrollbox ref={scrollRef} stickyScroll focused style={{ height: 1, flexGrow: 1, flexShrink: 1, minHeight: 0, paddingLeft: narrow ? 1 : 2, paddingRight: narrow ? 1 : 2 }}>
       <box style={{ flexDirection: "column", gap: 1, paddingTop: 1, paddingBottom: 1 }}>{rendered}</box>
     </scrollbox>
   );
@@ -506,23 +531,6 @@ function ActionButton({ icon, label, theme, color, activeColor, bold = false, de
       <text fg={active ? (activeColor ?? color) : color}>
         {bold ? <strong>{content}</strong> : content}
       </text>
-    </box>
-  );
-}
-
-function HeaderAction({ icon, label, theme, onInvoke }: { icon: string; label: string; theme: Theme; onInvoke: () => void }) {
-  return <ActionButton icon={icon} label={label} theme={theme} color={theme.subtle} activeColor={theme.text} defaultBg={theme.background} onInvoke={onInvoke} />;
-}
-
-function Header({ cwd, theme, icons, compact, narrow, onHistory, onNew }: { cwd: string; theme: Theme; icons: IconSet; compact: boolean; narrow: boolean; onHistory: () => void; onNew: () => void }) {
-  const label = compact ? (cwd.replace(/\\/g, "/").split("/").filter(Boolean).at(-1) ?? cwd) : cwd;
-  return (
-    <box style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", height: 1, flexShrink: 0, paddingLeft: narrow ? 1 : 2, paddingRight: 1 }}>
-      <text fg={theme.subtle}>{label}</text>
-      <box style={{ flexDirection: "row", gap: 1 }}>
-        <HeaderAction icon={icons.session} label={narrow ? "" : "历史"} theme={theme} onInvoke={onHistory} />
-        <HeaderAction icon={icons.newSession} label={narrow ? "" : "新会话"} theme={theme} onInvoke={onNew} />
-      </box>
     </box>
   );
 }
@@ -1260,58 +1268,29 @@ function ToolbarAction({ label, theme, tone, onInvoke }: { label: string; theme:
   return <ActionButton label={label} theme={theme} color={tone} defaultBg={theme.surface} onInvoke={onInvoke} />;
 }
 
-export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInteraction, onPickFiles, onReadClipboard, onCopyText, initialTask, themePreference = "auto", iconPreference = "auto" }: AppProps) {
-  const [state, dispatch] = useReducer(reduceEvent, initialState);
-  const [draft, setDraft] = useState("");
-  const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
+type UpdateUI = <K extends keyof SessionUI>(field: K, value: SessionUI[K] | ((current: SessionUI[K]) => SessionUI[K])) => void;
+type SessionPaneProps = AppProps & { resolvedTheme: Theme; state: SessionViewState; ui: SessionUI; updateUI: UpdateUI; dispatch: (event: SessionEvent) => void };
+const SessionPane = React.memo(function SessionPane({ resolvedTheme: theme, state, ui, updateUI, dispatch, onSubmit, onCancel, onExit, onAction, onResolveInteraction, onPickFiles, onReadClipboard, onCopyText, themePreference = "auto", iconPreference = "auto" }: SessionPaneProps) {
+  const draft = ui.draft;
+  const setDraft = (value: React.SetStateAction<string>) => updateUI("draft", value);
+  const attachments = ui.attachments;
+  const setAttachments = (value: React.SetStateAction<AttachmentItem[]>) => updateUI("attachments", value);
   const [composerVersion, setComposerVersion] = useState(0);
-  const [panel, setPanel] = useState<PanelSpec | null>(null);
+  const panel = ui.panel;
+  const setPanel = (value: PanelSpec | null) => updateUI("panel", value);
   const [panelBusyId, setPanelBusyId] = useState<string | null>(null);
   const [panelAnchor, setPanelAnchor] = useState<PanelAnchor>("top-right");
-  const [workbenchOpen, setWorkbenchOpen] = useState(false);
-  const [workbenchTab, setWorkbenchTab] = useState<WorkbenchTab>("plan");
-  const [detectedTheme, setDetectedTheme] = useState<ThemeMode | null>(null);
+  const workbenchOpen = ui.workbenchOpen;
+  const setWorkbenchOpen = (value: React.SetStateAction<boolean>) => updateUI("workbenchOpen", value);
+  const workbenchTab = ui.workbenchTab;
+  const setWorkbenchTab = (value: WorkbenchTab) => updateUI("workbenchTab", value);
   const renderer = useRenderer();
   const { width, height } = useTerminalDimensions();
-  const theme = resolveTheme(themePreference, detectedTheme);
   const icons = resolveIcons(iconPreference);
   const compact = width < 96;
   const narrow = width < 70;
   const stopping = state.turnState === "cancelling";
   const running = state.turnState === "running" || state.turnState === "queued" || stopping;
-
-  useEffect(() => {
-    let active = true;
-    void renderer.waitForThemeMode(120).then((mode) => { if (active && mode) setDetectedTheme(mode); });
-    const handler = (mode: ThemeMode) => setDetectedTheme(mode);
-    renderer.on(CliRenderEvents.THEME_MODE, handler);
-    return () => { active = false; renderer.off(CliRenderEvents.THEME_MODE, handler); };
-  }, [renderer]);
-  useEffect(() => {
-    if (!events) return;
-    let active = true;
-    void (async () => {
-      for await (const event of events) {
-        if (!active) return;
-        if (event.type === "panel") {
-          setPanel(event.panel);
-          setPanelAnchor(defaultPanelAnchor(event.panel));
-        }
-        else {
-          if (event.type === "interaction") setPanel(null);
-          if (event.type === "session_reset") {
-            setPanel(null);
-            setWorkbenchOpen(false);
-            setDraft("");
-            setAttachments([]);
-            setComposerVersion((version) => version + 1);
-          }
-          dispatch(event);
-        }
-      }
-    })();
-    return () => { active = false; };
-  }, [events]);
 
   const invoke = async (name: ActionName, params?: Record<string, unknown>, anchor?: PanelAnchor) => {
     if (!onAction) return;
@@ -1320,11 +1299,6 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
       if (result.panel) {
         setPanel(result.panel);
         setPanelAnchor(anchor ?? defaultPanelAnchor(result.panel));
-      }
-      else if (name === "new_session") {
-        setPanel(null);
-        setDraft("");
-        setComposerVersion((version) => version + 1);
       }
       if (result.message) dispatch({ type: "notice", text: result.message });
     } catch (error) {
@@ -1359,27 +1333,16 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
         }
         return;
       }
-      if (stopping) return;
-      if (running) onCancel?.();
-      else if (draft.length > 0) setDraft("");
-      else onExit?.();
+      onExit?.();
     }
     else if (key.ctrl && key.name === "o") { key.preventDefault(); void invoke("open_panel", { panel: "observe" }); }
     else if (key.ctrl && key.name === "p") { key.preventDefault(); void invoke("open_panel", { panel: "permission" }); }
-    else if (key.ctrl && key.name === "w") {
+    else if (key.ctrl && key.name === "w" && !key.shift) {
       if (panel || state.interaction) return;
       key.preventDefault();
       setWorkbenchOpen((open) => !open);
     }
   });
-
-  useEffect(() => {
-    const text = initialTask?.trim();
-    if (!text) return;
-    void onSubmit?.({ text, attachmentIds: [] }).then((result) => {
-      if (result.accepted) dispatch({ type: "transcript", item: { id: `user-${Date.now()}`, kind: "user", title: "你", body: text } });
-    }).catch((error) => dispatch({ type: "notice", level: "error", text: formatUserError(error) }));
-  }, [initialTask, onSubmit]);
 
   const stagePaths = async (paths: string[], source: "picker" | "mention" | "clipboard"): Promise<boolean> => {
     if (!onAction || !paths.length) return false;
@@ -1448,12 +1411,8 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
       // stays put and the decision happens in the Interaction surface.
       const result = await onSubmit({ text, attachmentIds: attachments.map((item) => item.id) });
       if (!result.accepted) return;
-      const submittedAttachments = result.attachments ?? attachments;
-      const summary = submittedAttachments.map((item) => `[${item.kind}] ${item.name} (${formatBytes(item.size)})`).join("\n");
-      const body = [text, summary].filter(Boolean).join("\n");
-      dispatch({ type: "transcript", item: withOptimisticUserMessage(state, body).items.at(-1)! });
-      setDraft("");
-      setAttachments([]);
+      setDraft((current) => current === draft ? "" : current);
+      setAttachments((current) => current.filter((item) => !attachments.some((submitted) => submitted.id === item.id)));
     } catch (error) {
       dispatch({ type: "notice", level: "error", text: formatUserError(error) });
     }
@@ -1485,9 +1444,8 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
   };
 
   return (
-    <box style={{ flexDirection: "column", width: "100%", height: "100%", backgroundColor: theme.background }}>
-      <Header cwd={state.snapshot.cwd} theme={theme} icons={icons} compact={compact} narrow={narrow} onHistory={() => void invoke("open_sessions", undefined, "history")} onNew={() => void invoke("new_session")} />
-      <Transcript items={state.items} theme={theme} icons={icons} narrow={narrow} onRewind={!running && !state.interaction && !workbenchOpen && !panel && onAction ? (pointId) => void invoke("rewind", { pointId }) : undefined} />
+    <box style={{ flexDirection: "column", width: "100%", height: 1, flexGrow: 1, flexShrink: 1, minHeight: 0, backgroundColor: theme.background }}>
+      <Transcript scrollTop={ui.scrollTop} onSaveScroll={(position) => updateUI("scrollTop", position)} items={state.items} theme={theme} icons={icons} narrow={narrow} onRewind={!running && !state.interaction && !workbenchOpen && !panel && onAction ? (pointId) => void invoke("rewind", { pointId }) : undefined} />
       <WorkStrip work={state.work} width={width} theme={theme} onOpen={openWorkbench} />
       {state.interaction ? <InteractionView interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping || workbenchOpen} sessionReady={Boolean(state.snapshot.sessionId) && state.snapshot.status !== "failed"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
       {panel && !state.interaction ? <PanelOverlay panel={panel} anchor={panelAnchor} theme={theme} icons={icons} terminalWidth={width} terminalHeight={height} onClose={() => setPanel(null)} onSelect={selectPanel} busyId={panelBusyId} /> : null}
@@ -1498,10 +1456,128 @@ export function App({ events, onSubmit, onCancel, onExit, onAction, onResolveInt
           terminalWidth={width}
           terminalHeight={height}
           initialTab={workbenchTab}
+          onTabChange={setWorkbenchTab}
           onClose={() => setWorkbenchOpen(false)}
           onWorkbench={workbenchOp}
         />
       ) : null}
     </box>
   );
+});
+
+
+type WorkbenchAppProps = Omit<AppProps, "onSubmit" | "onCancel" | "onAction" | "onResolveInteraction"> & {
+  onSubmit?: (sessionId: string, submission: TurnSubmission) => Promise<SubmitResult>;
+  onCancel?: (sessionId: string) => void;
+  onAction?: (sessionId: string, name: ActionName, params?: Record<string, unknown>) => Promise<ActionResult>;
+  onResolveInteraction?: (sessionId: string, id: string, result: Record<string, unknown>) => Promise<void>;
+};
+export function App(props: WorkbenchAppProps) {
+  const [app, dispatch] = useReducer(reduceEvent, initialAppState);
+  const activeId = app.activeSessionId;
+  const active = activeId ? app.sessions[activeId] : undefined;
+  const { width } = useTerminalDimensions();
+  const renderer = useRenderer();
+  const [detected, setDetected] = useState<ThemeMode | null>(null);
+  const theme = resolveTheme(props.themePreference ?? "auto", detected);
+  const appRef = useRef(app);
+  appRef.current = app;
+  const actionRef = useRef(props.onAction);
+  actionRef.current = props.onAction;
+  const initialSent = useRef(false);
+  useEffect(() => {
+    void renderer.waitForThemeMode(120).then(setDetected);
+    const onTheme = (mode: ThemeMode) => setDetected(mode);
+    renderer.on(CliRenderEvents.THEME_MODE, onTheme);
+    return () => { renderer.off(CliRenderEvents.THEME_MODE, onTheme); };
+  }, [renderer]);
+  useEffect(() => {
+    let mounted = true;
+    if (!props.events) return;
+    const seen = new Map<string, number>();
+    const waiting = new Map<string, UiEvent[]>();
+    void (async () => {
+      for await (const event of props.events!) {
+        if (!mounted) return;
+        if ("sessionId" in event && "sequence" in event) {
+          const id = event.sessionId;
+          const previous = seen.get(id) ?? appRef.current.sessions[id]?.sequence ?? 0;
+          if (waiting.has(id)) { waiting.get(id)!.push(event); continue; }
+          if (event.sequence > previous + 1) {
+            waiting.set(id, [event]);
+            void actionRef.current?.(id, "sync_session").then((result) => {
+              if (!mounted || !result.view) return;
+              dispatch({ type: "session_view", sessionId: id, view: result.view });
+              seen.set(id, result.view.sequence);
+              for (const queued of waiting.get(id) ?? []) {
+                if ("sequence" in queued && queued.sequence > (seen.get(id) ?? 0)) {
+                  dispatch(queued); seen.set(id, queued.sequence);
+                }
+              }
+              waiting.delete(id);
+            }).catch((error) => {
+              waiting.delete(id);
+              dispatch({ type: "local_event", sessionId: id, event: { type: "notice", level: "error", text: formatUserError(error) } });
+            });
+            continue;
+          }
+          seen.set(id, Math.max(previous, event.sequence));
+        } else if (event.type === "session_view") {
+          seen.set(event.sessionId, event.view.sequence);
+        }
+        dispatch(event);
+      }
+    })();
+    return () => { mounted = false; };
+  }, [props.events]);
+  useEffect(() => {
+    if (initialSent.current || !activeId || !active?.view.snapshot.sessionId || !props.initialTask?.trim()) return;
+    initialSent.current = true;
+    void props.onSubmit?.(activeId, { text: props.initialTask, attachmentIds: [] });
+  }, [activeId, active?.view.snapshot.sessionId, props.initialTask]);
+  const invoke = useCallback(async (name: ActionName, params?: Record<string, unknown>) => {
+    const id = appRef.current.activeSessionId;
+    if (!id) return;
+    try {
+      const result = await actionRef.current?.(id, name, params);
+      if (result?.message) dispatch({ type: "local_event", sessionId: id, event: { type: "notice", text: result.message } });
+      return result;
+    }
+    catch (error) { dispatch({ type: "local_event", sessionId: id, event: { type: "notice", level: "error", text: formatUserError(error) } }); }
+  }, []);
+  useKeyboard((key) => {
+    if (key.meta && (key.name === "left" || key.name === "right")) {
+      key.preventDefault();
+      const ids = appRef.current.sessionOrder;
+      const index = ids.indexOf(appRef.current.activeSessionId ?? "");
+      const next = ids[(index + (key.name === "right" ? 1 : -1) + ids.length) % ids.length];
+      if (next) void invoke("switch_session", { sessionId: next });
+    }
+    if (key.ctrl && key.shift && key.name === "w") { key.preventDefault(); void invoke("hide_session"); }
+    if (key.ctrl && key.name === "c" && !appRef.current.activeSessionId) { key.preventDefault(); props.onExit?.(); }
+    if (key.ctrl && key.name === "n") { key.preventDefault(); void invoke("new_session"); }
+  });
+  const updateUI: UpdateUI = useCallback((field, value) => {
+    if (activeId) dispatch({ type: "session_ui", sessionId: activeId, field, value });
+  }, [activeId]);
+  const scoped = useMemo(() => ({
+    dispatch: (event: SessionEvent) => { if (activeId) dispatch({ type: "local_event", sessionId: activeId, event }); },
+    onSubmit: props.onSubmit && activeId ? (submission: TurnSubmission) => props.onSubmit!(activeId, submission) : undefined,
+    onCancel: () => { if (activeId) props.onCancel?.(activeId); },
+    onAction: props.onAction && activeId ? (name: ActionName, params?: Record<string, unknown>) => props.onAction!(activeId, name, params) : undefined,
+    onResolveInteraction: props.onResolveInteraction && activeId ? (id: string, result: Record<string, unknown>) => props.onResolveInteraction!(activeId, id, result) : undefined,
+  }), [activeId, props.onSubmit, props.onCancel, props.onAction, props.onResolveInteraction]);
+  if (!activeId || !active) return <box style={{ width: "100%", height: "100%", padding: 2, backgroundColor: theme.background }}><text fg={theme.muted}>正在准备工作台…</text></box>;
+  const descriptor = app.descriptors[activeId];
+
+  return <box style={{ flexDirection: "column", width: "100%", height: "100%", padding: 0, backgroundColor: theme.background }}>
+    <SessionTabs sessions={app.sessionOrder.map((id) => app.descriptors[id]!)} activeId={activeId}
+      unread={Object.fromEntries(Object.entries(app.sessions).map(([id, value]) => [id, value.unreadCount]))}
+      width={width} theme={theme} onSelect={(id) => void invoke("switch_session", { sessionId: id })}
+      onNew={() => void invoke("new_session")} onHide={(id) => void invoke("hide_session", { sessionId: id })}
+      onSwitcher={() => void invoke("open_sessions").then((result) => { if (result?.panel) updateUI("panel", result.panel); })}
+      onWorktree={() => void invoke("fork_worktree")} onFork={() => void invoke("fork_session")}
+      onApply={descriptor?.environment === "worktree" ? () => void invoke("apply_worktree") : undefined} />
+    <SessionPane key={activeId} {...props} {...scoped} resolvedTheme={theme} state={active.view} ui={active.ui} updateUI={updateUI} />
+  </box>;
 }

@@ -451,16 +451,18 @@ function tabBadge(tab: WorkbenchTab, work: WorkState): string {
   }
 }
 
-export function Workbench({ work, theme, terminalWidth, terminalHeight, initialTab, onClose, onWorkbench }: {
+export function Workbench({ work, theme, terminalWidth, terminalHeight, initialTab, onTabChange, onClose, onWorkbench }: {
   work: WorkState;
   theme: Theme;
   terminalWidth: number;
   terminalHeight: number;
   initialTab: WorkbenchTab;
+  onTabChange?: (tab: WorkbenchTab) => void;
   onClose: () => void;
   onWorkbench: (params: WorkbenchParams) => Promise<ActionResult | undefined>;
 }) {
-  const [tab, setTab] = useState<WorkbenchTab>(initialTab);
+  const tab = initialTab;
+  const setTab = (value: WorkbenchTab) => onTabChange?.(value);
 
   useKeyboard((key) => {
     if (key.name === "escape") {

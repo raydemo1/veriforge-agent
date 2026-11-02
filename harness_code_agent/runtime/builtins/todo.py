@@ -67,7 +67,6 @@ def update_todo(
         )
 
     runtime_state.todo = todo
-    written = [str(state_path.relative_to(workspace))]
     counts = {status: sum(1 for item in normalized if item.status == status) for status in
               ("completed", "in_progress", "pending", "cancelled")}
     summary = ", ".join(f"{status} {count}" for status, count in counts.items() if count)
@@ -75,16 +74,12 @@ def update_todo(
         tool="update_todo",
         status="success",
         output=(
-            f"Updated todo list: {', '.join(written)}. Revision {revision} ({summary}).\n"
+            f"Updated todo list. Revision {revision} ({summary}).\n"
             + todo.render()
         ),
         metadata={
             "status_source": "native",
             "todo_state": payload,
-            "file_changes": [
-                {"path": path, "operation": "write_file", "snapshot_path": None}
-                for path in written
-            ],
         },
     )
 
@@ -94,6 +89,8 @@ def _utc_timestamp() -> str:
 
 
 def _todo_state_path(workspace: Path, runtime_state, tool_context: ToolContext | None) -> Path:
+    if tool_context is not None and tool_context.session_root is not None:
+        return tool_context.session_root / "todo" / "state.json"
     session_id = (
         (tool_context.session_id if tool_context is not None else None)
         or getattr(runtime_state, "session_id", None)

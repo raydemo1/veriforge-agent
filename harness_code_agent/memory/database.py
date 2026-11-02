@@ -8,6 +8,8 @@ import math
 import os
 import sqlite3
 import tempfile
+import threading
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
@@ -18,6 +20,8 @@ from typing import Literal
 from .extraction_schema import EXTRACTION_SCHEMA
 from .search_index import search_terms
 from .vector_schema import VECTOR_SCHEMA, load_vector_extension
+
+_INITIALIZATION_LOCK = threading.Lock()
 
 MemoryKind = Literal["preference", "project_fact", "convention", "decision", "lesson", "workflow"]
 KINDS = frozenset({"preference", "project_fact", "convention", "decision", "lesson", "workflow"})
@@ -75,9 +79,18 @@ class MemoryDatabase:
 
     def initialize(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        with contextlib.closing(sqlite3.connect(self.path, timeout=5)) as db:
+        with _INITIALIZATION_LOCK, contextlib.closing(sqlite3.connect(self.path, timeout=5)) as db:
             load_vector_extension(db)
-            db.execute("PRAGMA journal_mode=WAL")
+            if db.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        db.execute("PRAGMA journal_mode=WAL")
+                        break
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.05)
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS state (
                     id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);

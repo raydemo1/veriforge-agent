@@ -3,13 +3,17 @@ from __future__ import annotations
 import shutil
 import threading
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
+from .access import WorkspaceAccessCoordinator, WorkspaceConflict, fingerprint
+from ..agent.cancellation import current_token
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
 from .. import config
 from .change_journal import WorkspaceChangeJournal
+
+_UNOBSERVED = object()
 
 
 class WorkspaceQuotaError(RuntimeError):
@@ -62,8 +66,14 @@ class WorkspaceService:
         root: str | Path,
         snapshots_dir: str | Path | None = None,
         protected_names: set[str] | None = None,
+        session_id: str | None = None,
     ):
         self.root = Path(root).resolve()
+        self.session_id = session_id
+        self.turn_id = ""
+        self.access = WorkspaceAccessCoordinator(self.root)
+        self._versions = {}
+        self.unattributed_changes = False
         self.snapshots_dir = Path(snapshots_dir).resolve() if snapshots_dir else self.root / ".harness" / "snapshots"
         self.protected_names = protected_names or self.DEFAULT_PROTECTED_NAMES
         self.change_journal = WorkspaceChangeJournal()
@@ -88,11 +98,15 @@ class WorkspaceService:
     def read_text(self, path: str | Path) -> str:
         resolved = self.resolve(path)
         with self._path_lock(resolved):
-            return resolved.read_text(encoding="utf-8", errors="replace")
+            data = resolved.read_bytes()
+            self._versions[str(resolved).casefold()] = fingerprint(data)
+            return data.decode("utf-8", errors="replace")
 
     def write_text(self, path: str | Path, content: str) -> WorkspaceWriteResult:
         resolved = self.resolve(path)
-        with self._path_lock(resolved):
+        with self._path_lock(resolved, write=True):
+            if resolved.exists() and str(resolved).casefold() not in self._versions:
+                raise WorkspaceConflict(f"覆盖已有文件前必须先读取当前版本：{path}")
             self._ensure_writable(resolved)
             old_content = resolved.read_text(encoding="utf-8", errors="replace") if resolved.exists() else None
             old_size = resolved.stat().st_size if resolved.exists() else 0
@@ -100,13 +114,14 @@ class WorkspaceService:
             self._check_write_quota(new_size - old_size)
             snapshot_path = self._snapshot_unlocked(resolved) if resolved.exists() else None
             resolved.parent.mkdir(parents=True, exist_ok=True)
-            resolved.write_text(content, encoding="utf-8")
+            from ..runtime.recovery import atomic_bytes
+            atomic_bytes(resolved, content.encode("utf-8"))
             self._charge_quota(new_size - old_size)
             rel = resolved.relative_to(self.root)
             self._record_changed(rel, operation="write_file", snapshot_path=snapshot_path)
             return WorkspaceWriteResult(path=resolved, snapshot_path=snapshot_path, old_content=old_content)
 
-    def write_text_batch(self, changes: dict[str, str]) -> list[WorkspaceWriteResult]:
+    def write_text_batch(self, changes: dict[str, str], *, expected=None) -> list[WorkspaceWriteResult]:
         """Apply a validated text change set, rolling every file back on failure."""
         if not changes:
             return []
@@ -115,9 +130,10 @@ class WorkspaceService:
             for path, content in changes.items()
         }
         ordered = sorted(resolved_changes, key=lambda path: str(path).casefold())
+        versions = {self.resolve(path): data for path, data in expected.items()} if expected is not None else {}
         with ExitStack() as stack:
             for path in ordered:
-                stack.enter_context(self._path_lock(path))
+                stack.enter_context(self._path_lock(path, write=True, expected=versions.get(path, _UNOBSERVED)))
             originals: dict[Path, tuple[bool, bytes | None]] = {}
             results: list[WorkspaceWriteResult] = []
             total_net_new = 0
@@ -135,15 +151,16 @@ class WorkspaceService:
                 results.append(WorkspaceWriteResult(path=path, snapshot_path=snapshot_path, old_content=old_content))
             self._check_write_quota(total_net_new)
             try:
+                from ..runtime.recovery import atomic_bytes
                 for path in ordered:
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(resolved_changes[path], encoding="utf-8")
+                    atomic_bytes(path, resolved_changes[path].encode("utf-8"))
             except Exception:
                 for path in reversed(ordered):
                     existed, old_bytes = originals[path]
                     if existed:
                         path.parent.mkdir(parents=True, exist_ok=True)
-                        path.write_bytes(old_bytes or b"")
+                        atomic_bytes(path, old_bytes or b"")
                     elif path.exists():
                         path.unlink()
                 raise
@@ -164,7 +181,7 @@ class WorkspaceService:
         replace: str,
     ) -> WorkspacePatchResult:
         resolved = self.resolve(path)
-        with self._path_lock(resolved):
+        with self._path_lock(resolved, write=True):
             if not search:
                 raise ValueError("Patch search text must not be empty")
             self._ensure_writable(resolved)
@@ -178,7 +195,8 @@ class WorkspaceService:
             updated = original.replace(search, replace, 1)
             net_new_bytes = len(updated.encode("utf-8")) - resolved.stat().st_size
             self._check_write_quota(net_new_bytes)
-            resolved.write_text(updated, encoding="utf-8")
+            from ..runtime.recovery import atomic_bytes
+            atomic_bytes(resolved, updated.encode("utf-8"))
             self._charge_quota(net_new_bytes)
             rel = resolved.relative_to(self.root)
             self._record_changed(rel, operation="apply_patch", snapshot_path=snapshot_path)
@@ -192,7 +210,7 @@ class WorkspaceService:
 
     def rollback_latest_snapshot(self, path: str | Path) -> WorkspaceWriteResult:
         resolved = self.resolve(path)
-        with self._path_lock(resolved):
+        with self._path_lock(resolved, write=True):
             self._ensure_writable(resolved)
             rel = resolved.relative_to(self.root)
             snapshot_dir = self.snapshots_dir / rel.parent
@@ -213,7 +231,7 @@ class WorkspaceService:
 
     def snapshot(self, path: str | Path) -> Path | None:
         resolved = self.resolve(path)
-        with self._path_lock(resolved):
+        with self._path_lock(resolved, write=True):
             return self._snapshot_unlocked(resolved)
 
     def _snapshot_unlocked(self, resolved: Path) -> Path | None:
@@ -230,14 +248,31 @@ class WorkspaceService:
         shutil.copy2(resolved, snapshot_path)
         return snapshot_path
 
-    def _path_lock(self, resolved: Path) -> threading.RLock:
+    @contextmanager
+    def _path_lock(self, resolved: Path, *, write=False, expected=_UNOBSERVED):
         key = str(resolved).casefold()
         with self._path_locks_lock:
-            return self._path_locks.setdefault(key, threading.RLock())
+            lock = self._path_locks.setdefault(key, threading.RLock())
+        claims = [self.access.write_claim(resolved)] if write else []
+        with self.access.acquire(claims, current_token.get()), lock:
+            before = resolved.read_bytes() if resolved.is_file() else None
+            version = self._versions.get(key, _UNOBSERVED) if expected is _UNOBSERVED else fingerprint(expected)
+            if write and version is not _UNOBSERVED and version != fingerprint(before):
+                raise WorkspaceConflict(f"文件版本已变化，请重新读取并重新计算修改：{resolved.relative_to(self.root)}")
+            completed = False
+            try:
+                yield
+                completed = True
+            finally:
+                after = resolved.read_bytes() if resolved.is_file() else None
+                if write and before != after:
+                    self.access.record(self.session_id, self.turn_id, resolved, before, after)
+                if write and completed:
+                    self._versions[key] = fingerprint(after)
 
     @property
     def changed_files(self) -> list[Path]:
-        """Compatibility snapshot; callers cannot mutate journal state through it."""
+        """Return the changed paths without exposing the mutable journal."""
 
         return list(self.change_journal.changed_paths())
 

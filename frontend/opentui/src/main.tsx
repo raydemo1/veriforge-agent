@@ -3,7 +3,7 @@ import { CliRenderEvents, createCliRenderer, createHostClipboard } from "@opentu
 import { createRoot } from "@opentui/react";
 import { App } from "./app.tsx";
 import { formatUserError } from "./errors.ts";
-import { ActionName, ActionResult, BridgeMessage, BridgeRequest, DEFAULT_COMMANDS, IconPreference, SubmitResult, ThemePreference, TurnSubmission, UI_PROTOCOL_VERSION, UiEvent } from "./protocol.ts";
+import { ActionName, ActionResult, BridgeMessage, BridgeRequest, DEFAULT_COMMANDS, IconPreference, SubmitResult, ThemePreference, TurnSubmission, UI_PROTOCOL_VERSION, UiEvent, SessionEvent } from "./protocol.ts";
 
 function flag(name: string): boolean {
   return process.argv.includes(name);
@@ -15,7 +15,7 @@ function option(name: string): string | undefined {
   return process.argv[index + 1];
 }
 
-function mockEvents(): AsyncIterable<UiEvent> {
+function mockSessionEvents(): AsyncIterable<SessionEvent> {
   return {
     async *[Symbol.asyncIterator]() {
       yield {
@@ -120,13 +120,40 @@ function mockEvents(): AsyncIterable<UiEvent> {
   };
 }
 
+const previewSessions = [
+  { id: "preview-session", title: "重构执行生命周期", environment: "local" as "local" | "worktree", cwd: "veriforge-agent", visible: true, status: "idle", pendingApproval: false },
+  { id: "preview-mcp", title: "整理 MCP 注册", environment: "local" as "local" | "worktree", cwd: "veriforge-agent", visible: true, status: "idle", pendingApproval: false },
+  { id: "preview-ui", title: "工作台交互", environment: "worktree" as "local" | "worktree", cwd: "veriforge-agent", visible: true, status: "idle", pendingApproval: false },
+];
+let previewActive = previewSessions[0]!.id;
+const previewUpdates: UiEvent[] = [];
+const previewSequences: Record<string, number> = {};
+let wakePreview = () => {};
+const previewEvent = (sessionId: string, event: SessionEvent): UiEvent => ({ ...event, sessionId, sequence: previewSequences[sessionId] = (previewSequences[sessionId] ?? 0) + 1 });
+function updatePreview(event: UiEvent) { previewUpdates.push(event); wakePreview(); }
+function announcePreview() { updatePreview({ type: "sessions", sessions: structuredClone(previewSessions), activeSessionId: previewActive }); }
+function mockEvents(): AsyncIterable<UiEvent> {
+  return { async *[Symbol.asyncIterator]() {
+    yield { type: "sessions", sessions: previewSessions, activeSessionId: previewActive };
+    for (const session of previewSessions) {
+      for await (const event of mockSessionEvents()) {
+        yield previewEvent(session.id, event.type === "snapshot" ? { ...event, snapshot: { ...event.snapshot, sessionId: session.id } } : event);
+      }
+    }
+    while (true) {
+      if (!previewUpdates.length) await new Promise<void>((resolve) => { wakePreview = resolve; });
+      while (previewUpdates.length) yield previewUpdates.shift()!;
+    }
+  } };
+}
+
 type BridgeClient = {
   events: AsyncIterable<UiEvent>;
   closed: Promise<void>;
-  submit: (submission: TurnSubmission) => Promise<SubmitResult>;
-  cancel: () => void;
-  action: (name: ActionName, params?: Record<string, unknown>) => Promise<ActionResult>;
-  resolveInteraction: (id: string, result: Record<string, unknown>) => Promise<void>;
+  submit: (sessionId: string, submission: TurnSubmission) => Promise<SubmitResult>;
+  cancel: (sessionId: string) => void;
+  action: (sessionId: string, name: ActionName, params?: Record<string, unknown>) => Promise<ActionResult>;
+  resolveInteraction: (sessionId: string, id: string, result: Record<string, unknown>) => Promise<void>;
   shutdown: () => void;
 };
 
@@ -172,30 +199,6 @@ function createBridgeClient(): BridgeClient {
   const eventWaiters: Array<(event: UiEvent | null) => void> = [];
   let resolveClosed: () => void = () => undefined;
   const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
-  let readySettled = false;
-  let resolveReady: () => void = () => undefined;
-  let rejectReady: (reason: unknown) => void = () => undefined;
-  let sessionReady = Promise.resolve();
-  const resetReady = () => {
-    readySettled = false;
-    sessionReady = new Promise<void>((resolve, reject) => {
-      resolveReady = resolve;
-      rejectReady = reject;
-    });
-    void sessionReady.catch(() => undefined);
-  };
-  resetReady();
-  const markReady = () => {
-    if (readySettled) return;
-    readySettled = true;
-    resolveReady();
-  };
-  const markReadyFailed = (reason: unknown) => {
-    if (readySettled) return;
-    readySettled = true;
-    rejectReady(reason);
-  };
-
   const enqueue = (event: UiEvent) => {
     const waiter = eventWaiters.shift();
     if (waiter) waiter(event);
@@ -204,9 +207,6 @@ function createBridgeClient(): BridgeClient {
 
   const consumeMessage = (message: BridgeMessage) => {
     if (message.type === "event") {
-      if (message.event.type === "progress" && message.event.status === "starting" && readySettled) resetReady();
-      if (message.event.type === "progress" && message.event.status === "ready") markReady();
-      if (message.event.type === "progress" && message.event.status === "failed") markReadyFailed(new Error(message.event.detail));
       enqueue(message.event);
       return;
     }
@@ -239,40 +239,23 @@ function createBridgeClient(): BridgeClient {
       }
     } finally {
       ended = true;
-      markReadyFailed(new Error("OpenTUI bridge exited before the session became ready"));
-      // Surface the bridge exit inside the UI instead of only tearing down.
-      if (!graceful) {
-        enqueue({
-          type: "notice",
-          level: "error",
-          text: readySettled
-            ? "与 Python 桥接的连接已断开，当前暂时无法提交任务。"
-            : "会话启动失败，请检查 Python 环境与依赖后重试。",
-        });
-      }
-      for (const waiter of pending.values()) waiter.reject(new Error("OpenTUI bridge exited"));
-      pending.clear();
-      while (eventWaiters.length) eventWaiters.shift()?.(null);
+      if (!graceful) console.error("与 Python 桥接的连接已断开。");
       resolveClosed();
     }
   };
   void readLoop();
 
-  const request = (method: BridgeRequest["method"], params?: Record<string, unknown>) => {
+  const request = (method: BridgeRequest["method"], params?: Record<string, unknown>, sessionId?: string) => {
     if (ended || !child.stdin) return Promise.reject(new Error("OpenTUI bridge is closed"));
     const id = `req-${++requestCounter}`;
-    const message: BridgeRequest = { type: "request", id, method, params };
+    const message: BridgeRequest = { type: "request", id, method, params, sessionId };
     child.stdin.write(`${JSON.stringify(message)}\n`);
     child.stdin.flush();
     return new Promise<unknown>((resolve, reject) => pending.set(id, { resolve, reject }));
   };
 
-  void request("initialize", { protocolVersion: UI_PROTOCOL_VERSION }).then((result) => {
-    const status = (result as { status?: string } | undefined)?.status;
-    if (status === "ready") markReady();
-  }).catch((error) => {
-    markReadyFailed(error);
-    enqueue({ type: "notice", level: "error", text: `会话启动失败：${formatUserError(error)}` });
+  void request("initialize", { protocolVersion: UI_PROTOCOL_VERSION }).catch((error) => {
+    console.error(`工作台启动失败：${formatUserError(error)}`);
   });
 
   const events: AsyncIterable<UiEvent> = {
@@ -297,6 +280,10 @@ function createBridgeClient(): BridgeClient {
     if (!ended) {
       graceful = true;
       fire("shutdown");
+      const timer = setTimeout(() => {
+        if (!ended) { console.error("部分资源尚未退出，正在关闭工作台进程及其子进程。"); terminateBridgeTree(child); }
+      }, 20000);
+      void child.exited.finally(() => clearTimeout(timer));
     }
   };
   process.once("exit", () => {
@@ -306,10 +293,10 @@ function createBridgeClient(): BridgeClient {
   return {
     events,
     closed,
-    submit: (submission) => sessionReady.then(() => request("submit", submission)).then((result) => result as SubmitResult),
-    cancel: () => fire("cancel"),
-    action: (name, params) => sessionReady.then(() => request("action", { name, params })).then((result) => result as ActionResult),
-    resolveInteraction: (id, result) => request("resolve_interaction", { id, result }).then(() => undefined),
+    submit: (sessionId, submission) => request("submit", submission, sessionId).then((result) => result as SubmitResult),
+    cancel: (sessionId) => { void request("cancel", {}, sessionId).catch(console.error); },
+    action: (sessionId, name, params) => request("action", { name, params }, sessionId).then((result) => result as ActionResult),
+    resolveInteraction: (sessionId, id, result) => request("resolve_interaction", { id, result }, sessionId).then(() => undefined),
     shutdown,
   };
 }
@@ -336,11 +323,29 @@ async function openWindowsFilePicker(inputMode: "text" | "multimodal"): Promise<
   return Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
 }
 
-function mockAction(name: ActionName, params?: Record<string, unknown>): Promise<ActionResult> {
-  if (name === "open_sessions") return Promise.resolve({ ok: true, panel: { kind: "sessions", title: "历史会话", searchable: true, options: [
-    { id: "session-1", label: "重构命令栏滚动与焦点", description: "coding-agent  刚刚" },
-    { id: "session-2", label: "检查 MCP 工具加载", description: "general  2 小时前" },
-  ] } });
+function mockAction(name: ActionName, params?: Record<string, unknown>, sessionId = previewActive): Promise<ActionResult> {
+  if (["new_session", "fork_session", "fork_worktree"].includes(name)) {
+    const id = `preview-${Date.now()}`;
+    previewSessions.push({ ...previewSessions[0]!, id, title: "新会话", environment: name === "fork_worktree" ? "worktree" : "local" });
+    previewActive = id; announcePreview();
+    updatePreview(previewEvent(id, { type: "snapshot", snapshot: { sessionId: id, profile: "coding-agent", permissionMode: "workspace-write", model: "deepseek-flash", provider: "deepseek", contextPercent: 100, status: "ready", cwd: "veriforge-agent" } }));
+    updatePreview(previewEvent(id, { type: "progress", status: "ready", detail: "" }));
+    return Promise.resolve({ ok: true, sessionId: id });
+  }
+  if (name === "switch_session") {
+    const target = previewSessions.find((item) => item.id === params?.sessionId);
+    if (target) { target.visible = true; previewActive = target.id; announcePreview(); }
+    return Promise.resolve({ ok: Boolean(target) });
+  }
+  if (name === "hide_session") {
+    const target = previewSessions.find((item) => item.id === (params?.sessionId ?? sessionId));
+    if (target) target.visible = false;
+    if (previewActive === target?.id) previewActive = previewSessions.find((item) => item.visible)?.id ?? "";
+    if (!previewActive) return mockAction("new_session");
+    announcePreview(); return Promise.resolve({ ok: true });
+  }
+  if (name === "panel_action" && params?.panel === "sessions") return mockAction("switch_session", { sessionId: params.action });
+  if (name === "open_sessions") return Promise.resolve({ ok: true, panel: { kind: "sessions", title: "会话", searchable: true, options: previewSessions.map((item) => ({ id: item.id, label: item.title, selected: item.id === previewActive })) } });
   if (name === "open_panel") {
     const panel = String(params?.panel ?? "help");
     if (panel === "profile") return Promise.resolve({ ok: true, panel: {
@@ -364,7 +369,7 @@ function mockAction(name: ActionName, params?: Record<string, unknown>): Promise
     if (panel === "observe") return Promise.resolve({ ok: true, panel: { kind: "observe", title: "运行观察  当前会话", body: "当前会话  状态：就绪\n令牌：0\n工具：0", options: [{ id: "observe:project", label: "切换到项目概览" }] } });
 
     if (panel === "mcp") return Promise.resolve({ ok: true, panel: { kind: "mcp", title: "MCP 管理", body: "已连接 0 个服务  已注册 0 个工具", options: [{ id: "reload", label: "重新加载全部 MCP 服务" }] } });
-    return Promise.resolve({ ok: true, panel: { kind: "help", title: "快捷键与命令", body: "Enter 提交  Shift+Enter 换行  Ctrl+C 取消/退出  Ctrl+O 运行观察  Ctrl+P 打开审批模式" } });
+    return Promise.resolve({ ok: true, panel: { kind: "help", title: "快捷键与命令", body: "Enter 提交  Shift+Enter 换行  Ctrl+C 关闭工作台  Ctrl+O 运行观察  Ctrl+P 打开审批模式" } });
   }
   if (name === "complete_mention") return Promise.resolve({ ok: true, candidates: [
     { insertText: "session:session-1", display: "重构命令栏滚动与焦点", description: "历史会话", kind: "session" },
@@ -405,24 +410,31 @@ async function main() {
     rendererDestroyed = true;
     renderer.destroy();
   };
+  let closing = false;
+  const exitWorkbench = () => {
+    if (closing) return;
+    closing = true;
+    client?.shutdown();
+    void hostClipboard.dispose();
+    destroyRenderer();
+  };
+  process.once("SIGINT", exitWorkbench);
+  process.once("SIGTERM", exitWorkbench);
+  process.once("SIGHUP", exitWorkbench);
   createRoot(renderer).render(
     <App
       events={client?.events ?? (mock ? mockEvents() : undefined)}
       initialTask={initialTask}
-      onSubmit={client?.submit ?? (async (submission) => { if (mock) console.error(`mock submit: ${submission.text}`); return { accepted: true }; })}
+      onSubmit={client?.submit ?? (async (id, submission) => { updatePreview(previewEvent(id, { type: "transcript", item: { id: `user-${Date.now()}`, kind: "user", title: "你", body: submission.text } })); return { accepted: true }; })}
       onCancel={client?.cancel ?? (() => { if (mock) console.error("mock cancel"); })}
-      onAction={client?.action ?? (mock ? mockAction : undefined)}
+      onAction={client?.action ?? (mock ? ((id, name, params) => mockAction(name, params, id)) : undefined)}
       onResolveInteraction={client?.resolveInteraction}
       onPickFiles={openWindowsFilePicker}
       onReadClipboard={() => hostClipboard.read({ preferredTypes: ["image/png", "image/jpeg", "image/webp", "image/gif", "text/uri-list", "text/plain"] })}
       onCopyText={async (text) => (await hostClipboard.writeText(text, { selection: "clipboard" })).status === "written"}
       themePreference={themePreference}
       iconPreference={iconPreference}
-      onExit={() => {
-        client?.shutdown();
-        void hostClipboard.dispose();
-        destroyRenderer();
-      }}
+      onExit={exitWorkbench}
     />,
   );
   void client?.closed.then(destroyRenderer);

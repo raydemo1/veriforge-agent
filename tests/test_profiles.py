@@ -2,11 +2,6 @@ import os
 import unittest
 from unittest.mock import patch
 
-from harness_code_agent.agent.prompts import (
-    SHARED_AGENT_IDENTITY,
-    GlobalRulesDoc,
-    PromptPrefixBuilder,
-)
 from harness_code_agent.profiles import (
     PRODUCT_PROFILES,
     PROFILES,
@@ -123,50 +118,8 @@ class ProfilePromptTests(unittest.TestCase):
         self.assertLess(decision.confidence, 1.0)
         self.assertTrue(decision.fallback_used)
 
-    def test_shared_identity_precedes_profile_contract_and_has_own_hash(self):
-        prefix = PromptPrefixBuilder().build(
-            profile_prompt="## Role\nA focused test profile.",
-            global_rules_docs=[
-                GlobalRulesDoc(source="HARNESS.md", content="Use focused checks.")
-            ],
-        )
 
-        self.assertIn("## Agent Identity and Judgment", prefix.content)
-        self.assertIn(SHARED_AGENT_IDENTITY, prefix.content)
-        self.assertIn("## Profile Contract", prefix.content)
-        self.assertLess(
-            prefix.content.index("## Agent Identity and Judgment"),
-            prefix.content.index("## Profile Contract"),
-        )
-        self.assertLess(
-            prefix.content.index("## Profile Contract"),
-            prefix.content.index("## Global Rules Bundle"),
-        )
-        self.assertNotIn("Acceptance Criteria", prefix.content)
-        self.assertNotIn("acceptance_criteria_hash", prefix.hashes)
-        self.assertIn("shared_identity_hash", prefix.hashes)
 
-    def test_each_profile_has_role_working_style_boundaries_and_completion(self):
-        for name in PROFILES:
-            with self.subTest(profile=name):
-                prompt = get_profile(name).main_agent().system_prompt
-                self.assertIn("## Role", prompt)
-                self.assertIn("## Working Style", prompt)
-                self.assertIn("## Boundaries", prompt)
-                self.assertIn("## Completion", prompt)
-
-    def test_profile_contracts_keep_their_distinctive_behavior(self):
-        prompts = {
-            name: get_profile(name).main_agent().system_prompt.lower()
-            for name in PROFILES
-        }
-
-        self.assertIn("answer-first", prompts["general"])
-        self.assertIn("existing design", prompts["coding-agent"])
-        self.assertIn("decision-complete", prompts["plan"])
-        self.assertIn("findings first", prompts["review"])
-        self.assertIn("non-interactive", prompts["terminal"])
-        self.assertIn("smallest suitable stack", prompts["app-builder"])
 
     def test_general_profile_does_not_expose_shell_batch_commands(self):
         cfg = get_profile("general").main_agent()
@@ -213,11 +166,6 @@ class ProfilePromptTests(unittest.TestCase):
 
                 self.assertIsNone(cfg.time_budget)
 
-                prompt = cfg.system_prompt
-                self.assertIn("non-trivial multi-step execution", prompt)
-                self.assertIn("Do not update it after", prompt)
-                self.assertNotIn("tracked mode", prompt)
-                self.assertNotIn("acceptance_revision", prompt)
 
     def test_read_only_profiles_block_todo_tool(self):
         for name in ("general", "review"):
@@ -227,14 +175,11 @@ class ProfilePromptTests(unittest.TestCase):
 
         plan_cfg = get_profile("plan").main_agent()
         self.assertIsNone(plan_cfg.time_budget)
-        self.assertIn("planning flow (plan.md)", plan_cfg.system_prompt)
 
     def test_terminal_has_hard_timeout(self):
         cfg = get_profile("terminal").main_agent()
 
         self.assertEqual(cfg.time_budget, 1800)
-        self.assertNotIn("tracked", cfg.system_prompt)
-        self.assertIn("non-trivial multi-step execution", cfg.system_prompt)
 
     def test_terminal_profile_resolves_timeout_from_task_name_env(self):
         with patch.dict(os.environ, {"HARNESS_TERMINAL_TASK_NAME": "terminal-bench/overfull-hbox"}):

@@ -34,8 +34,8 @@ class WorkStateProjectionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_protocol_version_is_v5_and_accepts_work_events(self) -> None:
-        self.assertEqual(UI_PROTOCOL_VERSION, 6)
+    def test_protocol_version_is_v7_and_accepts_work_events(self) -> None:
+        self.assertEqual(UI_PROTOCOL_VERSION, 7)
         validate_ui_event({"type": "plan_updated", "plan": None})
         validate_ui_event({"type": "tasks_updated", "tasks": {"items": [], "completed": 0, "total": 0}})
         validate_ui_event({"type": "agent_run_updated", "agents": []})

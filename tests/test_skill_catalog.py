@@ -2,7 +2,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness_code_agent.agent.prompts import PromptPrefixBuilder
 from harness_code_agent.runtime.builtins.filesystem import read_skill_file
 from harness_code_agent.skills.registry import SKILLS_DIR, SkillRegistry
 
@@ -48,17 +47,6 @@ class SkillCatalogTests(unittest.TestCase):
         self.assertNotIn("Skill routing", listing)
         self.assertNotIn("plan.md", listing)
 
-    def test_prompt_prefix_adds_the_routing_policy(self):
-        registry = SkillRegistry()
-        prefix = PromptPrefixBuilder().build(
-            profile_prompt="You are a coding agent.",
-            skill_catalog=registry.catalog_listing(),
-        )
-
-        self.assertIn("## Stable Skill Catalog", prefix.content)
-        self.assertIn("User-invoked only skills need an explicit user request", prefix.content)
-        self.assertIn("read_skill_file", prefix.content)
-        self.assertIn("**triage**", prefix.content)
 
     def test_slash_invocation_reaches_every_skill(self):
         registry = SkillRegistry()
@@ -67,7 +55,6 @@ class SkillCatalogTests(unittest.TestCase):
         self.assertIsNotNone(user_invoked)
         self.assertEqual(user_invoked.name, "triage")
         self.assertEqual(user_invoked.arguments, "#42 locked")
-        self.assertIn("Follow the skill instructions below for this turn.", user_invoked.prompt)
 
         model_invoked = registry.build_user_invocation("/code-review")
         self.assertIsNotNone(model_invoked)

@@ -4,8 +4,10 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+from pathlib import Path
 
 from ..sessions.events import EventBus
+from ..config import ModelSelection
 from ..workspace.service import WorkspaceService
 from .approvals import ApprovalProvider, NoApprovalProvider
 from .execution_planner import ResourceCoordinator
@@ -24,6 +26,8 @@ class ToolContext:
     permission_policy: PermissionPolicy
     event_bus: EventBus
     session_id: str | None = None
+    session_root: Path | None = None
+    model_selection: ModelSelection = field(default_factory=ModelSelection)
     memory_use_enabled: bool = True
     memory_auto_extract_enabled: bool = True
     memory_service: object | None = field(default=None, repr=False)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import logging
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -347,6 +349,7 @@ class ToolExecutor:
                         future, turn_id=self.runtime_state.turn_id,
                         tool_call_id=prepared.tool_call_id, resources=prepared.effect.resources,
                         cancellation_token=child_token,
+                        foreground=self.agent.name == "main_agent",
                     )
                 futures[future] = prepared
                 pending.add(future)
@@ -451,9 +454,44 @@ class ToolExecutor:
     def _execute_one(self, prepared: PreparedToolCall, cancellation_token=None) -> ExecutedToolCall:
         context = self.agent.tool_context
         resource_guard = context.resource_coordinator.acquire(prepared.effect.resources, cancellation_token) if context is not None else nullcontext()
-        with cancellation_scope(cancellation_token), acquire_concurrency(prepared.effect.concurrency_key, cancellation_token), resource_guard:
+        project_guard = context.workspace.access.acquire(prepared.effect.resources, cancellation_token) if context is not None else nullcontext()
+        with cancellation_scope(cancellation_token), acquire_concurrency(prepared.effect.concurrency_key, cancellation_token), resource_guard, project_guard as lease:
             if cancellation_token is not None:
                 cancellation_token.check()
+            if context is not None and any(
+                claim.access == "write" and claim.domain in {"workspace", "global"}
+                for claim in prepared.effect.resources
+            ):
+                from ..runtime.recovery import RecoveryStore
+                store = RecoveryStore(context.workspace.root)
+                cursor = context.workspace.access.cursor()
+                claims = [claim for claim in prepared.effect.resources if claim.access == "write" and claim.domain in {"workspace", "global"}]
+                paths = None if any(claim.domain == "global" for claim in claims) else [Path(claim.key) for claim in claims]
+                before = store.manifest(store.capture(paths))
+                session_id = context.session_id
+                turn_id = self.runtime_state.turn_id
+                def record_external_changes():
+                    try:
+                        after = store.manifest(store.capture(paths))
+                        for name in before.keys() | after.keys():
+                            left, right = before.get(name), after.get(name)
+                            if left == right:
+                                continue
+                            if any(entry and entry["kind"] == "directory" for entry in (left, right)):
+                                context.workspace.unattributed_changes = True
+                                continue
+                            if any(entry and entry["kind"] != "file" for entry in (left, right)):
+                                context.workspace.unattributed_changes = True
+                                continue
+                            if left and right and left.get("mode") != right.get("mode"):
+                                context.workspace.unattributed_changes = True
+                            old = store.blob(left["hash"]) if left else None
+                            new = store.blob(right["hash"]) if right else None
+                            context.workspace.access.record_external(session_id, turn_id, context.workspace.root / name, old, new, cursor)
+                    except BaseException:
+                        context.workspace.unattributed_changes = True
+                        raise
+                lease.finalizers.append(record_external_changes)
             tool_result = execute_tool_result(
                 prepared.name,
                 prepared.args,
@@ -489,6 +527,24 @@ class ToolExecutor:
             item.result = tool_result
         elif tool_result.status == "success":
             self.runtime_state.failures.observe_success(prepared.name)
+
+        if tool_result.metadata.get("status_source") == "workspace_conflict":
+            from ..runtime.questions import QuestionRequest, QuestionOption
+            key = str(prepared.args.get("path", "workspace"))
+            attempts = self.runtime_state.workspace_conflict_attempts
+            attempts[key] = attempts.get(key, 0) + 1
+            if attempts[key] <= 2:
+                self._deferred_user_messages.append(
+                    f"工作区文件 {key} 已被其他执行者修改。请重新读取最新内容，在当前用户请求范围内重新计算修改；自动协调 {attempts[key]}/2。")
+            else:
+                answer = self.agent.tool_context.question_provider.ask(QuestionRequest(
+                    question=f"文件 {key} 连续发生版本冲突，已保留现有内容。是否继续重新读取并协调？",
+                    options=[QuestionOption("停止本轮修改", "stop"), QuestionOption("重新读取后继续", "retry")],
+                    session_id=self.agent.tool_context.session_id, agent_name=self.agent.name))
+                if answer.cancelled or answer.value != "retry":
+                    self.runtime_state.fallback.request_stop(reason="workspace_conflict", last_tool=prepared.name)
+                else:
+                    attempts[key] = 0
 
         observation = self.conversation.record_tool_result(prepared.tool_call_id, tool_result, prepared.args)
         if observation.inline_output is not None:

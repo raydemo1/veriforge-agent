@@ -1,7 +1,7 @@
 export type ThemePreference = "auto" | "dark" | "light";
 export type IconPreference = "auto" | "nerd" | "unicode";
 
-export const UI_PROTOCOL_VERSION = 6;
+export const UI_PROTOCOL_VERSION = 7;
 
 export type Snapshot = {
   profile: string;
@@ -170,9 +170,12 @@ export type ActionName =
   | "complete_mention"
   | "stage_attachments"
   | "remove_attachment"
-  | "workbench_action";
+  | "workbench_action"
+  | "switch_session" | "hide_session" | "fork_session" | "fork_worktree" | "apply_worktree" | "sync_session";
 export type ActionResult = {
   ok: boolean;
+  sessionId?: string;
+  view?: SessionViewSnapshot;
   message?: string;
   panel?: PanelSpec;
   candidates?: Array<{ insertText: string; display: string; description: string; kind: "file" | "session" }>;
@@ -194,7 +197,7 @@ export type WorkbenchParams =
   | { op: "read_proposal"; proposalId: string }
   | { op: "read_conflict"; conflictId: string };
 
-export type UiEvent =
+export type SessionEvent =
   | { type: "snapshot"; snapshot: Snapshot }
   | { type: "session_reset"; snapshot: Snapshot; items?: TranscriptItem[] }
   | { type: "transcript"; item: TranscriptItem }
@@ -216,10 +219,26 @@ export type UiEvent =
   | { type: "interaction_closed"; id: string }
   | { type: "shutdown"; reason?: string };
 
+export type SessionDescriptor = {
+  id: string; title: string; environment: "local" | "worktree"; cwd: string;
+  visible: boolean; status: string; pendingApproval: boolean;
+};
+export type SessionViewSnapshot = {
+  sequence: number; items: TranscriptItem[]; snapshot: Snapshot; interaction: Interaction | null;
+  work: Partial<WorkState>; turnState: "idle" | "running" | "queued" | "cancelling" | "cancelled";
+  queueDepth: number; commands: CommandItem[];
+};
+export type UiEvent =
+  | (SessionEvent & { sessionId: string; sequence: number })
+  | { type: "sessions"; sessions: SessionDescriptor[]; activeSessionId: string | null }
+  | { type: "session_view"; sessionId: string; view: SessionViewSnapshot }
+  | { type: "shutdown"; reason?: string };
+
 export type BridgeRequest = {
   type: "request";
   id: string;
   method: "initialize" | "submit" | "cancel" | "action" | "resolve_interaction" | "shutdown";
+  sessionId?: string;
   params?: Record<string, unknown>;
 };
 export type BridgeMessage =

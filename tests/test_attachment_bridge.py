@@ -11,12 +11,12 @@ from harness_code_agent.attachments import (
     ExternalPathConfirmationRequired,
     PreparedTurn,
 )
-from harness_code_agent.tui_bridge import BridgeServer
+from harness_code_agent.tui_bridge import SessionBridge
 
 
 class AttachmentBridgeTests(unittest.TestCase):
     def _server(self, session):
-        server = object.__new__(BridgeServer)
+        server = object.__new__(SessionBridge)
         server._session = session
         server._tasks = queue.Queue()
         server._stopping = threading.Event()
@@ -38,7 +38,7 @@ class AttachmentBridgeTests(unittest.TestCase):
         )
         server = self._server(session)
 
-        BridgeServer._handle_request(server, {
+        SessionBridge._handle_request(server, {
             "id": "submit-1",
             "method": "submit",
             "params": {"text": "compare", "attachmentIds": ["a1"], "authorizedPaths": [r"C:\outside.pdf"]},
@@ -54,7 +54,7 @@ class AttachmentBridgeTests(unittest.TestCase):
             raise ExternalPathConfirmationRequired([r"C:\outside.pdf"])
 
         server = self._server(SimpleNamespace(prepare_submission=prepare))
-        BridgeServer._handle_request(server, {
+        SessionBridge._handle_request(server, {
             "id": "submit-2",
             "method": "submit",
             "params": {"text": r"read C:\outside.pdf"},
@@ -115,7 +115,7 @@ class AttachmentBridgeTests(unittest.TestCase):
     def test_attachment_only_submission_is_allowed(self):
         prepared = PreparedTurn("", ())
         server = self._server(SimpleNamespace(prepare_submission=lambda _submission: prepared))
-        BridgeServer._handle_request(server, {
+        SessionBridge._handle_request(server, {
             "id": "submit-3",
             "method": "submit",
             "params": {"text": "", "attachmentIds": ["a1"]},
@@ -127,7 +127,7 @@ class AttachmentBridgeTests(unittest.TestCase):
         server = self._server(SimpleNamespace(
             remove_attachment=lambda attachment_id: removed.append(attachment_id) or True
         ))
-        result = BridgeServer._action(server, "remove_attachment", {"attachmentId": "a1"})
+        result = SessionBridge._action(server, "remove_attachment", {"attachmentId": "a1"})
         self.assertEqual(removed, ["a1"])
         self.assertEqual(result, {"ok": True})
 
@@ -168,7 +168,7 @@ class AttachmentBridgeTests(unittest.TestCase):
             patch("harness_code_agent.tui_bridge.model_input_mode", return_value="text"),
             patch("harness_code_agent.tui_bridge.MentionIndex", FakeMentionIndex),
         ):
-            result = BridgeServer._action(server, "complete_mention", {"prefix": ""})
+            result = SessionBridge._action(server, "complete_mention", {"prefix": ""})
 
         self.assertEqual(
             [item["insertText"] for item in result["candidates"]],

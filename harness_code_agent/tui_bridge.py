@@ -36,6 +36,7 @@ from .core.interactive import InteractiveSession
 from .runtime.approvals import ApprovalRequest, ApprovalResult
 from .runtime.permissions import PermissionPolicy
 from .runtime.questions import (
+    QuestionOption,
     QuestionRequest,
     QuestionResult,
     question_result_from_option,
@@ -159,6 +160,8 @@ class BridgeInteractionProvider:
         self._lock = threading.Lock()
         self._counter = 0
         self._pending: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
+        self._presentation_lock = threading.Lock()
+        self._closed = False
 
     def request(self, request: ApprovalRequest) -> ApprovalResult:
         if request.tool_name == "run_bash":
@@ -219,6 +222,23 @@ class BridgeInteractionProvider:
         )
 
     def _open(self, kind: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        from .agent.cancellation import current_token
+        token = current_token.get()
+        while not self._presentation_lock.acquire(timeout=0.05):
+            if token is not None:
+                token.check()
+            if self._closed:
+                raise CancelledError("工作台正在关闭")
+        try:
+            if token is not None:
+                token.check()
+            if self._closed:
+                raise CancelledError("工作台正在关闭")
+            return self._open_presented(kind, payload)
+        finally:
+            self._presentation_lock.release()
+
+    def _open_presented(self, kind: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         with self._lock:
             self._counter += 1
             interaction_id = f"interaction-{self._counter}"
@@ -252,6 +272,7 @@ class BridgeInteractionProvider:
 
     def cancel_all(self) -> None:
         with self._lock:
+            self._closed = True
             pending = list(self._pending.values())
         for event, result in pending:
             result["cancelled"] = True
@@ -260,10 +281,16 @@ class BridgeInteractionProvider:
 
 
 
-class BridgeServer:
+class SessionBridge:
     """Own one Python session and serve request/event messages over stdio."""
 
-    def __init__(self, *, cwd: Path, profile_name: str, profile_explicit: bool) -> None:
+    def __init__(self, *, cwd: Path, profile_name: str, profile_explicit: bool,
+                 session_id: str, state_root: Path, environment: str, emit, session_action) -> None:
+        self.runtime_id = session_id
+        self.environment = environment
+        self.state_root = state_root
+        self._emit_write = emit
+        self._session_action = session_action
         self.cwd = cwd.resolve()
         self.profile_name = profile_name
         self.profile_explicit = profile_explicit
@@ -325,6 +352,9 @@ class BridgeServer:
         try:
             session = InteractiveSession(
                 cwd=self.cwd,
+                session_id=self.runtime_id,
+                state_root=self.state_root,
+                environment=self.environment,
                 profile_name=self.profile_name,
                 profile_explicit=self.profile_explicit,
                 stream_sink=lambda text: (
@@ -358,6 +388,11 @@ class BridgeServer:
             if reset_ui:
                 self._send_event({"type": "session_reset", "snapshot": self._snapshot_payload(), "items": []})
             self._send_work_state()
+            metadata = session.session_store.read_metadata(session.session.id)
+            if metadata.get("history_boundary"):
+                items = self._history_items(session.session.id)
+                self._send_event({"type": "session_reset", "snapshot": self._snapshot_payload(), "items": items})
+                self._send_work_state()
             self._send_event({"type": "progress", "status": "ready", "detail": "Python 会话已就绪。"})
             self._start_mcp_warm(session)
         except Exception as exc:  # pragma: no cover - exercised by real startup failures
@@ -611,7 +646,7 @@ class BridgeServer:
                 0,
                 min(100, round((1 - snapshot.context_tokens / snapshot.context_window_tokens) * 100)),
             )
-        profile = config.resolve_model_profile(config.MODEL_INTENSITY)
+        profile = config.resolve_model_profile(config.MODEL_INTENSITY, self._require_session().model_selection)
         return {
             "profile": snapshot.profile,
             "permissionMode": snapshot.permission_mode,
@@ -641,16 +676,7 @@ class BridgeServer:
         self._write({"type": "event", "event": event})
 
     def _write(self, message: dict[str, Any]) -> None:
-        if self._output_broken.is_set():
-            return
-        line = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
-        with self._write_lock:
-            try:
-                sys.stdout.write(line + "\n")
-                sys.stdout.flush()
-            except (BrokenPipeError, OSError):
-                self._output_broken.set()
-                log.debug("OpenTUI output pipe closed", exc_info=True)
+        self._emit_write(message)
 
     def _response(self, request_id: str, *, result: Any = None, error: str | None = None) -> None:
         message: dict[str, Any] = {"type": "response", "id": request_id, "ok": error is None}
@@ -666,6 +692,12 @@ class BridgeServer:
             if task is None:
                 self._tasks.task_done()
                 return
+            if self._session is not None and self._session.tool_context.tool_tasks.pending_foreground_count:
+                self._send_event({"type": "turn_state", "state": "queued", "queueDepth": self._tasks.qsize() + 1})
+                while self._session.tool_context.tool_tasks.pending_foreground_count:
+                    if self._closing.wait(timeout=0.05):
+                        self._tasks.task_done()
+                        return
             token = CancellationToken()
             with self._active_lock:
                 self._active_token = token
@@ -751,7 +783,7 @@ class BridgeServer:
                 elif action == "compact":
                     self._notice("info", session.compact_current_context())
                 elif action == "fork":
-                    self._notice("info", session.fork_current_session())
+                    self._session_action("fork_session", {})
             if not should_continue:
                 self._closing.set()
             return
@@ -762,45 +794,8 @@ class BridgeServer:
         if getattr(result, "notice", ""):
             self._notice("info", str(result.notice))
 
-    def _sessions_panel(self) -> dict[str, Any]:
-        session = self._require_session()
-        options = []
-        current_session_id = session.session_id
-        for metadata in session.session_store.list_sessions():
-            session_id = str(metadata.get("id") or "").strip()
-            if not session_id:
-                continue
-            if session_id == current_session_id:
-                # Resuming the active session would fork it onto itself; the
-                # current session has no place in the resume list.
-                continue
-            preview = ""
-            try:
-                for event in reversed(session.session_store.read_events(session_id)):
-                    if event.get("type") == "user_input":
-                        preview = str((event.get("payload") or {}).get("text") or "").replace("\n", " ").strip()
-                        break
-            except (OSError, ValueError, KeyError, TypeError):
-                log.debug("Could not read session preview", exc_info=True)
-            if not preview:
-                continue
-            options.append(
-                {
-                    "id": session_id,
-                    "label": preview[:72] + ("…" if len(preview) > 72 else ""),
-                    "description": " · ".join((
-                        _PROFILE_COPY.get(str(metadata.get("profile") or "general"), (str(metadata.get("profile") or "general"), ""))[0],
-                        _relative_age(metadata.get("created_at")),
-                    )),
-                }
-            )
-        return {
-            "kind": "sessions",
-            "title": "历史会话",
-            "options": options,
-            "searchable": True,
-            "body": "" if options else "还没有包含用户任务的历史会话。",
-        }
+    def _sessions_panel(self):
+        return self._session_action("open_sessions", {})["panel"]
 
     def _panel(self, kind: str) -> dict[str, Any]:
         session = self._require_session()
@@ -849,7 +844,7 @@ class BridgeServer:
                 "options": options,
             }
         if kind == "model":
-            current = config.resolve_model_profile(config.MODEL_INTENSITY).model
+            current = config.resolve_model_profile(config.MODEL_INTENSITY, self._require_session().model_selection).model
             options = [
                 {
                     "id": name,
@@ -862,7 +857,7 @@ class BridgeServer:
             ]
             return {"kind": "model", "title": "模型", "options": options}
         if kind == "effort":
-            current = config.resolve_model_profile(config.MODEL_INTENSITY).reasoning_effort
+            current = config.resolve_model_profile(config.MODEL_INTENSITY, self._require_session().model_selection).reasoning_effort
             options = [
                 {
                     "id": effort,
@@ -923,7 +918,7 @@ class BridgeServer:
             return {
                 "kind": "help",
                 "title": "快捷键与命令",
-                "body": "Enter 提交  Shift+Enter 换行  Ctrl+C 取消/退出  Ctrl+O 运行观察  Ctrl+P 打开审批模式\n\n"
+                "body": "Enter 提交  Shift+Enter 换行  Ctrl+C 关闭工作台  Ctrl+O 运行观察  Ctrl+P 打开审批模式\nAlt+←/→ 切换会话  Ctrl+N 新建  Ctrl+Shift+W 隐藏标签\n\n"
                 + "\n".join(f"{item.usage:<18} {item.description}" for item in commands),
             }
         raise ValueError(f"unknown panel: {kind}")
@@ -933,19 +928,12 @@ class BridgeServer:
             raise ValueError("回撤正在进行，请稍候")
         session = self._require_session()
         if panel == "sessions":
-            session.resume_from_session(action)
-            items = self._history_items(action)
-            self._send_event({"type": "session_reset", "snapshot": self._snapshot_payload(), "items": items})
-            # Work state must land after session_reset: the reset reducer
-            # restores the initial empty work state.
-            self._refresh_proposal_state()
-            self._send_work_state()
-            return {"ok": True, "message": "已从历史会话创建分支"}
+            return self._session_action("switch_session", {"sessionId": action})
         if panel == "command":
             if action == "compact":
                 message = session.compact_current_context()
             elif action == "fork":
-                message = session.fork_current_session()
+                return self._session_action("fork_session", {})
             else:
                 raise ValueError(f"unknown command action: {action}")
         elif panel == "profile":
@@ -1024,7 +1012,11 @@ class BridgeServer:
         items = []
         self.work = WorkStateProjection(self.cwd)
         group = None
-        for index, event in enumerate(session.session_store.read_history_events(session_id)):
+        owned_points = session.recovery_points()
+        boundary = session.session_store.read_metadata(session_id).get("history_boundary")
+        for index, event in enumerate(session.session_store.read_history_events(session_id, event_count=boundary["event_count"] if boundary else 0)):
+            if event["type"] == "recovery_point_created" and event["payload"]["point_id"] not in owned_points:
+                continue
             if event["type"] == "turn_started":
                 turn = event["payload"]["turn"]
                 group = {"id": f"history-group-{turn}", "kind": "assistant", "title": "助手", "body": "", "state": "success", "role": "group", "turn": turn}
@@ -1059,7 +1051,6 @@ class BridgeServer:
         self.state.snapshot.status = "idle"
         self._assistant_group_id = None
         self._assistant_id = None
-        session.turn_count = replay.snapshot.turn
         return items
 
     def _queue_rewind(self, point_id: str) -> dict[str, Any]:
@@ -1083,33 +1074,8 @@ class BridgeServer:
             self._tasks.put(rewind)
         return {"ok": True, "queued": True}
 
-    def _new_session(self) -> dict[str, Any]:
-        if self._rewind_pending:
-            raise ValueError("回撤正在进行，请稍候")
-        if self._active_token is not None:
-            raise RuntimeError("当前回合仍在执行，暂时无法新建会话")
-        if self._session_thread.is_alive():
-            raise RuntimeError("新会话正在启动，请稍候")
-        self._discard_queued_tasks()
-        old_session = self._session
-        if old_session is not None:
-            old_session.close()
-        self._session = None
-        self._session_error = None
-        self.work = WorkStateProjection(self.cwd)
-        self._assistant_id = None
-        self.state = TuiState(snapshot=SessionStatusSnapshot(
-            profile=self.profile_name,
-            model=config.MODEL,
-            provider=config.PROVIDER,
-            permission_mode=os.environ.get("HARNESS_PERMISSION_MODE", "workspace-write"),
-            session_id=None,
-            cwd=self.cwd,
-            status="starting",
-        ))
-        self._send_event({"type": "progress", "status": "starting", "detail": "正在创建新会话…"})
-        self._start_session_construction(reset_ui=True)
-        return {"ok": True, "message": "新会话正在启动…"}
+    def _new_session(self):
+        return self._session_action("new_session", {})
 
     def _require_session(self) -> InteractiveSession:
         if self._session is None:
@@ -1199,29 +1165,6 @@ class BridgeServer:
         if not isinstance(params, dict):
             self._response(request_id, error="请求格式错误，请重试")
             return True
-        if method == "initialize":
-            client_version = params.get("protocolVersion")
-            if client_version != UI_PROTOCOL_VERSION:
-                self._response(
-                    request_id,
-                    error=(
-                        f"TUI 协议版本不兼容：客户端 {client_version!r}，"
-                        f"服务端 {UI_PROTOCOL_VERSION}"
-                    ),
-                )
-                return True
-            if self._session_error:
-                self._response(request_id, error=self._session_error)
-            else:
-                self._response(
-                    request_id,
-                    result={
-                        "protocolVersion": UI_PROTOCOL_VERSION,
-                        "cwd": str(self.cwd),
-                        "status": "ready" if self._session is not None else "starting",
-                    },
-                )
-            return True
         if method == "submit":
             text = str(params.get("text") or "").strip()
             attachment_ids = params.get("attachmentIds") or []
@@ -1259,6 +1202,10 @@ class BridgeServer:
                 except Exception as exc:
                     self._response(request_id, error=_localize_error(exc, "附件校验失败，请重试"))
                     return True
+                self._send_event({"type": "transcript", "item": {
+                    "id": f"user-{uuid.uuid4().hex}", "kind": "user", "title": "你",
+                    "body": _user_transcript_body(submission.text, prepared.attachments),
+                }})
                 self._tasks.put(prepared)
                 with self._active_lock:
                     active = self._active_token is not None
@@ -1310,10 +1257,6 @@ class BridgeServer:
                 self._response(request_id, result={"resolved": True})
                 self._send_event({"type": "interaction_closed", "id": interaction_id})
             return True
-        if method == "shutdown":
-            self._response(request_id, result={"closing": True})
-            self.close()
-            return False
         self._response(request_id, error="不支持的请求，请重试")
         return True
 
@@ -1335,45 +1278,252 @@ class BridgeServer:
         return discarded
 
     def close(self) -> None:
-        if self._closing.is_set():
-            return
         self._closing.set()
         with self._session_lock:
             self._session_generation += 1
             session = self._session
-            self._session = None
-            session_thread = self._session_thread
         with self._active_lock:
             token = self._active_token
         if token is not None:
             token.cancel()
         self._interactions.cancel_all()
+        self._discard_queued_tasks()
         self._tasks.put(None)
+        if self._session_thread is not threading.current_thread():
+            self._session_thread.join(timeout=10)
+        if self._session_thread.is_alive():
+            raise RuntimeError("会话初始化尚未退出，资源已保留")
+        session = session or self._session
         if session is not None:
-            try:
-                session.close()
-            except Exception as exc:
-                self._notice("error", f"会话清理未完成：{exc}")
-                log.warning("Failed to close OpenTUI session", exc_info=True)
-        if session_thread is not threading.current_thread():
-            session_thread.join(timeout=2)
+            session.close()
         if self._worker is not threading.current_thread():
             self._worker.join(timeout=2)
-        self._send_event({"type": "shutdown", "reason": "bridge closed"})
+        if self._worker.is_alive():
+            raise RuntimeError("会话执行线程尚未退出，资源已保留")
+        self._send_event({"type": "shutdown", "reason": "session closed"})
 
-    def run(self) -> int:
-        for raw_line in sys.stdin:
+
+class BridgeServer:
+    def __init__(self, *, cwd: Path, profile_name: str, profile_explicit: bool):
+        from .core.session_runtime_registry import SessionRuntimeRegistry
+        self.cwd = cwd.resolve()
+        self.profile_name, self.profile_explicit = profile_name, profile_explicit
+        self._write_lock = threading.Lock()
+        self._output_broken = threading.Event()
+        self._closed = False
+        self._closing = False
+        self._control_lock = threading.Lock()
+        self._controls = {}
+        self.registry = SessionRuntimeRegistry(self.cwd, self._create_host, self._event)
+        self.registry.create()
+
+    def _write(self, message):
+        line = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+        with self._write_lock:
+            if self._output_broken.is_set():
+                return
             try:
-                message = json.loads(raw_line)
-            except json.JSONDecodeError:
-                self._notice("error", "收到无法解析的桥接消息。")
-                continue
-            if not isinstance(message, dict) or message.get("type") != "request":
-                self._notice("error", "桥接消息缺少 request 类型。")
-                continue
-            if not self._handle_request(message):
-                return 0
-        self.close()
+                sys.stdout.write(line + "\n")
+                sys.stdout.flush()
+            except (BrokenPipeError, OSError):
+                self._output_broken.set()
+
+    def _event(self, event):
+        if event["type"] not in {"sessions", "shutdown", "session_view"}:
+            if not event.get("sessionId") or not isinstance(event.get("sequence"), int):
+                raise ValueError("会话事件缺少寻址或序列")
+        self._write({"type": "event", "event": event})
+
+    def _response(self, request_id, result=None, error=None):
+        response = {"type": "response", "id": request_id, "ok": error is None}
+        response["result" if error is None else "error"] = result if error is None else str(error)
+        self._write(response)
+
+    def _create_host(self, record):
+        def send(message):
+            if message["type"] == "event":
+                self.registry.publish(record.id, message["event"])
+            else:
+                self._write(message)
+        return SessionBridge(cwd=record.cwd, profile_name=self.profile_name,
+                             profile_explicit=self.profile_explicit, session_id=record.id,
+                             state_root=self.registry.store.root, environment=record.environment, emit=send,
+                             session_action=lambda name, params: self._action(record.id, name, params))
+
+    def _sessions_panel(self):
+        active = {entry.id: entry for entry in self.registry._records.values()}
+        options = [{"id": "action:new_session", "label": "新建会话"},
+                   {"id": "action:fork_session", "label": "从稳定历史创建分支"},
+                   {"id": "action:fork_worktree", "label": "在隔离工作区中继续"}]
+        if self.registry.active_id and self.registry.get(self.registry.active_id).environment == "worktree":
+            options.append({"id": "action:apply_worktree", "label": "应用更改到 Local"})
+        for metadata in self.registry.store.list_sessions():
+            session_id = metadata["id"]
+            entry = active.get(session_id)
+            options.append({"id": session_id, "label": entry.title if entry else metadata.get("title", "历史会话"),
+                            "description": (entry.status if entry else "已保存") + " · " + _relative_age(metadata["created_at"]),
+                            "selected": session_id == self.registry.active_id})
+        return {"kind": "sessions", "title": "会话", "searchable": True, "options": options}
+
+    def _action(self, session_id, name, params):
+        if name == "new_session":
+            return {"ok": True, "sessionId": self.registry.create()}
+        if name == "open_sessions" or (name == "open_panel" and params.get("panel") == "sessions"):
+            return {"ok": True, "panel": self._sessions_panel()}
+        if name == "panel_action" and params.get("panel") == "sessions":
+            action = params["action"]
+            if action.startswith("action:"):
+                return self._action(session_id, action.split(":", 1)[1], {})
+            name, params = "switch_session", {"sessionId": action}
+        if name == "switch_session":
+            target = params["sessionId"]
+            self.registry.resume(target)
+            return {"ok": True, "sessionId": target}
+        if name == "hide_session":
+            self.registry.hide(params.get("sessionId", session_id))
+            if self.registry.active_id is None:
+                self.registry.create()
+            return {"ok": True}
+        if name in {"fork_session", "fork_worktree"}:
+            target = self.registry.fork(session_id, worktree=name == "fork_worktree")
+            return {"ok": True, "sessionId": target}
+        if name == "apply_worktree":
+            record = self.registry.get(session_id)
+            session = record.host._require_session()
+            if record.environment != "worktree":
+                raise ValueError("当前会话不在 Worktree 中")
+            if session._turn_thread is not None or session.tool_context.tool_tasks.pending_count:
+                raise RuntimeError("当前会话仍在执行，请等待稳定边界再应用")
+            record.host._tasks.put(lambda: self._apply_worktree(record))
+            return {"ok": True, "message": "已排队应用到 Local"}
+        if name == "sync_session":
+            return {"ok": True, "sessionId": session_id, "view": self.registry.snapshot(session_id)}
+        return self.registry.get(session_id).host._action(name, params)
+
+    def _apply_worktree(self, record):
+        from .workspace.worktrees import WorktreeService
+        from .workspace.access import WorkspaceConflict
+        from .agent.cancellation import current_token
+        service = WorktreeService(self.cwd)
+        session = record.host._require_session()
+        if (session.tool_context.agent_coordinator.has_active_agents()
+                or session.conversation.runtime_state.shell_job_manager.running_jobs()):
+            raise RuntimeError("请先停止当前会话的后台任务，再应用更改")
+        resolutions = {}
+        for attempt in range(3):
+            try:
+                paths = service.apply(record.id, resolutions=resolutions)
+                record.host._notice("info", f"已应用 {len(paths)} 个文件到 Local")
+                return
+            except WorkspaceConflict as exc:
+                if attempt == 2:
+                    session.question_provider.ask(QuestionRequest(
+                        question=f"自动协调两轮后仍存在冲突，两边文件均已保留。{exc}。请检查后再应用，或在聊天中说明取舍。",
+                        options=[QuestionOption("保留现场", "keep")], session_id=record.id, agent_name="main_agent"))
+                    return
+                directory = record.cwd / ".harness" / "apply-conflicts" / uuid.uuid4().hex
+                descriptions = []
+                for name, versions in exc.files.items():
+                    descriptions.append(f"- {name}")
+                    for kind, data in versions.items():
+                        path = directory / kind / name
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        if data is not None:
+                            path.write_bytes(data)
+                        else:
+                            descriptions.append(f"  {kind} 版本不存在")
+                prompt = ("用户要求将当前 Worktree 的任务成果应用到 Local，但存在文件冲突。"
+                          f"这是第 {attempt + 1}/2 轮自动协调。仅在当前任务范围内协调以下文件，保留两边意图；"
+                          "读取 base、local、task 三个版本后，将合并结果写入当前 Worktree 的原文件。"
+                          "不要修改 Local；无法判断时询问用户，不要猜测。\n"
+                          f"版本目录：{directory}\n" + "\n".join(descriptions))
+                session.submit(prompt, cancellation_token=current_token.get())
+                for name, versions in exc.files.items():
+                    path = record.cwd / name
+                    desired = path.read_bytes() if path.is_file() else None
+                    if desired != versions["task"]:
+                        resolutions[name] = versions["local"]
+
+    def _handle_request(self, message):
+        request_id = message.get("id", "")
+        method = message.get("method")
+        params = message.get("params") or {}
+        try:
+            if method == "initialize":
+                if params.get("protocolVersion") != UI_PROTOCOL_VERSION:
+                    raise ValueError("TUI 协议版本不匹配")
+                self.registry.announce()
+                for record in list(self.registry._records.values()):
+                    self._event({"type": "session_view", "sessionId": record.id, "view": self.registry.snapshot(record.id)})
+                self._response(request_id, {"protocolVersion": UI_PROTOCOL_VERSION, "status": "ready", "activeSessionId": self.registry.active_id})
+            elif method == "shutdown":
+                self.close()
+                self._response(request_id, {"closed": True})
+                return False
+            else:
+                session_id = message.get("sessionId")
+                if not session_id:
+                    raise ValueError("请求缺少 sessionId")
+                if method == "action":
+                    name, action_params = params["name"], params.get("params") or {}
+                    slow = name in {"fork_session", "fork_worktree", "apply_worktree", "panel_action", "workbench_action"} or (
+                        name == "open_panel" and action_params.get("panel") == "mcp")
+                    if slow:
+                        self._start_control(request_id, session_id, name, action_params)
+                    else:
+                        self._response(request_id, self._action(session_id, name, action_params))
+                else:
+                    self.registry.get(session_id).host._handle_request(message)
+        except Exception as exc:
+            self._response(request_id, error=exc)
+        return True
+
+    def _start_control(self, request_id, session_id, name, params):
+        from .agent.cancellation import cancellation_scope
+        token = CancellationToken()
+        def run():
+            try:
+                with cancellation_scope(token):
+                    self._response(request_id, self._action(session_id, name, params))
+            except Exception as exc:
+                self._response(request_id, error=exc)
+            finally:
+                with self._control_lock:
+                    self._controls.pop(threading.current_thread(), None)
+        with self._control_lock:
+            if self._closing or len(self._controls) >= 4:
+                raise RuntimeError("工作台正在关闭或等待中的工作区操作过多")
+            thread = threading.Thread(target=run, name="workbench-control", daemon=True)
+            self._controls[thread] = token
+            thread.start()
+
+    def close(self):
+        if self._closed:
+            return
+        with self._control_lock:
+            self._closing = True
+            controls = list(self._controls.items())
+        for _, token in controls:
+            token.cancel()
+        for thread, _ in controls:
+            thread.join(timeout=2)
+        self.registry.close()
+        self._closed = True
+        self._event({"type": "shutdown", "reason": "工作台已关闭"})
+
+    def run(self):
+        try:
+            for line in sys.stdin:
+                try:
+                    message = json.loads(line)
+                    if message.get("type") != "request":
+                        raise ValueError("请求格式错误")
+                    if not self._handle_request(message):
+                        break
+                except (ValueError, TypeError) as exc:
+                    self._response("", error=exc)
+        finally:
+            self.close()
         return 0
 
 

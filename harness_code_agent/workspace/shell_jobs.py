@@ -135,6 +135,8 @@ class ShellJob:
     error: str | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _reader_threads: list[threading.Thread] = field(default_factory=list, repr=False)
+    _done_callbacks: list = field(default_factory=list, repr=False)
+    completion_pending: bool = False
 
     @property
     def output_tail(self) -> str:
@@ -144,13 +146,33 @@ class ShellJob:
         end = self.ended_at if self.ended_at is not None else time.time()
         return max(0.0, end - self.started_at)
 
+    def add_done_callback(self, callback):
+        with self._lock:
+            if self.status == "running":
+                self._done_callbacks.append(callback)
+                return
+        callback(self)
+
     def mark(self, status: ShellJobStatus, *, exit_code: int | None = None, error: str | None = None) -> None:
         with self._lock:
             self.status = status
             self.exit_code = exit_code
             self.error = error or self.error
-            if status != "running" and self.ended_at is None:
-                self.ended_at = time.time()
+            callbacks = []
+            if status != "running":
+                self.completion_pending = True
+                self.ended_at = self.ended_at or time.time()
+                callbacks, self._done_callbacks = self._done_callbacks, []
+        try:
+            for callback in callbacks:
+                callback(self)
+        except Exception as exc:
+            with self._lock:
+                self.error = str(exc)
+                self.status = "failed"
+        finally:
+            with self._lock:
+                self.completion_pending = False
 
 
 class ShellJobManager:
@@ -222,7 +244,7 @@ class ShellJobManager:
             return list(self._jobs.values())
 
     def running_jobs(self) -> list[ShellJob]:
-        return [job for job in self.list_jobs() if job.status == "running"]
+        return [job for job in self.list_jobs() if job.status == "running" or job.completion_pending]
 
     def read_output(self, job_id: str, max_chars: int = 12_000, *, offset: int | None = None) -> str:
         max_chars = _clamp_int(max_chars, minimum=1, maximum=100_000)

@@ -14,19 +14,25 @@ class ToolTaskSupervisor:
         self._futures: dict[Future, dict] = {}
         self._closed = False
 
-    def track(self, future: Future, *, turn_id=None, tool_call_id=None, resources=(), cancellation_token=None) -> None:
+    def track(self, future: Future, *, turn_id=None, tool_call_id=None, resources=(), cancellation_token=None, foreground=True) -> None:
         with self._lock:
             if self._closed:
                 future.cancel()
                 raise RuntimeError("tool task supervisor is closed")
             self._futures[future] = dict(turn_id=turn_id, tool_call_id=tool_call_id,
-                                         resources=tuple(resources), cancellation_token=cancellation_token)
+                                         resources=tuple(resources), cancellation_token=cancellation_token, foreground=foreground)
         future.add_done_callback(self._forget)
 
     @property
     def pending_count(self) -> int:
         with self._lock:
             return sum(not future.done() for future in self._futures)
+
+    @property
+    def pending_foreground_count(self) -> int:
+        with self._lock:
+            return sum(not future.done() and task["foreground"]
+                       for future, task in self._futures.items())
 
     def close(self, *, timeout: float = 1.0) -> bool:
         with self._lock:

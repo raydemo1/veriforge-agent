@@ -91,7 +91,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         lambda _args, context: CallEffect((workspace_claim(_root(context), ".", scope="global", access="read"),)),
         capabilities=all_agents)
     add("get_runtime_status", get_runtime_status, TOOL_PERMISSION_READ,
-        CallEffect.global_exclusive(kind="control"), capabilities=all_agents)
+        CallEffect(barrier=True, kind="control"), capabilities=all_agents)
 
     add(
         "read_file",
@@ -169,7 +169,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         "search_tools",
         search_tools,
         TOOL_PERMISSION_READ,
-        CallEffect.global_exclusive(kind="control"),
+        CallEffect(barrier=True, kind="control"),
         capabilities=all_agents,
     )
     add(
@@ -250,7 +250,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         "ask_user",
         ask_user,
         TOOL_PERMISSION_READ,
-        CallEffect.global_exclusive(kind="interaction"),
+        CallEffect(barrier=True, kind="interaction"),
     )
     add("memory_write", memory_write, TOOL_PERMISSION_EDIT)
     add("memory_validate", memory_validate, TOOL_PERMISSION_EDIT)
@@ -259,25 +259,25 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         "update_todo",
         update_todo,
         TOOL_PERMISSION_CONTROL,
-        CallEffect.global_exclusive(kind="control"),
+        CallEffect(barrier=True, kind="control"),
     )
     add(
         "list_shell_jobs",
         list_shell_jobs,
         TOOL_PERMISSION_READ,
-        CallEffect.global_exclusive(kind="control"),
+        CallEffect(barrier=True, kind="control"),
     )
     add(
         "read_shell_output",
         read_shell_output,
         TOOL_PERMISSION_READ,
-        CallEffect.global_exclusive(kind="control"),
+        CallEffect(barrier=True, kind="control"),
     )
     add(
         "stop_shell_job",
         stop_shell_job,
         TOOL_PERMISSION_CONTROL,
-        CallEffect.global_exclusive(kind="control"),
+        CallEffect(barrier=True, kind="control"),
     )
     add("stop_dev_server", stop_dev_server, TOOL_PERMISSION_SHELL)
     return registry

@@ -53,6 +53,10 @@ def run_bash(
                 metadata={"status_source": "runtime"},
             )
         job = manager.start(command, early_exit_seconds=0.5)
+        from ...workspace.access import current_lease
+        lease = current_lease.get()
+        if lease is not None:
+            lease.transfer_to(job)
         metadata = {
             "status_source": "shell_job",
             "job_id": job.job_id,

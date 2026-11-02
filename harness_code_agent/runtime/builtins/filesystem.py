@@ -296,6 +296,10 @@ def read_file(
     output = ""
     next_read = None
     budget = max(1, output_limit() - 800)
+    before = p.stat()
+    if tool_context is not None:
+        from ..output_artifacts import file_digest
+        tool_context.workspace._versions[str(p).casefold()] = file_digest(p)
     with p.open("r", encoding="utf-8", errors="replace", newline=None) as stream:
         while fragment := stream.readline(4096):
             fragment_line, fragment_col = line, col
@@ -328,6 +332,10 @@ def read_file(
             next_read = {"path": path, "start_line": next_line, "start_column": next_column,
                          "max_lines": limit, "include_line_numbers": include_line_numbers}
             break
+    after = p.stat()
+    if (before.st_ino, before.st_mtime_ns, before.st_size) != (after.st_ino, after.st_mtime_ns, after.st_size):
+        from ...workspace.access import WorkspaceConflict
+        raise WorkspaceConflict(f"读取期间文件发生变化，请重新读取：{path}")
     metadata = {"path": path, "start_line": start, "start_column": column, "max_lines": limit,
                 "status_source": "native"}
     if next_read:

@@ -162,6 +162,7 @@ class AgentRuntimeState:
     task_metadata: dict[str, Any] = field(default_factory=dict)
     fallback: AgentFallbackState = field(default_factory=AgentFallbackState)
     failures: FailureTracker = field(default_factory=FailureTracker)
+    workspace_conflict_attempts: dict[str, int] = field(default_factory=dict)
     current_turn_start_index: int = 0
     session_id: str = "default"
     permission_mode: str = ""
