@@ -92,6 +92,7 @@ class PreparedTurn:
     text: str
     attachments: tuple[Attachment, ...] = ()
     model_content: str | list[dict[str, Any]] = ""
+    session_id: str | None = None
 
 
 @dataclass

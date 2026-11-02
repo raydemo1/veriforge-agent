@@ -110,6 +110,21 @@ def _conversation_with_registry(root: Path, registry: ToolRegistry, tool_calls, 
 
 
 class ToolExecutorTests(unittest.TestCase):
+    def test_middleware_exception_closes_every_tool_call_and_preserves_error(self):
+        class Broken(AgentMiddleware):
+            def before_tool(self, *args, **kwargs):
+                raise ValueError("middleware exploded")
+        registry = ToolRegistry()
+        registry.register(_schema("read"), lambda: "unused", permission="read", effect=_READ_EFFECT)
+        calls = [_tool_call("first", "read"), _tool_call("second", "read")]
+        with tempfile.TemporaryDirectory() as tmp:
+            conversation, context = _conversation_with_registry(Path(tmp), registry, calls, [Broken()])
+            with self.assertRaisesRegex(ValueError, "middleware exploded"):
+                conversation.submit("inspect")
+            results = [message for message in conversation.messages if message.get("role") == "tool"]
+            self.assertEqual([message["tool_call_id"] for message in results], ["first", "second"])
+            self.assertTrue(all("middleware exploded" in message["content"] for message in results))
+
     def test_executor_pool_is_instance_scoped(self):
         from harness_code_agent.agent.tool_executor import ToolExecutor
 

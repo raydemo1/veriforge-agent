@@ -46,5 +46,165 @@ class LifecycleScopeTests(unittest.TestCase):
             lifecycle.register("late", lambda: None, order=10)
 
 
+class ExecutionBoundaryTests(unittest.TestCase):
+    def test_cancelled_resource_wait_never_enters_handler(self):
+        import threading
+        from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
+        from harness_code_agent.runtime.execution_planner import ResourceCoordinator, ResourceClaim
+        coordinator = ResourceCoordinator()
+        claim = ResourceClaim("workspace", "file", access="write")
+        token = CancellationToken()
+        waiting, exited = threading.Event(), threading.Event()
+        entered = []
+        def worker():
+            waiting.set()
+            try:
+                with coordinator.acquire([claim], token):
+                    entered.append(True)
+            except CancelledError:
+                exited.set()
+        with coordinator.acquire([claim]):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            self.assertTrue(waiting.wait(1))
+            token.cancel()
+            self.assertTrue(exited.wait(1))
+        thread.join(1)
+        self.assertFalse(entered)
+
+    def test_unknown_effect_conflicts_with_workspace_write(self):
+        from harness_code_agent.runtime.execution_planner import CallEffect, ResourceClaim, effects_conflict
+        self.assertTrue(effects_conflict(CallEffect.global_exclusive(),
+                        CallEffect((ResourceClaim("workspace", "file", access="write"),))))
+
+    def test_supervisor_keeps_running_future_until_real_completion(self):
+        from concurrent.futures import Future
+        from harness_code_agent.agent.cancellation import CancellationToken
+        from harness_code_agent.runtime.task_supervisor import ToolTaskSupervisor
+        supervisor, future, token = ToolTaskSupervisor(), Future(), CancellationToken()
+        future.set_running_or_notify_cancel()
+        supervisor.track(future, turn_id="old", cancellation_token=token)
+        supervisor.cancel(turn_id="other")
+        self.assertFalse(token.is_cancelled)
+        self.assertFalse(supervisor.close(timeout=0))
+        self.assertTrue(token.is_cancelled)
+        self.assertEqual(supervisor.pending_count, 1)
+        future.set_result("late")
+        self.assertEqual(supervisor.pending_count, 0)
+
+    def test_approval_wait_cancels_only_own_execution(self):
+        import threading
+        import tempfile
+        from pathlib import Path
+        from harness_code_agent.agent.cancellation import CancellationToken, CancelledError, cancellation_scope
+        from harness_code_agent.tui_bridge import BridgeInteractionProvider
+        opened, exited = threading.Event(), threading.Event()
+        token = CancellationToken()
+        with tempfile.TemporaryDirectory() as directory:
+            provider = BridgeInteractionProvider(lambda event: opened.set(), project_root=Path(directory))
+            def worker():
+                try:
+                    with cancellation_scope(token):
+                        provider._open("approval", {})
+                except CancelledError:
+                    exited.set()
+            thread = threading.Thread(target=worker)
+            thread.start()
+            self.assertTrue(opened.wait(1))
+            token.cancel()
+            self.assertTrue(exited.wait(1))
+            thread.join(1)
+            self.assertEqual(provider._pending, {})
+
+    def test_cancellation_runs_remaining_callbacks_after_failure(self):
+        from harness_code_agent.agent.cancellation import CancellationToken
+        token = CancellationToken()
+        calls = []
+        token.add_callback(lambda: 1 / 0)
+        token.add_callback(lambda: calls.append(True))
+        token.cancel()
+        self.assertEqual(calls, [True])
+
+
+    def test_submission_reports_each_terminal_outcome_once(self):
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
+        from harness_code_agent.attachments import PreparedTurn
+        from harness_code_agent.core.interactive import InteractiveSession
+        for error, status in [(None, "completed"), (CancelledError("stop"), "cancelled"), (ValueError("broken"), "failed")]:
+            session = InteractiveSession.__new__(InteractiveSession)
+            session._execution_condition = threading.Condition(threading.RLock())
+            session._closed = session._closing = False
+            session._turn_thread = session._turn_token = None
+            session.event_bus = Mock()
+            session.recovery = Mock()
+            session.session = Mock()
+            session.conversation = Mock()
+            session.session_store = Mock()
+            session.session_store.read_events.return_value = []
+            session._finish_recovery_turn = Mock()
+            session.turn_count = 1
+            session.tool_context = SimpleNamespace(tool_tasks=SimpleNamespace(pending_count=0))
+            session._submit_prepared = Mock(return_value="answer", side_effect=error)
+            if error:
+                with self.assertRaises(type(error)):
+                    session.submit_prepared(PreparedTurn("hello"), CancellationToken())
+            else:
+                self.assertEqual(session.submit_prepared(PreparedTurn("hello")), "answer")
+            self.assertEqual([call.args[0] for call in session.event_bus.emit.call_args_list],
+                             ["turn_started", "turn_finished"])
+            self.assertEqual(session.event_bus.emit.call_args.kwargs["payload"]["status"], status)
+            self.assertIsNone(session._turn_token)
+            self.assertIsNone(session._turn_thread)
+
+    def test_cancelled_startup_wait_retains_session_future(self):
+        from concurrent.futures import Future
+        from harness_code_agent.agent.cancellation import CancellationToken, CancelledError, cancellation_scope
+        from harness_code_agent.core.interactive import InteractiveSession
+        future, token = Future(), CancellationToken()
+        future.set_running_or_notify_cancel()
+        token.cancel()
+        session = InteractiveSession.__new__(InteractiveSession)
+        with cancellation_scope(token), self.assertRaises(CancelledError):
+            session._wait_session_future(future)
+        self.assertFalse(future.cancelled())
+        future.set_result("initialized")
+        self.assertEqual(future.result(), "initialized")
+
+    def test_session_close_retains_resources_while_foreground_tool_is_alive(self):
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from harness_code_agent.core.interactive import InteractiveSession
+        session = InteractiveSession.__new__(InteractiveSession)
+        session._execution_condition = threading.Condition(threading.RLock())
+        session._close_lock = threading.Lock()
+        session._closed = session._closing = False
+        session._turn_thread = session._turn_token = None
+        tasks = Mock()
+        tasks.wait_idle.return_value = False
+        session.tool_context = SimpleNamespace(tool_tasks=tasks, agent_coordinator=Mock())
+        session.lifecycle = Mock()
+        with self.assertRaisesRegex(RuntimeError, "资源未释放"):
+            session.close()
+        session.lifecycle.close.assert_not_called()
+        self.assertTrue(session._closing)
+        self.assertFalse(session._closed)
+
+    def test_runtime_mutation_is_rejected_for_lingering_foreground_work(self):
+        import threading
+        from types import SimpleNamespace
+        from harness_code_agent.core.interactive import InteractiveSession
+        session = InteractiveSession.__new__(InteractiveSession)
+        session._execution_condition = threading.Condition(threading.RLock())
+        session._closed = session._closing = False
+        session._turn_thread = None
+        session.tool_context = SimpleNamespace(tool_tasks=SimpleNamespace(pending_count=1))
+        with self.assertRaisesRegex(RuntimeError, "前台工具尚未退出"):
+            session.set_permission_mode("danger-full-access")
+
+
 if __name__ == "__main__":
     unittest.main()

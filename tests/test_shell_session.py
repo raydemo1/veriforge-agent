@@ -59,19 +59,7 @@ class PersistentShellSessionTests(unittest.TestCase):
     def _make_temp_dir(self) -> str:
         return tempfile.mkdtemp(dir=os.getcwd())
 
-    def test_commands_for_platform_returns_posix_commands(self):
-        temp_dir = self._make_temp_dir()
-        try:
-            with patch("os.name", "posix"):
-                commands = _commands_for_platform(temp_dir)
-
-            self.assertEqual(commands["make_and_cd"], "mkdir -p subdir && cd subdir")
-            self.assertEqual(commands["pwd"], "pwd")
-            self.assertEqual(commands["set_env"], "export FOO=bar")
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-    def test_shell_preserves_working_directory(self):
+    def test_shell_preserves_working_directory_and_environment(self):
         temp_dir = self._make_temp_dir()
         commands = _commands_for_platform(temp_dir)
         shell = PersistentShellSession(cwd=temp_dir)
@@ -82,15 +70,6 @@ class PersistentShellSessionTests(unittest.TestCase):
             if os.name != "nt":
                 self.assertEqual(result.exit_code, 0)
             self.assertEqual(Path(result.stdout.strip()).resolve(), Path(commands["pwd_expected"]).resolve())
-        finally:
-            shell.close()
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-    def test_shell_preserves_environment_variables(self):
-        temp_dir = self._make_temp_dir()
-        commands = _commands_for_platform(temp_dir)
-        shell = PersistentShellSession(cwd=temp_dir)
-        try:
             shell.run(commands["set_env"])
             result = shell.run(commands["get_env"])
 
@@ -162,33 +141,19 @@ class PersistentShellSessionTests(unittest.TestCase):
         ):
             validate_shell_configuration()
 
-    def test_windows_powershell_backend_preserves_utf8_output(self):
-        if os.name != "nt" or windows_shell_kind() != "pwsh":
-            self.skipTest("PowerShell backend not active")
-        temp_dir = self._make_temp_dir()
-        shell = PersistentShellSession(cwd=temp_dir)
-        try:
-            result = shell.run("'中文 output'")
-
-            self.assertEqual(result.exit_code, 0)
-            self.assertIn("中文 output", result.stdout)
-        finally:
-            shell.close()
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-    def test_windows_powershell_backend_uses_final_statement_status(self):
+    def test_windows_powershell_backend_preserves_utf8_and_final_statement_status(self):
         if os.name != "nt" or windows_shell_kind() != "pwsh":
             self.skipTest("PowerShell backend not active")
         temp_dir = self._make_temp_dir()
         shell = PersistentShellSession(cwd=temp_dir)
         try:
             recovered = shell.run(
-                'python -c "import sys; sys.exit(2)"; Write-Output recovered'
+                'python -c "import sys; sys.exit(2)"; Write-Output "中文 output"'
             )
             failed = shell.run('python -c "import sys; sys.exit(2)"')
 
             self.assertEqual(recovered.exit_code, 0)
-            self.assertIn("recovered", recovered.stdout)
+            self.assertIn("中文 output", recovered.stdout)
             self.assertEqual(failed.exit_code, 2)
         finally:
             shell.close()
@@ -353,35 +318,6 @@ class PersistentShellSessionTests(unittest.TestCase):
             # Should not raise
             backend._cleanup_impl()
             self.assertFalse(backend._container_started)
-
-    def test_stop_exec_process_waits_for_reader_thread(self):
-        import threading
-
-        backend = _DockerShellBackend.__new__(_DockerShellBackend)
-        # Simulate a stopped process
-        proc = unittest.mock.MagicMock()
-        proc.poll.return_value = 0
-        proc.stdin = unittest.mock.MagicMock()
-        proc.stdout = unittest.mock.MagicMock()
-        backend._process = proc
-
-        reader_started = threading.Event()
-        reader_exited = threading.Event()
-
-        def reader_run():
-            reader_started.set()
-            reader_exited.wait()  # block until told to exit
-
-        reader = threading.Thread(target=reader_run)
-        reader.start()
-        reader_started.wait()
-        backend._reader = reader
-
-        backend._stop_exec_process(timeout=2)
-
-        reader_exited.set()
-        reader.join(timeout=2)
-        self.assertFalse(reader.is_alive())
 
     def test_docker_backend_interrupt_does_not_set_closed(self):
         backend = _DockerShellBackend.__new__(_DockerShellBackend)

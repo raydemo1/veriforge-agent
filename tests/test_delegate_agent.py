@@ -214,6 +214,20 @@ class AgentCoordinatorTests(unittest.TestCase):
         self.coordinator.close()
         shutil.rmtree(self.temp, ignore_errors=True)
 
+    def test_registered_agent_survives_requesting_turn_cancellation(self):
+        from harness_code_agent.agent.cancellation import CancellationToken
+        token = CancellationToken()
+        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
+            spawned = self.coordinator.spawn(name="independent", role="explorer", task="inspect",
+                                              parent_cancellation_token=token)
+            conversation = self._wait_conversation("independent")
+            self.assertTrue(conversation.started.wait(1))
+            token.cancel()
+            self.assertFalse(conversation.release.wait(0.1))
+            self.assertEqual(self.coordinator.list()["agents"][0]["agent_id"], spawned["agent_id"])
+            conversation.release.set()
+            self.assertEqual(self._wait_terminal(spawned["agent_id"])["status"], "completed")
+
     def test_message_reaches_running_agent_without_waiting_for_turn_end(self):
         with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
             spawned = self.coordinator.spawn(name="explore", role="explorer", task="inspect")

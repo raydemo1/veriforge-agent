@@ -1138,6 +1138,11 @@ class ProductRuntimeTests(unittest.TestCase):
         config.set_model_override(model=None, reasoning_effort=None)
 
         session = InteractiveSession.__new__(InteractiveSession)
+        session._execution_condition = threading.Condition(threading.RLock())
+        session._closed = False
+        session._closing = False
+        session._turn_thread = None
+        session.tool_context = None
         session.conversation = SimpleNamespace(_cached_prompt_cache_key="cache-key")
         session.apply_model_override(model="deepseek-v4-pro")
 

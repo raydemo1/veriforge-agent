@@ -1098,22 +1098,23 @@ class AgentConversation:
         if self._closed:
             return
         self._closed = True
-        for mw in self.agent.middlewares:
-            on_close = getattr(mw, "on_conversation_close", None)
-            if on_close is None:
-                continue
-            on_close(
-                self.messages,
-                runtime_state=self.runtime_state,
-                agent_name=self.agent.name,
-            )
-        self.runtime_state.close_shell_sessions()
+        cleanups = [
+            lambda mw=mw: mw.on_conversation_close(
+                self.messages, runtime_state=self.runtime_state, agent_name=self.agent.name)
+            for mw in self.agent.middlewares if hasattr(mw, "on_conversation_close")
+        ]
+        cleanups.append(self.runtime_state.close_shell_sessions)
         if self.runtime_state.shell_job_manager is not None:
-            self.runtime_state.shell_job_manager.close()
+            cleanups.append(self.runtime_state.shell_job_manager.close)
         if self.agent.tool_context is not None:
-            self.agent.tool_context.close_language_service()
-        with contextlib.suppress(Exception):
-            self.client.close()
+            cleanups.append(self.agent.tool_context.close_language_service)
+        cleanups.append(lambda: self.client.close())
+        for cleanup in cleanups:
+            try:
+                cleanup()
+            except Exception:
+                log.exception("Conversation cleanup failed")
+
 
 
 def _safe_tool_summary(tool_name: str, tool_args: dict) -> str:

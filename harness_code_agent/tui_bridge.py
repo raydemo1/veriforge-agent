@@ -226,9 +226,18 @@ class BridgeInteractionProvider:
             result: dict[str, Any] = {}
             self._pending[interaction_id] = (event, result)
         self._emit({"type": "interaction", "id": interaction_id, "kind": kind, "payload": payload})
-        event.wait()
-        with self._lock:
-            self._pending.pop(interaction_id, None)
+        from .agent.cancellation import current_token
+        token = current_token.get()
+        try:
+            while not event.wait(timeout=0.05):
+                if token is not None:
+                    token.check()
+            if token is not None:
+                token.check()
+        finally:
+            with self._lock:
+                self._pending.pop(interaction_id, None)
+            self._emit({"type": "interaction_closed", "id": interaction_id})
         return interaction_id, result
 
     def resolve(self, interaction_id: str, result: dict[str, Any]) -> bool:
@@ -409,7 +418,7 @@ class BridgeServer:
                 if not self._stopping.is_set():
                     self._send_event({"type": "turn_state", "state": "running"})
             elif event_type == "turn_finished":
-                self._close_assistant_group("success")
+                self._close_assistant_group({"completed": "success", "cancelled": "cancelled", "failed": "error"}.get(event.payload.get("status"), "success"))
             elif event_type == "recovery_point_created":
                 self._send_event({"type": "recovery_available", "turn": event.payload["turn"], "pointId": event.payload["point_id"]})
                 self._send_event({"type": "turn_state", "state": "idle"})
@@ -657,17 +666,6 @@ class BridgeServer:
             if task is None:
                 self._tasks.task_done()
                 return
-            if callable(task):
-                self._send_event({"type": "turn_state", "state": "running"})
-                try:
-                    task()
-                except Exception as exc:
-                    self._notice("error", _localize_error(exc, "操作执行失败，请稍后重试"))
-                    log.debug("OpenTUI queued action failed\n%s", traceback.format_exc())
-                finally:
-                    self._send_event({"type": "turn_state", "state": "idle"})
-                    self._tasks.task_done()
-                continue
             token = CancellationToken()
             with self._active_lock:
                 self._active_token = token
@@ -679,7 +677,12 @@ class BridgeServer:
                 self._close_assistant_group("success")
             self._send_event({"type": "turn_state", "state": "running"})
             try:
-                self._run_task(task, token)
+                from .agent.cancellation import cancellation_scope
+                with cancellation_scope(token):
+                    if callable(task):
+                        task()
+                    else:
+                        self._run_task(task, token)
             except CancelledError:
                 self._finish_interrupted_assistant()
             except Exception as exc:  # runtime errors stay inside the protocol
@@ -689,9 +692,7 @@ class BridgeServer:
             finally:
                 with self._active_lock:
                     self._active_token = None
-                if self._stopping.is_set():
-                    self._discard_queued_tasks()
-                    self._stopping.clear()
+                self._stopping.clear()
                 self._send_event({"type": "turn_state", "state": "idle"})
                 self._tasks.task_done()
 
@@ -705,8 +706,11 @@ class BridgeServer:
         path; on denial nothing is submitted.
         """
 
+        session = self._require_session()
+
         def task() -> None:
-            session = self._require_session()
+            if session is not self._session:
+                return
             try:
                 prepared = session.prepare_with_external_approval(submission)
             except AttachmentError as exc:
@@ -1086,6 +1090,7 @@ class BridgeServer:
             raise RuntimeError("当前回合仍在执行，暂时无法新建会话")
         if self._session_thread.is_alive():
             raise RuntimeError("新会话正在启动，请稍候")
+        self._discard_queued_tasks()
         old_session = self._session
         if old_session is not None:
             old_session.close()
@@ -1112,6 +1117,13 @@ class BridgeServer:
         return self._session
 
     def _action(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
+        if name in {"toggle_permission", "panel_action", "workbench_action", "new_session", "rewind"}:
+            with self._active_lock:
+                if self._active_token is not None:
+                    raise RuntimeError("当前回合仍在执行，暂时无法修改运行时")
+            session = self._require_session()
+            if session.tool_context.tool_tasks.pending_count:
+                raise RuntimeError("前台工具尚未退出，暂时无法修改运行时")
         if name == "rewind":
             return self._queue_rewind(str(params.get("pointId") or ""))
         if name == "open_sessions":
@@ -1263,14 +1275,9 @@ class BridgeServer:
             self._stopping.set()
             if token is not None:
                 token.cancel()
-            discarded = self._discard_queued_tasks()
-            if self._session is not None:
-                try:
-                    self._session.interrupt_current_shell()
-                except Exception:
-                    log.debug("Failed to interrupt current shell", exc_info=True)
-            if token is not None or discarded:
-                self._send_event({"type": "turn_state", "state": "cancelling", "queueDepth": 0})
+            discarded = 0
+            if token is not None:
+                self._send_event({"type": "turn_state", "state": "cancelling", "queueDepth": self._tasks.qsize()})
             else:
                 self._stopping.clear()
             self._response(
@@ -1345,8 +1352,9 @@ class BridgeServer:
         if session is not None:
             try:
                 session.close()
-            except Exception:
-                log.debug("Failed to close OpenTUI session", exc_info=True)
+            except Exception as exc:
+                self._notice("error", f"会话清理未完成：{exc}")
+                log.warning("Failed to close OpenTUI session", exc_info=True)
         if session_thread is not threading.current_thread():
             session_thread.join(timeout=2)
         if self._worker is not threading.current_thread():

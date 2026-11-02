@@ -526,7 +526,7 @@ def test_cancellation_after_tool_completion_preserves_completed_result(tmp_path)
         token.cancel()
         return ExecutedToolCall(prepared, ToolResult(tool='read_file', status='success', output='COMPLETED_BEFORE_CANCEL'))
     try:
-        with patch.object(executor, '_execute_one_unlimited', side_effect=finish):
+        with patch.object(executor, '_execute_one', side_effect=finish):
             with pytest.raises(CancelledError):
                 executor.execute([call])
         assert 'COMPLETED_BEFORE_CANCEL' in conversation.messages[-1]['content']

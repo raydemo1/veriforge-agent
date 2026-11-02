@@ -9,6 +9,9 @@ parents do not accumulate callbacks to finished turns/calls.
 from __future__ import annotations
 
 import threading
+import logging
+from contextvars import ContextVar
+from contextlib import contextmanager
 from collections.abc import Callable
 
 
@@ -36,7 +39,10 @@ class CancellationToken:
             callbacks = list(self._callbacks)
             self._callbacks.clear()
         for callback in callbacks:
-            callback()
+            try:
+                callback()
+            except Exception:
+                logging.getLogger("harness").exception("Cancellation callback failed")
 
     def add_callback(self, callback: Callable[[], None]) -> Callable[[], None]:
         with self._lock:
@@ -86,3 +92,14 @@ class CancellationToken:
 
 class CancelledError(Exception):
     pass
+
+
+current_token = ContextVar("execution_cancellation_token", default=None)
+
+@contextmanager
+def cancellation_scope(token):
+    binding = current_token.set(token)
+    try:
+        yield
+    finally:
+        current_token.reset(binding)

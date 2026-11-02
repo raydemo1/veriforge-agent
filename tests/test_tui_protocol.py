@@ -23,6 +23,25 @@ class TuiProtocolTests(unittest.TestCase):
         )
         return server
 
+    def test_stop_preserves_queued_messages_and_resets_idle_flag(self):
+        import queue
+        from harness_code_agent.agent.cancellation import CancellationToken
+        for active in (False, True):
+            server = self._server()
+            server._active_lock = threading.Lock()
+            server._active_token = CancellationToken() if active else None
+            server._stopping = threading.Event()
+            server._tasks = queue.Queue()
+            server._tasks.put("next message")
+            server._session = SimpleNamespace()
+            server._send_event = lambda event: None
+            server._handle_request({"id": "stop", "method": "cancel", "params": {}})
+            self.assertEqual(server._tasks.get_nowait(), "next message")
+            self.assertEqual(server.responses[0]["result"]["discardedQueued"], 0)
+            self.assertEqual(server._stopping.is_set(), active)
+            if active:
+                self.assertTrue(server._active_token.is_cancelled)
+
     def test_initialize_requires_the_shared_protocol_version(self):
         server = self._server()
 

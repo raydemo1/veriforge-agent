@@ -11,15 +11,16 @@ class ToolTaskSupervisor:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._futures: set[Future] = set()
+        self._futures: dict[Future, dict] = {}
         self._closed = False
 
-    def track(self, future: Future) -> None:
+    def track(self, future: Future, *, turn_id=None, tool_call_id=None, resources=(), cancellation_token=None) -> None:
         with self._lock:
             if self._closed:
                 future.cancel()
                 raise RuntimeError("tool task supervisor is closed")
-            self._futures.add(future)
+            self._futures[future] = dict(turn_id=turn_id, tool_call_id=tool_call_id,
+                                         resources=tuple(resources), cancellation_token=cancellation_token)
         future.add_done_callback(self._forget)
 
     @property
@@ -31,11 +32,21 @@ class ToolTaskSupervisor:
         with self._lock:
             self._closed = True
             futures = tuple(self._futures)
-        for future in futures:
-            future.cancel()
+        self.cancel()
         if futures:
             wait(futures, timeout=max(0.0, timeout))
         return all(future.done() for future in futures)
+
+    def cancel(self, *, turn_id=None) -> None:
+        with self._lock:
+            tasks = list(self._futures.items())
+        for future, task in tasks:
+            if turn_id is not None and task["turn_id"] != turn_id:
+                continue
+            token = task["cancellation_token"]
+            if token is not None:
+                token.cancel()
+            future.cancel()
 
     def wait_idle(self, *, timeout: float = 1.0) -> bool:
         deadline = time.monotonic() + max(0.0, timeout)
@@ -51,4 +62,4 @@ class ToolTaskSupervisor:
 
     def _forget(self, future: Future) -> None:
         with self._lock:
-            self._futures.discard(future)
+            self._futures.pop(future, None)

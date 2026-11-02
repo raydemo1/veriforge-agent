@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import copy
+from functools import wraps
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from ..agent.cancellation import current_token
+from ..agent.cancellation import CancellationToken, CancelledError, cancellation_scope
 import hashlib
 import json
 import logging
@@ -121,6 +126,20 @@ class ProfileRuntime:
     conversation: AgentConversation
 
 
+def runtime_change(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self._execution_condition:
+            if self._closed or self._closing:
+                raise RuntimeError("会话正在关闭")
+            if self._turn_thread is not None and self._turn_thread != threading.get_ident():
+                raise RuntimeError("当前回合仍在执行，暂时无法修改运行时")
+            if self.tool_context is not None and self.tool_context.tool_tasks.pending_count:
+                raise RuntimeError("前台工具尚未退出，暂时无法修改运行时")
+            return method(self, *args, **kwargs)
+    return guarded
+
+
 class InteractiveSession:
     def __init__(
         self,
@@ -139,6 +158,13 @@ class InteractiveSession:
     ):
         self.cwd = Path(cwd).resolve()
         self.lifecycle = LifecycleScope()
+        self._execution_condition = threading.Condition(threading.RLock())
+        self._closing = False
+        self._turn_thread = None
+        self._turn_token = None
+        self._startup_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="session-startup")
+        self.lifecycle.register("startup_executor", lambda: self._startup_executor.shutdown(wait=True), order=50)
+        self._mcp_future = None
         try:
             self.profile_router = JevRouteClassifier()
             self.lifecycle.register("profile_router", self.profile_router.close, order=40)
@@ -275,13 +301,35 @@ class InteractiveSession:
         self._mcp_tools_loaded = True
 
     def _prepare_tool_registry(self) -> None:
+        self._mcp_future = None
         self.tool_registry = BUILTIN_TOOL_REGISTRY.copy()
         self.mcp_manager = McpClientManager.from_workspace(self.cwd)
         manager = self.mcp_manager
         self.lifecycle.register(f"mcp:{id(manager)}", manager.close, order=10)
         self._mcp_tools_loaded = False
 
+    def _wait_session_future(self, future):
+        token = current_token.get()
+        while True:
+            if token is not None:
+                token.check()
+            try:
+                return future.result(timeout=0.05)
+            except FutureTimeout:
+                if future.done():
+                    return future.result()
+
     def _ensure_mcp_tools_loaded(self) -> None:
+        with self._execution_condition:
+            if self._closed or self._closing:
+                raise RuntimeError("会话正在关闭")
+            if self._mcp_future is None:
+                self._mcp_future = self._startup_executor.submit(self._initialize_mcp_tools)
+                self.tool_context.tool_tasks.track(self._mcp_future)
+            future = self._mcp_future
+        self._wait_session_future(future)
+
+    def _initialize_mcp_tools(self) -> None:
         if self._mcp_tools_loaded:
             return
         with self._mcp_load_lock:
@@ -429,7 +477,7 @@ class InteractiveSession:
             self.ensure_profile_bound_for_first_task(submission.text)
         if self.attachment_manager is None:
             raise RuntimeError("附件模块尚未准备好，请稍候")
-        return self.attachment_manager.prepare(submission)
+        return replace(self.attachment_manager.prepare(submission), session_id=self.session.id)
 
     def stage_attachment_path(self, path: str | Path, *, source: str = "picker") -> Attachment:
         if self.attachment_manager is None:
@@ -489,11 +537,63 @@ class InteractiveSession:
                 authorized_paths=tuple(exc.paths),
             ))
 
+    @contextmanager
+    def _turn_scope(self, cancellation_token=None):
+        token = cancellation_token or current_token.get() or CancellationToken()
+        if self._turn_thread == threading.get_ident():
+            token.check()
+            yield token
+            return
+        with self._execution_condition:
+            if self._closed or self._closing or self._turn_thread is not None:
+                raise RuntimeError("会话正在执行或关闭")
+            self._turn_thread = threading.get_ident()
+            self._turn_token = token
+            self.turn_count += 1
+        started = time.monotonic()
+        status, reason = "completed", None
+        try:
+            self.recovery.begin_turn(
+                session_id=self.session.id, turn=self.turn_count - 1,
+                journal_sequence=self.conversation.journal.sequence,
+                event_count=len(self.session_store.read_events(self.session.id)),
+            )
+            self.event_bus.emit("turn_started", agent="main_agent", payload={"turn": self.turn_count})
+            with cancellation_scope(token):
+                token.check()
+                yield token
+                token.check()
+        except BaseException as exc:
+            status = "cancelled" if isinstance(exc, CancelledError) else "failed"
+            reason = str(exc)
+            raise
+        finally:
+            try:
+                self.event_bus.emit("turn_finished", agent="main_agent", payload={
+                    "turn": self.turn_count, "status": status, "reason": reason,
+                    "duration_seconds": time.monotonic() - started,
+                    "pending_foreground_tools": self.tool_context.tool_tasks.pending_count,
+                })
+                if status == "completed":
+                    self._finish_recovery_turn()
+            finally:
+                with self._execution_condition:
+                    self._turn_thread = None
+                    self._turn_token = None
+                    self._execution_condition.notify_all()
+
     def submit_prepared(self, prepared: PreparedTurn, cancellation_token=None) -> TurnResult:
+        with self._turn_scope(cancellation_token) as token:
+            return self._submit_prepared(prepared, token)
+
+    def _submit_prepared(self, prepared: PreparedTurn, cancellation_token) -> TurnResult:
+        if prepared.session_id != self.session.id:
+            raise ValueError("待执行消息不属于当前会话")
         user_prompt = prepared.text
         self._sync_mcp_connections()
         self._refresh_skill_catalog()
         self.ensure_profile_bound_for_first_task(user_prompt)
+        cancellation_token.check()
         skill_invocation = self.skill_registry.build_user_invocation(user_prompt)
         if skill_invocation is not None:
             result = self._submit_to_current_agent(
@@ -545,7 +645,7 @@ class InteractiveSession:
         ):
             return None
         current = self.profile.name()
-        decision = route_profile_for_turn(
+        future = self._startup_executor.submit(route_profile_for_turn,
             user_prompt,
             current_profile=current,
             routing_mode=self.routing_mode,
@@ -553,6 +653,8 @@ class InteractiveSession:
             previous_assistant_text=self.last_assistant_text,
             llm_classifier=self.profile_router,
         )
+        self.tool_context.tool_tasks.track(future)
+        decision = self._wait_session_future(future)
         switched = decision.action == ROUTE_ACTION_SWITCH_PROFILE and decision.profile_name != current
         self.event_bus.emit(
             "profile_route_decision",
@@ -728,29 +830,23 @@ class InteractiveSession:
         return created
 
     def _submit_to_current_agent(self, user_prompt: str, cancellation_token=None, turn_instruction: str | None = None, attachments: tuple[Attachment, ...] = ()) -> TurnResult:
-        with self.recovery.store.exclusive():
-            self.recovery.begin_turn(
-                session_id=self.session.id, turn=self.turn_count,
-                journal_sequence=self.conversation.journal.sequence,
-                event_count=len(self.session_store.read_events(self.session.id)),
-            )
-            try:
-                return self._run_turn(user_prompt, cancellation_token, turn_instruction, attachments)
-            except BaseException:
-                try:
-                    self.recovery.observed = self.recovery.store.capture()
-                    self._announce_recovery_origin()
-                except (OSError, ValueError, RuntimeError):
-                    pass
-                raise
+        return self._run_turn(user_prompt, cancellation_token, turn_instruction, attachments)
 
-    def _run_turn(
+    def _run_turn(self, user_prompt: str, cancellation_token=None,
+                  turn_instruction: str | None = None, attachments: tuple[Attachment, ...] = ()) -> TurnResult:
+        with self._turn_scope(cancellation_token) as token:
+            return self._run_tracked_turn(user_prompt, token, turn_instruction, attachments)
+
+    def _run_tracked_turn(
         self,
         user_prompt: str,
         cancellation_token=None,
         turn_instruction: str | None = None,
         attachments: tuple[Attachment, ...] = (),
     ) -> TurnResult:
+        cancellation_token = cancellation_token or current_token.get()
+        if cancellation_token is not None:
+            cancellation_token.check()
         session_id = self.session.id
         tracking = self.memory_auto_extract_enabled
         completed = False
@@ -812,7 +908,6 @@ class InteractiveSession:
             ),
         )
         attachment_metadata = [item.public_dict() for item in attachments]
-        self.turn_count += 1
         self.event_bus.emit_event(
             UserInputEvent(
                 text=user_prompt,
@@ -821,18 +916,11 @@ class InteractiveSession:
                 attachments=attachment_metadata,
             ).to_event()
         )
-        self.event_bus.emit(
-            "turn_started",
-            agent="main_agent",
-            payload={
-                "turn": self.turn_count,
-                "mentions": [item.raw for item in resolved],
-                "attachments": attachment_metadata,
-            },
-        )
         # MCP cold start follows turn_started so the UI shows the assistant
         # immediately while tools are loading.
         self._ensure_mcp_tools_loaded()
+        if cancellation_token is not None:
+            cancellation_token.check()
         turn_event_start = len(getattr(self.event_bus, "events", []))
         source = self.conversation.journal.append_user_input(
             user_prompt, turn_id=f"{self.session.id}:{self.turn_count}",
@@ -883,14 +971,17 @@ class InteractiveSession:
             turn_event_start=turn_event_start,
             duration_seconds=duration_seconds,
         )
-        self.event_bus.emit(
-            "turn_finished",
-            agent="main_agent",
-            payload={
-                "turn": self.turn_count,
-                "duration_seconds": duration_seconds,
-            },
-        )
+        return TurnResult(text=text, notice=notice, streamed=streamed)
+
+    def _finish_recovery_turn(self) -> None:
+        manager = self.conversation.runtime_state.shell_job_manager
+        unstable = (self.tool_context.tool_tasks.pending_count
+                    or self.tool_context.agent_coordinator.has_active_agents()
+                    or (manager is not None and any(job.status == "running" for job in manager.list_jobs())))
+        if unstable:
+            self.event_bus.emit("recovery_point_skipped", agent="main_agent",
+                                payload={"turn": self.turn_count, "reason": "active_workspace_tasks"})
+            return
         point = self.recovery.finish_turn(
             session_id=self.session.id,
             turn=self.turn_count,
@@ -899,7 +990,6 @@ class InteractiveSession:
         )
         self._announce_recovery_origin()
         self.event_bus.emit("recovery_point_created", agent="main_agent", payload={"turn": self.turn_count, "point_id": point["id"]})
-        return TurnResult(text=text, notice=notice, streamed=streamed)
 
     def _maybe_emit_turn_summary(
         self,
@@ -938,20 +1028,6 @@ class InteractiveSession:
                 generated_by=summary.generated_by,
             ).to_event()
         )
-
-    def interrupt_current_shell(self) -> bool:
-        """Best-effort interrupt for a shell command owned by the active conversation."""
-        if self.conversation is None:
-            return False
-        runtime_state = getattr(self.conversation, "runtime_state", None)
-        interrupt = getattr(runtime_state, "interrupt_shell_sessions", None)
-        if interrupt is None:
-            return False
-        try:
-            return bool(interrupt())
-        except Exception as exc:
-            log.debug("Failed to interrupt active shell session: %s", exc)
-            return False
 
     def execute_pending_plan(self, *, attachments: tuple[Attachment, ...] = ()) -> TurnResult:
         if not self.pending_plan_markdown:
@@ -1069,6 +1145,7 @@ class InteractiveSession:
         plan_path.write_text(plan_markdown.rstrip() + "\n", encoding="utf-8")
         return plan_path
 
+    @runtime_change
     def _switch_profile(
         self,
         profile_name: str,
@@ -1226,6 +1303,7 @@ class InteractiveSession:
             raise ValueError(f"Unknown user skill command: {line}")
         return self.submit(line)
 
+    @runtime_change
     def switch_profile(self, profile_name: str) -> str:
         previous = self.profile.name()
         self.pending_plan_markdown = None
@@ -1241,6 +1319,7 @@ class InteractiveSession:
             return f"profile selected: {current}"
         return f"profile switched: {previous} -> {current}"
 
+    @runtime_change
     def enable_auto_profile_routing(self) -> str:
         previous_mode = self.routing_mode
         self.routing_mode = ROUTING_MODE_AUTO
@@ -1250,6 +1329,7 @@ class InteractiveSession:
             return f"auto profile routing already active: {self.profile.name()}"
         return f"auto profile routing enabled: {self.profile.name()}"
 
+    @runtime_change
     def set_permission_mode(self, permission_mode: str) -> str:
         PermissionPolicy(mode=permission_mode)
         previous = self.permission_mode
@@ -1275,6 +1355,7 @@ class InteractiveSession:
             )
         return f"permission mode switched: {previous} -> {permission_mode}"
 
+    @runtime_change
     def apply_model_override(
         self,
         *,
@@ -1318,6 +1399,7 @@ class InteractiveSession:
         self._ensure_mcp_tools_loaded()
         return self.mcp_manager.tools_report()
 
+    @runtime_change
     def reload_mcp(self) -> str:
         self._ensure_mcp_tools_loaded()
         self.mcp_manager.close()
@@ -1335,6 +1417,7 @@ class InteractiveSession:
             )
         return "MCP reloaded\n" + self.mcp_manager.status_report()
 
+    @runtime_change
     def reload_mcp_server(self, server_name: str) -> str:
         """Reconnect one configured MCP server and refresh active tool schemas."""
         self._ensure_mcp_tools_loaded()
@@ -1342,6 +1425,7 @@ class InteractiveSession:
         self._rebuild_mcp_state()
         return result
 
+    @runtime_change
     def register_mcp_server(
         self,
         *,
@@ -1390,6 +1474,7 @@ class InteractiveSession:
         ]
         return "\n".join(lines)
 
+    @runtime_change
     def remove_mcp_server(self, server_name: str) -> str:
         """Remove one registered MCP server and refresh active tool schemas."""
         self._ensure_mcp_tools_loaded()
@@ -1397,6 +1482,7 @@ class InteractiveSession:
         self._rebuild_mcp_state()
         return result
 
+    @runtime_change
     def refresh_mcp_server_description(self, server_name: str, *, refresh: bool = True) -> str:
         """Regenerate one server description from its current tool catalog."""
         self._ensure_mcp_tools_loaded()
@@ -1452,6 +1538,7 @@ class InteractiveSession:
         refreshed = self.reload_mcp()
         return f"{result}\n{refreshed}"
 
+    @runtime_change
     def compact_current_context(self) -> str:
         """Run explicit compaction against the single shared conversation."""
         self._ensure_mcp_tools_loaded()
@@ -1459,6 +1546,7 @@ class InteractiveSession:
             return "当前还没有可压缩的对话"
         return self.conversation.compact_now()
 
+    @runtime_change
     def fork_current_session(self) -> str:
         """Create a durable branch and continue with the same live context."""
         if self.session is None or self.conversation is None:
@@ -1479,6 +1567,7 @@ class InteractiveSession:
         )
         return f"已进入会话分支：{branched.id}"
 
+    @runtime_change
     def resume_from_session(self, session_id: str) -> None:
         """Fork a history session and activate the fork.
 
@@ -1604,6 +1693,7 @@ class InteractiveSession:
             limit = metadata.get("forked_from_event_count")
         return {point_id: point for point_id, point in points.items() if point["session_id"] in seen}
 
+    @runtime_change
     def rewind_to_point(self, point_id: str) -> bool:
         from ..agent.runtime_state import AgentRuntimeState, TodoItem, TodoList
         from ..workspace.change_journal import WorkspaceChangeJournal
@@ -1860,6 +1950,16 @@ class InteractiveSession:
         with self._close_lock:
             if self._closed:
                 return
+            with self._execution_condition:
+                self._closing = True
+                if self._turn_token is not None:
+                    self._turn_token.cancel()
+                if not self._execution_condition.wait_for(lambda: self._turn_thread is None, timeout=10):
+                    raise RuntimeError("活动回合尚未退出，资源未释放，请稍后重试关闭")
+            self.tool_context.tool_tasks.cancel()
+            self.tool_context.agent_coordinator.close()
+            if not self.tool_context.tool_tasks.wait_idle(timeout=10):
+                raise RuntimeError("前台工具尚未退出，资源未释放，请稍后重试关闭")
             self._closed = True
         for error in self.lifecycle.close():
             log.warning("Failed to close session resource %s: %s", error.name, error.error)

@@ -294,7 +294,7 @@ class SubagentControlTests(unittest.TestCase):
                 name="late", role="explorer", task="x", parent_cancellation_token=token
             )
 
-    def test_parent_cancellation_interrupts_running_subagent(self):
+    def test_parent_cancellation_preserves_registered_subagent(self):
         with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
             parent_token = CancellationToken()
             spawned = self.coordinator.spawn(
@@ -312,7 +312,7 @@ class SubagentControlTests(unittest.TestCase):
             parent_token.cancel()
             terminal = self.coordinator.wait([spawned["agent_id"]], timeout_seconds=5)
             self.assertFalse(terminal["timed_out"])
-            self.assertEqual(terminal["agents"][0]["status"], "interrupted")
+            self.assertEqual(terminal["agents"][0]["status"], "completed")
 
 
 # --- Cancellation token tree -----------------------------------------------

@@ -16,30 +16,16 @@ class CompactionGateTests(unittest.TestCase):
         from harness_code_agent.agent.compaction import CompactionGate
         return CompactionGate()
 
-    def test_initial_state_allows_compaction(self):
+    def test_compaction_waits_until_all_tool_calls_finish(self):
         gate = self._make_gate()
         self.assertTrue(gate.can_compact())
-
-    def test_active_tool_calls_block_compaction(self):
-        gate = self._make_gate()
         gate.begin_tool_call()
         gate.begin_tool_call()
         self.assertFalse(gate.can_compact())
-
-    def test_tool_result_allows_compaction(self):
-        gate = self._make_gate()
-        gate.begin_tool_call()
-        gate.begin_tool_call()
-        gate.end_tool_call()
-        gate.end_tool_call()
-        self.assertTrue(gate.can_compact())
-
-    def test_partial_tool_calls_still_block(self):
-        gate = self._make_gate()
-        gate.begin_tool_call()
-        gate.begin_tool_call()
         gate.end_tool_call()
         self.assertFalse(gate.can_compact())
+        gate.end_tool_call()
+        self.assertTrue(gate.can_compact())
 
 
 

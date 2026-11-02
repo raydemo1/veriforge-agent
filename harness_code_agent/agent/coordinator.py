@@ -59,7 +59,6 @@ class AgentRecord:
     proposal_id: str | None = None
     conversation: Any = None
     token: CancellationToken | None = None
-    parent_token: CancellationToken | None = None
     followups: list[str] = field(default_factory=list)
     future: Any = None
     created_at: float = field(default_factory=time.time)
@@ -145,8 +144,9 @@ class AgentCoordinator:
                 allowed_paths=paths,
                 fork_turns=normalized_fork,
                 model_intensity=model_intensity,
-                parent_token=parent_cancellation_token,
             )
+            if parent_cancellation_token is not None:
+                parent_cancellation_token.check()
             self._records[agent_id] = record
             self._names[clean_name] = agent_id
             record.future = self._executor.submit(self._run_record, agent_id)
@@ -282,8 +282,6 @@ class AgentCoordinator:
 
     def close(self) -> None:
         with self._condition:
-            if self._closed:
-                return
             self._closed = True
             records = list(self._records.values())
             for record in records:
@@ -291,6 +289,8 @@ class AgentCoordinator:
                     record.token.cancel()
             self._changed_locked()
         self._executor.shutdown(wait=True, cancel_futures=True)
+        if not self.context.tool_tasks.wait_idle(timeout=10):
+            raise RuntimeError("Foreground tools are still running; agent resources retained")
         for record in records:
             if record.conversation is not None:
                 record.conversation.close()
@@ -306,14 +306,11 @@ class AgentCoordinator:
                     with self._condition:
                         if self._closed:
                             return
-                        if record.parent_token is not None and record.parent_token.is_cancelled:
-                            self._finish(record, "interrupted", error="Turn cancelled by user")
-                            return
                         record.state = "running"
                         record.started_at = record.started_at or time.time()
                         record.ended_at = None
                         previous_token = record.token
-                        record.token = CancellationToken(parent=record.parent_token)
+                        record.token = CancellationToken()
                         if previous_token is not None:
                             previous_token.close()
                         token = record.token

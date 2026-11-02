@@ -23,7 +23,7 @@ from ..runtime.tool_runner import (
     finalize_executed_tool_result,
     finalize_intercepted_tool_result,
 )
-from .cancellation import CancellationToken, CancelledError
+from .cancellation import CancellationToken, CancelledError, cancellation_scope
 
 log = logging.getLogger("harness")
 
@@ -87,6 +87,7 @@ class ToolExecutor:
                 executed = self._execute_group([by_index[index] for index in selected])
                 stop_after_group = False
                 for item in executed:
+                    self._cancelled_results[item.prepared.tool_call_id] = item.result
                     buffered[item.prepared.index] = item
                     pending.discard(item.prepared.index)
                     completed.add(item.prepared.index)
@@ -122,17 +123,20 @@ class ToolExecutor:
                     return True
             self._flush_deferred_user_messages()
             return False
-        except CancelledError:
+        except Exception as exc:
             # The assistant message with tool_calls is already in history;
             # answer every call the API still expects so the next request
             # is not rejected with a 400.
-            self._repair_orphaned_tool_calls()
+            try:
+                self._repair_orphaned_tool_calls(exc)
+            except Exception:
+                log.exception("Failed to repair tool protocol")
             raise
         finally:
             self.conversation.compaction_gate.end_tool_call()
             self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def _repair_orphaned_tool_calls(self) -> None:
+    def _repair_orphaned_tool_calls(self, error: Exception) -> None:
         answered = {
             message.get("tool_call_id")
             for message in self.conversation.messages
@@ -149,7 +153,10 @@ class ToolExecutor:
         self.conversation.trace.error("cancelled_tool_calls", f"{len(orphans)} unanswered")
         for call in orphans:
             self.conversation.record_tool_result(call.tool_call_id, self._cancelled_results.get(call.tool_call_id) or ToolResult(
-                tool=call.name, status="failed", output="[cancelled] Execution cancelled before this tool produced a result.",
+                tool=call.name, status="failed",
+                output=("[cancelled] Execution cancelled before this tool produced a result."
+                        if isinstance(error, CancelledError) else f"[error] Execution aborted: {type(error).__name__}: {error}"),
+                metadata={"status_source": "cancelled" if isinstance(error, CancelledError) else "exception"},
             ))
 
     def _prepare_calls(self, tool_calls: list) -> list[PreparedToolCall]:
@@ -336,7 +343,11 @@ class ToolExecutor:
                         lambda _f, token=child_token: token.close()
                     )
                 if self.agent.tool_context is not None:
-                    self.agent.tool_context.tool_tasks.track(future)
+                    self.agent.tool_context.tool_tasks.track(
+                        future, turn_id=self.runtime_state.turn_id,
+                        tool_call_id=prepared.tool_call_id, resources=prepared.effect.resources,
+                        cancellation_token=child_token,
+                    )
                 futures[future] = prepared
                 pending.add(future)
             # No generic per-call deadline: a tool runs until it finishes or
@@ -387,7 +398,9 @@ class ToolExecutor:
                 if future.done() and not future.cancelled():
                     try:
                         item = future.result()
-                    except Exception:
+                    except Exception as exc:
+                        if getattr(exc, "tool_result", None) is not None:
+                            self._cancelled_results.setdefault(prepared.tool_call_id, exc.tool_result)
                         continue
                     self._cancelled_results.setdefault(prepared.tool_call_id, item.result)
             raise
@@ -437,29 +450,21 @@ class ToolExecutor:
 
     def _execute_one(self, prepared: PreparedToolCall, cancellation_token=None) -> ExecutedToolCall:
         context = self.agent.tool_context
-        resource_guard = context.resource_coordinator.acquire(prepared.effect.resources) if context is not None else nullcontext()
-        with acquire_concurrency(prepared.effect.concurrency_key), resource_guard:
-            try:
-                return self._execute_one_unlimited(prepared, cancellation_token)
-            except CancelledError as exc:
-                if getattr(exc, "tool_result", None) is not None:
-                    self._cancelled_results[prepared.tool_call_id] = exc.tool_result
-                raise
-
-    def _execute_one_unlimited(
-        self, prepared: PreparedToolCall, cancellation_token=None
-    ) -> ExecutedToolCall:
-        tool_result = execute_tool_result(
-            prepared.name,
-            prepared.args,
-            runtime_state=self.runtime_state,
-            agent_name=self.agent.name,
-            tool_context=self.agent.tool_context,
-            emit_events=False,
-            validate_arguments=False,
-            cancellation_token=cancellation_token,
-        )
-        return ExecutedToolCall(prepared, tool_result)
+        resource_guard = context.resource_coordinator.acquire(prepared.effect.resources, cancellation_token) if context is not None else nullcontext()
+        with cancellation_scope(cancellation_token), acquire_concurrency(prepared.effect.concurrency_key, cancellation_token), resource_guard:
+            if cancellation_token is not None:
+                cancellation_token.check()
+            tool_result = execute_tool_result(
+                prepared.name,
+                prepared.args,
+                runtime_state=self.runtime_state,
+                agent_name=self.agent.name,
+                tool_context=context,
+                emit_events=False,
+                validate_arguments=False,
+                cancellation_token=cancellation_token,
+            )
+            return ExecutedToolCall(prepared, tool_result)
 
     def _record_executed_result(self, item: ExecutedToolCall) -> None:
         prepared = item.prepared

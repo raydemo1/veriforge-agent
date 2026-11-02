@@ -44,18 +44,16 @@ def service(tmp_path, monkeypatch):
         manager.close()
 
 
-@pytest.mark.parametrize(
-    "operation", ["definition", "references", "symbols", "diagnostics"]
-)
-def test_stdio_operations_and_close(service, tmp_path, operation):
+def test_stdio_operations_and_close(service, tmp_path):
     (tmp_path / "main.py").write_text("hello\n", encoding="utf-8")
     manager = service()
     assert manager._loop is None
-    result = manager.query(operation, "main.py", 1, 2)
-    assert result["available"], result
-    assert result["items"][0]["location"].startswith("main.py:1:")
-    if operation == "symbols":
-        assert result["items"][1]["name"] == "hello.child"
+    for operation in ["definition", "references", "symbols", "diagnostics"]:
+        result = manager.query(operation, "main.py", 1, 2)
+        assert result["available"], (operation, result)
+        assert result["items"][0]["location"].startswith("main.py:1:"), operation
+        if operation == "symbols":
+            assert result["items"][1]["name"] == "hello.child"
     server = next(iter(manager._servers.values()))
     pid = server.client._server.pid
     manager.close()

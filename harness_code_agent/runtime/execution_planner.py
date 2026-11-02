@@ -70,6 +70,8 @@ def effects_conflict(left: CallEffect, right: CallEffect) -> bool:
 
 
 def claims_conflict(left: ResourceClaim, right: ResourceClaim) -> bool:
+    if "global" in {left.domain, right.domain}:
+        return left.access == "write" or right.access == "write"
     if left.domain != right.domain or (left.access == right.access == "read"):
         return False
     if "global" in {left.scope, right.scope}:
@@ -110,7 +112,7 @@ class ResourceCoordinator:
         self._next_token = 0
 
     @contextmanager
-    def acquire(self, claims: Iterable[ResourceClaim]):
+    def acquire(self, claims: Iterable[ResourceClaim], cancellation_token=None):
         ordered = tuple(sorted(set(claims)))
         with self._condition:
             while any(
@@ -119,7 +121,11 @@ class ResourceCoordinator:
                 for wanted in ordered
                 for active in active_claims
             ):
-                self._condition.wait()
+                if cancellation_token is not None:
+                    cancellation_token.check()
+                self._condition.wait(timeout=0.05)
+            if cancellation_token is not None:
+                cancellation_token.check()
             self._next_token += 1
             token = self._next_token
             self._active[token] = ordered
@@ -132,10 +138,17 @@ class ResourceCoordinator:
 
 
 @contextmanager
-def acquire_concurrency(key: str | None):
+def acquire_concurrency(key: str | None, cancellation_token=None):
     semaphore = _CONCURRENCY_SEMAPHORES.get(key or "")
     if semaphore is None:
         yield
         return
-    with semaphore:
+    while not semaphore.acquire(timeout=0.05):
+        if cancellation_token is not None:
+            cancellation_token.check()
+    try:
+        if cancellation_token is not None:
+            cancellation_token.check()
         yield
+    finally:
+        semaphore.release()
