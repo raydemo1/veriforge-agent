@@ -33,6 +33,9 @@ class ToolSpec:
     effect_resolver: EffectResolver
     disclosure: str = "core"
     capabilities: frozenset[str] = frozenset({TOOL_CAPABILITY_MAIN})
+    #: Canonical owner identity for tools proxied from an external catalog.
+    origin_server: str | None = None
+    origin_tool: str | None = None
 
 
 VALID_TOOL_DISCLOSURES = {"core", "deferred"}
@@ -53,6 +56,8 @@ class ToolRegistry:
         effect: EffectResolver | CallEffect | None = None,
         disclosure: str = "core",
         capabilities: set[str] | frozenset[str] | None = None,
+        origin_server: str | None = None,
+        origin_tool: str | None = None,
     ) -> None:
         name = schema.get("function", {}).get("name")
         if not name:
@@ -86,6 +91,8 @@ class ToolRegistry:
             effect_resolver=resolver,
             disclosure=disclosure,
             capabilities=resolved_capabilities,
+            origin_server=origin_server,
+            origin_tool=origin_tool,
         )
 
     def register_spec(self, spec: ToolSpec) -> None:
@@ -96,6 +103,8 @@ class ToolRegistry:
             effect=spec.effect_resolver,
             disclosure=spec.disclosure,
             capabilities=spec.capabilities,
+            origin_server=spec.origin_server,
+            origin_tool=spec.origin_tool,
         )
 
     def get(self, name: str) -> Callable | None:
@@ -163,7 +172,7 @@ def tool_schemas_for_profile(
     allowed_permissions = (
         set(allowed_permissions) if allowed_permissions is not None else None
     )
-    include_names = set(include_names or set())
+    include_names = set(include_names) if include_names is not None else None
     exclude_names = set(exclude_names or set())
     disclosures = {"core"} if disclosure is None else set(disclosure)
     required_capabilities = frozenset(capabilities or {TOOL_CAPABILITY_MAIN})
@@ -191,8 +200,11 @@ def tool_schemas_for_profile(
             continue
         if spec.disclosure not in disclosures:
             continue
-        if spec.name in include_names or (
-            allowed_permissions is not None and spec.permission in allowed_permissions
-        ):
-            schemas.append(spec.schema)
+        if allowed_permissions is not None and spec.permission not in allowed_permissions:
+            continue
+        # An explicit name allowlist must bound the result set on its own;
+        # permissions are an additional constraint, never a substitute for it.
+        if include_names is not None and spec.name not in include_names:
+            continue
+        schemas.append(spec.schema)
     return schemas

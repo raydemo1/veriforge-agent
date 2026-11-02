@@ -1,6 +1,9 @@
 """Server-scoped tool discovery with confidence tiers."""
 from __future__ import annotations
 
+import hashlib
+import json
+
 from ..mcp import MCP_TOOL_PREFIX
 from ..permissions import VALID_TOOL_PERMISSIONS
 from ..tool_context import ToolContext
@@ -52,7 +55,7 @@ def search_tools(
     revealed = set(tool_context.revealed_tool_names or set())
 
     deferred = [spec for spec in registry.specs() if spec.disclosure == "deferred"]
-    servers = sorted({_server_of(spec.name) for spec in deferred if _server_of(spec.name)})
+    servers = sorted({_server_of(spec) for spec in deferred if _server_of(spec)})
     if server_name is not None and server_name not in servers:
         valid = ", ".join(servers) if servers else "none"
         return _failure(
@@ -64,13 +67,23 @@ def search_tools(
     catalog = [
         spec for spec in deferred if spec.name not in blocked_names and spec.permission in allowed_permissions
     ]
+    spec_by_name = {spec.name: spec for spec in catalog}
     documents = [
         _document(spec)
         for spec in catalog
-        if spec.name not in revealed and (server_name is None or _server_of(spec.name) == server_name)
+        if spec.name not in revealed and (server_name is None or _server_of(spec) == server_name)
     ]
 
-    query_key = (server_name or "", " ".join(query.lower().split()))
+    signature = _catalog_signature(catalog)
+    if signature != tool_context.search_tools_signature:
+        # A changed visible catalog (including a permission or profile change)
+        # invalidates the previous query history; the old repeat guard must not
+        # outlive the view it was recorded against.
+        tool_context.search_tools_queries.clear()
+        tool_context.search_tools_signature = signature
+        tool_context.search_tools_no_progress = 0
+
+    query_key = (server_name or "", " ".join(query.lower().split()), limit)
     if query_key in tool_context.search_tools_queries:
         tool_context.search_tools_no_progress += 1
         return _result(
@@ -137,7 +150,9 @@ def search_tools(
         tool_context.search_tools_no_progress = 0
 
     listing = "\n".join(
-        f"- {_tool_of(hit.key)}: {_one_line(hit.metadata.get('description'))}" for hit in hits
+        f"- {_tool_of(spec_by_name[hit.key])}: {_one_line(hit.metadata.get('description'))}"
+        for hit in hits
+        if hit.key in spec_by_name
     )
     if new_names:
         heading = f"Mounted {len(new_names)} new tool(s) from {_scope_label(server_name)}{note}:"
@@ -157,6 +172,33 @@ def search_tools(
             "revealed_tool_names": mounted,
             "no_progress": tool_context.search_tools_no_progress,
         },
+    )
+
+
+def _catalog_signature(deferred: list[ToolSpec]) -> tuple[str, ...]:
+    """Fingerprint the deferred catalog with fields that affect discovery.
+
+    Names alone are insufficient: a permission change (for example
+    ``dangerous`` -> ``read``) can make a tool usable under a profile without
+    changing its schema, and a reconnect can change the schema while keeping
+    the name. Both invalidate the repeat-query guard.
+    """
+    return tuple(
+        hashlib.sha256(
+            json.dumps(
+                {
+                    "name": spec.name,
+                    "permission": spec.permission,
+                    "origin_server": spec.origin_server,
+                    "origin_tool": spec.origin_tool,
+                    "schema": spec.schema,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        for spec in sorted(deferred, key=lambda item: item.name)
     )
 
 
@@ -184,20 +226,20 @@ def _scope_label(server_name: str | None) -> str:
 
 def _directory(catalog: list[ToolSpec], server_name: str | None) -> str:
     selected = [
-        spec for spec in catalog if server_name is None or _server_of(spec.name) == server_name
+        spec for spec in catalog if server_name is None or _server_of(spec) == server_name
     ]
     if not selected:
         return "No tools are available in this catalog."
     lines = ["Available tools (names and descriptions only):"]
     grouped: dict[str, list[ToolSpec]] = {}
     for spec in selected:
-        grouped.setdefault(_server_of(spec.name) or "", []).append(spec)
+        grouped.setdefault(_server_of(spec) or "", []).append(spec)
     for name in sorted(grouped):
         if name and server_name is None:
             lines.append(f"[{name}]")
         for spec in grouped[name]:
             description = _one_line(_description_of(spec))
-            lines.append(f"- {_tool_of(spec.name)}: {description}")
+            lines.append(f"- {_tool_of(spec)}: {description}")
     return "\n".join(lines)
 
 
@@ -218,8 +260,8 @@ def _document(spec: ToolSpec) -> SearchDocument:
         text=text,
         metadata={
             "description": description,
-            "server": _server_of(spec.name),
-            "tool": _tool_of(spec.name),
+            "server": _server_of(spec),
+            "tool": _tool_of(spec),
             "permission": spec.permission,
         },
     )
@@ -246,7 +288,10 @@ def _schema_parameter_text(schema: dict) -> str:
     return " ".join(part for part in parts if part)
 
 
-def _server_of(name: str) -> str | None:
+def _server_of(spec: ToolSpec) -> str | None:
+    if spec.origin_server:
+        return spec.origin_server
+    name = spec.name
     if not name.startswith(MCP_TOOL_PREFIX):
         return None
     remainder = name[len(MCP_TOOL_PREFIX):]
@@ -255,7 +300,10 @@ def _server_of(name: str) -> str | None:
     return remainder.split("__", 1)[0] or None
 
 
-def _tool_of(name: str) -> str:
+def _tool_of(spec: ToolSpec) -> str:
+    if spec.origin_tool:
+        return spec.origin_tool
+    name = spec.name
     if not name.startswith(MCP_TOOL_PREFIX):
         return name
     remainder = name[len(MCP_TOOL_PREFIX):]

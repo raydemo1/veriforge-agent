@@ -91,12 +91,14 @@ class ToolFailurePolicyMiddleware(AgentMiddleware):
         self,
         *,
         tool_registry: Any | None = None,
+        tool_context: Any | None = None,
         schema_streak_guidance: int = DEFAULT_SCHEMA_STREAK_GUIDANCE,
         schema_streak_stop: int = DEFAULT_SCHEMA_STREAK_STOP,
         policy_streak_guidance: int = DEFAULT_POLICY_STREAK_GUIDANCE,
         execution_streak_guidance: int = DEFAULT_EXECUTION_STREAK_GUIDANCE,
     ) -> None:
         self.tool_registry = tool_registry
+        self.tool_context = tool_context
         self.schema_streak_guidance = schema_streak_guidance
         self.schema_streak_stop = schema_streak_stop
         self.policy_streak_guidance = policy_streak_guidance
@@ -243,9 +245,12 @@ class ToolFailurePolicyMiddleware(AgentMiddleware):
         return "\n".join(lines)
 
     def _parameters_schema(self, tool_name: str) -> dict:
-        if self.tool_registry is None:
+        # Read through the live context: MCP reconnects rebuild the registry,
+        # so a snapshot captured at stack construction would go stale.
+        registry = getattr(self.tool_context, "tool_registry", None) or self.tool_registry
+        if registry is None:
             return {}
-        schema = self.tool_registry.schema_for(tool_name)
+        schema = registry.schema_for(tool_name)
         if not isinstance(schema, dict):
             return {}
         # OpenAI function wrapper: {"type": "function", "function": {...}}

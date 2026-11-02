@@ -170,6 +170,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         search_tools,
         TOOL_PERMISSION_READ,
         CallEffect.global_exclusive(kind="control"),
+        capabilities=all_agents,
     )
     add(
         "spawn_agent", spawn_agent, TOOL_PERMISSION_READ, CallEffect(kind="agent_spawn")

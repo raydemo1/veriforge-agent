@@ -187,8 +187,9 @@ class ToolExecutor:
             fn_args = validation.arguments
             effect = self._classify_call(fn_name, fn_args)
             blocked = None
-            if self.agent.allowed_tool_names is not None and fn_name not in self.agent.allowed_tool_names:
-                output = f"[blocked] Tool '{fn_name}' is not available to this agent profile."
+            blocked_reason = self._profile_block_reason(fn_name, registry)
+            if blocked_reason is not None:
+                output = f"[blocked] {blocked_reason}"
                 blocked = ToolResult(
                     tool=fn_name,
                     status="failed",
@@ -228,6 +229,23 @@ class ToolExecutor:
             tool_permission=registry.permission_for(name),
             workspace_root=root,
         )
+
+    def _profile_block_reason(self, name: str, registry) -> str | None:
+        """Enforce profile tool policy at execution time, not only via schemas."""
+        context = self.agent.tool_context
+        if context is not None:
+            if name in (context.blocked_tool_names or set()):
+                return f"Tool '{name}' is blocked for this agent profile."
+            allowed = context.allowed_tool_permissions
+            if allowed is not None:
+                permission = registry.permission_for(name)
+                if permission is not None and permission not in set(allowed):
+                    return (
+                        f"Tool '{name}' permission '{permission}' is not allowed for this agent profile."
+                    )
+        if self.agent.allowed_tool_names is not None and name not in self.agent.allowed_tool_names:
+            return f"Tool '{name}' is not available to this agent profile."
+        return None
 
     def _requires_approval(self, prepared: PreparedToolCall) -> bool:
         if prepared.blocked_result is not None:
@@ -681,6 +699,12 @@ class ToolExecutor:
         )
         if not revealed_schemas:
             return
+        permitted_names = {
+            schema.get("function", {}).get("name")
+            for schema in revealed_schemas
+            if isinstance(schema, dict)
+        }
+        new_names &= permitted_names
 
         current_schemas = list(self.agent.tool_schemas or [])
         current_names = {
@@ -695,8 +719,10 @@ class ToolExecutor:
         ]
         if not additions:
             revealed.update(new_names)
+            context.discovered_tool_names.update(new_names)
             return
         revealed.update(new_names)
+        context.discovered_tool_names.update(new_names)
         self.agent.update_tool_schemas(current_schemas + additions)
 
 

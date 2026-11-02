@@ -293,7 +293,10 @@ class RecoveryMiddleware(AgentMiddleware):
     def on_tool_allowed(self, tool_name, tool_args, messages, runtime_state=None, agent_name=None):
         if agent_name != "main_agent":
             return
-        effect = self.registry.effect_for(tool_name, tool_args, self.context)
+        # Prefer the live registry: MCP reconnects replace it after the
+        # middleware stack was built.
+        registry = getattr(self.context, "tool_registry", None) or self.registry
+        effect = registry.effect_for(tool_name, tool_args, self.context)
         if effect.kind in {"interaction", "control"}:
             return
         if any(

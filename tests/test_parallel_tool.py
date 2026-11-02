@@ -111,11 +111,12 @@ class ParallelToolTests(unittest.TestCase):
         binding = McpToolBinding("mcp_read", "docs", "read", "", {}, "network_read", {})
         captured = {}
 
-        def call_tool(name, arguments, cancellation_token=None):
+        def call_tool(name, arguments, cancellation_token=None, expected_binding=None):
             captured.update(
                 name=name,
                 arguments=arguments,
                 cancellation_token=cancellation_token,
+                expected_binding=expected_binding,
             )
             return "ok"
 
@@ -133,6 +134,7 @@ class ParallelToolTests(unittest.TestCase):
         self.assertEqual(captured["name"], "mcp_read")
         self.assertEqual(captured["arguments"], {"query": "needle"})
         self.assertIs(captured["cancellation_token"], token)
+        self.assertIs(captured["expected_binding"], binding)
 
     def test_mcp_loop_cancels_one_call_and_remains_usable(self):
         from harness_code_agent.agent.cancellation import CancelledError

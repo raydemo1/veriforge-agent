@@ -261,58 +261,62 @@ def mcp_command(cwd: Path, args: list[str]) -> int:
         parsed.args = list(parsed.args) + command_args
 
     manager = McpClientManager.from_workspace(cwd)
-    if parsed.command == "list":
-        print(manager.registered_report())
-        return 0
-    if parsed.command == "remove":
-        try:
-            print(manager.remove_server(parsed.name))
-        except McpConfigError as exc:
-            _print_error(f"Error: {exc}")
-            return 1
-        return 0
-    if parsed.command == "describe":
-        if manager.config_error:
-            _print_error(f"Error: {manager.config_error}")
-            return 1
-        if parsed.name not in manager.config.servers:
-            _print_error(f"Error: MCP server is not registered or is disabled: {parsed.name}")
-            return 1
-        manager.connect_all()
-        try:
-            print(manager.generate_server_description(parsed.name, refresh=parsed.refresh))
-        except McpConfigError as exc:
-            _print_error(f"Error: {exc}")
-            return 1
-        return 0
-
     try:
-        server = build_server_config(
-            name=parsed.name,
-            url=parsed.url,
-            command=parsed.stdio_command,
-            args=parsed.args,
-            env=_parse_pairs(parsed.env),
-            cwd=parsed.cwd,
-            headers=_parse_pairs(parsed.header),
-            permission=parsed.permission,
-            title=parsed.title,
-            description=parsed.description,
-        )
-        registration = manager.register_server(server)
-    except ValueError as exc:
-        _print_error(f"Error: {exc}")
-        return 1
+        if parsed.command == "list":
+            print(manager.registered_report())
+            return 0
+        if parsed.command == "remove":
+            try:
+                print(manager.remove_server(parsed.name))
+            except McpConfigError as exc:
+                _print_error(f"Error: {exc}")
+                return 1
+            return 0
+        if parsed.command == "describe":
+            if manager.config_error:
+                _print_error(f"Error: {manager.config_error}")
+                return 1
+            if parsed.name not in manager.config.servers:
+                _print_error(f"Error: MCP server is not registered or is disabled: {parsed.name}")
+                return 1
+            manager.connect_all()
+            try:
+                print(manager.generate_server_description(parsed.name, refresh=parsed.refresh))
+            except McpConfigError as exc:
+                _print_error(f"Error: {exc}")
+                return 1
+            return 0
 
-    state = "connected" if registration.state == "connected" else f"connection failed: {registration.error}"
-    action = "updated" if registration.replaced else "registered"
-    print(f"MCP server {action}: {server.name} ({state}, {registration.tool_count} tool(s))")
-    if registration.state == "connected" and not registration.server.description:
         try:
-            print(manager.generate_server_description(server.name))
-        except McpConfigError as exc:
-            print(f"Description not generated: {exc}", file=sys.stderr)
-    return 0 if registration.state == "connected" else 1
+            server = build_server_config(
+                name=parsed.name,
+                url=parsed.url,
+                command=parsed.stdio_command,
+                args=parsed.args,
+                env=_parse_pairs(parsed.env),
+                cwd=parsed.cwd,
+                headers=_parse_pairs(parsed.header),
+                permission=parsed.permission,
+                title=parsed.title,
+                description=parsed.description,
+            )
+            registration = manager.register_server(server)
+        except ValueError as exc:
+            _print_error(f"Error: {exc}")
+            return 1
+
+        state = "connected" if registration.state == "connected" else f"connection failed: {registration.error}"
+        action = "updated" if registration.replaced else "registered"
+        print(f"MCP server {action}: {server.name} ({state}, {registration.tool_count} tool(s))")
+        if registration.state == "connected" and not registration.server.description:
+            try:
+                print(manager.generate_server_description(server.name))
+            except McpConfigError as exc:
+                print(f"Description not generated: {exc}", file=sys.stderr)
+        return 0 if registration.state == "connected" else 1
+    finally:
+        # One-shot CLI processes own the stdio/HTTP resources they started.
+        manager.close()
 
 
 def _parse_pairs(values: list[str]) -> dict[str, str]:

@@ -390,7 +390,9 @@ class AgentCoordinator:
             name=record.name,
             system_prompt=role_prompt,
             use_tools=True,
-            tool_schemas=registry.schemas(),
+            tool_schemas=[
+                spec.schema for spec in registry.specs() if spec.disclosure == "core"
+            ],
             middlewares=build_subagent_middlewares(
                 tool_context=sub_context,
                 tool_registry=registry,
@@ -430,6 +432,9 @@ class AgentCoordinator:
         for spec in source.specs():
             if capability not in spec.capabilities:
                 continue
+            # Deferred specs stay in the registry so child agents can discover
+            # them through search_tools, but they are not part of the initial
+            # schema set (see ``_ensure_conversation``).
             registry.register_spec(spec)
         return registry
 

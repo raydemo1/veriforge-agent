@@ -178,6 +178,7 @@ class InteractiveSession:
             self.mcp_manager = None
             self._mcp_tools_loaded = False
             self._mcp_load_lock = threading.Lock()
+            self._mcp_connection_revision = 0
             self.agent = None
             self.conversation: AgentConversation | None = None
             self.profile_runtimes: dict[str, ProfileRuntime] = {}
@@ -268,7 +269,9 @@ class InteractiveSession:
         if self.tool_registry is None or self.mcp_manager is None:
             self._prepare_tool_registry()
         self.mcp_manager.connect_all()
-        self.mcp_manager.register_tools(self.tool_registry)
+        snapshot = self.mcp_manager.catalog_snapshot()
+        self.mcp_manager.register_tools(self.tool_registry, snapshot=snapshot)
+        self._mcp_connection_revision = snapshot.revision
         self._mcp_tools_loaded = True
 
     def _prepare_tool_registry(self) -> None:
@@ -300,20 +303,33 @@ class InteractiveSession:
             exclude_names=cfg.blocked_tool_names,
             registry=self.tool_registry,
         )
-        revealed = set()
+        discovered = set()
         if self.tool_context is not None and update_context:
             self.tool_context.allowed_tool_permissions = set(cfg.allowed_tool_permissions)
             self.tool_context.blocked_tool_names = set(cfg.blocked_tool_names)
-            revealed = set(self.tool_context.revealed_tool_names)
-        if not revealed:
+            discovered = set(self.tool_context.discovered_tool_names)
+        if not discovered:
+            if update_context and self.tool_context is not None:
+                # The callable view must not outlive the discovery it came
+                # from; recompute it even when nothing is discovered.
+                self.tool_context.revealed_tool_names = set()
             return core_schemas
         revealed_schemas = tool_schemas_for_profile(
             allowed_permissions=cfg.allowed_tool_permissions,
-            include_names=revealed,
+            include_names=discovered,
             exclude_names=cfg.blocked_tool_names,
             registry=self.tool_registry,
             disclosure={"deferred"},
         )
+        if update_context and self.tool_context is not None:
+            # A profile switch only recomputes the callable view; discovery is
+            # history and must survive, otherwise switching away and back would
+            # make the repeat-query guard permanently block remounting.
+            self.tool_context.revealed_tool_names = {
+                schema.get("function", {}).get("name")
+                for schema in revealed_schemas
+                if isinstance(schema, dict)
+            }
         known = {
             schema.get("function", {}).get("name")
             for schema in core_schemas
@@ -475,6 +491,7 @@ class InteractiveSession:
 
     def submit_prepared(self, prepared: PreparedTurn, cancellation_token=None) -> TurnResult:
         user_prompt = prepared.text
+        self._sync_mcp_connections()
         self._refresh_skill_catalog()
         self.ensure_profile_bound_for_first_task(user_prompt)
         skill_invocation = self.skill_registry.build_user_invocation(user_prompt)
@@ -1389,12 +1406,40 @@ class InteractiveSession:
 
     def _rebuild_mcp_state(self) -> None:
         if self.tool_registry is not None and self.mcp_manager is not None:
+            snapshot = self.mcp_manager.catalog_snapshot()
+            self._mcp_connection_revision = snapshot.revision
             self.tool_registry = BUILTIN_TOOL_REGISTRY.copy()
-            self.mcp_manager.register_tools(self.tool_registry)
+            self.mcp_manager.register_tools(self.tool_registry, snapshot=snapshot)
         if self.tool_context is not None:
             self.tool_context.tool_registry = self.tool_registry
+            # Discovery history survives profile switches, but a tool that no
+            # longer exists in the rebuilt catalog is dropped: it is gone, not
+            # merely disallowed by the current profile.
+            existing = {spec.name for spec in self.tool_registry.specs()}
+            removed = self.tool_context.discovered_tool_names - existing
+            self.tool_context.discovered_tool_names &= existing
+            self.tool_context.revealed_tool_names &= self.tool_context.discovered_tool_names
+            if removed:
+                # Results from the old catalog can no longer justify skipping
+                # a repeat query; a reconnect with the same names must allow
+                # rediscovery.
+                self.tool_context.search_tools_queries.clear()
+                self.tool_context.search_tools_no_progress = 0
         self._refresh_agent_tool_schemas()
         self._refresh_mcp_catalog()
+
+    def _sync_mcp_connections(self) -> None:
+        """Refresh registry and schemas when a worker connection changed.
+
+        Workers exit outside the user-visible commands; this runs only at the
+        safe boundary before a turn, never from the worker thread.
+        """
+        manager = self.mcp_manager
+        if manager is None:
+            return
+        if manager.connection_revision == self._mcp_connection_revision:
+            return
+        self._rebuild_mcp_state()
 
     def toggle_mcp_server(self, server_name: str) -> str:
         """Toggle one MCP config entry and rebuild the active manager."""

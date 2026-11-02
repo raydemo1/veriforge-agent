@@ -34,8 +34,13 @@ class ToolContext:
     tool_registry: ToolRegistry | None = None
     allowed_tool_permissions: set[str] | None = None
     blocked_tool_names: set[str] = field(default_factory=set)
+    #: Deferred tools this session has discovered.  This is the historical
+    #: record; ``revealed_tool_names`` is the current callable view (the
+    #: intersection of discovered tools and the active profile's permissions).
+    discovered_tool_names: set[str] = field(default_factory=set)
     revealed_tool_names: set[str] = field(default_factory=set)
-    search_tools_queries: set[tuple[str, str]] = field(default_factory=set)
+    search_tools_queries: set[tuple[str, str, int]] = field(default_factory=set)
+    search_tools_signature: tuple[str, ...] = ()
     search_tools_no_progress: int = 0
     resource_coordinator: ResourceCoordinator = field(default_factory=ResourceCoordinator)
     tool_tasks: ToolTaskSupervisor = field(default_factory=ToolTaskSupervisor)

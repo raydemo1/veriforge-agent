@@ -36,7 +36,12 @@ def build_main_agent_middlewares(
     """
     middlewares: list[AgentMiddleware] = list(user_middlewares)
     middlewares.append(ToolGuardMiddleware())
-    middlewares.append(ToolFailurePolicyMiddleware(tool_registry=tool_registry))
+    middlewares.append(
+        ToolFailurePolicyMiddleware(
+            tool_registry=tool_registry,
+            tool_context=tool_context,
+        )
+    )
     middlewares.append(
         PermissionMiddleware(
             tool_context=tool_context,
