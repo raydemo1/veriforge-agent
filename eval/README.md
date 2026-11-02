@@ -42,6 +42,25 @@ python eval/benchmarks/run_terminal_bench.py --task fix-git
 python eval/benchmarks/run_claw_swe_bench.py --limit 5
 ```
 
+## A/B tests and final evaluation
+
+The default `.env` remains the final-evaluation configuration. To run a local
+evaluation or tuning script with the separate `.env.ab` model profile, use:
+
+```powershell
+python eval/scripts/run_with_ab_model.py eval/scripts/run_memory_candidate_eval.py
+python eval/scripts/run_with_ab_model.py eval/scripts/run_memory_candidate_eval.py --run
+```
+
+The first command prints the evaluation protocol without making model calls;
+`--run` executes it. The wrapper selects the A/B profile for its child process
+and its subprocesses; other commands keep the default configuration. Set
+`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `HARNESS_PROVIDER`, `HARNESS_MODEL`, and
+`HARNESS_MODEL_FAST/NORMAL/HARD/MAX` in the ignored `.env.ab` file. The base
+URL ends at `/v1`; the client adds `/chat/completions`. A missing A/B file is an
+error rather than a fallback to the final model. Record the model and evaluation
+conditions with results; A/B tuning outcomes are not final-model measurements.
+
 Claw-SWE-Bench uses the Hugging Face dataset `TokenRhythm/Claw-SWE-Bench`
 with the `lite` config by default. It requires Docker SWE-bench images and the
 optional host dependency `datasets`; the launcher will clone the upstream
