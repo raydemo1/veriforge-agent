@@ -85,7 +85,7 @@ from ..sessions.store import Session, SessionStore
 from ..sessions.turn_summary import generate_turn_summary, should_summarize_turn
 from ..skills import SkillRegistry
 from ..workspace.service import WorkspaceService
-from ..workspace.shell_session import (
+from ..workspace.shell_environment import (
     validate_shell_configuration,
 )
 from .mentions import (
@@ -748,6 +748,7 @@ class InteractiveSession:
             event_bus=self.event_bus,
             session_id=self.session.id,
             session_root=self.session.root,
+            environment=self.environment,
             model_selection=self.model_selection,
             memory_use_enabled=self.memory_use_enabled,
             memory_auto_extract_enabled=self.memory_auto_extract_enabled,

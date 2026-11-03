@@ -1,14 +1,11 @@
 """Agent runtime state containers."""
 from __future__ import annotations
 
-import contextlib
-import threading
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..runtime.tool_failures import FailureTracker
 from ..workspace.shell_jobs import ShellJobManager
-from ..workspace.shell_session import PersistentShellSession
 
 TODO_STATUSES = ("pending", "in_progress", "completed", "cancelled")
 MAX_TODO_ITEMS = 20
@@ -154,8 +151,6 @@ class AgentFallbackState:
 
 @dataclass
 class AgentRuntimeState:
-    active_shell_sessions: set[PersistentShellSession] = field(default_factory=set)
-    _shell_sessions_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     shell_job_manager: ShellJobManager | None = None
     browser_job_id: str | None = None
     todo: TodoList | None = None
@@ -180,27 +175,3 @@ class AgentRuntimeState:
     verification: dict | None = None
     verification_stale: bool = False
     agent_config: Any = None
-
-    def register_shell_session(self, session: PersistentShellSession) -> None:
-        with self._shell_sessions_lock:
-            self.active_shell_sessions.add(session)
-
-    def unregister_shell_session(self, session: PersistentShellSession) -> None:
-        with self._shell_sessions_lock:
-            self.active_shell_sessions.discard(session)
-
-    def interrupt_shell_sessions(self) -> bool:
-        with self._shell_sessions_lock:
-            sessions = tuple(self.active_shell_sessions)
-        for session in sessions:
-            with contextlib.suppress(Exception):
-                session.interrupt()
-        return bool(sessions)
-
-    def close_shell_sessions(self) -> None:
-        with self._shell_sessions_lock:
-            sessions = tuple(self.active_shell_sessions)
-            self.active_shell_sessions.clear()
-        for session in sessions:
-            with contextlib.suppress(Exception):
-                session.close()

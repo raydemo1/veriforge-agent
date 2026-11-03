@@ -70,7 +70,7 @@ def _launch_chromium(playwright):
         raise
 
 
-def _ensure_dev_server(runtime_state, start_command: str, port: int, startup_wait: int, cancellation_token) -> str:
+def _ensure_dev_server(runtime_state, start_command: str, port: int, startup_wait: int, cancellation_token, write_paths=()) -> str:
     """Start a conversation-owned dev server and wait cancellably for startup."""
     manager = getattr(runtime_state, "shell_job_manager", None)
     if manager is None:
@@ -84,7 +84,9 @@ def _ensure_dev_server(runtime_state, start_command: str, port: int, startup_wai
         if existing is not None and existing.status == "running":
             return f"Dev server already running (pid={existing.pid})"
 
-    job = manager.start(start_command)
+    job = (manager.start(start_command, write_paths=write_paths, cancellation_token=cancellation_token,
+                         turn_id=getattr(runtime_state, "turn_id", ""))
+           if os.name == "nt" else manager.start(start_command))
     runtime_state.browser_job_id = job.job_id
     deadline = time.monotonic() + max(0, startup_wait)
     while time.monotonic() < deadline and job.status == "running":
@@ -135,6 +137,7 @@ def browser_test(
     start_command: str | None = None,
     port: int = 5173,
     startup_wait: int = 8,
+    write_paths: list[str] | None = None,
     runtime_state=None,
     tool_context=None,
     cancellation_token=None,
@@ -180,6 +183,7 @@ def browser_test(
                 port,
                 startup_wait,
                 cancellation_token,
+                write_paths or [],
             )
         except CancelledError:
             stop_dev_server(runtime_state)

@@ -13,10 +13,8 @@ from harness_code_agent import config
 from harness_code_agent.agent import llm_channel
 from harness_code_agent.agent.cancellation import CancelledError, CancellationToken
 from harness_code_agent.agent.coordinator import AgentCoordinator
-from harness_code_agent.agent.tool_executor import ToolExecutor
 from harness_code_agent.runtime.builtins.filesystem import write_file
 from harness_code_agent.runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
-from harness_code_agent.runtime.builtins.shell import run_bash
 from harness_code_agent.runtime.execution_planner import _CONCURRENCY_LIMITS
 from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
@@ -78,79 +76,6 @@ class LlmRetryHelperTests(unittest.TestCase):
         self.assertTrue(llm_channel._is_retryable_llm_error(connection))
         self.assertFalse(llm_channel._is_retryable_llm_error(SimpleNamespace(status_code=400)))
         self.assertFalse(llm_channel._is_retryable_llm_error(ValueError("nope")))
-
-
-class RunBashTimeoutClampTests(unittest.TestCase):
-    """run_bash owns its own timeout; the clamp is observable via metadata."""
-
-    def _run_with_timeout(self, timeout):
-        calls = []
-
-        def fake_run(command, timeout=300, artifact_dir=None):
-            calls.append(timeout)
-            return SimpleNamespace(
-                stdout="ok",
-                stderr="",
-                exit_code=0,
-                timed_out=False,
-                output_spilled=False,
-                output_bytes=2,
-            )
-
-        fake_session = SimpleNamespace(
-            run=fake_run, close=lambda: None, interrupt=lambda: None
-        )
-        with patch(
-            "harness_code_agent.workspace.shell_session.PersistentShellSession",
-            return_value=fake_session,
-        ):
-            result = run_bash("echo ok", timeout=timeout)
-        return result, calls[0]
-
-    def test_run_bash_timeout_is_clamped_to_maximum(self):
-        with patch.object(config, "TOOL_MAX_TIMEOUT_SECONDS", 1800):
-            result, effective = self._run_with_timeout(999999)
-        self.assertEqual(effective, 1800)
-        self.assertEqual(result.metadata["requested_timeout"], 999999)
-        self.assertEqual(result.metadata["effective_timeout"], 1800)
-
-    def test_run_bash_timeout_is_clamped_to_floor(self):
-        result, effective = self._run_with_timeout(0)
-        self.assertEqual(effective, 1)
-        self.assertEqual(result.metadata["requested_timeout"], 0)
-        self.assertEqual(result.metadata["effective_timeout"], 1)
-
-    def test_invalid_timeout_falls_back_to_shell_default(self):
-        with patch.object(config, "SHELL_DEFAULT_TIMEOUT_SECONDS", 300):
-            result, effective = self._run_with_timeout("soon")
-        self.assertEqual(effective, 300)
-        self.assertEqual(result.metadata["requested_timeout"], "soon")
-        self.assertEqual(result.metadata["effective_timeout"], 300)
-
-    def test_timeout_result_carries_requested_and_effective_timeout(self):
-        def fake_run(command, timeout=300, artifact_dir=None):
-            return SimpleNamespace(
-                stdout="", stderr="", exit_code=130, timed_out=True, output_spilled=False
-            )
-
-        fake_session = SimpleNamespace(
-            run=fake_run, close=lambda: None, interrupt=lambda: None
-        )
-        with patch(
-            "harness_code_agent.workspace.shell_session.PersistentShellSession",
-            return_value=fake_session,
-        ):
-            result = run_bash("slow", timeout=999999)
-        self.assertEqual(result.status, "failed")
-        self.assertTrue(result.metadata["timed_out"])
-        self.assertEqual(result.metadata["requested_timeout"], 999999)
-        self.assertEqual(result.metadata["effective_timeout"], 1800)
-
-    def test_no_global_tool_deadline_exists(self):
-        # The global per-tool deadline was removed: timeout is a backend
-        # capability (run_bash, HTTP, MCP...), not a ToolExecutor concept.
-        self.assertFalse(hasattr(ToolExecutor, "_deadline_seconds"))
-        self.assertFalse(hasattr(config, "TOOL_DEFAULT_TIMEOUT_SECONDS"))
 
 
 class WorkspaceQuotaTests(unittest.TestCase):

@@ -183,52 +183,6 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(tool_result.payload["metadata"]["validation_phase"], "structural")
         self.assertIn("failure", [event.type for event in context.event_bus.events])
 
-    def test_shell_effect_classification_distinguishes_inspect_verify_and_mutation(self):
-        cases = {
-            "rg \"needle\" .": "inspect",
-            "git status --short": "inspect",
-            "pytest tests": "verify",
-            "ruff check .": "verify",
-            "npm run build": "verify",
-            "bun run check": "verify",
-            "npm run dev": "long_running",
-            "cd web && npm run dev": "long_running",
-            "python script.py": "unknown_execution",
-            "cd src; pwd": "unknown_execution",
-            "cat > file.txt": "workspace_mutation",
-            "rm -rf build": "recursive_delete",
-            "rm -rf /": "destructive",
-        }
-
-        with tempfile.TemporaryDirectory() as tmp:
-            context = ToolContext(
-                workspace=WorkspaceService(root=Path(tmp)),
-                permission_policy=PermissionPolicy(mode="workspace-write"),
-                event_bus=EventBus(),
-            )
-            for command, expected in cases.items():
-                with self.subTest(command=command):
-                    effect = BUILTIN_TOOL_REGISTRY.effect_for(
-                        "run_bash", {"command": command}, context
-                    )
-                    self.assertEqual(effect.kind, expected)
-
-    def test_run_bash_uses_a_self_contained_shell(self):
-        from harness_code_agent import config
-
-        old_workspace = config.WORKSPACE
-        with tempfile.TemporaryDirectory() as temp_dir:
-            config.WORKSPACE = temp_dir
-            try:
-                result = run_bash(
-                    "pwd",
-                    timeout=10,
-                )
-            finally:
-                config.WORKSPACE = old_workspace
-
-        self.assertEqual(result.status, "success")
-        self.assertTrue(result.output.strip())
 
     def test_run_bash_does_not_leak_cwd_or_environment_between_calls(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -246,8 +200,14 @@ class ToolExecutorTests(unittest.TestCase):
             else:
                 first_command = "cd nested; export VERIFORGE_SHELL_ISOLATION=leak; printf ready"
                 second_command = 'pwd; printf "%s" "${VERIFORGE_SHELL_ISOLATION-}"'
-            first = run_bash(first_command, tool_context=context)
-            second = run_bash(second_command, tool_context=context)
+            from harness_code_agent.workspace.shell_jobs import ShellJobManager
+            manager = ShellJobManager(root)
+            runtime = SimpleNamespace(shell_job_manager=manager)
+            try:
+                first = run_bash(first_command, tool_context=context, runtime_state=runtime)
+                second = run_bash(second_command, tool_context=context, runtime_state=runtime)
+            finally:
+                manager.close()
 
         self.assertEqual(first.status, "success")
         self.assertEqual(second.status, "success")
@@ -1035,52 +995,6 @@ class ToolExecutorTests(unittest.TestCase):
             ]
             self.assertTrue(cancelled_contents, "orphaned calls must be answered with [cancelled]")
 
-    def test_long_running_shell_is_serial_barrier_and_returns_job_id(self):
-        registry = BUILTIN_TOOL_REGISTRY.copy()
-        tool_calls = [
-            _tool_call("tc_before", "read_file", {"path": "note.txt"}),
-            _tool_call("tc_long", "run_bash", {"command": "npm run dev"}),
-            _tool_call("tc_logs", "read_shell_output", {"job_id": "shell-job-test"}),
-        ]
-
-        class FakeJobs:
-            def __init__(self):
-                self.started = []
-                self.closed = False
-
-            def start(self, command, *, early_exit_seconds=0.5):
-                self.started.append((command, early_exit_seconds))
-                return SimpleNamespace(
-                    job_id="shell-job-test",
-                    command=command,
-                    pid=123,
-                    status="running",
-                    exit_code=None,
-                    output_tail="",
-                )
-
-            def read_output(self, job_id, max_chars=12000, *, offset=None):
-                return "server ready"
-
-            def close(self):
-                self.closed = True
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "note.txt").write_text("before", encoding="utf-8")
-            conversation, _context = _conversation_with_registry(root, registry, tool_calls)
-            fake_jobs = FakeJobs()
-            conversation.runtime_state.shell_job_manager = fake_jobs
-            with (
-                patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
-            ):
-                conversation.run_until_idle()
-
-        tool_messages = [msg for msg in conversation.messages if msg.get("role") == "tool"]
-        self.assertEqual(fake_jobs.started, [("npm run dev", 0.5)])
-        self.assertIn("before", tool_messages[0]["content"])
-        self.assertIn("shell-job-test", tool_messages[1]["content"])
-        self.assertIn("server ready", tool_messages[2]["content"])
 
     def test_missing_provider_call_id_uses_index_fallback(self):
         registry = ToolRegistry()

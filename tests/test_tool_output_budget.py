@@ -1,5 +1,4 @@
 
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -165,50 +164,6 @@ def test_web_and_skill_text_are_not_cut_before_budgeting(tmp_path):
     assert result.output == text
 
 
-@pytest.mark.parametrize('stdout,stderr', [('', 'ERROR_STDERR_ONLY'), ('stdout', ' ' * 2000 + 'ERROR_MIDDLE' + ' ' * 2000)])
-def test_streamed_stderr_is_preserved(tmp_path, stdout, stderr):
-    from harness_code_agent.workspace.shell_session import (
-        _BoundedPipeSink,
-        _stream_sinks_to_artifact,
-        combine_output,
-    )
-
-    out = _BoundedPipeSink(preview_chars=256, spool_dir=tmp_path)
-    err = _BoundedPipeSink(preview_chars=256, spool_dir=tmp_path)
-    try:
-        out.feed(stdout)
-        err.feed(stderr)
-        out.finish_writing()
-        err.finish_writing()
-        path, preview, *_ = _stream_sinks_to_artifact(out, err, artifact_dir=tmp_path)
-        assert Path(path).read_text(encoding='utf-8') == combine_output(stdout, stderr)
-        if not stdout:
-            assert 'ERROR_STDERR_ONLY' in preview
-    finally:
-        out.discard()
-        err.discard()
-
-
-def test_persistent_capture_artifact_matches_inline_layout(tmp_path):
-    from harness_code_agent.workspace.shell_session import (
-        _stream_capture_to_artifact,
-        combine_output,
-    )
-
-    stdout = '  中文🙂 line\n' * 7000
-    stderr = '\nerror 中文🙂\n  '
-    raw = tmp_path / 'capture.raw'
-    raw.write_bytes(('OUT\r\n' + stdout + '\nERR\r\n' + stderr + '\nEXIT:7\r\n').encode('utf-8'))
-    built = _stream_capture_to_artifact(raw, artifact_dir=tmp_path / 'artifacts',
-                                      stdout_marker=b'OUT', stderr_marker=b'ERR', exit_marker=b'EXIT',
-                                      preview_bytes=2000)
-    expected = combine_output(stdout, stderr)
-    assert Path(built.path).read_bytes() == expected.encode('utf-8')
-    assert built.exit_code == 7
-    assert built.total_chars == len(expected)
-    assert built.total_bytes == len(expected.encode('utf-8'))
-
-
 def test_background_log_spills_only_when_long_and_keeps_its_beginning(tmp_path):
     from harness_code_agent.workspace.shell_jobs import ShellOutputBuffer
 
@@ -221,18 +176,6 @@ def test_background_log_spills_only_when_long_and_keeps_its_beginning(tmp_path):
     assert buffer.read(0, 12) == 'START_MARKER'
     assert buffer.read_tail(10) == 'END_MARKER'
     assert 'START_MARKER' in buffer.path.read_text(encoding='utf-8')
-
-
-def test_timeout_wrapper_keeps_captured_output(tmp_path):
-    from harness_code_agent.runtime.builtins.shell import run_bash
-    from harness_code_agent.workspace.shell_session import ShellResult
-
-    shell = SimpleNamespace(run=lambda *a, **kw: ShellResult(stdout='PARTIAL_STDOUT', stderr='PARTIAL_STDERR', exit_code=130, timed_out=True), close=lambda: None)
-    with patch('harness_code_agent.workspace.shell_session.PersistentShellSession', return_value=shell), patch('harness_code_agent.runtime.builtins.shell._requires_one_shot_powershell', return_value=False):
-        result = run_bash('echo hello', timeout=1, tool_context=SimpleNamespace(workspace=SimpleNamespace(root=tmp_path)))
-    assert result.status == 'failed'
-    assert 'PARTIAL_STDOUT' in result.output
-    assert 'PARTIAL_STDERR' in result.output
 
 
 def test_artifact_copy_is_verified_and_cannot_escape_workspace(tmp_path):
@@ -279,96 +222,6 @@ def make_conversation(context):
 
     with patch('harness_code_agent.agent.conversation.get_client', return_value=SimpleNamespace(close=lambda: None)):
         return Agent('test', 'system', tool_context=context).start_conversation()
-
-
-def test_native_powershell_multiline_artifact_preserves_unicode(tmp_path):
-    import os
-    import sys
-
-    from harness_code_agent.runtime.builtins.shell import run_bash
-    from harness_code_agent.workspace.shell_session import (
-        windows_shell_kind,
-        windows_shell_path,
-    )
-
-    if os.name != 'nt' or windows_shell_kind() != 'pwsh' or not windows_shell_path():
-        pytest.skip('requires Windows PowerShell 7')
-    source = 'HEAD_NATIVE\n' + '中文🙂ABCDE\n' * 4000 + 'TAIL_NATIVE'
-    (tmp_path / 'emit.py').write_text('import sys\nsys.stdout.write(' + repr(source) + ')', encoding='utf-8')
-    context = make_context(tmp_path, 'native_session')
-    conversation = make_conversation(context)
-    try:
-        result = run_bash("& '" + sys.executable.replace("'", "''") + "' -X utf8 'emit.py'",
-                          runtime_state=conversation.runtime_state, tool_context=context)
-        assert result.status == 'success' and result.return_code == 0
-        observation = conversation.record_tool_result('native', result)
-        assert observation.raw_output_path.read_text(encoding='utf-8') == source
-        assert 'HEAD_NATIVE' in observation.message and 'TAIL_NATIVE' in observation.message
-        assert count_tokens([{'role': 'tool', 'content': observation.message}]) <= 5000
-        arguments = {'path': observation.artifact_reference['path']}
-        pages = []
-        while True:
-            page = read_file(**arguments, tool_context=context)
-            assert page.status == 'success'
-            pages.append(page.output)
-            if not page.metadata.get('next_read'):
-                break
-            assert page.metadata['next_read'] != arguments
-            arguments = page.metadata['next_read']
-        assert ''.join(pages) == source
-    finally:
-        conversation.close()
-
-
-@pytest.mark.parametrize('interruption', ['timeout', 'cancel'])
-def test_native_powershell_interruption_preserves_unterminated_tail(tmp_path, interruption):
-    import os
-    import sys
-    import threading
-    import time
-
-    from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
-    from harness_code_agent.runtime.builtins.shell import run_bash
-    from harness_code_agent.workspace.shell_session import (
-        windows_shell_kind,
-        windows_shell_path,
-    )
-
-    if os.name != 'nt' or windows_shell_kind() != 'pwsh' or not windows_shell_path():
-        pytest.skip('requires Windows PowerShell 7')
-    source = 'BEFORE_INTERRUPT\n' + 'captured line\n' * 8000 + 'UNTERMINATED_TAIL'
-    (tmp_path / 'emit.py').write_text('import sys,time\nsys.stdout.write(' + repr(source) + ')\n'
-                                    'sys.stdout.flush()\nopen("ready", "w").close()\ntime.sleep(30)', encoding='utf-8')
-    context = make_context(tmp_path, 'native_interrupt')
-    conversation = make_conversation(context)
-    token = CancellationToken()
-    timer = None
-    def cancel_when_ready():
-        deadline = time.monotonic() + 10
-        while not (tmp_path / 'ready').exists() and time.monotonic() < deadline:
-            time.sleep(.02)
-        token.cancel()
-    if interruption == 'cancel':
-        timer = threading.Thread(target=cancel_when_ready, daemon=True)
-        timer.start()
-    try:
-        command = "& '" + sys.executable.replace("'", "''") + "' -X utf8 'emit.py'"
-        if interruption == 'cancel':
-            with pytest.raises(CancelledError) as caught:
-                run_bash(command, timeout=15, runtime_state=conversation.runtime_state,
-                         tool_context=context, cancellation_token=token)
-            result = caught.value.tool_result
-            assert result.metadata['cancelled']
-        else:
-            result = run_bash(command, timeout=2, runtime_state=conversation.runtime_state, tool_context=context)
-            assert result.return_code == 130 and result.metadata['timed_out']
-        observation = conversation.record_tool_result('native_interrupt', result)
-        assert source in observation.raw_output_path.read_text(encoding='utf-8')
-        assert not list(tmp_path.rglob('*.raw'))
-    finally:
-        if timer:
-            timer.join(timeout=10)
-        conversation.close()
 
 
 def record_large_result(conversation, call_id='call'):
@@ -473,23 +326,6 @@ def test_intercepted_results_use_the_same_budget(tmp_path):
         assert conversation.observation_store.observations[-1].raw_output_path.is_file()
     finally:
         conversation.close()
-
-
-def test_cancelled_shell_keeps_its_captured_result(tmp_path):
-    from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
-    from harness_code_agent.runtime.builtins.shell import run_bash
-    from harness_code_agent.workspace.shell_session import ShellResult
-
-    token = CancellationToken()
-    def finish(*args, **kwargs):
-        token.cancel()
-        return ShellResult(stdout='BEFORE_CANCEL', stderr='', exit_code=130)
-    shell = SimpleNamespace(run=finish, close=lambda: None, interrupt=lambda: None)
-    with patch('harness_code_agent.workspace.shell_session.PersistentShellSession', return_value=shell), patch('harness_code_agent.runtime.builtins.shell._requires_one_shot_powershell', return_value=False):
-        with pytest.raises(CancelledError) as caught:
-            run_bash('echo hello', tool_context=make_context(tmp_path, 'session'), cancellation_token=token)
-    assert 'BEFORE_CANCEL' in caught.value.tool_result.output
-    assert caught.value.tool_result.metadata['cancelled']
 
 
 def test_shell_log_pages_advance_unicode_offsets_without_duplicate_artifacts(tmp_path):

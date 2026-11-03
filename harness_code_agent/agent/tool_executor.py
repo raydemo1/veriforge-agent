@@ -455,14 +455,14 @@ class ToolExecutor:
     def _execute_one(self, prepared: PreparedToolCall, cancellation_token=None) -> ExecutedToolCall:
         context = self.agent.tool_context
         resource_guard = context.resource_coordinator.acquire(prepared.effect.resources, cancellation_token) if context is not None else nullcontext()
-        project_claims = () if prepared.effect.kind == "long_running" else prepared.effect.resources
+        project_claims = () if prepared.effect.kind in {"long_running", "native_shell"} else prepared.effect.resources
         project_guard = context.workspace.access.acquire(project_claims, cancellation_token) if context is not None else nullcontext()
         with cancellation_scope(cancellation_token), acquire_concurrency(prepared.effect.concurrency_key, cancellation_token), resource_guard, project_guard as lease:
             if cancellation_token is not None:
                 cancellation_token.check()
             claims = [claim for claim in prepared.effect.resources
                       if claim.access == "write" and claim.domain in {"workspace", "global"}]
-            if context is not None and claims:
+            if context is not None and claims and prepared.effect.kind != "native_shell":
                 access = context.workspace.access
                 session_id, turn_id = context.session_id, self.runtime_state.turn_id
                 if any(claim.domain == "global" or claim.scope != "exact" for claim in claims):

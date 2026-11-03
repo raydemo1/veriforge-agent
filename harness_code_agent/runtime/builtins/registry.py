@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from ..execution_planner import CallEffect, ResourceClaim, workspace_claim
 from ..permissions import (
     TOOL_PERMISSION_CONTROL,
@@ -149,7 +150,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         _shell_effect,
         capabilities=all_agents,
     )
-    add("browser_test", browser_test, TOOL_PERMISSION_SHELL, capabilities=all_agents)
+    add("browser_test", browser_test, TOOL_PERMISSION_SHELL, _browser_effect, capabilities=all_agents)
     add(
         "write_file",
         write_file,
@@ -352,13 +353,20 @@ def _conflict_effect(args, context):
     )
 
 
+def _browser_effect(args, context):
+    if os.name == "nt":
+        key = str(getattr(context, "session_id", None) or id(context))
+        return CallEffect((ResourceClaim("browser", key, "exact", "write"),), kind="browser")
+    return CallEffect.global_exclusive()
+
+
 def _shell_effect(args, context):
     command = str(args.get("command") or "")
     root = _root(context)
-    sandbox = getattr(
-        getattr(context, "permission_policy", None), "sandbox_mode", None
-    )
-    analysis = analyze_shell_command(command, root, sandbox)
+    if os.name == "nt":
+        from ...workspace.native_shell import write_claims
+        return CallEffect(write_claims(root, args.get("write_paths", [])), kind="native_shell")
+    analysis = analyze_shell_command(command, root)
     effects = analysis.effects
     traits = analysis.traits
     scopes = {t.scope for t in analysis.targets}

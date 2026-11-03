@@ -18,7 +18,6 @@ from harness_code_agent.runtime.builtins.schemas import BROWSER_TOOL_SCHEMAS
 from harness_code_agent.runtime.builtins.shell import (
     list_shell_jobs,
     read_shell_output,
-    run_bash,
     stop_shell_job,
 )
 from harness_code_agent.runtime.tool_registry import (
@@ -36,7 +35,6 @@ def _result(text: str, *, status: str | None = None) -> ToolResult:
     metadata = {"status_source": "permission"} if text.startswith("[blocked]") else {}
     error = text.removeprefix("[error] ").removeprefix("[blocked] ") if status == "failed" else None
     return ToolResult(tool="run_bash", status=status, output=text, error=error, metadata=metadata)
-
 
 
 class ProductRuntimeTests(unittest.TestCase):
@@ -1365,119 +1363,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertTrue(all(spec.capabilities for spec in BUILTIN_TOOL_REGISTRY.specs()))
         self.assertIsNone(BUILTIN_TOOL_REGISTRY.get("missing_tool"))
 
-    def test_run_bash_long_running_uses_shell_job_manager(self):
-
-        class FakeJobs:
-            def start(self, command, *, early_exit_seconds=0.5):
-                self.request = (command, early_exit_seconds)
-                return SimpleNamespace(
-                    job_id="shell-job-abc123",
-                    command=command,
-                    pid=456,
-                    status="running",
-                    exit_code=None,
-                    output_tail="",
-                )
-
-        fake_jobs = FakeJobs()
-        runtime_state = SimpleNamespace(shell_session=None, shell_job_manager=fake_jobs)
-
-        result = run_bash(
-            "npm run dev",
-            timeout=300,
-            runtime_state=runtime_state,
-        )
-
-        self.assertEqual(result.status, "success")
-        self.assertEqual(fake_jobs.request, ("npm run dev", 0.5))
-        self.assertIn("shell-job-abc123", result.output)
-        self.assertEqual(result.metadata["job_id"], "shell-job-abc123")
-
-    def test_run_bash_does_not_reuse_runtime_shell_session(self):
-
-        class DeadShell:
-            def __init__(self):
-                self.closed = False
-
-            def run(self, command, timeout=300, artifact_dir=None):
-                raise RuntimeError("Shell failed to become ready")
-
-            def close(self):
-                self.closed = True
-
-        dead_shell = DeadShell()
-        runtime_state = SimpleNamespace(shell_session=dead_shell, shell_job_manager=None)
-
-        fresh_shell = SimpleNamespace(
-            run=lambda command, timeout=300, artifact_dir=None: SimpleNamespace(
-                stdout="hi", stderr="", exit_code=0, timed_out=False, output_spilled=False
-            ),
-            close=lambda: None,
-        )
-        with patch("harness_code_agent.workspace.shell_session.PersistentShellSession", return_value=fresh_shell):
-            result = run_bash("echo hi", runtime_state=runtime_state)
-
-        self.assertEqual(result.status, "success")
-        self.assertFalse(dead_shell.closed)
-
-    def test_run_bash_reports_nonzero_exit_as_success_with_exit_code_footer(self):
-
-        class ExpectedFailureShell:
-            def run(self, command, timeout=300, artifact_dir=None):
-                return SimpleNamespace(
-                    stdout="",
-                    stderr="error: minutes must be between 1 and 120",
-                    exit_code=2,
-                    timed_out=False,
-                    output_spilled=False,
-                )
-
-        shell = ExpectedFailureShell()
-        shell.close = lambda: None
-        with patch("harness_code_agent.workspace.shell_session.PersistentShellSession", return_value=shell):
-            result = run_bash(
-                'python focusflow.py "Task" 0',
-                runtime_state=SimpleNamespace(shell_job_manager=None),
-            )
-
-        self.assertEqual(result.status, "success")
-        self.assertIsNone(result.error)
-        self.assertEqual(result.return_code, 2)
-        self.assertIn("[exit_code: 2]", result.output)
-
-    def test_run_bash_uses_one_shot_shell_for_powershell_exit(self):
-        from unittest.mock import Mock
-
-
-        persistent_shell = Mock()
-        runtime_state = SimpleNamespace(shell_session=persistent_shell, shell_job_manager=None)
-        shell_result = SimpleNamespace(
-            stdout="ready",
-            stderr="",
-            exit_code=0,
-            timed_out=False,
-        )
-
-        with (
-            patch("harness_code_agent.workspace.shell_session.PersistentShellSession", return_value=Mock()),
-            patch(
-                "harness_code_agent.runtime.builtins.shell._requires_one_shot_powershell",
-                return_value=True,
-            ),
-            patch(
-                "harness_code_agent.runtime.builtins.shell._run_one_shot_powershell",
-                return_value=shell_result,
-            ) as one_shot,
-        ):
-            result = run_bash(
-                "Write-Output ready; exit 0",
-                runtime_state=runtime_state,
-            )
-
-        self.assertEqual(result.status, "success")
-        self.assertEqual(result.output, "ready\n\n[exit_code: 0]")
-        one_shot.assert_called_once()
-        persistent_shell.run.assert_not_called()
 
     def test_shell_job_tools_handle_list_read_stop(self):
 
@@ -1487,6 +1372,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 self.command = "npm run dev"
                 self.pid = 111
                 self.status = status
+                self.background = True
                 self.exit_code = None
                 self.started_at = 10.0
                 self.ended_at = None
@@ -2501,7 +2387,7 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
             self.assertTrue(result.snapshot_path.exists())
 
-    def test_permission_policy_uses_codex_sandbox_modes(self):
+    def test_permission_policy_defaults_to_workspace_scope(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy
 
         workspace_policy = PermissionPolicy(mode="workspace-write")

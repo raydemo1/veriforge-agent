@@ -77,7 +77,7 @@ def _iter_shell_cases(workspace_root: str):
 
 def _new_effective_action(mode: str, command: str, workspace_root: str) -> str:
     """The migrated composition: session policy restricted by the preset."""
-    policy = PermissionPolicy(mode, sandbox_mode="host").restricted_by(
+    policy = PermissionPolicy(mode).restricted_by(
         PermissionPreset.NO_WORKSPACE_WRITES
     )
     return policy.decide_tool_call(
@@ -106,7 +106,7 @@ def test_preset_only_tightens_never_loosens(tmp_path):
     rank = {"allow": 0, "ask": 1, "deny": 2}
     for _, command, _ in _iter_shell_cases(str(tmp_path)):
         for mode in MODES:
-            session = PermissionPolicy(mode, sandbox_mode="host")
+            session = PermissionPolicy(mode)
             session_action = session.decide_tool_call(
                 "run_bash", {"command": command}, TOOL_PERMISSION_SHELL, str(tmp_path)
             ).action

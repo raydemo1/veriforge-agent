@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import tempfile
-import unittest
 from pathlib import Path
+import unittest
 from unittest.mock import patch
 
 from harness_code_agent import config
@@ -32,6 +32,7 @@ def _result(text: str, *, status: str | None = None) -> ToolResult:
 
 
 class RepositoryToolPolicyTests(unittest.TestCase):
+
     def setUp(self) -> None:
         self._old_workspace = config.WORKSPACE
         self._tmp = tempfile.TemporaryDirectory()
@@ -41,6 +42,7 @@ class RepositoryToolPolicyTests(unittest.TestCase):
         (self.workspace / "pkg" / "target.py").write_text("VALUE = 'needle'\n", encoding="utf-8")
         (self.workspace / "pkg" / "__pycache__").mkdir()
         (self.workspace / "pkg" / "__pycache__" / "ignored.pyc").write_text("needle", encoding="utf-8")
+
 
     def tearDown(self) -> None:
         config.WORKSPACE = self._old_workspace
@@ -210,10 +212,10 @@ class ShellPolicyTests(unittest.TestCase):
 class ShellPermissionPolicyTests(unittest.TestCase):
     """Facts come from the analyzer; allow/ask/deny comes only from the policy."""
 
-    def setUp(self) -> None:
-        self.workspace = PermissionPolicy("workspace-write", sandbox_mode="host")
-        self.eval = PermissionPolicy("terminal-eval", sandbox_mode="docker")
-        self.full = PermissionPolicy("danger-full-access", sandbox_mode="host")
+    def setUp(self):
+        self.workspace = PermissionPolicy("workspace-write")
+        self.eval = PermissionPolicy("terminal-eval")
+        self.full = PermissionPolicy("danger-full-access")
 
     def _decide(self, policy, command):
         return policy.decide_tool_call("run_bash", {"command": command})
@@ -263,20 +265,6 @@ class ShellPermissionPolicyTests(unittest.TestCase):
         self.assertTrue(decision.requires_approval)
         self.assertTrue(self._decide(self.eval, "python -m ruff check --fix .").allowed)
 
-    def test_container_absolute_paths_are_workspace_targets_in_docker(self):
-        analysis = analyze_shell_command("rm -rf /tests/build", sandbox_mode="docker")
-        target = analysis.targets[0]
-        self.assertIs(target.scope, TargetScope.WORKSPACE)
-        self.assertIn(ShellEffect.DELETE, analysis.effects)
-        self.assertTrue(
-            self._decide(self.eval, "rm -rf /tests/build").allowed
-        )
-        # The same absolute path on a host is outside the workspace.
-        host_analysis = analyze_shell_command("rm -rf /tests/build", sandbox_mode="host")
-        self.assertIs(host_analysis.targets[0].scope, TargetScope.EXTERNAL)
-        self.assertFalse(
-            self._decide(self.workspace, "rm -rf /tests/build").allowed
-        )
 
     # --- unknown execution: ask / allow, never proven safe ---------------
 
@@ -339,20 +327,6 @@ class ShellPermissionPolicyTests(unittest.TestCase):
         # Full access permits ordinary system writes but not destructive ones.
         self.assertTrue(self._decide(self.full, command).allowed)
         self.assertFalse(self._decide(self.full, "rm -rf /etc").allowed)
-
-    def test_legacy_eval_env_marker_selects_eval_preset(self):
-        with patch.dict("os.environ", {"HCA_TERMINAL_EVAL_MODE": "1"}):
-            policy = PermissionPolicy("danger-full-access")
-            self.assertEqual(policy.sandbox_mode, "docker")
-            self.assertTrue(
-                self._decide(policy, "rm -rf /tests/build").allowed
-            )
-            self.assertFalse(
-                self._decide(policy, "cat > /etc/profile").allowed
-            )
-            self.assertFalse(
-                self._decide(policy, "git reset --hard").allowed
-            )
 
 
 if __name__ == "__main__":

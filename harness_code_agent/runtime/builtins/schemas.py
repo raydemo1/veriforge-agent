@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 
-from ... import config
 from .filesystem import READ_FILE_MAX_LINES
 
 CORE_TOOL_SCHEMAS = [
@@ -474,36 +473,34 @@ CORE_TOOL_SCHEMAS = [
             "name": "run_bash",
             "description": (
                 "Execute a shell command in the workspace directory. "
-                + (
-                    "When HARNESS_SANDBOX_MODE=docker this runs inside a Linux Bash Docker sandbox with the workspace mounted at /workspace. "
-                    if (config.SANDBOX_MODE or "host").strip().lower() == "docker"
-                    else ""
-                )
-                + (
-                    f"On Windows this uses the explicitly configured HARNESS_WINDOWS_SHELL={config.WINDOWS_SHELL} backend with no fallback. "
-                    + (
-                        "Use Bash syntax; commands run inside WSL and start in the workspace. "
-                        if (config.WINDOWS_SHELL or "pwsh").strip().lower() == "wsl"
-                        else "Use PowerShell 7 syntax; commands start in the Windows workspace. "
-                    )
-                    if os.name == "nt"
-                    else "On POSIX this runs a shell suitable for standard Bash-style commands. "
-                )
+                + ("On Windows use PowerShell 7 syntax; processes run under the native directory write sandbox. "
+                   if os.name == "nt" else "Use Bash syntax; commands run directly in the current execution environment. ")
                 + "Use for installing deps, running builds, starting servers, running tests, etc. "
-                "Keep each call to one logical verification whenever practical. "
+                + (
+                    "The Windows sandbox makes the project read-only unless write_paths declares writable directories. "
+                    "Declare only required output/cache/source directories; private TEMP is writable. "
+                    "Background jobs retain those directory write permits until their process trees exit. "
+                    "A background job cannot request the whole shared Local workspace. Never create a Worktree automatically; only the user creates one. "
+                    if os.name == "nt" else ""
+                )
+                + "Keep each call to one logical verification whenever practical. "
                 "A command that runs to completion is reported as success even when it exits non-zero (a failing test run or compiler error is a normal result for you to read and act on); the exit code is appended as [exit_code: N]. Only timeouts or tool/runtime errors are reported as failed. "
                 "Do not use shell for repository search or file listing; use repo_search/list_files/read_file. "
                 "Repository-browsing shell commands such as bare rg without a path, recursive grep/findstr, Get-ChildItem -Recurse, or dir /s may be blocked. "
                 "For long-running verification commands (compilation, training), increase the timeout parameter. "
                 "For dev servers, watch mode, and runserver commands, this returns a background shell job id; use read_shell_output, list_shell_jobs, and stop_shell_job to manage it. "
                 "Prefer bounded inspection commands such as rg, head/tail, sed -n, Select-Object -First/-Last, or line counts instead of dumping whole files or logs. "
-                "Stderr is preserved separately in output for easier debugging."
+                "Stderr is labelled in output for easier debugging."
             ),
             "parameters": {
                 "type": "object",
                 "required": ["command"],
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to run; keep inspection commands bounded and avoid combining unrelated checks."},
+                    **({"write_paths": {
+                        "type": "array", "items": {"type": "string"}, "default": [],
+                        "description": "Workspace directories that this process may write, relative to the workspace. Omit for a read-only project. Directory permits last until the process tree exits."
+                    }} if os.name == "nt" else {}),
                     "timeout": {
                         "type": "integer",
                         "description": "Timeout in seconds (default 300). Increase for long builds/training.",
@@ -740,6 +737,10 @@ BROWSER_TOOL_SCHEMAS = [
                         "type": "string",
                         "description": "Shell command to start the dev server (e.g. 'npm run dev'). Only needed on first call.",
                     },
+                    **({"write_paths": {
+                        "type": "array", "items": {"type": "string"}, "default": [],
+                        "description": "Workspace directories the background dev server may write, such as build or cache directories."
+                    }} if os.name == "nt" else {}),
                     "port": {
                         "type": "integer",
                         "description": "Port the dev server runs on (default: 5173)",

@@ -365,7 +365,6 @@ class AgentCoordinator:
         policy = PermissionPolicy.for_role(
             record.role,
             allowed_paths=record.allowed_paths,
-            sandbox_mode="host",
         )
         sub_context = ToolContext(
             workspace=workspace,

@@ -239,22 +239,14 @@ WORKSPACE_WRITE_QUOTA_BYTES = (
 MIN_FREE_DISK_BYTES = int(os.environ.get("HARNESS_MIN_FREE_DISK_MB", "100")) * 1024 * 1024
 
 # --- Shell process resource limits ---
-# Docker sandbox: passed to `docker run` as --memory / --cpus; 0 leaves them unset.
-DOCKER_MEMORY_MB = int(os.environ.get("HARNESS_DOCKER_MEMORY_MB", "0"))
-DOCKER_CPUS = float(os.environ.get("HARNESS_DOCKER_CPUS", "0"))
-# POSIX host sandbox: injected as ulimit -v (address space KB), -t (CPU
-# seconds), -f (single-file blocks) before each command.  All default to 0
+# POSIX process limits: address space KB, CPU seconds, single-file blocks.
+# All default to 0
 # (disabled) because address-space caps can false-kill JVM/Node workloads.
 SHELL_MEMORY_KB = int(os.environ.get("HARNESS_SHELL_MEMORY_KB", "0"))
 SHELL_CPU_SECONDS = int(os.environ.get("HARNESS_SHELL_CPU_SECONDS", "0"))
 SHELL_FSIZE_BLOCKS = int(os.environ.get("HARNESS_SHELL_FSIZE_BLOCKS", "0"))
 
 TRACE_STDERR = os.environ.get("HARNESS_TRACE_STDERR", "").lower() in {"1", "true", "yes", "on"}
-WINDOWS_SHELL = os.environ.get("HARNESS_WINDOWS_SHELL", "pwsh")
-SANDBOX_MODE = os.environ.get("HARNESS_SANDBOX_MODE", "host")
-DOCKER_IMAGE = os.environ.get("HARNESS_DOCKER_IMAGE", "python:3.12")
-DOCKER_NETWORK = os.environ.get("HARNESS_DOCKER_NETWORK", "none")
-DOCKER_USER = os.environ.get("HARNESS_DOCKER_USER", "")
 
 # --- Paths ---
 WORKSPACE = os.path.abspath(os.environ.get("HARNESS_WORKSPACE", "./workspace"))

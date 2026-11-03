@@ -27,6 +27,7 @@ class ToolContext:
     event_bus: EventBus
     session_id: str | None = None
     session_root: Path | None = None
+    environment: str = "local"
     model_selection: ModelSelection = field(default_factory=ModelSelection)
     memory_use_enabled: bool = True
     memory_auto_extract_enabled: bool = True

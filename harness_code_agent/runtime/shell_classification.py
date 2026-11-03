@@ -44,11 +44,6 @@ class TargetScope(str, Enum):
     UNKNOWN = "unknown"
 
 
-class SandboxMode(str, Enum):
-    HOST = "host"
-    DOCKER = "docker"
-
-
 @dataclass(frozen=True)
 class ShellTarget:
     raw: str
@@ -215,7 +210,6 @@ _PARALLEL_VERIFY_PREFIXES = (
 def analyze_shell_command(
     command: str,
     workspace_root: str | None = None,
-    sandbox_mode: str = SandboxMode.HOST.value,
 ) -> ShellAnalysis:
     """Return factual effects/traits/targets for a (possibly compound) command."""
     text = str(command or "").strip()
@@ -223,11 +217,6 @@ def analyze_shell_command(
         return ShellAnalysis(frozenset(), frozenset())
 
     root = _normalize_root(workspace_root)
-    try:
-        sandbox = SandboxMode(sandbox_mode)
-    except ValueError:
-        sandbox = SandboxMode.HOST
-
     effects: set[ShellEffect] = set()
     traits: set[ShellTrait] = set()
     targets: list[ShellTarget] = []
@@ -237,7 +226,7 @@ def analyze_shell_command(
         traits |= {ShellTrait.DYNAMIC, ShellTrait.UNKNOWN_EFFECT}
 
     for segment in _split_segments(text):
-        seg_effects, seg_traits, seg_targets = _analyze_segment(segment, root, sandbox)
+        seg_effects, seg_traits, seg_targets = _analyze_segment(segment, root)
         effects |= seg_effects
         traits |= seg_traits
         targets.extend(seg_targets)
@@ -261,7 +250,7 @@ def analyze_shell_command(
 # ---------------------------------------------------------------------------
 
 def _analyze_segment(
-    segment: str, root: str | None, sandbox: SandboxMode
+    segment: str, root: str | None
 ) -> tuple[set[ShellEffect], set[ShellTrait], list[ShellTarget]]:
     effects: set[ShellEffect] = set()
     traits: set[ShellTrait] = set()
@@ -269,7 +258,7 @@ def _analyze_segment(
 
     invocation = _parse_invocation(segment)
     if invocation is None:
-        redir_targets = _redirection_targets(segment, root, sandbox)
+        redir_targets = _redirection_targets(segment, root)
         if redir_targets:
             effects.add(ShellEffect.WRITE)
             targets.extend(redir_targets)
@@ -283,7 +272,7 @@ def _analyze_segment(
             traits.add(ShellTrait.PRIVILEGED)
 
     # Redirection targets apply regardless of the executable.
-    redir_targets = _redirection_targets(segment, root, sandbox)
+    redir_targets = _redirection_targets(segment, root)
     if redir_targets:
         effects.add(ShellEffect.WRITE)
         targets.extend(redir_targets)
@@ -292,42 +281,42 @@ def _analyze_segment(
     if exe in _DELETE_COMMANDS:
         windows_switches = exe in {"del", "erase"}
         e, tr, tg = _delete_facts(
-            args, root, sandbox, force_flag=True, windows_switches=windows_switches
+            args, root, force_flag=True, windows_switches=windows_switches
         )
         effects |= e
         traits |= tr
         targets.extend(tg)
     elif exe in _RECURSE_DIR_COMMANDS:
         e, tr, tg = _delete_facts(
-            args, root, sandbox, force_flag=False,
+            args, root, force_flag=False,
             always_recursive=True, windows_switches=True,
         )
         effects |= e
         traits |= tr
         targets.extend(tg)
     elif exe == "git":
-        e, tr, tg = _git_facts(args, root, sandbox)
+        e, tr, tg = _git_facts(args, root)
         effects |= e
         traits |= tr
         targets.extend(tg)
     elif exe in _INTERPRETERS:
-        e, tr, tg = _interpreter_facts(exe, args, root, sandbox)
+        e, tr, tg = _interpreter_facts(exe, args, root)
         effects |= e
         traits |= tr
         targets.extend(tg)
     elif exe in _NETWORK_TOOLS:
-        e, tg = _network_facts(exe, args, root, sandbox)
+        e, tg = _network_facts(exe, args, root)
         effects |= e
         targets.extend(tg)
     elif exe in _MKDIR_COMMANDS:
         effects.add(ShellEffect.WRITE)
-        targets.extend(_positional_targets(args, root, sandbox))
+        targets.extend(_positional_targets(args, root))
     elif exe in _PS_DELETE_ALIASES or exe in _COPY_COMMANDS:
         effects.add(ShellEffect.WRITE)
-        targets.extend(_positional_targets(args, root, sandbox, powershell_path_options=True))
+        targets.extend(_positional_targets(args, root, powershell_path_options=True))
     elif _looks_like_inplace_formatter(exe, args):
         effects.add(ShellEffect.WRITE)
-        targets.extend(_formatter_targets(exe, args, root, sandbox))
+        targets.extend(_formatter_targets(exe, args, root))
     elif exe in _PROCESS_CONTROL:
         effects.add(ShellEffect.EXECUTE)
         traits.add(ShellTrait.UNKNOWN_EFFECT)
@@ -353,7 +342,7 @@ def _analyze_segment(
 # Dispatchers
 # ---------------------------------------------------------------------------
 
-def _delete_facts(args, root, sandbox, *, force_flag: bool,
+def _delete_facts(args, root, *, force_flag: bool,
                   always_recursive: bool = False, windows_switches: bool = False):
     effects = {ShellEffect.DELETE}
     traits: set[ShellTrait] = set()
@@ -365,7 +354,7 @@ def _delete_facts(args, root, sandbox, *, force_flag: bool,
         powershell_path_options=not windows_switches,
     )
     for raw in positions:
-        scope = _classify_path_scope(raw, root, sandbox)
+        scope = _classify_path_scope(raw, root)
         targets.append(ShellTarget(raw, scope))
     if recursive and positions:
         traits.add(ShellTrait.RECURSIVE)
@@ -390,7 +379,7 @@ def _is_recursive_delete(args, *, force_flag: bool) -> bool:
     return False
 
 
-def _git_facts(args, root, sandbox):
+def _git_facts(args, root):
     effects: set[ShellEffect] = set()
     traits: set[ShellTrait] = set()
     targets: list[ShellTarget] = []
@@ -445,7 +434,7 @@ def _git_clone_target(sub_args) -> str:
     return "."
 
 
-def _interpreter_facts(exe, args, root, sandbox):
+def _interpreter_facts(exe, args, root):
     # Test runners and builds are treated as reads (derived artifacts only).
     if is_verify_shell_command(" ".join((exe, *args))):
         return {ShellEffect.READ}, set(), []
@@ -471,19 +460,19 @@ def _interpreter_facts(exe, args, root, sandbox):
     low = script_path.lower()
     if low.endswith(_INTERP_SCRIPT_SUFFIXES) or "." not in low.rsplit("/", 1)[-1]:
         targets.append(
-            ShellTarget(script_path, _classify_path_scope(script_path, root, sandbox))
+            ShellTarget(script_path, _classify_path_scope(script_path, root))
         )
     return effects, traits, targets
 
 
-def _network_facts(exe, args, root, sandbox):
+def _network_facts(exe, args, root):
     effects = {ShellEffect.NETWORK, ShellEffect.READ}
     targets: list[ShellTarget] = []
     output_path = _option_value(args, ("-o", "--output"))
     if output_path:
         effects.add(ShellEffect.WRITE)
         targets.append(
-            ShellTarget(output_path, _classify_path_scope(output_path, root, sandbox))
+            ShellTarget(output_path, _classify_path_scope(output_path, root))
         )
     if any(a in {"-O", "--remote-name"} for a in args):
         effects.add(ShellEffect.WRITE)
@@ -583,9 +572,9 @@ def _positional_tokens(
     return positions
 
 
-def _positional_targets(args, root, sandbox, *, powershell_path_options=False):
+def _positional_targets(args, root, *, powershell_path_options=False):
     return [
-        ShellTarget(raw, _classify_path_scope(raw, root, sandbox))
+        ShellTarget(raw, _classify_path_scope(raw, root))
         for raw in _positional_tokens(
             args,
             skip_slash_options=True,
@@ -626,11 +615,11 @@ def _looks_like_inplace_formatter(exe: str, args) -> bool:
     return False
 
 
-def _formatter_targets(exe, args, root, sandbox):
+def _formatter_targets(exe, args, root):
     filtered = list(args)
     if exe == "ruff" and filtered and filtered[0] == "check":
         filtered = filtered[1:]
-    return _positional_targets(filtered, root, sandbox)
+    return _positional_targets(filtered, root)
 
 
 def _git_subcommand_index(tokens) -> int | None:
@@ -663,7 +652,6 @@ def _git_clean_forces_directory_delete(args) -> bool:
 def _classify_path_scope(
     raw_path: str,
     root: str | None,
-    sandbox: SandboxMode,
 ) -> TargetScope:
     token = _bare(raw_path).strip()
     if not token:
@@ -699,41 +687,31 @@ def _classify_path_scope(
         if low.endswith(":"):
             return TargetScope.SYSTEM
         if root:
-            return _scope_against_root(token, root, sandbox)
+            return _scope_against_root(token, root)
         return TargetScope.EXTERNAL
 
     # POSIX-style absolute path.
     if token.startswith("/"):
         if root:
-            return _scope_against_root(token, root, sandbox)
-        return (
-            TargetScope.WORKSPACE
-            if sandbox is SandboxMode.DOCKER
-            else TargetScope.EXTERNAL
-        )
+            return _scope_against_root(token, root)
+        return TargetScope.EXTERNAL
 
     expanded = Path(token).expanduser()
     if expanded.is_absolute():
         if root:
-            return _scope_against_root(token, root, sandbox)
-        return (
-            TargetScope.WORKSPACE
-            if sandbox is SandboxMode.DOCKER
-            else TargetScope.EXTERNAL
-        )
+            return _scope_against_root(token, root)
+        return TargetScope.EXTERNAL
 
     return TargetScope.WORKSPACE
 
 
-def _scope_against_root(token: str, root: str, sandbox: SandboxMode) -> TargetScope:
+def _scope_against_root(token: str, root: str) -> TargetScope:
     try:
         candidate = Path(token).expanduser()
         if not candidate.is_absolute():
             candidate = Path(root) / candidate
         resolved = os.path.normcase(os.path.normpath(str(candidate.resolve())))
         if _is_same_or_child(resolved, root):
-            return TargetScope.WORKSPACE
-        if sandbox is SandboxMode.DOCKER and not re.match(r"^[a-z]:[\\/]", token.lower()):
             return TargetScope.WORKSPACE
     except (OSError, ValueError):
         pass
@@ -760,10 +738,10 @@ def _normalize_root(root: str | None) -> str | None:
 # Redirections / substitution
 # ---------------------------------------------------------------------------
 
-def _redirection_targets(segment: str, root, sandbox) -> list[ShellTarget]:
+def _redirection_targets(segment: str, root) -> list[ShellTarget]:
     targets: list[ShellTarget] = []
     for token in _write_redirection_targets(segment):
-        targets.append(ShellTarget(token, _classify_path_scope(token, root, sandbox)))
+        targets.append(ShellTarget(token, _classify_path_scope(token, root)))
     return targets
 
 

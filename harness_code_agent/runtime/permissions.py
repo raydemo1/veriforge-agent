@@ -2,20 +2,18 @@
 
 The analyzer (:mod:`runtime.shell_classification`) reports facts only; this
 module maps those facts onto ``allow / ask / deny`` according to the active
-:class:`~runtime.shell_classification.SandboxMode` / permission mode preset.
+permission mode preset.
 
 Catastrophic shell patterns (``rm -rf /``, ``git reset --hard`` ...) are
 denied in EVERY mode, including full access.
 """
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import ClassVar
 
 from .shell_classification import (
-    SandboxMode,
     ShellEffect,
     ShellTrait,
     TargetScope,
@@ -140,7 +138,6 @@ class PermissionPolicy:
         mode: str = WORKSPACE_WRITE,
         *,
         shell_config: ShellPermissionConfig | None = None,
-        sandbox_mode: str | None = None,
         role: str | None = None,
         allowed_paths: tuple[str, ...] | list[str] | None = None,
     ):
@@ -149,16 +146,6 @@ class PermissionPolicy:
         self.mode = mode
         self.role = role
         self.allowed_paths = tuple(allowed_paths or ())
-        self.sandbox_mode = sandbox_mode or resolve_sandbox_mode()
-        if self.sandbox_mode not in {m.value for m in SandboxMode}:
-            self.sandbox_mode = SandboxMode.HOST.value
-        # Backward compatibility: eval runs used to combine danger-full-access
-        # with HCA_TERMINAL_EVAL_MODE=1 to relax container path handling.
-        if mode == self.DANGER_FULL_ACCESS and _terminal_eval_enabled():
-            self._terminal_eval = True
-            shell_config = shell_config or self._SHELL_PRESETS[self.EVAL]
-        else:
-            self._terminal_eval = False
         self.shell_config = shell_config or self._SHELL_PRESETS[mode]
 
     # ------------------------------------------------------------------
@@ -171,7 +158,6 @@ class PermissionPolicy:
         role: str,
         *,
         allowed_paths: tuple[str, ...] | list[str] | None = None,
-        sandbox_mode: str | None = None,
     ) -> PermissionPolicy:
         """Policy for a delegated agent role.
 
@@ -182,7 +168,6 @@ class PermissionPolicy:
             return cls(
                 cls.READ_ONLY,
                 role=role,
-                sandbox_mode=sandbox_mode,
             )
         if role == "worker":
             return cls(
@@ -196,7 +181,6 @@ class PermissionPolicy:
                 ),
                 role="worker",
                 allowed_paths=allowed_paths,
-                sandbox_mode=sandbox_mode,
             )
         raise ValueError(f"Unknown agent role: {role}")
 
@@ -239,7 +223,7 @@ class PermissionPolicy:
     ) -> PermissionDecision:
         command = str(args.get("command", ""))
         analysis = analyze_shell_command(
-            command, workspace_root, self.sandbox_mode
+            command, "/" if self.mode == self.EVAL and self.role is None else workspace_root
         )
         effects = analysis.effects
         traits = analysis.traits
@@ -332,7 +316,7 @@ class PermissionPolicy:
                 f"{self.mode} mode allows control tools",
             )
         if permission == TOOL_PERMISSION_DANGEROUS:
-            if self.mode in {self.DANGER_FULL_ACCESS, self.EVAL} or self._terminal_eval:
+            if self.mode in {self.DANGER_FULL_ACCESS, self.EVAL}:
                 return PermissionDecision(
                     PermissionAction.ALLOW.value,
                     "dangerous",
@@ -350,7 +334,7 @@ class PermissionPolicy:
                 f"{self.mode} mode requires approval for dangerous tools",
             )
         # Unknown / undeclared tool.
-        if self.mode in {self.DANGER_FULL_ACCESS, self.EVAL} or self._terminal_eval:
+        if self.mode in {self.DANGER_FULL_ACCESS, self.EVAL}:
             return PermissionDecision(
                 PermissionAction.ALLOW.value, "unknown", f"{self.mode} mode allows this tool call"
             )
@@ -435,24 +419,6 @@ class _ProfilePresetPolicy(PermissionPolicy):
                 "profile does not allow shell commands that write workspace files",
             )
         return decision
-
-
-def resolve_sandbox_mode() -> str:
-    """Effective sandbox mode: explicit config wins; eval flag implies docker."""
-    from .. import config
-
-    if str(getattr(config, "SANDBOX_MODE", "host")).lower() == SandboxMode.DOCKER.value:
-        return SandboxMode.DOCKER.value
-    if _terminal_eval_enabled():
-        return SandboxMode.DOCKER.value
-    return SandboxMode.HOST.value
-
-
-def _terminal_eval_enabled() -> bool:
-    return (
-        os.environ.get("HCA_TERMINAL_EVAL_MODE", "").strip().lower()
-        in {"1", "true", "yes", "on"}
-    )
 
 
 def _normalize_rel_path(value: str) -> str:

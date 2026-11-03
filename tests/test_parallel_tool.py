@@ -68,20 +68,6 @@ class ParallelToolTests(unittest.TestCase):
 
         self.assertEqual(planner.ready({0, 1}, set()), [0, 1])
 
-    def test_shell_inspections_parallel_but_verifications_serialize(self):
-        inspections = [
-            BUILTIN_TOOL_REGISTRY.effect_for("run_bash", {"command": command}, self.context)
-            for command in ("git status --short", "rg needle .")
-        ]
-        verifications = [
-            BUILTIN_TOOL_REGISTRY.effect_for("run_bash", {"command": command}, self.context)
-            for command in ("pytest -q", "bun run check")
-        ]
-
-        inspect_plan = ExecutionPlanner(enumerate(inspections))
-        verify_plan = ExecutionPlanner(enumerate(verifications))
-        self.assertEqual(inspect_plan.ready({0, 1}, set()), [0, 1])
-        self.assertEqual(verify_plan.ready({0, 1}, set()), [0])
 
     def test_mcp_read_only_hint_and_server_write_effects(self):
         manager = McpClientManager(workspace=self.root)

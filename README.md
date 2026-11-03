@@ -107,11 +107,13 @@ raise SystemExit(result.exit_code)
 
 独立验证脚本：`eval/scripts/check_memory_consolidation.py`、`check_memory_runtime.py`；真实模型评测必须显式带 `--run`，场景与请求上限写入各次评测产物，不纳入默认测试集。
 
-一个工作台可以同时运行多个会话，每个会话独立保存对话、队列、审批、模型设置、草稿和后台任务。切换标签不会中断执行，关闭标签只隐藏会话，历史会话恢复后沿用原 ID；「分支」从最近结算的历史边界创建新会话。输入区的停止只取消当前回合，保留排队消息和后台任务；Ctrl+C 或关闭工作台会清理所有会话及其托管进程。
+一个工作台可以同时运行多个会话，每个会话独立保存对话、队列、审批、模型设置、草稿和后台任务。切换标签不会中断执行，关闭标签只隐藏会话，历史会话恢复后沿用原 ID；「分支」从最近完整稳定的历史边界创建新会话。输入区的停止只取消当前回合，保留排队消息和后台任务；Ctrl+C 或关闭工作台会清理所有会话及其托管进程。
 
 会话默认共享 Local。不同文件可以并行修改，同一文件写入前校验版本；真实冲突最多由 Agent 自动协调两轮；三方合并能安全通过时自动应用，仍有重叠或无法验证时展示最终差异，确认后才覆盖 Local。短命未知命令执行期间互斥写入；长期后台 Shell 允许其他会话继续写入，接受它直接改文件时的并发冲突风险。未知范围操作不扫描整个项目，只记录无法完整回撤的边界，回撤跨过该边界时才警告并拒绝。
 
 需要隔离时选择「隔离工作区」，会 Fork 一个新会话，原会话和任务继续保留。Worktree 继承当前 Local 的未提交内容和非忽略的未跟踪文件，暂不支持从已有 Worktree 再派生；「应用到 Local」只计算创建后的任务改动，并检查 Local 后续修改，发生冲突时不会直接覆盖。
+
+Windows 默认使用原生 PowerShell 7，使用随项目 Bun 依赖安装的 DSH Windows ACL 独立库限制写入，无需安装 Codex 或 DSH 应用。项目默认只读；Agent 在 `run_bash(write_paths=["dist", "cache"])` 中声明所需目录，进程只能写这些目录及私有临时目录。目录许可持续到整个进程树退出，其他目录仍可修改；后台任务不能申请整个共享 Local。Worktree 仅由用户主动创建，运行时不会因权限不足或写入范围未知而自动创建。此后端提供文件写入限制，不隔离读取和网络，沿用上游声明的 NTFS 硬链接等限制。Linux/macOS 使用同一进程托管链路执行 Bash，文件隔离由实际运行环境提供；Linux 评测沿用外层评测容器，不在工具内部再次启动 Docker。
 
 稳定回合结束后保存回撤点，悬停或键盘聚焦该轮即可选择「回撤到此处」。「会话开始」可撤回第一轮。回撤沿用当前会话 ID，只撤销其拥有且仍可安全恢复的文件变化；其他会话或外部程序的后续修改会阻止回撤。原始记录保留，活动对话、计划和任务状态回到目标边界。后台 Shell 不阻止新恢复点；回撤时校验文件版本，并提示仍在运行的 Shell 可能带来的直接写入冲突。替换运行时前需先停止子代理。文件与会话记录通过可恢复事务一起更新。数据库、远端操作等外部副作用不在恢复范围内。
 
@@ -191,8 +193,6 @@ veriforge --profile review "Review the current branch"
 | `HARNESS_ROUTER_MODEL` | 路由模型，默认 `jev-latest` |
 | `HARNESS_ROUTER_TIMEOUT_SECONDS` | 路由请求超时，默认 3 秒，不重试 |
 | `HARNESS_PERMISSION_MODE` | `workspace-write` / `llm-auto` / `danger-full-access` |
-| `HARNESS_WINDOWS_SHELL` | `pwsh` 或 `wsl` |
-| `HARNESS_SANDBOX_MODE` | `host` 或 `docker` |
 | `HARNESS_MODEL_INPUT_MODE` | `text` 或 `multimodal` |
 
 完整配置见 `.env.template`。

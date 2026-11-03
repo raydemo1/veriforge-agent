@@ -6,6 +6,7 @@ import os
 import subprocess
 import threading
 import time
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,17 +15,11 @@ from typing import Literal
 import psutil
 
 from .. import config
+from ..agent.cancellation import CancellationToken, CancelledError
 from ..agent.context import count_text_tokens
 from ..runtime.tool_output import output_limit
-from .shell_session import (
-    _docker_resource_args,
-    _docker_user_arg,
-    docker_cli_path,
-    sandbox_mode,
-    validate_shell_configuration,
-    windows_shell_kind,
-    windows_shell_path,
-)
+from .shell_environment import shell_executable
+
 
 ShellJobStatus = Literal["running", "stopping", "exited", "stopped", "failed"]
 
@@ -39,9 +34,7 @@ def _posix_rlimits_enabled() -> bool:
 def _apply_posix_rlimits() -> None:
     """Apply per-job rlimits in the forked child (POSIX host only).
 
-    Failures are swallowed to mirror the ``ulimit ... || true`` semantics
-    of the persistent-session path: an unsupported cap or a value above
-    the hard limit must not prevent the job from starting.
+    Unsupported caps leave the child process's inherited limit in place.
     """
     import resource
 
@@ -127,17 +120,18 @@ class ShellJob:
     pid: int | None
     process: subprocess.Popen | None
     status: ShellJobStatus = "running"
+    background: bool = True
     exit_code: int | None = None
     started_at: float = field(default_factory=time.time)
     ended_at: float | None = None
     output: ShellOutputBuffer = field(default_factory=ShellOutputBuffer)
-    container_name: str | None = None
     error: str | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _reader_threads: list[threading.Thread] = field(default_factory=list, repr=False)
     _finished: threading.Event = field(default_factory=threading.Event, repr=False)
     _processes: dict = field(default_factory=dict, repr=False)
-    _container_stopped: bool = False
+    _write_lease: object = field(default=None, repr=False)
+    _temporary_directory: object = field(default=None, repr=False)
 
     @property
     def output_tail(self) -> str:
@@ -163,23 +157,57 @@ class ShellJob:
             self.exit_code = exit_code
             self.error = error or self.error
             if status in {"exited", "stopped", "failed"}:
+                try:
+                    if self._temporary_directory is not None:
+                        self._temporary_directory.cleanup()
+                        self._temporary_directory = None
+                except OSError as exc:
+                    self.error = f"Private shell temp cleanup failed: {exc}"
+                finally:
+                    if self._write_lease is not None:
+                        self._write_lease.release()
+                        self._write_lease = None
                 self.ended_at = self.ended_at or time.time()
                 self._finished.set()
 
 
 class ShellJobManager:
-    def __init__(self, workspace: str | Path, *, artifact_dir: Path | None = None):
+    def __init__(self, workspace: str | Path, *, artifact_dir: Path | None = None, environment="local", session_id=None):
         self.workspace = str(Path(workspace).resolve())
+        self.environment = environment
+        self.session_id = session_id
         self.artifact_dir = artifact_dir or Path(workspace) / ".harness" / "observations" / "default" / "jobs"
         self._jobs: dict[str, ShellJob] = {}
         self._lock = threading.RLock()
         self._closed = False
         self._closing = False
+        self._start_token = CancellationToken()
+        self._starting = 0
+        self._starts_idle = threading.Event()
+        self._starts_idle.set()
 
-    def start(self, command: str, *, early_exit_seconds: float = 0.0) -> ShellJob:
+    def start(self, command: str, *, early_exit_seconds: float = 0.0, write_paths=(),
+              background=True, cancellation_token=None, turn_id="") -> ShellJob:
         with self._lock:
             if self._closing:
                 raise RuntimeError("Shell job manager is closing")
+            self._starting += 1
+            self._starts_idle.clear()
+        token = self._start_token.create_child()
+        remove_callback = cancellation_token.add_callback(token.cancel) if cancellation_token else lambda: None
+        try:
+            return self._start_job(command, early_exit_seconds=early_exit_seconds, write_paths=write_paths,
+                                   background=background, cancellation_token=token, turn_id=turn_id)
+        finally:
+            remove_callback()
+            token.close()
+            with self._lock:
+                self._starting -= 1
+                if not self._starting:
+                    self._starts_idle.set()
+
+    def _start_job(self, command, *, early_exit_seconds, write_paths, background, cancellation_token, turn_id):
+        cancellation_token.check()
         command = str(command or "").strip()
         job_id = f"shell-job-{uuid.uuid4().hex[:8]}"
         output = ShellOutputBuffer(self.artifact_dir)
@@ -189,18 +217,46 @@ class ShellJobManager:
             self._store(job)
             return job
 
+        lease, temporary = None, None
         try:
-            process, container_name = self._start_process(command)
-        except Exception as exc:
-            job = ShellJob(
-                job_id=job_id,
-                command=command,
-                pid=None,
-                process=None,
-                status="failed",
-                output=output,
-                error=str(exc),
-            )
+            if os.name == "nt":
+                from .native_shell import launch_arguments, write_claims, write_directories
+                from .access import WorkspaceAccessCoordinator
+
+                root = Path(self.workspace)
+                directories = write_directories(root, write_paths)
+                if background and root in directories and self.environment != "worktree":
+                    raise ValueError("后台任务不能申请整个共享 Local 的写入许可；请缩小 write_paths，或由用户主动创建 Worktree")
+                access = WorkspaceAccessCoordinator(root)
+                lease = access.lease(write_claims(root, write_paths), cancellation_token)
+                if directories and self.session_id is not None:
+                    access.limit_recovery(self.session_id, turn_id, "Shell：目录内写入无法完整回撤")
+                for directory in directories:
+                    directory.mkdir(parents=True, exist_ok=True)
+                temporary = tempfile.TemporaryDirectory(prefix="veriforge-shell-")
+                args = launch_arguments(root, directories, temporary.name, command)
+                if cancellation_token is not None:
+                    cancellation_token.check()
+                process = subprocess.Popen(
+                    args, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    env=dict(os.environ, TEMP=temporary.name, TMP=temporary.name, TMPDIR=temporary.name),
+                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                )
+            else:
+                if write_paths:
+                    raise ValueError("write_paths requires the Windows directory sandbox")
+                process = self._start_posix_process(command)
+        except BaseException as exc:
+            if temporary is not None:
+                temporary.cleanup()
+            if lease is not None:
+                lease.release()
+            if not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, CancelledError):
+                raise
+            job = ShellJob(job_id=job_id, command=command, pid=None, process=None,
+                           status="failed", output=output, error=str(exc))
             output.append(f"[error] Failed to start shell job: {exc}\n")
             job.mark("failed", error=str(exc))
             self._store(job)
@@ -212,7 +268,9 @@ class ShellJobManager:
             pid=process.pid,
             process=process,
             output=output,
-            container_name=container_name,
+            _write_lease=lease,
+            _temporary_directory=temporary,
+            background=background,
         )
         self._store(job)
         self._track_process_tree(job)
@@ -255,8 +313,6 @@ class ShellJobManager:
                 return job
             job.status = "stopping"
         deadline = time.monotonic() + max(0.0, grace_seconds) + 2.0
-        if job.container_name:
-            self._stop_docker_container(job)
         self._terminate_process_tree(job, grace_seconds=grace_seconds)
         job._finished.wait(timeout=max(0.0, deadline - time.monotonic()))
         return job
@@ -266,6 +322,10 @@ class ShellJobManager:
             if self._closed:
                 return
             self._closing = True
+        self._start_token.cancel()
+        if not self._starts_idle.wait(5):
+            raise RuntimeError("Shell startup has not exited; job resources retained")
+        with self._lock:
             jobs = list(self._jobs.values())
         for job in jobs:
             if job.status in {"running", "stopping"}:
@@ -278,16 +338,9 @@ class ShellJobManager:
         with self._lock:
             self._jobs[job.job_id] = job
 
-    def _start_process(self, command: str) -> tuple[subprocess.Popen, str | None]:
-        if sandbox_mode() == "docker":
-            return self._start_docker_process(command)
-        if os.name == "nt":
-            return self._start_windows_process(command), None
-        return self._start_posix_process(command), None
-
     def _start_posix_process(self, command: str) -> subprocess.Popen:
         return subprocess.Popen(
-            ["/bin/bash", "-lc", command],
+            [shell_executable(), "-lc", command],
             cwd=self.workspace,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -295,65 +348,6 @@ class ShellJobManager:
             start_new_session=True,
             preexec_fn=_apply_posix_rlimits if _posix_rlimits_enabled() else None,
         )
-
-    def _start_windows_process(self, command: str) -> subprocess.Popen:
-        # Windows Job Objects are the native enforcement mechanism; the host
-        # backend intentionally applies no CPU/memory cap here — run with
-        # HARNESS_SANDBOX_MODE=docker when those caps are required.
-        validate_shell_configuration()
-        path = windows_shell_path()
-        assert path is not None
-        kind = windows_shell_kind()
-        if kind == "pwsh":
-            wrapped = (
-                f"& {{ {command} }}; "
-                "if ($global:LASTEXITCODE -is [int]) { exit $global:LASTEXITCODE } "
-                "elseif ($?) { exit 0 } else { exit 1 }"
-            )
-            args = [path, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", wrapped]
-        else:
-            args = [path, "--cd", self.workspace, "--exec", "bash", "-lc", command]
-        return subprocess.Popen(
-            args,
-            cwd=self.workspace,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-        )
-
-    def _start_docker_process(self, command: str) -> tuple[subprocess.Popen, str]:
-        docker = docker_cli_path()
-        if not docker:
-            raise RuntimeError("Docker sandbox requested but docker CLI was not found")
-        container_name = f"hca-job-{uuid.uuid4().hex[:12]}"
-        network = (config.DOCKER_NETWORK or "none").strip().lower()
-        if network not in {"none", "bridge"}:
-            raise ValueError("HARNESS_DOCKER_NETWORK must be none or bridge")
-        args = [
-            docker,
-            "run",
-            "--rm",
-            "--name",
-            container_name,
-            "--network",
-            network,
-            "--security-opt=no-new-privileges",
-            "-v",
-            f"{self.workspace}:/workspace",
-            "-w",
-            "/workspace",
-        ]
-        args.extend(_docker_resource_args())
-        args.extend(_docker_user_arg())
-        args.extend([config.DOCKER_IMAGE, "bash", "--noprofile", "--norc", "-lc", command])
-        process = subprocess.Popen(
-            args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-        )
-        return process, container_name
 
     def _start_reader(self, job: ShellJob, pipe, stream_name: str) -> None:
         if pipe is None:
@@ -395,7 +389,7 @@ class ShellJobManager:
             self._track_process_tree(job)
             with job._lock:
                 processes = list(job._processes.values())
-            if not any(_process_running(proc) for proc in processes) and not self._container_running(job):
+            if not any(_process_running(proc) for proc in processes):
                 break
             time.sleep(0.1)
         for thread in list(job._reader_threads):
@@ -456,34 +450,6 @@ class ShellJobManager:
             with contextlib.suppress(Exception):
                 os.killpg(job.pid, 15)
 
-    def _stop_docker_container(self, job: ShellJob) -> None:
-        if not job.container_name:
-            return
-        docker = docker_cli_path()
-        if not docker:
-            return
-        with contextlib.suppress(Exception):
-            result = subprocess.run(
-                [docker, "rm", "-f", job.container_name],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-                check=False,
-            )
-            if result.returncode == 0:
-                job._container_stopped = True
-
-    def _container_running(self, job):
-        if not job.container_name or job._container_stopped:
-            return False
-        docker = docker_cli_path()
-        if not docker:
-            return True
-        result = subprocess.run([docker, "inspect", "--format", "{{.State.Running}}", job.container_name],
-                                capture_output=True, timeout=5, check=False)
-        if result.returncode == 0:
-            return result.stdout.strip() == b"true"
-        return not any(message in result.stderr.lower() for message in (b"no such object", b"no such container"))
 
 
 def _safe_terminate(process) -> None:

@@ -139,14 +139,11 @@ def test_untracked_operation_blocks_only_rewinds_across_its_boundary(tmp_path):
 
 
 def test_rewind_keeps_session_background_shell_alive(runtime_factory, tmp_path):
-    import subprocess
-    import sys
+    import os
     session = runtime_factory[0]()
     jobs = session.conversation.runtime_state.shell_job_manager
-    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
-                               cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    with patch.object(jobs, "_start_process", return_value=(process, None)):
-        job = jobs.start("controlled background")
+    job = jobs.start("Start-Sleep -Seconds 30" if os.name == "nt" else "sleep 30")
+    process = job.process
     try:
         session.tool_context.workspace.access.limit_recovery(session.session.id, "background", "long shell")
         session.submit("稳定边界")

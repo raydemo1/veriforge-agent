@@ -1,14 +1,7 @@
 """Shell execution and background shell job tools."""
 from __future__ import annotations
 
-import contextlib
 import json
-import os
-import re
-import subprocess
-import tempfile
-import threading
-from pathlib import Path
 
 from ... import config
 from ...agent.cancellation import CancelledError
@@ -21,6 +14,7 @@ from ..tool_result import ToolResult
 def run_bash(
     command: str,
     timeout: int = 300,
+    write_paths: list[str] | None = None,
     runtime_state=None,
     agent_name: str | None = None,
     tool_context=None,
@@ -38,269 +32,65 @@ def run_bash(
         cancellation_token.check()
     requested_timeout = timeout
     try:
-        effective_timeout = max(1, min(int(timeout), int(config.TOOL_MAX_TIMEOUT_SECONDS)))
+        timeout = max(1, min(int(timeout), int(config.TOOL_MAX_TIMEOUT_SECONDS)))
     except (TypeError, ValueError):
-        effective_timeout = int(config.SHELL_DEFAULT_TIMEOUT_SECONDS)
-    timeout = effective_timeout
-    if is_long_running_shell_command(command):
-        manager = _shell_job_manager(runtime_state)
-        if manager is None:
-            return ToolResult(
-                tool="run_bash",
-                status="failed",
-                output="[error] No shell job manager available for long-running run_bash command",
-                error="No shell job manager available",
-                metadata={"status_source": "runtime"},
-            )
-        job = manager.start(command, early_exit_seconds=0.5)
-        metadata = {
-            "status_source": "shell_job",
-            "job_id": job.job_id,
-            "pid": job.pid,
-            "job_status": job.status,
-            "exit_code": job.exit_code,
-        }
-        if job.status == "running":
-            output = (
-                f"Started background shell job {job.job_id} (pid={job.pid}). "
-                "Use read_shell_output to inspect logs and stop_shell_job to stop it."
-            )
-            return ToolResult(tool="run_bash", status="success", output=output, metadata=metadata)
-        # The process started and ended on its own: an invocation success,
-        # even though the "long-running" command exited early (often an error
-        # the model needs to diagnose). Report it as content, not failure.
-        output = f"Long-running command exited immediately as {job.status}."
-        if job.output.path is not None:
-            metadata["artifact_path"] = str(job.output.path)
-            metadata["output_spilled"] = True
-        else:
-            output += "\n\n" + job.output.read(0, job.output.total_chars)
-        output += _exit_code_footer(job.exit_code)
-        return ToolResult(
-            tool="run_bash",
-            status="success",
-            output=output,
-            return_code=job.exit_code,
-            metadata=metadata,
-        )
-
-    from ...workspace.shell_session import PersistentShellSession
-
-    artifact_dir = _artifact_dir(tool_context, runtime_state)
-    one_shot_powershell = _requires_one_shot_powershell(command)
-    shell_session = PersistentShellSession(_workspace_root(tool_context))
-    remove_cancel_callback = None
-    if runtime_state is not None and hasattr(runtime_state, "register_shell_session"):
-        runtime_state.register_shell_session(shell_session)
-    if cancellation_token is not None and not one_shot_powershell:
-        remove_cancel_callback = cancellation_token.add_callback(
-            lambda: _interrupt_shell_session(shell_session)
-        )
-    try:
-        if cancellation_token is not None:
-            cancellation_token.check()
-        if one_shot_powershell:
-            shell_result = _run_one_shot_powershell(
-                command,
-                timeout,
-                tool_context,
-                cancellation_token,
-                artifact_dir,
-            )
-        else:
-            shell_result = shell_session.run(command, timeout=timeout, artifact_dir=artifact_dir)
-        output = _build_shell_output(shell_result.stdout, shell_result.stderr)
-        output = output or "(no output)"
-        metadata = {
-            "timed_out": shell_result.timed_out,
-            "status_source": "shell",
-            "output_bytes": int(getattr(shell_result, "output_bytes", 0) or 0),
-            "requested_timeout": requested_timeout,
-            "effective_timeout": effective_timeout,
-        }
-        if getattr(shell_result, "output_spilled", False):
-            # The command ran to completion; only a head+tail preview is held
-            # in memory, the full output is in the streamed artifact.
-            metadata["output_spilled"] = True
-            metadata["artifact_path"] = shell_result.artifact_path
-            metadata["artifact_sha256"] = shell_result.artifact_sha256
-            metadata["output_chars"] = getattr(shell_result, "output_chars", 0)
-        output += _exit_code_footer(shell_result.exit_code)
-        error = f"Command timed out after {effective_timeout}s" if shell_result.timed_out else None
-        if error:
-            output += f"\n[error] {error}"
-        result = ToolResult(tool="run_bash", status="failed" if error else "success", output=output,
-                            error=error, return_code=shell_result.exit_code, metadata=metadata)
-        if cancellation_token is not None and cancellation_token.is_cancelled:
-            metadata["cancelled"] = True
-            exc = CancelledError("Turn cancelled by user")
-            exc.tool_result = ToolResult(tool="run_bash", status="failed", output=output,
-                                         error="Execution cancelled", return_code=shell_result.exit_code, metadata=metadata)
-            raise exc
-        return result
-
-    except CancelledError:
-        raise
-    except Exception as e:
-        metadata = {"status_source": "exception"}
-        return ToolResult(
-            tool="run_bash",
-            status="failed",
-            output=f"[error] {e}",
-            error=str(e),
-            metadata=metadata,
-        )
-    finally:
-        if remove_cancel_callback is not None:
-            remove_cancel_callback()
-        if runtime_state is not None and hasattr(runtime_state, "unregister_shell_session"):
-            runtime_state.unregister_shell_session(shell_session)
-        shell_session.close()
+        timeout = int(config.SHELL_DEFAULT_TIMEOUT_SECONDS)
+    return _run_shell(command, timeout, write_paths or [], runtime_state, cancellation_token, requested_timeout)
 
 
-def _requires_one_shot_powershell(command: str) -> bool:
-    """Run PowerShell ``exit`` through an explicit one-shot process."""
-    if os.name != "nt" or not re.search(r"(?i)(?:^|[;|&]\s*)exit(?:\s|$)", command):
-        return False
-    from ...workspace.shell_session import sandbox_mode, windows_shell_kind
+def _run_shell(command, timeout, write_paths, runtime_state, cancellation_token, requested_timeout):
+    import time
 
-    return sandbox_mode() == "host" and windows_shell_kind() == "pwsh"
-
-
-def _interrupt_shell_session(shell_session) -> None:
-    with contextlib.suppress(Exception):
-        shell_session.interrupt()
-
-
-def _run_one_shot_powershell(
-    command: str,
-    timeout: int,
-    tool_context,
-    cancellation_token=None,
-    artifact_dir=None,
-):
-    # Only used for a bare `exit`.  Pipes are drained by reader threads into
-    # bounded sinks (head+tail in memory, full output spooled to disk), so
-    # this path — like the persistent shell — is bounded-memory no matter how
-    # much the process prints.
-    from ...workspace.shell_session import (
-        ShellResult,
-        _BoundedPipeSink,
-        _stream_sinks_to_artifact,
-        windows_shell_path,
-    )
-
-    executable = windows_shell_path()
-    if executable is None:
-        raise RuntimeError("PowerShell 7 (pwsh) was not found")
-    process = subprocess.Popen(
-        [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
-        cwd=_workspace_root(tool_context),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-    )
-    preview_chars = int(config.SHELL_OUTPUT_PREVIEW_CHARS)
-    spool_dir = Path(tempfile.mkdtemp(prefix="hca_oneshot_"))
-    stdout_sink = _BoundedPipeSink(preview_chars=preview_chars, spool_dir=spool_dir)
-    stderr_sink = _BoundedPipeSink(preview_chars=preview_chars, spool_dir=spool_dir)
-
-    def _drain(pipe, sink) -> None:
-        with contextlib.suppress(Exception):
-            while True:
-                chunk = pipe.read(4096)
-                if not chunk:
-                    break
-                sink.feed(chunk)
-        with contextlib.suppress(Exception):
-            pipe.close()
-
-    readers = [
-        threading.Thread(target=_drain, args=(process.stdout, stdout_sink), daemon=True),
-        threading.Thread(target=_drain, args=(process.stderr, stderr_sink), daemon=True),
-    ]
-    for reader in readers:
-        reader.start()
-    remove_cancel_callback = None
-    if cancellation_token is not None:
-        remove_cancel_callback = cancellation_token.add_callback(
-            lambda: _terminate_process_tree(process)
-        )
+    manager = _shell_job_manager(runtime_state)
+    if manager is None:
+        return ToolResult(tool="run_bash", status="failed", output="[error] No shell job manager available",
+                          error="No shell job manager available", metadata={"status_source": "runtime"})
+    background = is_long_running_shell_command(command)
+    job = manager.start(command, write_paths=write_paths, background=background,
+                        early_exit_seconds=0.5 if background else 0,
+                        cancellation_token=cancellation_token, turn_id=getattr(runtime_state, "turn_id", ""))
+    metadata = {"status_source": "shell", "job_id": job.job_id, "pid": job.pid,
+                "write_paths": write_paths, "job_status": job.status,
+                "requested_timeout": requested_timeout, "effective_timeout": timeout}
+    if background and job.status == "running":
+        return ToolResult(tool="run_bash", status="success",
+                          output=f"Started background shell job {job.job_id} (pid={job.pid}). Use read_shell_output to inspect logs and stop_shell_job to stop it.",
+                          metadata=metadata)
     timed_out = False
     try:
-        try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate_process_tree(process)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                process.wait(timeout=5)
-        for reader in readers:
-            reader.join(timeout=5)
-    finally:
-        if remove_cancel_callback is not None:
-            remove_cancel_callback()
-
-    stdout_sink.finish_writing()
-    stderr_sink.finish_writing()
-    try:
-        total_seen = stdout_sink.total_chars + stderr_sink.total_chars
-        if total_seen <= preview_chars and not stdout_sink.spilled and not stderr_sink.spilled:
-            stdout = stdout_sink.buffered_text().strip()
-            stderr = stderr_sink.buffered_text().strip()
-            combined = _build_shell_output(
-                stdout_sink.buffered_text(), stderr_sink.buffered_text()
-            )
-            return ShellResult(
-                stdout=stdout,
-                stderr=stderr,
-                exit_code=130 if timed_out else process.returncode,
-                timed_out=timed_out,
-                output_bytes=len(combined.encode("utf-8", errors="replace")),
-                output_chars=len(combined),
-            )
-
-        path, preview, total_bytes, total_chars, sha = _stream_sinks_to_artifact(
-            stdout_sink,
-            stderr_sink,
-            artifact_dir=artifact_dir if artifact_dir is not None else spool_dir,
-            preview_chars=preview_chars,
-        )
-        return ShellResult(
-            stdout=preview,
-            stderr="",
-            exit_code=130 if timed_out else process.returncode,
-            timed_out=timed_out,
-            output_spilled=True,
-            output_bytes=total_bytes,
-            output_chars=total_chars,
-            artifact_path=path,
-            artifact_sha256=sha,
-        )
-    finally:
-        stdout_sink.discard()
-        stderr_sink.discard()
-        with contextlib.suppress(OSError):
-            spool_dir.rmdir()
+        deadline = time.monotonic() + timeout
+        while not job._finished.wait(0.05):
+            if cancellation_token is not None:
+                cancellation_token.check()
+            if time.monotonic() >= deadline:
+                timed_out = True
+                manager.stop(job.job_id)
+                break
+    except CancelledError as exc:
+        manager.stop(job.job_id)
+        exc.tool_result = _job_result(job, dict(metadata, cancelled=True), "Execution cancelled")
+        raise
+    error = job.error or (f"Command timed out after {timeout}s" if timed_out else None)
+    return _job_result(job, dict(metadata, timed_out=timed_out), error)
 
 
-def _terminate_process_tree(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
-        return
-    if os.name == "nt":
-        with contextlib.suppress(Exception):
-            subprocess.run(
-                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                capture_output=True,
-                timeout=5,
-                check=False,
-            )
-    if process.poll() is None:
-        with contextlib.suppress(Exception):
-            process.kill()
+def _job_result(job, metadata, error=None):
+    if job.output.path is None:
+        output = job.output.read(0, job.output.total_chars)
+    else:
+        preview = max(2, int(config.SHELL_OUTPUT_PREVIEW_CHARS))
+        output = (job.output.read(0, preview // 2) + "\n\n[Full output saved to artifact]\n\n"
+                  + job.output.read_tail(preview - preview // 2))
+    if job.exit_code == 127 and "native-sandbox:" in output:
+        error = output
+    metadata.update(job_status=job.status, exit_code=job.exit_code,
+                    output_bytes=job.output.path.stat().st_size if job.output.path else len(output.encode("utf-8")),
+                    output_chars=job.output.total_chars)
+    if job.output.path is not None:
+        metadata.update(artifact_path=str(job.output.path), output_spilled=True)
+    return ToolResult(tool="run_bash", status="failed" if error else "success",
+                      output=(output or "(no output)") + _exit_code_footer(job.exit_code),
+                      error=error, return_code=job.exit_code, metadata=metadata)
 
 
 def list_shell_jobs(runtime_state=None) -> ToolResult:
@@ -325,6 +115,7 @@ def list_shell_jobs(runtime_state=None) -> ToolResult:
             "uptime_seconds": job.uptime_seconds(),
         }
         for job in manager.list_jobs()
+        if job.background
     ]
     return ToolResult(
         tool="list_shell_jobs",
@@ -424,31 +215,9 @@ def _exit_code_footer(exit_code) -> str:
     return f"\n\n[exit_code: {exit_code}]"
 
 
-def _workspace_root(tool_context=None) -> str:
-    if tool_context is not None:
-        return str(tool_context.workspace.root)
-    return config.WORKSPACE
-
-
 def _clamp_shell_output_chars(value: int) -> int:
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         parsed = 12_000
     return max(1, min(100_000, parsed))
-
-
-def _build_shell_output(stdout: str, stderr: str) -> str:
-    """Build shell output string from stdout and stderr."""
-    from ...workspace.shell_session import combine_output
-
-    return combine_output(stdout, stderr)
-
-
-def _artifact_dir(tool_context, runtime_state):
-    """Session observation dir, where streamed output artifacts live."""
-    from ...agent.observations import observation_dir_for
-
-    root = _workspace_root(tool_context)
-    session_id = getattr(runtime_state, "session_id", None) if runtime_state is not None else None
-    return observation_dir_for(root, session_id, getattr(tool_context, "agent_id", None))

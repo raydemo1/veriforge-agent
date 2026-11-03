@@ -140,7 +140,9 @@ class Agent:
         return AgentRuntimeState(
             task_metadata=dict(self.current_task_metadata or {}),
             shell_job_manager=ShellJobManager(workspace, artifact_dir=observation_dir_for(
-                workspace, getattr(self.tool_context, "session_id", None), getattr(self.tool_context, "agent_id", None))),
+                workspace, getattr(self.tool_context, "session_id", None), getattr(self.tool_context, "agent_id", None)),
+                environment=getattr(self.tool_context, "environment", "local"),
+                session_id=getattr(self.tool_context, "session_id", None)),
             agent_config=self,
         )
 
@@ -1112,7 +1114,6 @@ class AgentConversation:
                 self.messages, runtime_state=self.runtime_state, agent_name=self.agent.name)
             for mw in self.agent.middlewares if hasattr(mw, "on_conversation_close")
         ]
-        cleanups.append(self.runtime_state.close_shell_sessions)
         if self.agent.tool_context is not None:
             cleanups.append(self.agent.tool_context.close_language_service)
         cleanups.append(lambda: self.client.close())

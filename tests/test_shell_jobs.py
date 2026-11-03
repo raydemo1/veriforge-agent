@@ -9,25 +9,6 @@ from types import SimpleNamespace
 
 
 class ShellJobManagerTests(unittest.TestCase):
-    def test_wsl_background_job_uses_wsl_bash_without_fallback(self):
-        if os.name != "nt":
-            self.skipTest("Windows-only shell selection")
-        from harness_code_agent import config
-        from harness_code_agent.workspace.shell_jobs import ShellJobManager
-
-        with tempfile.TemporaryDirectory() as tmp:
-            manager = ShellJobManager(Path(tmp))
-            with (
-                patch.object(config, "WINDOWS_SHELL", "wsl"),
-                patch("harness_code_agent.workspace.shell_jobs.windows_shell_path", return_value="C:/Windows/System32/wsl.exe"),
-                patch("harness_code_agent.workspace.shell_jobs.subprocess.Popen") as popen,
-            ):
-                manager._start_windows_process("python -m http.server")
-
-        args = popen.call_args.args[0]
-        self.assertEqual(args[:4], ["C:/Windows/System32/wsl.exe", "--cd", str(Path(tmp).resolve()), "--exec"])
-        self.assertEqual(args[4:6], ["bash", "-lc"])
-        self.assertEqual(args[6], "python -m http.server")
 
     def test_natural_exit_records_status_and_exit_code(self):
         from harness_code_agent.workspace.shell_jobs import ShellJobManager

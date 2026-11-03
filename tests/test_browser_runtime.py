@@ -18,7 +18,7 @@ class _FakeJobManager:
             error=None,
         )
 
-    def start(self, command):
+    def start(self, command, **kwargs):
         self.command = command
         self.started.set()
         return self.job

@@ -236,8 +236,7 @@ def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("HARNESS_WORKSPACE", str(workspace))
     if args.task_name:
         os.environ["HARNESS_TERMINAL_TASK_NAME"] = args.task_name
-    os.environ.setdefault("HARNESS_PERMISSION_MODE", "danger-full-access")
-    os.environ.setdefault("HCA_TERMINAL_EVAL_MODE", "1")
+    os.environ.setdefault("HARNESS_PERMISSION_MODE", "terminal-eval")
     os.environ.setdefault("HARNESS_STREAM", "0")
     os.environ.setdefault("HARNESS_MEMORY_DISABLED", "1")
 

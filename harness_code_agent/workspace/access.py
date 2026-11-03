@@ -28,9 +28,10 @@ def fingerprint(data: bytes | None) -> str | None:
 
 
 class WriteLease:
-    def __init__(self, coordinator, key):
+    def __init__(self, coordinator, key, owner):
         self.coordinator = coordinator
         self.key = key
+        self.owner = owner
         self._lock = threading.Lock()
         self._released = False
         self.finalizers = []
@@ -89,12 +90,11 @@ class WorkspaceAccessCoordinator:
         except psutil.NoSuchProcess:
             return False
 
-    @contextmanager
-    def acquire(self, claims, cancellation_token=None):
+    def lease(self, claims, cancellation_token=None):
         claims = tuple(claim for claim in claims if claim.access == "write")
         owner = _owner.get() or uuid.uuid4().hex
         key = uuid.uuid4().hex
-        lease = WriteLease(self, key)
+        lease = WriteLease(self, key, owner)
         while claims:
             if cancellation_token is not None:
                 cancellation_token.check()
@@ -120,7 +120,12 @@ class WorkspaceAccessCoordinator:
                 cancellation_token.wait(0.05)
             else:
                 time.sleep(0.05)
-        binding = _owner.set(owner)
+        return lease
+
+    @contextmanager
+    def acquire(self, claims, cancellation_token=None):
+        lease = self.lease(claims, cancellation_token)
+        binding = _owner.set(lease.owner)
         try:
             if cancellation_token is not None:
                 cancellation_token.check()
