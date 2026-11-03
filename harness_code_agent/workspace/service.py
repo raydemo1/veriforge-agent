@@ -73,7 +73,6 @@ class WorkspaceService:
         self.turn_id = ""
         self.access = WorkspaceAccessCoordinator(self.root)
         self._versions = {}
-        self.unattributed_changes = False
         self.snapshots_dir = Path(snapshots_dir).resolve() if snapshots_dir else self.root / ".harness" / "snapshots"
         self.protected_names = protected_names or self.DEFAULT_PROTECTED_NAMES
         self.change_journal = WorkspaceChangeJournal()

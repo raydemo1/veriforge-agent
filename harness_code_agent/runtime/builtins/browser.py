@@ -118,11 +118,12 @@ def stop_dev_server(runtime_state=None) -> ToolResult:
             error=str(exc),
             metadata={"status_source": "shell_job", "job_id": job_id},
         )
-    runtime_state.browser_job_id = None
+    if job.status not in {"running", "stopping"}:
+        runtime_state.browser_job_id = None
     return ToolResult(
         tool="stop_dev_server",
         status="success",
-        output=f"Dev server stopped (job_id={job_id}, pid={job.pid})",
+        output=f"Dev server {job.status} (job_id={job_id}, pid={job.pid})",
         metadata={"status_source": "shell_job", "job_id": job_id},
     )
 

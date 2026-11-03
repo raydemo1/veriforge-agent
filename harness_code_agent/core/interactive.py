@@ -952,12 +952,7 @@ class InteractiveSession:
         return TurnResult(text=text, notice=notice, streamed=streamed)
 
     def _finish_recovery_turn(self) -> None:
-        manager = self.conversation.runtime_state.shell_job_manager
-        unstable = (self.tool_context.workspace.unattributed_changes
-                    or self.tool_context.tool_tasks.pending_count
-                    or self.tool_context.agent_coordinator.has_active_agents()
-                    or (manager is not None and manager.running_jobs()))
-        if unstable:
+        if self.tool_context.tool_tasks.pending_foreground_count:
             self.event_bus.emit("recovery_point_skipped", agent="main_agent",
                                 payload={"turn": self.turn_count, "reason": "active_workspace_tasks"})
             return
@@ -1632,12 +1627,13 @@ class InteractiveSession:
         point = self.recovery_points().get(point_id)
         if point is None:
             raise ValueError("回撤点不属于当前会话")
-        if self.tool_context.workspace.unattributed_changes:
-            raise RuntimeError("存在无法安全归属的文件系统变更，请先处理后再回撤")
-        if self.tool_context.agent_coordinator.has_active_agents() or self.conversation.runtime_state.shell_job_manager.running_jobs():
-            raise RuntimeError("请先停止当前会话的后台任务，再执行回撤")
+        self.tool_context.workspace.access.check_rewind(self.session.id, point["change_cursor"])
+        if self.tool_context.agent_coordinator.has_active_agents():
+            raise RuntimeError("请先停止当前会话的子代理，再执行回撤")
+        background_note = ("后台 Shell 仍在运行，其直接写入可能与回撤发生冲突。"
+                           if self.conversation.runtime_state.shell_job_manager.running_jobs() else "")
         answer = self.question_provider.ask(QuestionRequest(
-            question=f"回撤到第 {point['turn']} 轮？仅撤销本会话之后可安全恢复的修改。",
+            question=f"回撤到第 {point['turn']} 轮？仅撤销本会话之后可安全恢复的修改。{background_note}",
             options=[QuestionOption("取消", "cancel"), QuestionOption("确认回撤", "rewind")],
             session_id=self.session.id, agent_name="main_agent"))
         if answer.cancelled or answer.value != "rewind":
@@ -1714,6 +1710,10 @@ class InteractiveSession:
         self.last_assistant_text = next((e["payload"].get("text", "") for e in reversed(events) if e["type"] == "assistant_message"), "")
         self.conversation.last_text = self.last_assistant_text
         context.workspace._versions.clear()
+        replacement.runtime_state.shell_job_manager.close()
+        replacement.runtime_state.shell_job_manager = old.runtime_state.shell_job_manager
+        replacement.runtime_state.browser_job_id = old.runtime_state.browser_job_id
+        old.runtime_state.shell_job_manager = None
         previous_context.agent_coordinator.close()
         old.close()
         return True
@@ -1794,6 +1794,7 @@ class InteractiveSession:
             self.tool_context.agent_coordinator.close()
             if not self.tool_context.tool_tasks.wait_idle(timeout=10):
                 raise RuntimeError("前台工具尚未退出，资源未释放，请稍后重试关闭")
+            self.conversation.runtime_state.shell_job_manager.close()
             self._closed = True
         for error in self.lifecycle.close():
             log.warning("Failed to close session resource %s: %s", error.name, error.error)

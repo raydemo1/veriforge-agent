@@ -200,6 +200,7 @@ class BridgeInteractionProvider:
             {
                 "question": request.question,
                 "options": [option.to_dict() for option in request.options],
+                "details": request.details,
             },
         )
         if bool(result.get("cancelled")):
@@ -1083,7 +1084,10 @@ class SessionBridge:
         return self._session
 
     def _action(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
-        if name in {"toggle_permission", "panel_action", "workbench_action", "new_session", "rewind"}:
+        changes_runtime = name in {"toggle_permission", "rewind"} or (
+            name == "panel_action" and params.get("panel") not in {"observe", "sessions"}
+            and not (params.get("panel") == "mcp" and params.get("action") in {"add", "open_config"}))
+        if changes_runtime:
             with self._active_lock:
                 if self._active_token is not None:
                     raise RuntimeError("当前回合仍在执行，暂时无法修改运行时")
@@ -1389,11 +1393,9 @@ class BridgeServer:
             return {"ok": True, "sessionId": target}
         if name == "apply_worktree":
             record = self.registry.get(session_id)
-            session = record.host._require_session()
             if record.environment != "worktree":
                 raise ValueError("当前会话不在 Worktree 中")
-            if session._turn_thread is not None or session.tool_context.tool_tasks.pending_count:
-                raise RuntimeError("当前会话仍在执行，请等待稳定边界再应用")
+            record.host._require_session()
             record.host._tasks.put(lambda: self._apply_worktree(record))
             return {"ok": True, "message": "已排队应用到 Local"}
         if name == "sync_session":
@@ -1401,25 +1403,32 @@ class BridgeServer:
         return self.registry.get(session_id).host._action(name, params)
 
     def _apply_worktree(self, record):
-        from .workspace.worktrees import WorktreeService
-        from .workspace.access import WorkspaceConflict
+        from .workspace.worktrees import WorktreeService, WorktreeMergeConflict, prepare_merge_review
         from .agent.cancellation import current_token
         service = WorktreeService(self.cwd)
         session = record.host._require_session()
-        if (session.tool_context.agent_coordinator.has_active_agents()
-                or session.conversation.runtime_state.shell_job_manager.running_jobs()):
+        if session.tool_context.agent_coordinator.has_active_agents():
             raise RuntimeError("请先停止当前会话的后台任务，再应用更改")
-        resolutions = {}
+        originals = {}
         for attempt in range(3):
             try:
-                paths = service.apply(record.id, resolutions=resolutions)
+                paths = service.apply(record.id)
                 record.host._notice("info", f"已应用 {len(paths)} 个文件到 Local")
                 return
-            except WorkspaceConflict as exc:
+            except WorktreeMergeConflict as exc:
+                for name, versions in exc.files.items():
+                    originals.setdefault(name, versions)
                 if attempt == 2:
-                    session.question_provider.ask(QuestionRequest(
-                        question=f"自动协调两轮后仍存在冲突，两边文件均已保留。{exc}。请检查后再应用，或在聊天中说明取舍。",
-                        options=[QuestionOption("保留现场", "keep")], session_id=record.id, agent_name="main_agent"))
+                    directory = record.cwd / ".harness" / "apply-conflicts" / uuid.uuid4().hex
+                    details, approved = prepare_merge_review(directory, exc.files, originals)
+                    answer = session.question_provider.ask(QuestionRequest(
+                        question="Agent 已完成两轮协调。请审阅合并结果，确认后才会写入 Local。",
+                        details=f"完整版本与差异已保存：{directory}\n\n{details}",
+                        options=[QuestionOption("保留现场", "keep"), QuestionOption("确认应用以上合并结果", "apply")],
+                        session_id=record.id, agent_name="main_agent"))
+                    if not answer.cancelled and answer.value == "apply":
+                        paths = service.apply(record.id, approved=approved)
+                        record.host._notice("info", f"已应用确认的合并结果：{len(paths)} 个文件")
                     return
                 directory = record.cwd / ".harness" / "apply-conflicts" / uuid.uuid4().hex
                 descriptions = []
@@ -1438,11 +1447,6 @@ class BridgeServer:
                           "不要修改 Local；无法判断时询问用户，不要猜测。\n"
                           f"版本目录：{directory}\n" + "\n".join(descriptions))
                 session.submit(prompt, cancellation_token=current_token.get())
-                for name, versions in exc.files.items():
-                    path = record.cwd / name
-                    desired = path.read_bytes() if path.is_file() else None
-                    if desired != versions["task"]:
-                        resolutions[name] = versions["local"]
 
     def _handle_request(self, message):
         request_id = message.get("id", "")

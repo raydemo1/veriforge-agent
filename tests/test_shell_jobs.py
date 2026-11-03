@@ -5,6 +5,7 @@ import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 
 class ShellJobManagerTests(unittest.TestCase):
@@ -80,6 +81,11 @@ class ShellJobManagerTests(unittest.TestCase):
         calls = []
 
         class FakeChild:
+            pid = 124
+
+            def create_time(self):
+                return 1.0
+
             def terminate(self):
                 calls.append("child-terminate")
 
@@ -87,6 +93,11 @@ class ShellJobManagerTests(unittest.TestCase):
                 calls.append("child-kill")
 
         class FakeParent:
+            pid = 123
+
+            def create_time(self):
+                return 1.0
+
             def children(self, recursive=False):
                 calls.append(("children", recursive))
                 return [FakeChild()]
@@ -113,7 +124,7 @@ class ShellJobManagerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             manager = ShellJobManager(Path(tmp))
-            job = ShellJob(job_id="shell-job-test", command="sleep", pid=123, process=None)
+            job = ShellJob(job_id="shell-job-test", command="sleep", pid=123, process=SimpleNamespace(poll=lambda: None))
             with patch("harness_code_agent.workspace.shell_jobs.psutil", FakePsutil):
                 manager._terminate_process_tree(job, grace_seconds=0.01)
 
@@ -130,6 +141,9 @@ class ShellJobManagerTests(unittest.TestCase):
         from harness_code_agent.workspace.shell_jobs import ShellJob, ShellJobManager
 
         class FakeProcess:
+            def poll(self):
+                return 0
+
             def wait(self):
                 return 0
 
@@ -177,3 +191,26 @@ def _python_command(script: str) -> str:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_stop_keeps_stopping_until_exit_is_confirmed(tmp_path):
+    import threading
+    from harness_code_agent.workspace.shell_jobs import ShellJob, ShellJobManager
+    released = threading.Event()
+    process = SimpleNamespace(poll=lambda: -9 if released.is_set() else None, wait=lambda: -9)
+    manager = ShellJobManager(tmp_path)
+    job = ShellJob("pending-stop", "controlled", None, process)
+    manager._store(job)
+    monitor = threading.Thread(target=manager._monitor, args=(job,), daemon=True)
+    monitor.start()
+    try:
+        with patch.object(job._finished, "wait", return_value=False):
+            assert manager.stop(job.job_id, grace_seconds=0).status == "stopping"
+        assert job.ended_at is None
+        assert manager.running_jobs() == [job]
+    finally:
+        released.set()
+        monitor.join(2)
+        manager.close()
+    assert job.status == "stopped"
+    assert job._finished.is_set()

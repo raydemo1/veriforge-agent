@@ -772,6 +772,10 @@ const APPROVAL_REASON_LABELS: Record<string, string> = {
 };
 
 function InteractionView({ interaction, theme, icons, narrow, onResolve }: { interaction: Interaction; theme: Theme; icons: IconSet; narrow: boolean; onResolve: (result: Record<string, unknown>) => void }) {
+  const { height } = useTerminalDimensions();
+  const detailsRef = useRef<ScrollBoxRenderable | null>(null);
+  const details = interaction.kind === "question" ? interaction.payload.details : "";
+  const detailsHeight = Math.max(3, Math.min(14, height - 16));
   const [selected, setSelected] = useState(0);
   const selectedRef = useRef(0);
   const otherRef = useRef<InputRenderable | null>(null);
@@ -790,6 +794,11 @@ function InteractionView({ interaction, theme, icons, narrow, onResolve }: { int
     else onResolve({ selectedIndex: selectedRef.current, customText: otherRef.current?.value ?? "" });
   };
   useKeyboard((key) => {
+    if (details && (key.name === "pageup" || key.name === "pagedown")) {
+      key.preventDefault();
+      detailsRef.current?.scrollBy((key.name === "pageup" ? -1 : 1) * Math.max(1, detailsHeight - 1));
+      return;
+    }
     // Up/down always move selection, including while the "other" input is open,
     // so the custom branch can never become a navigation trap.
     if (key.name === "up" || (!otherSelected && key.name === "left")) {
@@ -834,6 +843,9 @@ function InteractionView({ interaction, theme, icons, narrow, onResolve }: { int
   return (
     <box border borderStyle="rounded" borderColor={interaction.kind === "approval" ? theme.warning : theme.accent} style={{ flexDirection: "column", flexShrink: 0, marginLeft: narrow ? 1 : 2, marginRight: narrow ? 1 : 2, paddingLeft: 1, paddingRight: 1, paddingTop: 1, paddingBottom: 1, backgroundColor: theme.surfaceRaised }}>
       <text fg={interaction.kind === "approval" ? theme.warning : theme.accent}><strong>{interaction.kind === "approval" ? "需要确认" : interaction.payload.question}</strong></text>
+      {details ? <scrollbox ref={detailsRef} style={{ height: detailsHeight, flexShrink: 0, marginTop: 1, backgroundColor: theme.surface }}>
+        <text fg={theme.text}>{details}</text>
+      </scrollbox> : null}
       {interaction.kind === "approval" ? (
         <box style={{ flexDirection: "column", flexShrink: 0, marginTop: 1 }}>
           {isBash ? (
@@ -880,7 +892,7 @@ function InteractionView({ interaction, theme, icons, narrow, onResolve }: { int
         ))}
       </box>
       {otherSelected ? <input ref={otherRef} placeholder="其他说明…" focused style={{ backgroundColor: theme.surface, textColor: theme.text, cursorColor: theme.accent, placeholderColor: theme.muted }} /> : null}
-      <text fg={theme.subtle}>{`↑↓/点击 选择 · Enter 确认 · Esc ${interaction.kind === "approval" ? "拒绝" : "取消"}`}</text>
+      <text fg={theme.subtle}>{`${details ? "PgUp/PgDn 查看差异 · " : ""}↑↓/点击 选择 · Enter 确认 · Esc ${interaction.kind === "approval" ? "拒绝" : "取消"}`}</text>
     </box>
   );
 }
@@ -1447,7 +1459,7 @@ const SessionPane = React.memo(function SessionPane({ resolvedTheme: theme, stat
     <box style={{ flexDirection: "column", width: "100%", height: 1, flexGrow: 1, flexShrink: 1, minHeight: 0, backgroundColor: theme.background }}>
       <Transcript scrollTop={ui.scrollTop} onSaveScroll={(position) => updateUI("scrollTop", position)} items={state.items} theme={theme} icons={icons} narrow={narrow} onRewind={!running && !state.interaction && !workbenchOpen && !panel && onAction ? (pointId) => void invoke("rewind", { pointId }) : undefined} />
       <WorkStrip work={state.work} width={width} theme={theme} onOpen={openWorkbench} />
-      {state.interaction ? <InteractionView interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping || workbenchOpen} sessionReady={Boolean(state.snapshot.sessionId) && state.snapshot.status !== "failed"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
+      {state.interaction ? <InteractionView key={state.interaction.id} interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping || workbenchOpen} sessionReady={Boolean(state.snapshot.sessionId) && state.snapshot.status !== "failed"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
       {panel && !state.interaction ? <PanelOverlay panel={panel} anchor={panelAnchor} theme={theme} icons={icons} terminalWidth={width} terminalHeight={height} onClose={() => setPanel(null)} onSelect={selectPanel} busyId={panelBusyId} /> : null}
       {workbenchOpen && !state.interaction ? (
         <Workbench

@@ -62,7 +62,7 @@ export type QuestionInteraction = {
   type: "interaction";
   id: string;
   kind: "question";
-  payload: { question: string; options: Array<{ label: string; value: string; description: string; is_other: boolean }> };
+  payload: { question: string; details?: string; options: Array<{ label: string; value: string; description: string; is_other: boolean }> };
 };
 export type Interaction = ApprovalInteraction | QuestionInteraction;
 

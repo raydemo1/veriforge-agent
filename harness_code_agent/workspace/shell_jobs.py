@@ -26,7 +26,7 @@ from .shell_session import (
     windows_shell_path,
 )
 
-ShellJobStatus = Literal["running", "exited", "stopped", "failed"]
+ShellJobStatus = Literal["running", "stopping", "exited", "stopped", "failed"]
 
 
 def _posix_rlimits_enabled() -> bool:
@@ -135,8 +135,9 @@ class ShellJob:
     error: str | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _reader_threads: list[threading.Thread] = field(default_factory=list, repr=False)
-    _done_callbacks: list = field(default_factory=list, repr=False)
-    completion_pending: bool = False
+    _finished: threading.Event = field(default_factory=threading.Event, repr=False)
+    _processes: dict = field(default_factory=dict, repr=False)
+    _container_stopped: bool = False
 
     @property
     def output_tail(self) -> str:
@@ -146,33 +147,24 @@ class ShellJob:
         end = self.ended_at if self.ended_at is not None else time.time()
         return max(0.0, end - self.started_at)
 
-    def add_done_callback(self, callback):
+    def track_process(self, process):
+        try:
+            key = (process.pid, process.create_time())
+        except psutil.NoSuchProcess:
+            return
         with self._lock:
-            if self.status == "running":
-                self._done_callbacks.append(callback)
+            if key in self._processes:
                 return
-        callback(self)
+            self._processes[key] = process
 
     def mark(self, status: ShellJobStatus, *, exit_code: int | None = None, error: str | None = None) -> None:
         with self._lock:
             self.status = status
             self.exit_code = exit_code
             self.error = error or self.error
-            callbacks = []
-            if status != "running":
-                self.completion_pending = True
+            if status in {"exited", "stopped", "failed"}:
                 self.ended_at = self.ended_at or time.time()
-                callbacks, self._done_callbacks = self._done_callbacks, []
-        try:
-            for callback in callbacks:
-                callback(self)
-        except Exception as exc:
-            with self._lock:
-                self.error = str(exc)
-                self.status = "failed"
-        finally:
-            with self._lock:
-                self.completion_pending = False
+                self._finished.set()
 
 
 class ShellJobManager:
@@ -182,8 +174,12 @@ class ShellJobManager:
         self._jobs: dict[str, ShellJob] = {}
         self._lock = threading.RLock()
         self._closed = False
+        self._closing = False
 
     def start(self, command: str, *, early_exit_seconds: float = 0.0) -> ShellJob:
+        with self._lock:
+            if self._closing:
+                raise RuntimeError("Shell job manager is closing")
         command = str(command or "").strip()
         job_id = f"shell-job-{uuid.uuid4().hex[:8]}"
         output = ShellOutputBuffer(self.artifact_dir)
@@ -219,6 +215,7 @@ class ShellJobManager:
             container_name=container_name,
         )
         self._store(job)
+        self._track_process_tree(job)
         self._start_reader(job, process.stdout, "stdout")
         self._start_reader(job, process.stderr, "stderr")
         threading.Thread(target=self._monitor, args=(job,), daemon=True).start()
@@ -244,7 +241,7 @@ class ShellJobManager:
             return list(self._jobs.values())
 
     def running_jobs(self) -> list[ShellJob]:
-        return [job for job in self.list_jobs() if job.status == "running" or job.completion_pending]
+        return [job for job in self.list_jobs() if job.status in {"running", "stopping"}]
 
     def read_output(self, job_id: str, max_chars: int = 12_000, *, offset: int | None = None) -> str:
         max_chars = _clamp_int(max_chars, minimum=1, maximum=100_000)
@@ -253,31 +250,29 @@ class ShellJobManager:
 
     def stop(self, job_id: str, *, grace_seconds: float = 5.0) -> ShellJob:
         job = self.get(job_id)
-        if job.status != "running":
-            return job
+        with job._lock:
+            if job.status not in {"running", "stopping"}:
+                return job
+            job.status = "stopping"
+        deadline = time.monotonic() + max(0.0, grace_seconds) + 2.0
         if job.container_name:
             self._stop_docker_container(job)
         self._terminate_process_tree(job, grace_seconds=grace_seconds)
-        process = job.process
-        if process is not None and process.poll() is None:
-            try:
-                process.wait(timeout=max(0.1, grace_seconds))
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(Exception):
-                    process.kill()
-        job.mark("stopped", exit_code=process.poll() if process is not None else None)
+        job._finished.wait(timeout=max(0.0, deadline - time.monotonic()))
         return job
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
-            self._closed = True
+            self._closing = True
             jobs = list(self._jobs.values())
         for job in jobs:
-            if job.status == "running":
-                with contextlib.suppress(Exception):
-                    self.stop(job.job_id)
+            if job.status in {"running", "stopping"}:
+                self.stop(job.job_id)
+        if self.running_jobs():
+            raise RuntimeError("Shell processes have not exited; job resources retained")
+        self._closed = True
 
     def _store(self, job: ShellJob) -> None:
         with self._lock:
@@ -380,25 +375,61 @@ class ShellJobManager:
                 pipe.close()
 
     def _monitor(self, job: ShellJob) -> None:
+        try:
+            self._wait_for_exit(job)
+        except Exception as exc:
+            with job._lock:
+                job.error = f"Process exit could not be confirmed: {exc}"
+
+    def _wait_for_exit(self, job: ShellJob) -> None:
         process = job.process
         if process is None:
             return
+        while process.poll() is None:
+            self._track_process_tree(job)
+            with job._lock:
+                job._processes = {key: proc for key, proc in job._processes.items() if _process_running(proc)}
+            time.sleep(0.1)
         exit_code = process.wait()
+        while True:
+            self._track_process_tree(job)
+            with job._lock:
+                processes = list(job._processes.values())
+            if not any(_process_running(proc) for proc in processes) and not self._container_running(job):
+                break
+            time.sleep(0.1)
         for thread in list(job._reader_threads):
             thread.join()
-        if job.status == "running":
-            job.mark("exited", exit_code=exit_code)
+        if job.status in {"running", "stopping"}:
+            job.mark("stopped" if job.status == "stopping" else "exited", exit_code=exit_code)
+
+    def _track_process_tree(self, job):
+        with job._lock:
+            processes = list(job._processes.values())
+        if not processes and job.pid is not None and job.process is not None and job.process.poll() is None:
+            try:
+                processes.append(psutil.Process(job.pid))
+            except psutil.NoSuchProcess:
+                pass
+        if job.process is not None and job.process.poll() is None:
+            processes = processes[:1]
+        for process in processes:
+            try:
+                job.track_process(process)
+                for child in process.children(recursive=True):
+                    job.track_process(child)
+            except psutil.NoSuchProcess:
+                continue
 
     def _terminate_process_tree(self, job: ShellJob, *, grace_seconds: float = 5.0) -> None:
         if job.pid is None:
             return
         try:
-            parent = psutil.Process(job.pid)
-            children = parent.children(recursive=True)
-            processes = children + [parent]
-            for proc in children:
+            self._track_process_tree(job)
+            with job._lock:
+                processes = list(job._processes.values())
+            for proc in processes:
                 _safe_terminate(proc)
-            _safe_terminate(parent)
             _, alive = psutil.wait_procs(processes, timeout=grace_seconds)
             for proc in alive:
                 _safe_kill(proc)
@@ -410,7 +441,7 @@ class ShellJobManager:
             self._terminate_process_tree_fallback(job)
 
     def _terminate_process_tree_fallback(self, job: ShellJob) -> None:
-        if job.pid is None:
+        if job.pid is None or job.process is None or job.process.poll() is not None:
             return
         if os.name == "nt":
             with contextlib.suppress(Exception):
@@ -432,13 +463,27 @@ class ShellJobManager:
         if not docker:
             return
         with contextlib.suppress(Exception):
-            subprocess.run(
+            result = subprocess.run(
                 [docker, "rm", "-f", job.container_name],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=10,
                 check=False,
             )
+            if result.returncode == 0:
+                job._container_stopped = True
+
+    def _container_running(self, job):
+        if not job.container_name or job._container_stopped:
+            return False
+        docker = docker_cli_path()
+        if not docker:
+            return True
+        result = subprocess.run([docker, "inspect", "--format", "{{.State.Running}}", job.container_name],
+                                capture_output=True, timeout=5, check=False)
+        if result.returncode == 0:
+            return result.stdout.strip() == b"true"
+        return not any(message in result.stderr.lower() for message in (b"no such object", b"no such container"))
 
 
 def _safe_terminate(process) -> None:
@@ -449,6 +494,13 @@ def _safe_terminate(process) -> None:
 def _safe_kill(process) -> None:
     with contextlib.suppress(Exception):
         process.kill()
+
+
+def _process_running(process) -> bool:
+    try:
+        return process.is_running() and process.status() not in {psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD}
+    except psutil.NoSuchProcess:
+        return False
 
 
 def _clamp_int(value: int, *, minimum: int, maximum: int) -> int:

@@ -1104,6 +1104,8 @@ class AgentConversation:
     def close(self) -> None:
         if self._closed:
             return
+        if self.runtime_state.shell_job_manager is not None:
+            self.runtime_state.shell_job_manager.close()
         self._closed = True
         cleanups = [
             lambda mw=mw: mw.on_conversation_close(
@@ -1111,8 +1113,6 @@ class AgentConversation:
             for mw in self.agent.middlewares if hasattr(mw, "on_conversation_close")
         ]
         cleanups.append(self.runtime_state.close_shell_sessions)
-        if self.runtime_state.shell_job_manager is not None:
-            cleanups.append(self.runtime_state.shell_job_manager.close)
         if self.agent.tool_context is not None:
             cleanups.append(self.agent.tool_context.close_language_service)
         cleanups.append(lambda: self.client.close())

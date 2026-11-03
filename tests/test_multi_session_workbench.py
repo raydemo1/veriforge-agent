@@ -12,7 +12,6 @@ from harness_code_agent import config
 from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
 from harness_code_agent.workspace.access import WorkspaceAccessCoordinator, WorkspaceConflict
 from harness_code_agent.workspace.service import WorkspaceService
-from harness_code_agent.workspace.shell_jobs import ShellJob
 from harness_code_agent.workspace.worktrees import WorktreeService
 
 
@@ -90,19 +89,6 @@ with a.acquire([a.write_claim(Path(sys.argv[1]) / 'a.txt')]):
         pass
 
 
-def test_background_job_holds_project_lease_until_real_exit(tmp_path):
-    first, second = WorkspaceAccessCoordinator(tmp_path), WorkspaceAccessCoordinator(tmp_path)
-    job = ShellJob("job", "server", None, None)
-    with first.acquire([first.write_claim()]) as lease:
-        lease.transfer_to(job)
-    token = CancellationToken()
-    token.cancel()
-    with pytest.raises(CancelledError), second.acquire([second.write_claim(tmp_path / "a")], token):
-        pass
-    job.mark("exited", exit_code=0)
-    with second.acquire([second.write_claim(tmp_path / "a")]):
-        pass
-
 
 def test_rewind_preserves_another_sessions_changes(runtime_factory, tmp_path):
     create, _ = runtime_factory
@@ -144,6 +130,21 @@ def test_worktree_inherits_dirty_local_and_applies_only_task_delta(tmp_path):
     assert service.apply("isolated") == ["task"]
     assert (tmp_path / "tracked").read_text(encoding="utf-8") == "later Local"
     assert (tmp_path / "task").read_text(encoding="utf-8") == "new task"
+
+    from harness_code_agent.workspace.worktrees import WorktreeMergeConflict, prepare_merge_review
+    (tree / "tracked").write_text("agent candidate", encoding="utf-8")
+    with pytest.raises(WorktreeMergeConflict) as caught:
+        service.apply("isolated")
+    files = caught.value.files
+    _, approved = prepare_merge_review(tree / ".harness/review", files, files)
+    assert (tmp_path / "tracked").read_text(encoding="utf-8") == "later Local"
+    (tmp_path / "tracked").write_text("newer Local", encoding="utf-8")
+    with pytest.raises(WorkspaceConflict):
+        service.apply("isolated", approved=approved)
+    assert (tmp_path / "tracked").read_text(encoding="utf-8") == "newer Local"
+    (tmp_path / "tracked").write_text("later Local", encoding="utf-8")
+    assert service.apply("isolated", approved=approved) == ["tracked"]
+    assert (tmp_path / "tracked").read_text(encoding="utf-8") == "agent candidate"
 
 
 def test_bridge_parallel_turns_switch_cancel_and_independent_approval(runtime_factory, tmp_path):

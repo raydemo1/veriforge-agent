@@ -93,6 +93,8 @@ class SessionRuntimeRegistry:
 
     def fork(self, session_id, *, worktree=False):
         source = self.get(session_id)
+        if worktree and source.environment == "worktree":
+            raise ValueError("暂不支持从 Worktree 再创建 Worktree，请从 Local 会话创建隔离工作区")
         runtime = source.host._require_session()
         fork = self.store.fork(runtime.session.id)
         root = WorktreeService(self.project).create(fork.id) if worktree else source.cwd

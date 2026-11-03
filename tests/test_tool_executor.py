@@ -325,7 +325,7 @@ class ToolExecutorTests(unittest.TestCase):
             ):
                 conversation.run_until_idle()
 
-        self.assertTrue(both_entered.is_set())
+        self.assertTrue(both_entered.is_set(), str([item for item in conversation.messages if item.get("role") == "tool"]))
         self.assertEqual(overlap_failed, [])
 
     def test_parallel_workers_do_not_emit_events_before_main_thread_ordering(self):
@@ -1057,7 +1057,6 @@ class ToolExecutorTests(unittest.TestCase):
                     status="running",
                     exit_code=None,
                     output_tail="",
-                    add_done_callback=lambda callback: None,
                 )
 
             def read_output(self, job_id, max_chars=12000, *, offset=None):

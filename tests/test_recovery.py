@@ -124,3 +124,38 @@ with a.acquire([a.write_claim()]):
     WorkspaceAccessCoordinator(tmp_path)
     assert (tmp_path / "a").read_bytes() == b"before"
     assert journal.read_bytes() == b"old-journal"
+
+
+def test_untracked_operation_blocks_only_rewinds_across_its_boundary(tmp_path):
+    access = WorkspaceAccessCoordinator(tmp_path)
+    before = access.cursor()
+    access.limit_recovery("A", "turn-A", "unknown shell")
+    after = access.cursor()
+    access = WorkspaceAccessCoordinator(tmp_path)
+    with pytest.raises(WorkspaceConflict):
+        access.rewind("A", before)
+    access.check_rewind("A", after)
+    access.check_rewind("B", before)
+
+
+def test_rewind_keeps_session_background_shell_alive(runtime_factory, tmp_path):
+    import subprocess
+    import sys
+    session = runtime_factory[0]()
+    jobs = session.conversation.runtime_state.shell_job_manager
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                               cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    with patch.object(jobs, "_start_process", return_value=(process, None)):
+        job = jobs.start("controlled background")
+    try:
+        session.tool_context.workspace.access.limit_recovery(session.session.id, "background", "long shell")
+        session.submit("稳定边界")
+        point = max(session.recovery_points().values(), key=lambda value: value["turn"])
+        session.tool_context.workspace.write_text("owned.txt", "later")
+        assert session.rewind_to_point(point["id"])
+        assert not (tmp_path / "owned.txt").exists()
+        assert session.conversation.runtime_state.shell_job_manager is jobs
+        assert process.poll() is None
+        assert jobs.get(job.job_id).status == "running"
+    finally:
+        jobs.close()

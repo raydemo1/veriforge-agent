@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 
 
 EXCLUDED_NAMES = frozenset({
-    ".git", ".harness", "node_modules", ".venv", "venv", "__pycache__",
+    ".git", ".harness", ".harbor", "node_modules", ".venv", "venv", "__pycache__",
     ".pytest_cache", ".ruff_cache", ".mypy_cache", ".cache", "build", "dist",
 })
 

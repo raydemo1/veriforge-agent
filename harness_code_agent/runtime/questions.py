@@ -29,6 +29,7 @@ class QuestionRequest:
     options: list[QuestionOption]
     agent_name: str | None = None
     session_id: str | None = None
+    details: str = ""
 
 
 @dataclass
@@ -96,6 +97,8 @@ class ConsoleQuestionProvider:
 
         print()
         print(request.question)
+        if request.details:
+            print(request.details)
         for index, option in enumerate(request.options, start=1):
             suffix = f" - {option.description}" if option.description else ""
             print(f"  {index}. {option.label}{suffix}")

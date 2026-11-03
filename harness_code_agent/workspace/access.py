@@ -17,7 +17,6 @@ import psutil
 from ..runtime.execution_planner import ResourceClaim, claims_conflict
 
 _owner = ContextVar("workspace_write_owner", default=None)
-current_lease = ContextVar("workspace_write_lease", default=None)
 
 
 class WorkspaceConflict(RuntimeError):
@@ -32,7 +31,6 @@ class WriteLease:
     def __init__(self, coordinator, key):
         self.coordinator = coordinator
         self.key = key
-        self.retained = False
         self._lock = threading.Lock()
         self._released = False
         self.finalizers = []
@@ -48,23 +46,7 @@ class WriteLease:
                 self.finalizers.clear()
                 with self.coordinator.connect() as db:
                     db.execute("DELETE FROM leases WHERE id=?", (self.key,))
-                    db.execute("DELETE FROM lease_processes WHERE lease=?", (self.key,))
                 self._released = True
-
-    def transfer_to(self, job):
-        self.retained = True
-        try:
-            if job.pid is not None:
-                try:
-                    process = psutil.Process(job.pid)
-                    with self.coordinator.connect() as db:
-                        db.execute("INSERT INTO lease_processes VALUES (?,?,?)", (self.key, job.pid, process.create_time()))
-                except psutil.NoSuchProcess:
-                    pass
-            job.add_done_callback(lambda _: self.release())
-        except BaseException:
-            self.retained = False
-            raise
 
 
 class WorkspaceAccessCoordinator:
@@ -80,7 +62,6 @@ class WorkspaceAccessCoordinator:
                 CREATE TABLE IF NOT EXISTS leases (
                     id TEXT PRIMARY KEY, owner TEXT, pid INTEGER, born REAL, claims TEXT);
                 CREATE TABLE IF NOT EXISTS runtimes (session TEXT PRIMARY KEY, pid INTEGER, born REAL);
-                CREATE TABLE IF NOT EXISTS lease_processes (lease TEXT, pid INTEGER, born REAL);
                 CREATE TABLE IF NOT EXISTS changes (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT, turn TEXT,
                     path TEXT, before BLOB, after BLOB, reverted INTEGER DEFAULT 0);
@@ -121,10 +102,8 @@ class WorkspaceAccessCoordinator:
                 db.execute("BEGIN IMMEDIATE")
                 blocked = False
                 for lease_id, other_owner, pid, born, raw in db.execute("SELECT * FROM leases").fetchall():
-                    executors = db.execute("SELECT pid,born FROM lease_processes WHERE lease=?", (lease_id,)).fetchall()
-                    if not self._alive(pid, born) and not any(self._alive(*process) for process in executors):
+                    if not self._alive(pid, born):
                         db.execute("DELETE FROM leases WHERE id=?", (lease_id,))
-                        db.execute("DELETE FROM lease_processes WHERE lease=?", (lease_id,))
                         continue
                     if other_owner != owner and any(
                         claims_conflict(wanted, ResourceClaim(**active))
@@ -142,16 +121,13 @@ class WorkspaceAccessCoordinator:
             else:
                 time.sleep(0.05)
         binding = _owner.set(owner)
-        lease_binding = current_lease.set(lease)
         try:
             if cancellation_token is not None:
                 cancellation_token.check()
             yield lease
         finally:
-            current_lease.reset(lease_binding)
             _owner.reset(binding)
-            if not lease.retained:
-                lease.release()
+            lease.release()
 
     def reserve_runtime(self, session_id):
         with self.connect() as db:
@@ -181,6 +157,18 @@ class WorkspaceAccessCoordinator:
             db.execute("INSERT INTO changes(session,turn,path,before,after) VALUES (?,?,?,?,?)",
                        (session, turn, Path(path).relative_to(self.root).as_posix(), before, after))
 
+    def limit_recovery(self, session, turn, reason):
+        with self.connect() as db:
+            db.execute("INSERT INTO changes(session,turn,path,before,after) VALUES (?,?,NULL,?,NULL)",
+                       (session, turn, reason.encode("utf-8")))
+
+    def check_rewind(self, session, cursor):
+        with self.connect() as db:
+            row = db.execute("SELECT before FROM changes WHERE session=? AND sequence>? AND path IS NULL AND reverted=0 LIMIT 1",
+                             (session, cursor)).fetchone()
+        if row:
+            raise WorkspaceConflict("无法安全回撤：目标点之后包含无法完整追踪的操作（" + row[0].decode("utf-8") + "）。现有文件已保留。")
+
     def record_external(self, session, turn, path, before, after, cursor):
         if before == after:
             return
@@ -197,6 +185,7 @@ class WorkspaceAccessCoordinator:
     @contextmanager
     def rewind_transaction(self, session, cursor, cancellation_token=None, *, participants=()):
         with self.acquire([self.write_claim()], cancellation_token):
+            self.check_rewind(session, cursor)
             changes = self.owned_changes(session, cursor)
             grouped = {}
             for seq, name, before, after in changes:
