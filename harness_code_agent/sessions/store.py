@@ -87,9 +87,9 @@ class SessionStore:
     def fork(self, source_session_id: str) -> Session:
         from ..runtime.recovery import atomic_json, atomic_bytes
         source = self.read_metadata(source_session_id)
-        boundary = source.get("history_boundary") or source.get("checkpoint") or {
-            "turn": 0, "journal_sequence": 0, "event_count": 0, "change_cursor": 0,
-        }
+        boundary = source.get("fork_boundary")
+        if boundary is None:
+            raise ValueError("会话尚无完整、稳定的回合，暂时无法创建分支")
         fork = self.create(profile=source["profile"], cwd=source["cwd"], model=source["model"],
                            permission_mode=source["permission_mode"], profile_source=source["profile_source"])
         journal = []
@@ -116,7 +116,8 @@ class SessionStore:
             if key in source:
                 metadata[key] = source[key]
         metadata.update(forked_from=source_session_id,
-                        history_boundary=dict(boundary), title=source.get("title", "新会话"))
+                        history_boundary=dict(boundary), fork_boundary=dict(boundary),
+                        title=source.get("title", "新会话"))
         atomic_json(fork.metadata_path, metadata)
         return fork
 

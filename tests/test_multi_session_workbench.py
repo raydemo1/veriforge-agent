@@ -34,7 +34,10 @@ def test_resume_preserves_id_and_fork_uses_stable_boundary(runtime_factory):
     original = create()
     original.submit("已经完成")
     session_id = original.session.id
-    original.conversation.add_user_turn("尚未结算")
+    for error in (CancelledError("停止"), RuntimeError("执行失败")):
+        with pytest.raises(type(error)), original._turn_scope():
+            original.conversation.add_user_turn("尚未结算")
+            raise error
     fork = original.session_store.fork(session_id)
     assert fork.id != session_id
     branch = create(session_id=fork.id)
@@ -44,7 +47,26 @@ def test_resume_preserves_id_and_fork_uses_stable_boundary(runtime_factory):
     resumed = create(session_id=session_id)
     assert resumed.session.id == session_id
     assert "已经完成" in str(resumed.conversation.messages)
-    assert "尚未结算" not in str(resumed.conversation.messages)
+    assert "尚未结算" in str(resumed.conversation.messages)
+
+
+def test_registry_creation_failure_preserves_active_session_and_rejects_worktree_forks(tmp_path):
+    from types import SimpleNamespace
+    from harness_code_agent.core.session_runtime_registry import SessionRuntimeRegistry
+
+    events = []
+    registry = SessionRuntimeRegistry(tmp_path, lambda _: SimpleNamespace(), events.append)
+    first = registry.create(environment="worktree")
+    for isolated in (False, True):
+        with pytest.raises(ValueError, match="Worktree"):
+            registry.fork(first, worktree=isolated)
+    with patch.object(registry, "factory", side_effect=RuntimeError("初始化失败")):
+        with pytest.raises(RuntimeError, match="初始化失败"):
+            registry.create()
+    assert registry.active_id == first
+    assert events[-1]["activeSessionId"] == first
+    assert [record["id"] for record in events[-1]["sessions"]] == [first]
+    registry.access.release_runtime(first)
 
 
 def test_file_versions_prevent_stale_writes(tmp_path):

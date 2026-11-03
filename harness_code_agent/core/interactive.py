@@ -588,6 +588,8 @@ class InteractiveSession:
                     "event_count": len(self.session_store.read_events(self.session.id)),
                     "change_cursor": self.tool_context.workspace.access.cursor(),
                 }
+                if status == "completed" and not self.tool_context.tool_tasks.pending_foreground_count:
+                    metadata["fork_boundary"] = dict(metadata["history_boundary"])
                 atomic_json(self.session.metadata_path, metadata)
         finally:
             with self._execution_condition:
@@ -1678,6 +1680,7 @@ class InteractiveSession:
                                 history_boundary=dict(turn=point["turn"], journal_sequence=replacement.journal.sequence,
                                                       event_count=len(self.session_store.read_events(self.session.id)),
                                                       change_cursor=point["change_cursor"]))
+                metadata["fork_boundary"] = dict(metadata["history_boundary"])
                 atomic_json(self.session.metadata_path, metadata)
                 if todo_payload is not None:
                     atomic_json(todo_path, todo_payload)

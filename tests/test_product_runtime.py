@@ -2185,7 +2185,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
             from harness_code_agent.runtime.recovery import atomic_json
             source_metadata = store.read_metadata(source.id)
-            source_metadata["history_boundary"] = dict(turn=0, journal_sequence=0, event_count=2, change_cursor=0)
+            source_metadata["fork_boundary"] = dict(turn=0, journal_sequence=0, event_count=2, change_cursor=0)
             atomic_json(source.metadata_path, source_metadata)
             fork = store.fork(source.id)
             metadata = store.read_metadata(fork.id)
@@ -2210,6 +2210,12 @@ class ProductRuntimeTests(unittest.TestCase):
                 model="model-a",
                 permission_mode="workspace-write",
             )
+            with self.assertRaisesRegex(ValueError, "稳定"):
+                store.fork(source.id)
+            from harness_code_agent.runtime.recovery import atomic_json
+            metadata = store.read_metadata(source.id)
+            metadata["fork_boundary"] = dict(turn=0, journal_sequence=0, event_count=0, change_cursor=0)
+            atomic_json(source.metadata_path, metadata)
             fork = store.fork(source.id)
             lineage = store.read_lineage(fork.id)
 

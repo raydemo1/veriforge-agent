@@ -50,6 +50,7 @@ class SessionRuntimeRegistry:
             self._records[session_id] = record
             self._views[session_id] = {"sequence": 0, "items": [], "snapshot": {}, "interaction": None,
                                        "work": {}, "turnState": "idle", "queueDepth": 0, "commands": []}
+            previous_active_id = self.active_id
             self.active_id = session_id
         try:
             record.host = self.factory(record)
@@ -58,6 +59,11 @@ class SessionRuntimeRegistry:
                 self.access.release_runtime(session_id)
                 self._records.pop(session_id, None)
                 self._views.pop(session_id, None)
+                if self.active_id == session_id:
+                    previous = self._records.get(previous_active_id)
+                    self.active_id = (previous.id if previous and previous.visible else
+                                      next((r.id for r in self._records.values() if r.visible), None))
+            self.announce()
             raise
         self.announce()
         return session_id
@@ -93,8 +99,8 @@ class SessionRuntimeRegistry:
 
     def fork(self, session_id, *, worktree=False):
         source = self.get(session_id)
-        if worktree and source.environment == "worktree":
-            raise ValueError("暂不支持从 Worktree 再创建 Worktree，请从 Local 会话创建隔离工作区")
+        if source.environment == "worktree":
+            raise ValueError("暂不支持从 Worktree 派生会话，请从 Local 会话创建分支")
         runtime = source.host._require_session()
         fork = self.store.fork(runtime.session.id)
         root = WorktreeService(self.project).create(fork.id) if worktree else source.cwd
