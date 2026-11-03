@@ -1,7 +1,7 @@
 export type ThemePreference = "auto" | "dark" | "light";
 export type IconPreference = "auto" | "nerd" | "unicode";
 
-export const UI_PROTOCOL_VERSION = 7;
+export const UI_PROTOCOL_VERSION = 8;
 
 export type Snapshot = {
   profile: string;
@@ -161,6 +161,7 @@ export const initialWorkState: WorkState = {
 };
 
 export type ActionName =
+  | "watch_resources"
   | "rewind"
   | "open_sessions"
   | "new_session"
@@ -174,6 +175,7 @@ export type ActionName =
   | "switch_session" | "hide_session" | "fork_session" | "fork_worktree" | "apply_worktree" | "sync_session";
 export type ActionResult = {
   ok: boolean;
+  resources?: ProjectResourcesSnapshot;
   sessionId?: string;
   view?: SessionViewSnapshot;
   message?: string;
@@ -197,7 +199,18 @@ export type WorkbenchParams =
   | { op: "read_proposal"; proposalId: string }
   | { op: "read_conflict"; conflictId: string };
 
+export type ResourceUse = { resource: string; sessionId: string | null; turnId: string | null; label: string; since: number };
+export type ProjectResourcesSnapshot = {
+  budget: { limits: Record<string, number>; active: ResourceUse[]; waiting: ResourceUse[] };
+  sessions: Array<{ id: string; title: string; environment: string; state: string; turn: boolean;
+    queue: number; approvals: number; tools: number; agents: number; waitingReason: string | null; lastError: string | null;
+    jobs: Array<{ id: string; pid: number; status: string; command: string; background: boolean;
+      processes: number; rssMiB: number; cpuSeconds: number }> }>;
+};
+
 export type SessionEvent =
+  | { type: "runtime_state"; state: string }
+  | { type: "resource_wait"; reason: string | null }
   | { type: "snapshot"; snapshot: Snapshot }
   | { type: "session_reset"; snapshot: Snapshot; items?: TranscriptItem[] }
   | { type: "transcript"; item: TranscriptItem }
@@ -226,9 +239,10 @@ export type SessionDescriptor = {
 export type SessionViewSnapshot = {
   sequence: number; items: TranscriptItem[]; snapshot: Snapshot; interaction: Interaction | null;
   work: Partial<WorkState>; turnState: "idle" | "running" | "queued" | "cancelling" | "cancelled";
-  queueDepth: number; commands: CommandItem[];
+  queueDepth: number; commands: CommandItem[]; waitingReason: string | null;
 };
 export type UiEvent =
+  | { type: "resources"; snapshot: ProjectResourcesSnapshot }
   | (SessionEvent & { sessionId: string; sequence: number })
   | { type: "sessions"; sessions: SessionDescriptor[]; activeSessionId: string | null }
   | { type: "session_view"; sessionId: string; view: SessionViewSnapshot }

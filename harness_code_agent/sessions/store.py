@@ -39,6 +39,8 @@ class SessionStore:
         permission_mode: str,
         profile_source: str | None = None,
         session_id: str | None = None,
+        routing_mode: str = "auto",
+        environment: str = "local",
     ) -> Session:
         session_id = session_id or self._new_session_id()
         session_root = self._session_root(session_id)
@@ -69,6 +71,8 @@ class SessionStore:
             "model": model,
             "permission_mode": permission_mode,
             "status": "running",
+            "routing_mode": routing_mode,
+            "environment": environment,
         }
         session.metadata_path.write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",

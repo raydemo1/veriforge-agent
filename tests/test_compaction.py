@@ -2,6 +2,7 @@
 import os
 import tempfile
 import unittest
+import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -120,6 +121,7 @@ class ContextAnxietyTests(unittest.TestCase):
 # /compact slash command
 # ---------------------------------------------------------------------------
 
+@pytest.mark.session
 class CompactCommandTests(unittest.TestCase):
     """Tests for /compact and its subcommands."""
 
@@ -170,6 +172,7 @@ class CompactCommandTests(unittest.TestCase):
         summarize.assert_called_once()
 
 
+@pytest.mark.session
 class AgentConversationCompactionLifecycleTests(unittest.TestCase):
     def test_compacts_before_rejecting_a_request_in_the_old_threshold_gap(self):
         from harness_code_agent import config

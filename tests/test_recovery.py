@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -42,6 +43,7 @@ from harness_code_agent.workspace.access import WorkspaceAccessCoordinator, Work
 from harness_code_agent.runtime.recovery import atomic_bytes
 
 
+@pytest.mark.session
 def test_repeated_rewind_and_resume_keep_only_effective_history(runtime_factory):
     create, _ = runtime_factory
     session = create()
@@ -64,6 +66,7 @@ def test_repeated_rewind_and_resume_keep_only_effective_history(runtime_factory)
 
 
 
+@pytest.mark.session
 def test_rewind_cancel_and_external_edit_preserve_state(runtime_factory, tmp_path):
     session = runtime_factory[0]()
     session.submit("第一条测试请求")
@@ -84,6 +87,7 @@ def test_rewind_cancel_and_external_edit_preserve_state(runtime_factory, tmp_pat
 
 
 
+@pytest.mark.session
 def test_transaction_failure_rolls_back_all_files_and_journal(tmp_path):
     access = WorkspaceAccessCoordinator(tmp_path)
     (tmp_path / "a").write_bytes(b"old-a")
@@ -103,6 +107,7 @@ def test_transaction_failure_rolls_back_all_files_and_journal(tmp_path):
     assert journal.read_bytes() == b"old-journal"
 
 
+@pytest.mark.session
 def test_process_crash_restores_files_and_session_participants(tmp_path):
     import subprocess
     import sys
@@ -126,6 +131,7 @@ with a.acquire([a.write_claim()]):
     assert journal.read_bytes() == b"old-journal"
 
 
+@pytest.mark.session
 def test_untracked_operation_blocks_only_rewinds_across_its_boundary(tmp_path):
     access = WorkspaceAccessCoordinator(tmp_path)
     before = access.cursor()
@@ -138,6 +144,7 @@ def test_untracked_operation_blocks_only_rewinds_across_its_boundary(tmp_path):
     access.check_rewind("B", before)
 
 
+@pytest.mark.session
 def test_rewind_keeps_session_background_shell_alive(runtime_factory, tmp_path):
     import os
     session = runtime_factory[0]()

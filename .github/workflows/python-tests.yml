@@ -25,7 +25,7 @@ jobs:
       - name: Install Python dependencies
         run: python -m pip install -e ".[test]"
       - name: Run runtime and protocol tests
-        run: python -m pytest -q -m "not integration" -rs
+        run: python -m pytest -q -m "not integration and not external" --durations=30 -rs
 
   lsp:
     name: LSP integration (${{ matrix.os }})
@@ -63,4 +63,29 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm ls --global --prefix (Join-Path $env:RUNNER_TEMP 'lsp-tools') --depth=0
       - name: Run required real-tool tests
-        run: python -m pytest -q -m integration --require-integration-tools -rs
+        run: python -m pytest tests/test_code_intelligence.py tests/test_language_service_integration.py -q -m integration --require-integration-tools -rs
+
+  windows-shell:
+    name: Windows ACL integration
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.18.0'
+          package-manager-cache: false
+      - name: Install runtimes and dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[test]"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm install --global bun@1.4.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun install --frozen-lockfile --cwd frontend/opentui
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Run required Windows file sandbox tests
+        run: python -m pytest tests/test_native_shell.py -q -m integration --require-integration-tools -rs

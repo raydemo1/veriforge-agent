@@ -1,4 +1,4 @@
-import type { CommandItem, Interaction, Snapshot, TranscriptItem, SessionEvent, UiEvent, WorkState, SessionDescriptor, AttachmentItem, PanelSpec } from "./protocol.ts";
+import type { ProjectResourcesSnapshot, CommandItem, Interaction, Snapshot, TranscriptItem, SessionEvent, UiEvent, WorkState, SessionDescriptor, AttachmentItem, PanelSpec } from "./protocol.ts";
 import { DEFAULT_COMMANDS, initialWorkState } from "./protocol.ts";
 import { formatUserError } from "./errors.ts";
 
@@ -9,13 +9,13 @@ export const initialSnapshot: Snapshot = {
 export type SessionViewState = {
   snapshot: Snapshot; items: TranscriptItem[]; commands: CommandItem[];
   turnState: "idle" | "running" | "queued" | "cancelling" | "cancelled"; queueDepth: number; interaction: Interaction | null;
-  work: WorkState;
+  work: WorkState; waitingReason: string | null;
 };
 export const initialSessionState: SessionViewState = {
   snapshot: initialSnapshot,
   items: [{ id: "welcome", kind: "status", title: "VeriForge", body: "准备工作区…", state: "running" }],
   commands: DEFAULT_COMMANDS, turnState: "idle", queueDepth: 0, interaction: null,
-  work: initialWorkState,
+  work: initialWorkState, waitingReason: null,
 };
 
 const STARTUP_COPY: Record<string, string> = {
@@ -26,13 +26,12 @@ const STARTUP_COPY: Record<string, string> = {
   "connecting external tools": "正在连接外部工具…",
 };
 const READY_HINT = "今天想造点什么？";
-// "ready" = core session usable; "external tools ready" = background MCP
-// warm-up also finished, i.e. the whole startup is done.
-const READY_STATUSES = new Set(["ready", "external tools ready"]);
+const READY_STATUSES = new Set(["ready"]);
 
 export function reduceSessionEvent(state: SessionViewState, event: SessionEvent): SessionViewState {
+  if (event.type === "resource_wait") return { ...state, waitingReason: event.reason };
   if (event.type === "snapshot") return { ...state, snapshot: event.snapshot };
-  if (event.type === "session_reset") return { ...state, snapshot: event.snapshot, items: event.items ?? [], turnState: "idle", queueDepth: 0, interaction: null, work: initialWorkState };
+  if (event.type === "session_reset") return { ...state, snapshot: event.snapshot, items: event.items ?? [], turnState: "idle", queueDepth: 0, interaction: null, work: initialWorkState, waitingReason: null };
   if (event.type === "commands") return { ...state, commands: event.commands };
   if (event.type === "progress") {
     const isReady = READY_STATUSES.has(event.status);
@@ -104,16 +103,18 @@ export type SessionState = {
   view: SessionViewState; ui: SessionUI; sequence: number; unreadCount: number;
 };
 export type AppState = {
+  resources: ProjectResourcesSnapshot | null;
   activeSessionId: string | null; sessionOrder: string[];
   descriptors: Record<string, SessionDescriptor>; sessions: Record<string, SessionState>;
 };
-export const initialState: AppState = { activeSessionId: null, sessionOrder: [], descriptors: {}, sessions: {} };
+export const initialState: AppState = { resources: null, activeSessionId: null, sessionOrder: [], descriptors: {}, sessions: {} };
 export type AppAction = UiEvent | {
   type: "session_ui"; sessionId: string; field: keyof SessionUI;
   value: SessionUI[keyof SessionUI] | ((current: any) => any);
 } | { type: "local_event"; sessionId: string; event: SessionEvent };
 const emptySession = (): SessionState => ({ view: structuredClone(initialSessionState), ui: structuredClone(initialSessionUI), sequence: 0, unreadCount: 0 });
 export function reduceEvent(state: AppState, action: AppAction): AppState {
+  if (action.type === "resources") return { ...state, resources: action.snapshot };
   if (action.type === "sessions") {
     const sessions = { ...state.sessions };
     for (const descriptor of action.sessions) sessions[descriptor.id] ??= emptySession();

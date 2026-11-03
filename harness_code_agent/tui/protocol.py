@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-UI_PROTOCOL_VERSION = 7
+UI_PROTOCOL_VERSION = 8
 
 _EVENT_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
     "snapshot": frozenset({"snapshot"}),
@@ -17,6 +17,8 @@ _EVENT_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
     "progress": frozenset({"status", "detail"}),
     "notice": frozenset({"text"}),
     "turn_state": frozenset({"state"}),
+    "runtime_state": frozenset({"state"}),
+    "resource_wait": frozenset({"reason"}),
     "panel": frozenset({"panel"}),
     "interaction": frozenset({"id", "kind", "payload"}),
     "interaction_closed": frozenset({"id"}),

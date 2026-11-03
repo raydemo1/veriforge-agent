@@ -184,9 +184,16 @@ class AgentConversation:
 
     def __init__(self, agent: Agent, initial_task: str | None = None):
         self.agent = agent
+        from ..runtime.project_resources import ProjectResourceBudget
+        self.project_resources = (agent.tool_context.project_resources if agent.tool_context is not None
+                                  else ProjectResourceBudget.for_project(Path.cwd()))
+        self._resource_owner = weakref.finalize(self, self.project_resources.hold())
         self.trace = TraceWriter(
             agent.name,
             workspace=(agent.tool_context.workspace.root if agent.tool_context is not None else Path.cwd()),
+            session_id=getattr(agent.tool_context, "session_id", None),
+            turn_id=lambda: self.runtime_state.turn_id or None,
+            request_id=lambda: getattr(agent.tool_context, "ui_request_id", None),
         )
         self.runtime_state = agent._create_runtime_state(initial_task or "")
         if agent.tool_context is not None and agent.tool_context.session_id:
@@ -413,7 +420,7 @@ class AgentConversation:
 
     def _summarize(self, messages: list[dict]) -> str:
         return llm_call_simple(messages, diagnostics=self.summary_diagnostics,
-                               trace=self.trace, epoch=self.history.epoch)
+                               trace=self.trace, epoch=self.history.epoch, project_resources=self.project_resources)
 
     def add_user_turn(
         self,
@@ -920,7 +927,8 @@ class AgentConversation:
                 agent_name=self.agent.name,
             )
             result = tool_result.to_text()
-            self.trace.tool_call(fn_name, fn_args, result)
+            self.trace.tool_call(fn_name, fn_args, result, tool_call_id=call.tool_call_id,
+                                 shell_job_id=tool_result.metadata.get("job_id"))
             self.record_tool_result(call.tool_call_id, tool_result, fn_args)
 
     def run_until_idle(self, cancellation_token=None) -> str:
@@ -1117,6 +1125,7 @@ class AgentConversation:
         if self.agent.tool_context is not None:
             cleanups.append(self.agent.tool_context.close_language_service)
         cleanups.append(lambda: self.client.close())
+        cleanups.append(self._resource_owner)
         for cleanup in cleanups:
             try:
                 cleanup()

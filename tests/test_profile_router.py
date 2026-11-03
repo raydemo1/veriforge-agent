@@ -179,7 +179,7 @@ class JevProfileRouterTests(unittest.TestCase):
     def test_selected_profile_stays_fixed_until_auto_is_selected(self):
         from harness_code_agent.core.interactive import InteractiveSession
         import threading
-        from concurrent.futures import ThreadPoolExecutor
+        from harness_code_agent.runtime.project_resources import ProjectResourceBudget
         from types import SimpleNamespace
         from harness_code_agent.runtime.task_supervisor import ToolTaskSupervisor
         session = InteractiveSession.__new__(InteractiveSession)
@@ -187,8 +187,8 @@ class JevProfileRouterTests(unittest.TestCase):
         session._closed = session._closing = False
         session._turn_thread = None
         session.tool_context = SimpleNamespace(tool_tasks=ToolTaskSupervisor())
-        session._startup_executor = ThreadPoolExecutor(max_workers=1)
-        self.addCleanup(session._startup_executor.shutdown)
+        session.project_resources = ProjectResourceBudget.for_project("workspace")
+        self.addCleanup(session.project_resources.hold())
         session.session = Mock(id="test-session")
         session.conversation = Mock()
         session.event_bus = Mock()

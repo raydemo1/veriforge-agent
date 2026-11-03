@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from contextlib import nullcontext
 
 from harness_code_agent.agent import llm_channel as ch
 
@@ -66,6 +67,9 @@ class _FakeTrace:
     def __init__(self):
         self.errors = []
 
+    def _write(self, *args):
+        pass
+
     def error(self, label, detail):
         self.errors.append((label, detail))
 
@@ -78,6 +82,8 @@ def _make_conversation(rate_limit: bool):
     client = _FakeClient(completions)
     return (
         SimpleNamespace(
+            project_resources=SimpleNamespace(acquire=lambda *args, **kwargs: nullcontext()),
+            runtime_state=SimpleNamespace(session_id="test", turn_id="turn"),
             provider=_FakeProvider(),
             client=client,
             agent=SimpleNamespace(stream_callback=lambda delta: None),
@@ -139,7 +145,9 @@ class _EmptyChoicesCompletions:
 def _make_nonstream_conversation(completions):
     client = _FakeClient(completions)
     return SimpleNamespace(
-        provider=_FakeProvider(),
+        project_resources=SimpleNamespace(acquire=lambda *args, **kwargs: nullcontext()),
+            runtime_state=SimpleNamespace(session_id="test", turn_id="turn"),
+            provider=_FakeProvider(),
         client=client,
         agent=SimpleNamespace(stream_callback=None),
         emitter=_FakeEmitter(),

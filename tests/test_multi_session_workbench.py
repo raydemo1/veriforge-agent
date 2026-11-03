@@ -14,6 +14,8 @@ from harness_code_agent.workspace.access import WorkspaceAccessCoordinator, Work
 from harness_code_agent.workspace.service import WorkspaceService
 from harness_code_agent.workspace.worktrees import WorktreeService
 
+pytestmark = pytest.mark.session
+
 
 def test_profiles_models_and_histories_are_session_owned(runtime_factory):
     create, clients = runtime_factory

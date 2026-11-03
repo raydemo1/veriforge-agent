@@ -15,7 +15,6 @@ from harness_code_agent.agent.cancellation import CancelledError, CancellationTo
 from harness_code_agent.agent.coordinator import AgentCoordinator
 from harness_code_agent.runtime.builtins.filesystem import write_file
 from harness_code_agent.runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
-from harness_code_agent.runtime.execution_planner import _CONCURRENCY_LIMITS
 from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.sessions.events import EventBus
@@ -183,17 +182,12 @@ class SubagentControlTests(unittest.TestCase):
             event_bus=EventBus(),
             tool_registry=BUILTIN_TOOL_REGISTRY,
         )
-        self.coordinator = AgentCoordinator(self.context, max_concurrent=3)
+        self.coordinator = AgentCoordinator(self.context)
         self.context.agent_coordinator = self.coordinator
 
     def tearDown(self):
         self.coordinator.close()
         shutil.rmtree(self.temp, ignore_errors=True)
-
-    def test_concurrency_limits_follow_config(self):
-        self.assertEqual(
-            _CONCURRENCY_LIMITS["subagent"], max(1, int(config.MAX_CONCURRENT_AGENTS))
-        )
 
     def test_role_registries_cannot_spawn_agents(self):
         # Structural depth cap: neither read-only roles nor worker may spawn.

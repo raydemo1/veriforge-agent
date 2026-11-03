@@ -10,11 +10,12 @@ import logging
 import random
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from email.utils import parsedate_to_datetime
 
 from .. import config
 from . import context
-from .cancellation import CancelledError
+from .cancellation import CancelledError, current_token
 from .providers import ProviderAdapter, client_scope
 from .utils import _usage_to_dict
 
@@ -186,7 +187,7 @@ def _reset_client_after_stream_timeout(conv) -> None:
     conv._client_needs_refresh = True
 
 
-def llm_call_simple(messages: list[dict], *, diagnostics=None, trace=None, epoch=None) -> str:
+def llm_call_simple(messages: list[dict], *, diagnostics=None, trace=None, epoch=None, project_resources=None) -> str:
     """Simple LLM call without tools — used for summarization.
 
     Retries 429/5xx/transport errors with bounded backoff so context
@@ -204,7 +205,9 @@ def llm_call_simple(messages: list[dict], *, diagnostics=None, trace=None, epoch
         record = diagnostics.begin(kwargs, provider=profile.provider, epoch=epoch,
                                    request_id="summary") if diagnostics is not None else None
         try:
-            with client_scope() as client:
+            quota = project_resources.acquire("llm", session_id=getattr(trace, "session_id", None),
+                                              label="压缩上下文", cancellation_token=current_token.get()) if project_resources else nullcontext()
+            with quota, client_scope() as client:
                 resp = client.chat.completions.create(**kwargs)
         except Exception as exc:
             if record is not None and trace is not None:
@@ -216,7 +219,7 @@ def llm_call_simple(messages: list[dict], *, diagnostics=None, trace=None, epoch
         return resp.choices[0].message.content or ""
 
     try:
-        return _call_with_retry(_invoke, operation="llm_call_simple", attempts=attempts)
+        return _call_with_retry(_invoke, operation="llm_call_simple", attempts=attempts, cancellation_token=current_token.get())
     except CancelledError:
         raise
     except Exception as e:
@@ -234,6 +237,7 @@ class LlmChannel:
 
     def _create(self, client, kwargs, request_id):
         conv = self.conversation
+        conv.trace._write("llm_request", {"llm_call_id": request_id, "streamed": bool(kwargs.get("stream"))})
         diagnostics = getattr(conv, "request_diagnostics", None)
         if diagnostics is None:
             return client.chat.completions.create(**kwargs)
@@ -329,15 +333,15 @@ class LlmChannel:
                 def _stream_attempt():
                     # Only errors before the first chunk are safe to retry;
                     # once deltas were produced the caller already saw them.
-                    stream = self._create(_stream_client(conv.client), stream_kwargs, call_id)
-                    return conv.provider.assistant_message_from_stream(
-                        stream,
-                        on_text_delta=on_text_delta,
-                        on_chunk=on_chunk,
-                        on_reasoning_start=on_reasoning_start,
-                        on_reasoning_delta=on_reasoning_delta,
-                        cancellation_token=cancellation_token,
-                    )
+                    with conv.project_resources.acquire("llm", session_id=conv.runtime_state.session_id,
+                                                         turn_id=conv.runtime_state.turn_id, label="模型请求",
+                                                         cancellation_token=cancellation_token):
+                        stream = self._create(_stream_client(conv.client), stream_kwargs, call_id)
+                        return conv.provider.assistant_message_from_stream(
+                            stream, on_text_delta=on_text_delta, on_chunk=on_chunk,
+                            on_reasoning_start=on_reasoning_start, on_reasoning_delta=on_reasoning_delta,
+                            cancellation_token=cancellation_token,
+                        )
 
                 result = _call_with_retry(
                     _stream_attempt,
@@ -389,10 +393,13 @@ class LlmChannel:
         remove_cancel_callback = self._interrupt_client_on_cancel(cancellation_token)
         try:
             def _nonstream_attempt():
-                response = self._create(conv.client, kwargs, call_id)
-                if not response.choices:
-                    raise _EmptyChoicesError("API returned no choices")
-                return response
+                with conv.project_resources.acquire("llm", session_id=conv.runtime_state.session_id,
+                                                     turn_id=conv.runtime_state.turn_id, label="模型请求",
+                                                     cancellation_token=cancellation_token):
+                    response = self._create(conv.client, kwargs, call_id)
+                    if not response.choices:
+                        raise _EmptyChoicesError("API returned no choices")
+                    return response
 
             response = _call_with_retry(
                 _nonstream_attempt,

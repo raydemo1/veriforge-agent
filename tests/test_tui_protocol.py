@@ -16,6 +16,7 @@ class TuiProtocolTests(unittest.TestCase):
         server.cwd = Path("workspace")
         server._session = SimpleNamespace()
         server._session_error = None
+        server.project_resources = None
         server._session_thread = SimpleNamespace(is_alive=lambda: False)
         server.responses = []
         server._response = lambda request_id, result=None, error=None: server.responses.append(
@@ -98,6 +99,7 @@ class TuiProtocolTests(unittest.TestCase):
         server._session_generation = 2
         server._closing = threading.Event()
         server._session = None
+        server.project_resources = None
         server._session_error = None
         closed: list[bool] = []
         stale_session = SimpleNamespace(close=lambda: closed.append(True))

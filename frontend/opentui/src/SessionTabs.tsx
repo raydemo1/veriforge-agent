@@ -27,9 +27,10 @@ function Action({ children, onClick, theme, accent = false }: {
 }
 
 export function SessionTabs({ sessions, activeId, unread, width, theme, onSelect, onNew, onHide,
-  onSwitcher, onWorktree, onFork, onApply }: {
+  onSwitcher, onWorktree, onFork, onApply, onResources, resourcesOpen }: {
   sessions: SessionDescriptor[]; activeId: string; unread: Record<string, number>; width: number; theme: Theme;
   onSelect: (id: string) => void; onNew: () => void; onHide: (id: string) => void;
+  onResources: () => void; resourcesOpen: boolean;
   onSwitcher: () => void; onWorktree: () => void; onFork: () => void; onApply?: () => void;
 }) {
   const scroll = useRef<ScrollBoxRenderable | null>(null);
@@ -40,13 +41,14 @@ export function SessionTabs({ sessions, activeId, unread, width, theme, onSelect
   const path = active?.cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? "工作台";
   return <box style={{ flexDirection: "column", flexShrink: 0, backgroundColor: theme.background }}>
     <box style={{ flexDirection: "row", justifyContent: "space-between", paddingLeft: 2, paddingRight: 1, paddingTop: 1 }}>
-      <text><span fg={theme.accent}><strong>VeriForge</strong></span><span fg={theme.subtle}>{`  /  ${fit(path, narrow ? 16 : 28)}`}</span></text>
+      <text><span fg={theme.accent}><strong>VeriForge</strong></span>{!narrow ? <span fg={theme.subtle}>{`  /  ${fit(path, 28)}`}</span> : null}</text>
       <box style={{ flexDirection: "row" }}>
         {onApply ? <Action theme={theme} accent onClick={onApply}>应用到 Local</Action> : null}
         {!narrow ? <>
           <Action theme={theme} onClick={onFork}>分支</Action>
           <Action theme={theme} onClick={onWorktree}>隔离工作区</Action>
         </> : null}
+        <Action theme={theme} accent={resourcesOpen} onClick={onResources}>资源</Action>
         <Action theme={theme} onClick={onSwitcher}>{pending ? (narrow ? `◆ ${pending} ▾` : `会话 ${pending} 待审批 ▾`) : "会话 ▾"}</Action>
         <Action theme={theme} accent onClick={onNew}>＋ 新建</Action>
       </box>

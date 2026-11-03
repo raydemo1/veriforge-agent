@@ -205,7 +205,7 @@ class AgentCoordinatorTests(unittest.TestCase):
             event_bus=EventBus(),
             tool_registry=BUILTIN_TOOL_REGISTRY,
         )
-        self.coordinator = AgentCoordinator(self.context, max_concurrent=3)
+        self.coordinator = AgentCoordinator(self.context)
         self.context.agent_coordinator = self.coordinator
         _ControlledConversation.instances.clear()
         _ControlledAgent.contexts.clear()

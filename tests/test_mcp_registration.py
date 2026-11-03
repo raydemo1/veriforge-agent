@@ -47,26 +47,6 @@ def test_register_server_persists_entry_when_probe_fails(tmp_path):
     assert "description" not in entry
 
 
-def test_register_server_replaces_existing_entry(tmp_path):
-    _write_config(
-        tmp_path,
-        {"docs": {"transport": "stdio", "command": MISSING_COMMAND}},
-    )
-    manager = McpClientManager.from_workspace(tmp_path)
-    manager.timeout_seconds = 5
-    server = build_server_config(
-        name="docs",
-        url="http://127.0.0.1:1/mcp",
-        permission="network_read",
-    )
-    registration = manager.register_server(server)
-    assert registration.replaced is True
-    entry = _read_config(tmp_path)["servers"]["docs"]
-    assert entry["url"] == "http://127.0.0.1:1/mcp"
-    assert entry["permission"] == "network_read"
-    assert "command" not in entry
-
-
 def test_reregister_server_keeps_existing_metadata(tmp_path):
     _write_config(
         tmp_path,
@@ -82,7 +62,7 @@ def test_reregister_server_keeps_existing_metadata(tmp_path):
     )
     manager = McpClientManager.from_workspace(tmp_path)
     manager.timeout_seconds = 5
-    server = build_server_config(name="docs", url="http://127.0.0.1:1/mcp")
+    server = build_server_config(name="docs", url="http://127.0.0.1:1/mcp", permission="network_read")
     registration = manager.register_server(server)
     assert registration.replaced is True
     assert registration.server.description == "Searches project documentation."
@@ -90,6 +70,8 @@ def test_reregister_server_keeps_existing_metadata(tmp_path):
     assert registration.server.tool_permissions == {"search": "read"}
     entry = _read_config(tmp_path)["servers"]["docs"]
     assert entry["url"] == "http://127.0.0.1:1/mcp"
+    assert entry["permission"] == "network_read"
+    assert "command" not in entry
     assert entry["description"] == "Searches project documentation."
     assert entry["title"] == "Docs"
     assert entry["tool_permissions"] == {"search": "read"}

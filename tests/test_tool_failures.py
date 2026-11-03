@@ -956,7 +956,7 @@ class FailureObservabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _run_schema_streak(root)
-            trace_path = root / ".harness" / "traces" / "trace_main_agent.jsonl"
+            trace_path = next((root / ".harness" / "traces").rglob("*.jsonl"))
             lines = [
                 json.loads(line)
                 for line in trace_path.read_text(encoding="utf-8").splitlines()

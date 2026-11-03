@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from functools import wraps
+from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from ..agent.cancellation import current_token
 from ..agent.cancellation import CancellationToken, CancelledError, cancellation_scope
 import hashlib
@@ -151,6 +151,7 @@ class InteractiveSession:
         session_id: str | None = None,
         state_root: str | Path | None = None,
         environment: str = "local",
+        project_resources=None,
     ):
         self.cwd = Path(cwd).resolve()
         self._requested_session_id = session_id
@@ -158,13 +159,13 @@ class InteractiveSession:
         self.state_root = Path(state_root).resolve() if state_root else self.cwd / ".harness"
         self.model_selection = config.ModelSelection()
         self.lifecycle = LifecycleScope()
+        from ..runtime.project_resources import ProjectResourceBudget
+        self.project_resources = project_resources or ProjectResourceBudget.for_project(self.cwd)
+        self.lifecycle.register("project resources", self.project_resources.hold(), order=100)
         self._execution_condition = threading.Condition(threading.RLock())
         self._closing = False
         self._turn_thread = None
         self._turn_token = None
-        self._startup_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="session-startup")
-        self.lifecycle.register("startup_executor", lambda: self._startup_executor.shutdown(wait=True), order=50)
-        self._mcp_future = None
         try:
             self.profile_router = JevRouteClassifier()
             self.lifecycle.register("profile_router", self.profile_router.close, order=40)
@@ -302,56 +303,31 @@ class InteractiveSession:
     def _load_mcp_tools(self) -> None:
         if self.tool_registry is None or self.mcp_manager is None:
             self._prepare_tool_registry()
-        self.mcp_manager.connect_all()
+        self.mcp_manager.prime_catalog()
         snapshot = self.mcp_manager.catalog_snapshot()
         self.mcp_manager.register_tools(self.tool_registry, snapshot=snapshot)
         self._mcp_connection_revision = snapshot.revision
         self._mcp_tools_loaded = True
 
     def _prepare_tool_registry(self) -> None:
-        self._mcp_future = None
         self.tool_registry = BUILTIN_TOOL_REGISTRY.copy()
-        self.mcp_manager = McpClientManager.from_workspace(self.cwd)
+        self.mcp_manager = McpClientManager.from_workspace(self.cwd, project_resources=self.project_resources, session_id=self.session.id)
         manager = self.mcp_manager
         self.lifecycle.register(f"mcp:{id(manager)}", manager.close, order=10)
         self._mcp_tools_loaded = False
 
-    def _wait_session_future(self, future):
-        token = current_token.get()
-        while True:
-            if token is not None:
-                token.check()
-            try:
-                return future.result(timeout=0.05)
-            except FutureTimeout:
-                if future.done():
-                    return future.result()
-
     def _ensure_mcp_tools_loaded(self) -> None:
-        with self._execution_condition:
-            if self._closed or self._closing:
-                raise RuntimeError("会话正在关闭")
-            if self._mcp_future is None:
-                self._mcp_future = self._startup_executor.submit(self._initialize_mcp_tools)
-                self.tool_context.tool_tasks.track(self._mcp_future, foreground=False)
-            future = self._mcp_future
-        self._wait_session_future(future)
-
-    def _initialize_mcp_tools(self) -> None:
-        if self._mcp_tools_loaded:
-            return
         with self._mcp_load_lock:
-            if self._mcp_tools_loaded:
-                return
-            self._report_startup("connecting external tools")
-            self._load_mcp_tools()
-            self._refresh_agent_tool_schemas()
-            self._refresh_mcp_catalog()
-            self._report_startup("external tools ready")
+            if not self._mcp_tools_loaded:
+                self._load_mcp_tools()
+                self._refresh_agent_tool_schemas()
+                self._refresh_mcp_catalog()
 
-    def warm_mcp_tools(self) -> None:
-        """Connect configured MCP servers after the core session is usable."""
-        self._ensure_mcp_tools_loaded()
+    def _discover_mcp_tools(self, server_name=None):
+        self.mcp_manager.discover(server_name, cancellation_token=current_token.get())
+        self.mcp_manager.register_tools(self.tool_registry)
+        self._mcp_connection_revision = self.mcp_manager.connection_revision
+        self._refresh_mcp_catalog()
 
     def _tool_schemas_for_agent_config(self, cfg, *, update_context: bool = True, tool_context=None) -> list[dict]:
         context = tool_context or self.tool_context
@@ -652,6 +628,17 @@ class InteractiveSession:
         if self.is_bound and self.profile is not None:
             self._activate_profile(self.profile.name())
 
+    def _wait_session_future(self, future):
+        token = current_token.get()
+        while True:
+            if token is not None:
+                token.check()
+            try:
+                return future.result(timeout=.05)
+            except FutureTimeout:
+                if future.done():
+                    return future.result()
+
     def _maybe_auto_route_profile(self, user_prompt: str) -> RouteDecision | None:
         if (
             not self.is_bound
@@ -660,14 +647,20 @@ class InteractiveSession:
         ):
             return None
         current = self.profile.name()
-        future = self._startup_executor.submit(route_profile_for_turn,
-            user_prompt,
-            current_profile=current,
-            routing_mode=self.routing_mode,
-            previous_user_task=self.last_user_task,
-            previous_assistant_text=self.last_assistant_text,
-            llm_classifier=self.profile_router,
-        )
+        token = current_token.get()
+
+        def classify(**kwargs):
+            with self.project_resources.acquire("llm", session_id=self.session.id,
+                                                label="选择 Agent", cancellation_token=token):
+                return self.profile_router(**kwargs)
+
+        def route():
+            with cancellation_scope(token):
+                return route_profile_for_turn(user_prompt, current_profile=current,
+                    routing_mode=self.routing_mode, previous_user_task=self.last_user_task,
+                    previous_assistant_text=self.last_assistant_text, llm_classifier=classify)
+
+        future = self.project_resources.submit("tools", route, session_id=self.session.id, label="选择 Agent")
         self.tool_context.tool_tasks.track(future)
         decision = self._wait_session_future(future)
         switched = decision.action == ROUTE_ACTION_SWITCH_PROFILE and decision.profile_name != current
@@ -749,6 +742,8 @@ class InteractiveSession:
             session_id=self.session.id,
             session_root=self.session.root,
             environment=self.environment,
+            project_resources=self.project_resources,
+            discover_mcp_tools=self._discover_mcp_tools,
             model_selection=self.model_selection,
             memory_use_enabled=self.memory_use_enabled,
             memory_auto_extract_enabled=self.memory_auto_extract_enabled,
@@ -1784,7 +1779,7 @@ class InteractiveSession:
     def _append_conversation_message(self, message: dict) -> None:
         self.conversation._append_message(message)
 
-    def close(self) -> None:
+    def close(self, *, suspend: bool = False) -> None:
         with self._close_lock:
             if self._closed:
                 return
@@ -1805,6 +1800,8 @@ class InteractiveSession:
         if self.session is None or self.event_bus is None:
             return
         close_memory_session(self.cwd, self.session.id)
+        if suspend:
+            return
         try:
             metadata = self.session_store.read_metadata(self.session.id)
             events = self.session_store.read_events(self.session.id)

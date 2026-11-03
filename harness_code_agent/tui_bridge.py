@@ -16,8 +16,10 @@ import os
 import queue
 import sys
 import threading
+import time
 import traceback
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -286,12 +288,16 @@ class SessionBridge:
     """Own one Python session and serve request/event messages over stdio."""
 
     def __init__(self, *, cwd: Path, profile_name: str, profile_explicit: bool,
-                 session_id: str, state_root: Path, environment: str, emit, session_action) -> None:
+                 session_id: str, state_root: Path, environment: str, emit, session_action,
+                 project_resources=None) -> None:
         self.runtime_id = session_id
         self.environment = environment
         self.state_root = state_root
         self._emit_write = emit
         self._session_action = session_action
+        self.project_resources = project_resources
+        self._runtime_lock = threading.RLock()
+        self._last_activity = time.monotonic()
         self.cwd = cwd.resolve()
         self.profile_name = profile_name
         self.profile_explicit = profile_explicit
@@ -307,6 +313,8 @@ class SessionBridge:
         self._session_lock = threading.Lock()
         self._session_generation = 0
         self._session: InteractiveSession | None = None
+        self._session_thread = None
+        self._worker = None
         self._session_error: str | None = None
         self._assistant_group_id: str | None = None
         self._assistant_group_counter = 0
@@ -326,18 +334,33 @@ class SessionBridge:
         )
         self._interactions = BridgeInteractionProvider(self._send_event, project_root=self.cwd)
         self._mention_index: MentionIndex | None = None
-        self._send_event({"type": "progress", "status": "starting", "detail": "正在准备 Python 会话…"})
-        self._start_session_construction()
-        self._worker = threading.Thread(target=self._worker_loop, name="opentui-submit", daemon=True)
-        self._worker.start()
+        from .sessions.store import SessionStore
+        store = SessionStore(self.state_root)
+        if not (store.sessions_dir / self.runtime_id / "session.json").exists():
+            store.create(profile=profile_name, cwd=self.cwd, model=config.MODEL,
+                                 permission_mode=self.state.snapshot.permission_mode,
+                                 profile_source="explicit" if profile_explicit else "default",
+                                 session_id=self.runtime_id, routing_mode="pinned" if profile_explicit else "auto",
+                                 environment=environment)
+        metadata = store.read_metadata(self.runtime_id)
+        self._model_selection = config.ModelSelection(**metadata.get("model_selection", {}))
+        self.state.snapshot.session_id = self.runtime_id
+        self.state.snapshot.profile = metadata["profile"]
+        self.state.snapshot.permission_mode = metadata["permission_mode"]
+        self.state.snapshot.status = "idle"
+        items = self._history_items(self.runtime_id)
+        self._emit_commands()
+        self._send_event({"type": "session_reset", "snapshot": self._snapshot_payload(), "items": items})
+        self._send_event({"type": "runtime_state", "state": "dormant"})
+        self._send_event({"type": "progress", "status": "ready", "detail": ""})
 
-    def _start_session_construction(self, *, reset_ui: bool = False) -> None:
+    def _start_session_construction(self) -> None:
         with self._session_lock:
             self._session_generation += 1
             generation = self._session_generation
         thread = threading.Thread(
             target=self._construct_session,
-            kwargs={"generation": generation, "reset_ui": reset_ui},
+            kwargs={"generation": generation},
             name="opentui-session",
             daemon=True,
         )
@@ -348,7 +371,7 @@ class SessionBridge:
         with self._session_lock:
             return generation == self._session_generation and not self._closing.is_set()
 
-    def _construct_session(self, *, generation: int, reset_ui: bool = False) -> None:
+    def _construct_session(self, *, generation: int) -> None:
         session: InteractiveSession | None = None
         try:
             session = InteractiveSession(
@@ -356,6 +379,7 @@ class SessionBridge:
                 session_id=self.runtime_id,
                 state_root=self.state_root,
                 environment=self.environment,
+                project_resources=self.project_resources,
                 profile_name=self.profile_name,
                 profile_explicit=self.profile_explicit,
                 stream_sink=lambda text: (
@@ -384,18 +408,9 @@ class SessionBridge:
                 return
             self._emit_commands()
             self._send_snapshot()
-            # session_reset must precede work state: the reset reducer
-            # restores the initial empty work state.
-            if reset_ui:
-                self._send_event({"type": "session_reset", "snapshot": self._snapshot_payload(), "items": []})
             self._send_work_state()
-            metadata = session.session_store.read_metadata(session.session.id)
-            if metadata.get("history_boundary"):
-                items = self._history_items(session.session.id)
-                self._send_event({"type": "session_reset", "snapshot": self._snapshot_payload(), "items": items})
-                self._send_work_state()
             self._send_event({"type": "progress", "status": "ready", "detail": "Python 会话已就绪。"})
-            self._start_mcp_warm(session)
+            self._send_event({"type": "runtime_state", "state": "warm"})
         except Exception as exc:  # pragma: no cover - exercised by real startup failures
             error = _localize_error(exc, "会话启动失败，请稍后重试")
             with self._session_lock:
@@ -411,22 +426,9 @@ class SessionBridge:
     def _startup_progress(self, stage: str) -> None:
         self._send_event({"type": "progress", "status": stage, "detail": stage})
 
-    def _start_mcp_warm(self, session: InteractiveSession) -> None:
-        """Connect configured MCP servers in the background after ready."""
-
-        def _warm() -> None:
-            try:
-                session.warm_mcp_tools()
-            except Exception:  # warm failures are invisible to the user path
-                log.debug("Background MCP warm failed", exc_info=True)
-
-        threading.Thread(target=_warm, name="opentui-mcp-warm", daemon=True).start()
-
     def _emit_commands(self) -> None:
-        if self._session is None:
-            return
         try:
-            registry = default_command_registry(skill_registry=self._session.skill_registry)
+            registry = default_command_registry(skill_registry=self._session.skill_registry if self._session else None)
             commands = [
                 {
                     "name": spec.name,
@@ -647,7 +649,8 @@ class SessionBridge:
                 0,
                 min(100, round((1 - snapshot.context_tokens / snapshot.context_window_tokens) * 100)),
             )
-        profile = config.resolve_model_profile(config.MODEL_INTENSITY, self._require_session().model_selection)
+        profile = config.resolve_model_profile(config.MODEL_INTENSITY,
+                                               self._session.model_selection if self._session else self._model_selection)
         return {
             "profile": snapshot.profile,
             "permissionMode": snapshot.permission_mode,
@@ -687,21 +690,27 @@ class SessionBridge:
             message["error"] = error
         self._write(message)
 
+    def _enqueue_task(self, task):
+        with self._runtime_lock:
+            if self._closing.is_set():
+                raise RuntimeError("会话正在关闭")
+            self._last_activity = time.monotonic()
+            self._tasks.put(task)
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(target=self._worker_loop, name="opentui-submit", daemon=True)
+                self._worker.start()
+
     def _worker_loop(self) -> None:
         while not self._closing.is_set():
-            task = self._tasks.get()
-            if task is None:
-                self._tasks.task_done()
-                return
-            if self._session is not None and self._session.tool_context.tool_tasks.pending_foreground_count:
-                self._send_event({"type": "turn_state", "state": "queued", "queueDepth": self._tasks.qsize() + 1})
-                while self._session.tool_context.tool_tasks.pending_foreground_count:
-                    if self._closing.wait(timeout=0.05):
-                        self._tasks.task_done()
-                        return
-            token = CancellationToken()
-            with self._active_lock:
-                self._active_token = token
+            with self._runtime_lock:
+                try:
+                    task = self._tasks.get_nowait()
+                except queue.Empty:
+                    self._worker = None
+                    return
+                token = CancellationToken()
+                with self._active_lock:
+                    self._active_token = token
             self._assistant_id = None
             self._assistant_text = ""
             if self._assistant_group_id is not None:
@@ -712,6 +721,10 @@ class SessionBridge:
             try:
                 from .agent.cancellation import cancellation_scope
                 with cancellation_scope(token):
+                    if self._session is not None:
+                        while self._session.tool_context.tool_tasks.pending_foreground_count:
+                            token.check()
+                            self._closing.wait(.05)
                     if callable(task):
                         task()
                     else:
@@ -729,7 +742,7 @@ class SessionBridge:
                 self._send_event({"type": "turn_state", "state": "idle"})
                 self._tasks.task_done()
 
-    def _enqueue_external_submission(self, submission: TurnSubmission) -> None:
+    def _enqueue_external_submission(self, submission: TurnSubmission, request_id=None) -> None:
         """Queue approval-then-submit for a prompt referencing external files.
 
         Runs on the worker thread so the approval interaction can block while
@@ -746,6 +759,7 @@ class SessionBridge:
                 return
             try:
                 prepared = session.prepare_with_external_approval(submission)
+                prepared = replace(prepared, ui_request_id=request_id)
             except AttachmentError as exc:
                 self._notice("info", str(exc))
                 return
@@ -758,19 +772,15 @@ class SessionBridge:
                     "body": _user_transcript_body(submission.text, prepared.attachments),
                 },
             })
-            self._tasks.put(prepared)
+            self._enqueue_task(prepared)
 
-        self._tasks.put(task)
+        self._enqueue_task(task)
 
     def _run_task(self, task: PreparedTurn, token: CancellationToken) -> None:
-        session = self._session
-        if session is None:
-            if self._session_thread.is_alive():
-                self._session_thread.join(timeout=30)
-            session = self._session
-        if session is None:
-            raise RuntimeError(self._session_error or "会话尚未准备好，请稍候")
+        session = self._require_session()
         text = task.text
+        session.tool_context.ui_request_id = task.ui_request_id
+        session.conversation.trace._write("ui_request", {"ui_request_id": task.ui_request_id, "turn_id": None})
         registry = default_command_registry(skill_registry=session.skill_registry)
         if not task.attachments and text.lstrip().startswith("/") and not registry.is_agent_command(text):
             should_continue = session.handle_slash_command(text)
@@ -1004,18 +1014,32 @@ class SessionBridge:
         raise ValueError(f"unknown workbench action: {op}")
 
     def _history_items(self, session_id: str) -> list[dict[str, Any]]:
-        session = self._require_session()
+        from .sessions.store import SessionStore
+        store = SessionStore(self.state_root)
+        metadata = store.read_metadata(session_id)
         replay = TuiState(snapshot=SessionStatusSnapshot(
-            profile=self.state.snapshot.profile, model=self.state.snapshot.model,
-            provider=self.state.snapshot.provider, permission_mode=self.state.snapshot.permission_mode,
-            session_id=session.session.id, cwd=self.cwd,
+            profile=metadata["profile"], model=self.state.snapshot.model,
+            provider=self.state.snapshot.provider, permission_mode=metadata["permission_mode"],
+            session_id=session_id, cwd=self.cwd,
         ))
         items = []
         self.work = WorkStateProjection(self.cwd)
         group = None
-        owned_points = session.recovery_points()
-        boundary = session.session_store.read_metadata(session_id).get("history_boundary")
-        for index, event in enumerate(session.session_store.read_history_events(session_id, event_count=boundary["event_count"] if boundary else 0)):
+        owned_points = {}
+        for key in ("checkpoint", "branch_origin"):
+            point = metadata.get(key)
+            if point and point["session_id"] == session_id:
+                owned_points[point["id"]] = point
+        for event in store.read_history_events(session_id):
+            if event["type"] in {"recovery_point_created", "session_rewound"}:
+                point_id = event["payload"]["point_id"]
+                path = self.cwd / ".harness" / "recovery" / "points" / f"{point_id}.json"
+                if path.is_file():
+                    point = json.loads(path.read_text(encoding="utf-8"))
+                    if point["session_id"] == session_id:
+                        owned_points[point_id] = point
+        boundary = metadata.get("history_boundary")
+        for index, event in enumerate(store.read_history_events(session_id, event_count=boundary["event_count"] if boundary else 0)):
             if event["type"] == "recovery_point_created" and event["payload"]["point_id"] not in owned_points:
                 continue
             if event["type"] == "turn_started":
@@ -1039,16 +1063,16 @@ class SessionBridge:
                         item["recoveryPointId"] = event["payload"]["point_id"]
             if event["type"] == "turn_finished":
                 group = None
-        for point_id, point in session.recovery_points().items():
+        for point_id, point in owned_points.items():
             if point["turn"] == 0:
                 items.insert(0, {"id": "recovery-origin", "kind": "status", "title": "会话开始", "body": "", "turn": 0, "recoveryPointId": point_id})
             for item in items:
                 if item.get("role") == "group" and item.get("turn") == point["turn"]:
                     item["recoveryPointId"] = point_id
         self.state = replay
-        self.state.snapshot.session_id = session.session.id
-        self.state.snapshot.profile = session.profile.name()
-        self.state.snapshot.permission_mode = session.permission_mode
+        self.state.snapshot.session_id = session_id
+        self.state.snapshot.profile = metadata["profile"]
+        self.state.snapshot.permission_mode = metadata["permission_mode"]
         self.state.snapshot.status = "idle"
         self._assistant_group_id = None
         self._assistant_id = None
@@ -1072,16 +1096,86 @@ class SessionBridge:
                         self._notice("info", f"已回撤到{destination}")
                 finally:
                     self._rewind_pending = False
-            self._tasks.put(rewind)
+            self._enqueue_task(rewind)
         return {"ok": True, "queued": True}
 
     def _new_session(self):
         return self._session_action("new_session", {})
 
+    def resource_state(self):
+        session = self._session
+        with self._active_lock:
+            turn = self._active_token is not None
+        pending = self._tasks.unfinished_tasks
+        interactions = bool(self._interactions._pending)
+        jobs, agents = [], []
+        tools = 0
+        if session is not None:
+            tools = session.tool_context.tool_tasks.pending_count
+            managers = [session.conversation.runtime_state.shell_job_manager]
+            coordinator = session.tool_context.agent_coordinator
+            if coordinator is not None:
+                with coordinator._condition:
+                    records = list(coordinator._records.values())
+                agents = [record.id for record in records if record.future is not None and not record.future.done()]
+                for record in records:
+                    if record.conversation is not None:
+                        managers.append(record.conversation.runtime_state.shell_job_manager)
+            for manager in managers:
+                if manager is not None:
+                    jobs.extend(manager.running_jobs())
+        constructing = self._session_thread is not None and self._session_thread.is_alive()
+        resources = self.project_resources or (session.project_resources if session is not None else None)
+        executing = resources.snapshot() if resources is not None else {"active": [], "waiting": []}
+        occupied = any(entry["sessionId"] == self.runtime_id for entry in [*executing["active"], *executing["waiting"]])
+        active = bool(turn or pending or interactions or tools or jobs or agents or constructing or occupied)
+        return dict(state="active" if active else "warm" if session is not None else "dormant",
+                    turn=turn, queue=max(0, pending - int(turn)), approvals=int(interactions),
+                    tools=tools, agents=len(agents),
+                    jobs=[dict(id=job.job_id, pid=job.pid, status=job.status, command=job.command,
+                               background=job.background) for job in jobs])
+
+    def suspend_if_idle(self, now, idle_seconds):
+        with self._runtime_lock:
+            state = self.resource_state()["state"]
+            if state == "active":
+                self._last_activity = now
+                return False
+            if state != "warm" or now - self._last_activity < idle_seconds:
+                return False
+            session = self._session
+            self._model_selection = session.model_selection
+            self.profile_name = session.profile.name()
+            self.profile_explicit = session.routing_mode == "pinned"
+            with self._session_lock:
+                self._session_generation += 1
+            session.close(suspend=True)
+            self._session = None
+            self._session_thread = None
+            self._session_error = None
+            self._mention_index = None
+            self._send_event({"type": "runtime_state", "state": "dormant"})
+            return True
+
     def _require_session(self) -> InteractiveSession:
-        if self._session is None:
-            raise RuntimeError(self._session_error or "会话尚未准备好，请稍候")
-        return self._session
+        if self._closing.is_set():
+            raise RuntimeError("会话正在关闭")
+        if self._session is not None:
+            self._last_activity = time.monotonic()
+            return self._session
+        with self._runtime_lock:
+            if self._closing.is_set():
+                raise RuntimeError("会话正在关闭")
+            if self._session is None:
+                if self._session_thread is None or not self._session_thread.is_alive():
+                    self._session_error = None
+                    self._send_event({"type": "progress", "status": "starting", "detail": "正在唤醒会话…"})
+                    self._start_session_construction()
+                self._session_thread.join(30)
+            if self._session is None:
+                raise RuntimeError(self._session_error or "会话尚未准备好，请稍候")
+            self._last_activity = time.monotonic()
+            return self._session
 
     def _action(self, name: str, params: dict[str, Any]) -> dict[str, Any]:
         changes_runtime = name in {"toggle_permission", "rewind"} or (
@@ -1163,6 +1257,12 @@ class SessionBridge:
         raise ValueError("不支持的操作，请重试")
 
     def _handle_request(self, message: dict[str, Any]) -> bool:
+        if message.get("method") in {"cancel", "resolve_interaction"}:
+            return self._dispatch_request(message)
+        with self._runtime_lock:
+            return self._dispatch_request(message)
+
+    def _dispatch_request(self, message: dict[str, Any]) -> bool:
         request_id = str(message.get("id") or "")
         method = str(message.get("method") or "")
         params = message.get("params") or {}
@@ -1188,7 +1288,7 @@ class SessionBridge:
                     authorized_paths=tuple(str(item) for item in authorized_paths),
                 )
                 try:
-                    prepared = self._require_session().prepare_submission(submission)
+                    prepared = replace(self._require_session().prepare_submission(submission), ui_request_id=request_id)
                 except ExternalPathConfirmationRequired:
                     # The single decision surface handles this as an approval
                     # interaction. It must be requested on the worker thread:
@@ -1196,7 +1296,7 @@ class SessionBridge:
                     # loop stays free to receive resolve_interaction. The
                     # client keeps its draft (accepted: false) and shows no
                     # custom confirmation UI.
-                    self._enqueue_external_submission(submission)
+                    self._enqueue_external_submission(submission, request_id)
                     with self._active_lock:
                         active = self._active_token is not None
                     if active:
@@ -1210,7 +1310,7 @@ class SessionBridge:
                     "id": f"user-{uuid.uuid4().hex}", "kind": "user", "title": "你",
                     "body": _user_transcript_body(submission.text, prepared.attachments),
                 }})
-                self._tasks.put(prepared)
+                self._enqueue_task(prepared)
                 with self._active_lock:
                     active = self._active_token is not None
                 if active:
@@ -1271,10 +1371,6 @@ class SessionBridge:
                 task = self._tasks.get_nowait()
             except queue.Empty:
                 break
-            if task is None:
-                self._tasks.task_done()
-                self._tasks.put(None)
-                break
             discarded += 1
             if callable(task) and self._rewind_pending:
                 self._rewind_pending = False
@@ -1292,18 +1388,20 @@ class SessionBridge:
             token.cancel()
         self._interactions.cancel_all()
         self._discard_queued_tasks()
-        self._tasks.put(None)
-        if self._session_thread is not threading.current_thread():
+        if self._session_thread is not None and self._session_thread is not threading.current_thread():
             self._session_thread.join(timeout=10)
-        if self._session_thread.is_alive():
+        if self._session_thread is not None and self._session_thread.is_alive():
             raise RuntimeError("会话初始化尚未退出，资源已保留")
         session = session or self._session
         if session is not None:
             session.close()
-        if self._worker is not threading.current_thread():
+        if self._worker is not None and self._worker is not threading.current_thread():
             self._worker.join(timeout=2)
-        if self._worker.is_alive():
+        if self._worker is not None and self._worker.is_alive():
             raise RuntimeError("会话执行线程尚未退出，资源已保留")
+        if session is None:
+            from .sessions.store import SessionStore
+            SessionStore(self.state_root).update_status(self.runtime_id, "closed")
         self._send_event({"type": "shutdown", "reason": "session closed"})
 
 
@@ -1320,6 +1418,7 @@ class BridgeServer:
         self._controls = {}
         self.registry = SessionRuntimeRegistry(self.cwd, self._create_host, self._event)
         self.registry.create()
+        self.registry.start_maintenance()
 
     def _write(self, message):
         line = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
@@ -1333,7 +1432,7 @@ class BridgeServer:
                 self._output_broken.set()
 
     def _event(self, event):
-        if event["type"] not in {"sessions", "shutdown", "session_view"}:
+        if event["type"] not in {"sessions", "shutdown", "session_view", "resources"}:
             if not event.get("sessionId") or not isinstance(event.get("sequence"), int):
                 raise ValueError("会话事件缺少寻址或序列")
         self._write({"type": "event", "event": event})
@@ -1352,7 +1451,8 @@ class BridgeServer:
         return SessionBridge(cwd=record.cwd, profile_name=self.profile_name,
                              profile_explicit=self.profile_explicit, session_id=record.id,
                              state_root=self.registry.store.root, environment=record.environment, emit=send,
-                             session_action=lambda name, params: self._action(record.id, name, params))
+                             session_action=lambda name, params: self._action(record.id, name, params),
+                             project_resources=self.registry.resources)
 
     def _sessions_panel(self):
         active = {entry.id: entry for entry in self.registry._records.values()}
@@ -1370,6 +1470,9 @@ class BridgeServer:
         return {"kind": "sessions", "title": "会话", "searchable": True, "options": options}
 
     def _action(self, session_id, name, params):
+        if name == "watch_resources":
+            self.registry.watch_resources = bool(params.get("enabled"))
+            return {"ok": True, "resources": self.registry.resource_snapshot()}
         if name == "new_session":
             return {"ok": True, "sessionId": self.registry.create()}
         if name == "open_sessions" or (name == "open_panel" and params.get("panel") == "sessions"):
@@ -1396,7 +1499,7 @@ class BridgeServer:
             if record.environment != "worktree":
                 raise ValueError("当前会话不在 Worktree 中")
             record.host._require_session()
-            record.host._tasks.put(lambda: self._apply_worktree(record))
+            record.host._enqueue_task(lambda: self._apply_worktree(record))
             return {"ok": True, "message": "已排队应用到 Local"}
         if name == "sync_session":
             return {"ok": True, "sessionId": session_id, "view": self.registry.snapshot(session_id)}

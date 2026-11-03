@@ -15,6 +15,7 @@ import type { Theme, ThemeMode } from "./theme.ts";
 import { WorkStrip } from "./workbench/WorkStrip.tsx";
 import { Workbench } from "./workbench/Workbench.tsx";
 import type { SessionUI, SessionViewState } from "./state.ts";
+import { Resources } from "./Resources.tsx";
 import { SessionTabs } from "./SessionTabs.tsx";
 import type { WorkbenchTab } from "./workbench/strip.ts";
 
@@ -1070,7 +1071,7 @@ function CompletionOverlay({ theme, title, footer, bottomOffset, maxHeight, narr
   );
 }
 
-function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queueDepth, commands, theme, icons, compact, narrow, terminalWidth, terminalHeight, disabled, sessionReady, onAction, attachments, onAddFiles, onStagePaths, onPaste, onRemoveAttachment, snapshot, onOpenPanel }: { value: string; onChange: (value: string) => void; onSubmit: () => void; onCancel: () => void; running: boolean; stopping: boolean; queueDepth: number; commands: CommandItem[]; theme: Theme; icons: IconSet; compact: boolean; narrow: boolean; terminalWidth: number; terminalHeight: number; disabled: boolean; sessionReady: boolean; onAction?: AppProps["onAction"]; attachments: AttachmentItem[]; onAddFiles: () => void; onStagePaths: (paths: string[], source: "mention" | "clipboard") => Promise<boolean>; onPaste: (editor: TextareaRenderable | null) => void; onRemoveAttachment: (id: string) => void; snapshot: typeof initialState.snapshot; onOpenPanel: (panel: "profile" | "permission" | "model" | "effort") => void }) {
+function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queueDepth, waitingReason, commands, theme, icons, compact, narrow, terminalWidth, terminalHeight, disabled, sessionReady, onAction, attachments, onAddFiles, onStagePaths, onPaste, onRemoveAttachment, snapshot, onOpenPanel }: { value: string; onChange: (value: string) => void; onSubmit: () => void; onCancel: () => void; running: boolean; stopping: boolean; queueDepth: number; waitingReason: string | null; commands: CommandItem[]; theme: Theme; icons: IconSet; compact: boolean; narrow: boolean; terminalWidth: number; terminalHeight: number; disabled: boolean; sessionReady: boolean; onAction?: AppProps["onAction"]; attachments: AttachmentItem[]; onAddFiles: () => void; onStagePaths: (paths: string[], source: "mention" | "clipboard") => Promise<boolean>; onPaste: (editor: TextareaRenderable | null) => void; onRemoveAttachment: (id: string) => void; snapshot: typeof initialState.snapshot; onOpenPanel: (panel: "profile" | "permission" | "model" | "effort") => void }) {
   const [selected, setSelected] = useState(0);
   const [mentions, setMentions] = useState<Completion[]>([]);
   const [dismissedCompletionValue, setDismissedCompletionValue] = useState<string | null>(null);
@@ -1232,6 +1233,7 @@ function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queu
             <ContextGauge percent={snapshot.contextPercent} tokens={snapshot.contextTokens ?? 0} windowTokens={snapshot.contextWindowTokens ?? 0} theme={theme} />
             <ToolbarAction label={`${icons.assistant} ${modelText} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("model")} />
             <ToolbarAction label={`${effortLabel(snapshot.reasoningEffort)} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("effort")} />
+            {waitingReason ? <text fg={theme.warning}>{` ${waitingReason}`}</text> : null}
             {queueDepth ? <text fg={theme.subtle}>{` 已排队 ${queueDepth}`}</text> : null}
             {stopping ? <text fg={theme.subtle}> 停止中…</text> : running ? <StopAction icon={icons.stop} theme={theme} onStop={onCancel} /> : null}
           </box>
@@ -1459,7 +1461,7 @@ const SessionPane = React.memo(function SessionPane({ resolvedTheme: theme, stat
     <box style={{ flexDirection: "column", width: "100%", height: 1, flexGrow: 1, flexShrink: 1, minHeight: 0, backgroundColor: theme.background }}>
       <Transcript scrollTop={ui.scrollTop} onSaveScroll={(position) => updateUI("scrollTop", position)} items={state.items} theme={theme} icons={icons} narrow={narrow} onRewind={!running && !state.interaction && !workbenchOpen && !panel && onAction ? (pointId) => void invoke("rewind", { pointId }) : undefined} />
       <WorkStrip work={state.work} width={width} theme={theme} onOpen={openWorkbench} />
-      {state.interaction ? <InteractionView key={state.interaction.id} interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping || workbenchOpen} sessionReady={Boolean(state.snapshot.sessionId) && state.snapshot.status !== "failed"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
+      {state.interaction ? <InteractionView key={state.interaction.id} interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} waitingReason={state.waitingReason} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping || workbenchOpen} sessionReady={Boolean(state.snapshot.sessionId) && state.snapshot.status !== "failed"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
       {panel && !state.interaction ? <PanelOverlay panel={panel} anchor={panelAnchor} theme={theme} icons={icons} terminalWidth={width} terminalHeight={height} onClose={() => setPanel(null)} onSelect={selectPanel} busyId={panelBusyId} /> : null}
       {workbenchOpen && !state.interaction ? (
         <Workbench
@@ -1488,7 +1490,8 @@ export function App(props: WorkbenchAppProps) {
   const [app, dispatch] = useReducer(reduceEvent, initialAppState);
   const activeId = app.activeSessionId;
   const active = activeId ? app.sessions[activeId] : undefined;
-  const { width } = useTerminalDimensions();
+  const { width, height } = useTerminalDimensions();
+  const [resourcesOpen, setResourcesOpen] = useState(false);
   const renderer = useRenderer();
   const [detected, setDetected] = useState<ThemeMode | null>(null);
   const theme = resolveTheme(props.themePreference ?? "auto", detected);
@@ -1552,6 +1555,7 @@ export function App(props: WorkbenchAppProps) {
     if (!id) return;
     try {
       const result = await actionRef.current?.(id, name, params);
+      if (result?.resources) dispatch({ type: "resources", snapshot: result.resources });
       if (result?.message) dispatch({ type: "local_event", sessionId: id, event: { type: "notice", text: result.message } });
       return result;
     }
@@ -1588,8 +1592,10 @@ export function App(props: WorkbenchAppProps) {
       width={width} theme={theme} onSelect={(id) => void invoke("switch_session", { sessionId: id })}
       onNew={() => void invoke("new_session")} onHide={(id) => void invoke("hide_session", { sessionId: id })}
       onSwitcher={() => void invoke("open_sessions").then((result) => { if (result?.panel) updateUI("panel", result.panel); })}
+      resourcesOpen={resourcesOpen} onResources={() => { const enabled = !resourcesOpen; setResourcesOpen(enabled); void invoke("watch_resources", { enabled }); }}
       onWorktree={() => void invoke("fork_worktree")} onFork={() => void invoke("fork_session")}
       onApply={descriptor?.environment === "worktree" ? () => void invoke("apply_worktree") : undefined} />
+    {resourcesOpen ? <Resources snapshot={app.resources} theme={theme} height={height} onSelect={(id) => void invoke("switch_session", { sessionId: id })} /> : null}
     <SessionPane key={activeId} {...props} {...scoped} resolvedTheme={theme} state={active.view} ui={active.ui} updateUI={updateUI} />
   </box>;
 }

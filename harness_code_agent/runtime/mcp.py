@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import json
 import logging
@@ -9,6 +10,7 @@ import os
 import re
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
@@ -25,6 +27,11 @@ from .permissions import (
 )
 from .recovery import atomic_bytes
 from .tool_result import ToolResult
+from .project_resources import ProjectResourceBudget
+
+_static_lock = threading.RLock()
+_config_cache = {}
+_schema_cache = {}
 
 MCP_CONFIG_RELATIVE_PATH = Path(".harness") / "mcp.json"
 MCP_TOOL_PREFIX = "mcp__"
@@ -250,8 +257,16 @@ class McpClientManager:
         config_error: str | None = None,
         timeout_seconds: float = 30.0,
         tool_timeout_seconds: float = 120.0,
+        project_resources=None,
+        session_id=None,
     ):
         self.workspace = Path(workspace).resolve()
+        self.project_resources = project_resources or ProjectResourceBudget.for_project(self.workspace)
+        self._resource_owner = weakref.finalize(self, self.project_resources.hold())
+        self.session_id = session_id
+        self._connect_lock = threading.RLock()
+        self._catalog_only = set()
+        self._closed = False
         self.config = config or McpConfig(path=self.workspace / MCP_CONFIG_RELATIVE_PATH)
         self.config_error = config_error
         self.timeout_seconds = timeout_seconds
@@ -264,17 +279,66 @@ class McpClientManager:
         self._loop_thread: _AsyncLoopThread | None = None
 
     @classmethod
-    def from_workspace(cls, workspace: str | Path) -> McpClientManager:
+    def from_workspace(cls, workspace: str | Path, *, project_resources=None, session_id=None) -> McpClientManager:
         try:
-            config = load_mcp_config(workspace)
-            return cls(workspace=workspace, config=config)
-        except McpConfigError as exc:
+            path = Path(workspace).resolve() / MCP_CONFIG_RELATIVE_PATH
+            info = path.stat() if path.exists() else None
+            signature = (info.st_mtime_ns, info.st_size) if info else None
+            with _static_lock:
+                cached = _config_cache.get(path)
+                if cached is None or cached[0] != signature:
+                    cached = (signature, load_mcp_config(workspace))
+                    _config_cache[path] = cached
+                config = copy.deepcopy(cached[1])
+            return cls(workspace=workspace, config=config, project_resources=project_resources, session_id=session_id)
+        except (McpConfigError, OSError) as exc:
             root = Path(workspace).resolve()
             return cls(
                 workspace=root,
                 config=McpConfig(path=root / MCP_CONFIG_RELATIVE_PATH),
                 config_error=str(exc),
+                project_resources=project_resources, session_id=session_id,
             )
+
+    def _schema_key(self, server):
+        data = dict(workspace=str(self.workspace), server=_server_entry(server))
+        return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+
+    def prime_catalog(self):
+        with self._connect_lock, _static_lock:
+            for server in self.config.servers.values():
+                if any(binding.server_name == server.name for binding in self.tool_bindings):
+                    continue
+                cached = _schema_cache.get(self._schema_key(server), ())
+                for binding in copy.deepcopy(cached):
+                    self.tool_bindings.append(binding)
+                    self._bindings_by_exposed_name[binding.exposed_name] = binding
+                    self._catalog_only.add(binding.exposed_name)
+
+    def discover(self, server_name=None, *, cancellation_token=None):
+        self.prime_catalog()
+        for server in self.config.servers.values():
+            if server_name is not None and server.name != server_name:
+                continue
+            if not any(binding.server_name == server.name for binding in self.tool_bindings):
+                self.ensure_connected(server.name, cancellation_token=cancellation_token)
+
+    def ensure_connected(self, server_name, *, cancellation_token=None):
+        while not self._connect_lock.acquire(timeout=.05):
+            if cancellation_token is not None:
+                cancellation_token.check()
+        try:
+            connection = self._connections.get(server_name)
+            if connection is not None and connection.task is not None and not connection.task.done():
+                return
+            if self._closed:
+                raise RuntimeError("MCP manager is closed")
+            server = self.config.servers[server_name]
+            self._ensure_loop()
+            self._loop_thread.run(self._connect_one_and_store(server), timeout=None,
+                                  cancellation_token=cancellation_token)
+        finally:
+            self._connect_lock.release()
 
     def connect_all(self) -> None:
         if self.config_error:
@@ -287,40 +351,13 @@ class McpClientManager:
             return
         if not self.config.servers:
             return
-        self._ensure_loop()
-        self._run(self._connect_all_parallel())
-
-    async def _connect_all_parallel(self) -> None:
-        """Connect to all configured MCP servers concurrently."""
-        servers = list(self.config.servers.values())
-        results = await asyncio.gather(
-            *(self._connect_one(server) for server in servers),
-            return_exceptions=True,
-        )
-        for server, result in zip(servers, results):
-            if isinstance(result, BaseException):
-                self.statuses[server.name] = McpServerStatus(
-                    name=server.name,
-                    transport=server.transport,
-                    state="failed",
-                    error=f"{type(result).__name__}: {result}",
-                )
-                continue
-            connection, bindings = result
+        for server in self.config.servers.values():
             try:
-                # A worker may exit while a sibling server is still connecting.
-                # Publish ``connected`` only if the worker is alive at this
-                # instant; the state transition and the registry update happen
-                # in the same loop tick, so no callback can interleave.
-                self._store_connection(server, connection, bindings)
-            except RuntimeError as exc:
-                with contextlib.suppress(Exception):
-                    await self._close_connections([connection])
+                self.ensure_connected(server.name)
+            except Exception as exc:
                 self.statuses[server.name] = McpServerStatus(
-                    name=server.name,
-                    transport=server.transport,
-                    state="failed",
-                    error=f"RuntimeError: {exc}",
+                    name=server.name, transport=server.transport, state="failed",
+                    error=f"{type(exc).__name__}: {exc}",
                 )
 
     async def _connect_one(
@@ -328,27 +365,28 @@ class McpClientManager:
         server: McpServerConfig,
     ) -> tuple[_McpConnection, list[McpToolBinding]]:
         """Connect to a single server with a per-server timeout."""
-        request_queue: asyncio.Queue = asyncio.Queue()
-        ready: asyncio.Future = asyncio.get_running_loop().create_future()
-        connection = _McpConnection(config=server, request_queue=request_queue, task=None)
-        task = asyncio.create_task(self._connection_worker(server, request_queue, ready))
-        connection.task = task
-        task.add_done_callback(lambda _task, item=connection: self._on_worker_done(item))
-        try:
-            bindings = await asyncio.wait_for(
-                asyncio.shield(ready), timeout=self.timeout_seconds
-            )
-        except asyncio.CancelledError:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-            raise
-        except Exception:
-            task.cancel()
-            with contextlib.suppress(Exception):
-                await task
-            raise
-        return connection, bindings
+        async with self.project_resources.acquire_async("mcp_connect", session_id=self.session_id, label=server.name):
+            request_queue: asyncio.Queue = asyncio.Queue()
+            ready: asyncio.Future = asyncio.get_running_loop().create_future()
+            connection = _McpConnection(config=server, request_queue=request_queue, task=None)
+            task = asyncio.create_task(self._connection_worker(server, request_queue, ready))
+            connection.task = task
+            task.add_done_callback(lambda _task, item=connection: self._on_worker_done(item))
+            try:
+                bindings = await asyncio.wait_for(
+                    asyncio.shield(ready), timeout=self.timeout_seconds
+                )
+            except asyncio.CancelledError:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                raise
+            except Exception:
+                task.cancel()
+                with contextlib.suppress(Exception):
+                    await task
+                raise
+            return connection, bindings
 
     def register_tools(self, registry, snapshot: McpCatalogSnapshot | None = None) -> None:
         from .execution_planner import CallEffect, ResourceClaim
@@ -421,10 +459,14 @@ class McpClientManager:
         and then be routed to a newer binding from another connection.
         """
         try:
-            return self._run(
+            binding = self._bindings_by_exposed_name.get(exposed_name)
+            if binding is not None:
+                self.ensure_connected(binding.server_name, cancellation_token=cancellation_token)
+            self._ensure_loop()
+            return self._loop_thread.run(
                 self._dispatch_tool(exposed_name, dict(arguments or {}), expected_binding),
                 cancellation_token=cancellation_token,
-                timeout=self.tool_timeout_seconds,
+                timeout=None,
             )
         except CancelledError:
             raise
@@ -532,7 +574,7 @@ class McpClientManager:
             "## MCP Servers",
             "",
             (
-                "Connected MCP servers. Their tools are not mounted up front; use the id when "
+                "Configured MCP servers, connected on demand. Use the server id when "
                 "calling search_tools:"
             ),
         ]
@@ -740,8 +782,7 @@ class McpClientManager:
             return f"MCP 服务不存在或未启用：{server_name}"
         self._drop_server(server_name)
         try:
-            self._ensure_loop()
-            self._run(self._connect_one_and_store(server))
+            self.ensure_connected(server_name)
         except Exception as exc:
             return f"MCP 服务连接失败：{server_name}（{type(exc).__name__}: {exc}）"
         status = self.statuses.get(server_name)
@@ -801,8 +842,14 @@ class McpClientManager:
             state="connected",
             tool_count=len(bindings),
         )
-        self.tool_bindings.extend(bindings)
+        bindings = [self._bindings_by_exposed_name[item.exposed_name]
+                    if item.exposed_name in self._catalog_only and self._bindings_by_exposed_name.get(item.exposed_name) == item
+                    else item for item in bindings]
+        self.tool_bindings = [item for item in self.tool_bindings if item.server_name != server.name] + bindings
         self._bindings_by_exposed_name.update({item.exposed_name: item for item in bindings})
+        self._catalog_only.difference_update(item.exposed_name for item in bindings)
+        with _static_lock:
+            _schema_cache[self._schema_key(server)] = copy.deepcopy(tuple(bindings))
         self.connection_revision += 1
 
     async def _register_connection(
@@ -967,7 +1014,11 @@ class McpClientManager:
         return True, f"{len(self.config.servers)} server(s), {len(self.tool_bindings)} tool(s)"
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         if self._loop_thread is None:
+            self._resource_owner()
             return
         try:
             try:
@@ -977,6 +1028,7 @@ class McpClientManager:
         finally:
             self._loop_thread.close()
             self._loop_thread = None
+            self._resource_owner()
 
     async def _connection_worker(
         self,
@@ -1042,7 +1094,9 @@ class McpClientManager:
                 if response.cancelled():
                     return
                 try:
-                    result = await session.call_tool(binding.tool_name, arguments)
+                    async with self.project_resources.acquire_async(f"mcp:{server.name}", session_id=self.session_id, label=binding.exposed_name):
+                        result = await asyncio.wait_for(session.call_tool(binding.tool_name, arguments),
+                                                        timeout=self.tool_timeout_seconds)
                     tool_result = mcp_result_to_tool_result(binding.exposed_name, result, binding=binding)
                 except Exception as exc:
                     if not response.done():
@@ -1471,7 +1525,7 @@ class _AsyncLoopThread:
         self._thread.start()
         self._ready.wait(timeout=5)
 
-    def run(self, coro, *, timeout: float, cancellation_token=None):
+    def run(self, coro, *, timeout: float | None, cancellation_token=None):
         future: Future = Future()
         actor_holder: list[asyncio.Task | None] = [None]
 
@@ -1480,12 +1534,12 @@ class _AsyncLoopThread:
             self._queue.put_nowait((coro, future, actor_holder))
 
         self.loop.call_soon_threadsafe(submit)
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
             if cancellation_token is not None and cancellation_token.is_cancelled:
                 self._cancel(future, actor_holder)
                 raise CancelledError("Turn cancelled by user")
-            remaining = deadline - time.monotonic()
+            remaining = deadline - time.monotonic() if deadline is not None else .05
             if remaining <= 0:
                 self._cancel(future, actor_holder)
                 raise TimeoutError("MCP operation timed out and was cancelled")

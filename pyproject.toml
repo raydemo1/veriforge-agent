@@ -37,8 +37,13 @@ veriforge = "harness_code_agent.cli:main"
 # run artifacts (including stale symlink trees on Windows) that are not
 # tests and break collection when pytest recurses the whole repository.
 testpaths = ["tests"]
-addopts = "--strict-markers -m 'not integration'"
-markers = ["integration: requires installed external tools"]
+addopts = "--strict-markers -m 'not integration and not external'"
+markers = [
+    "integration: requires installed native sandbox or language tools",
+    "session: initializes complete Session, subprocess transport, or multi-session execution",
+    "external: explicitly enabled external service acceptance",
+]
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.setuptools.packages.find]
 include = ["harness_code_agent*"]

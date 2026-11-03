@@ -10,6 +10,8 @@ from harness_code_agent.agent.cancellation import CancellationToken
 from harness_code_agent.agent.coordinator import AgentCoordinator
 from harness_code_agent.runtime.task_supervisor import ToolTaskSupervisor
 
+pytestmark = pytest.mark.session
+
 
 def test_lingering_foreground_future_blocks_next_turn(runtime_factory):
     session = runtime_factory[0]()
@@ -40,7 +42,7 @@ def test_coordinator_close_is_bounded_and_preserves_dependencies():
     coordinator = AgentCoordinator.__new__(AgentCoordinator)
     coordinator._condition = threading.Condition()
     coordinator._version = 0
-    coordinator._executor = executor
+    coordinator._resource_owner = Mock()
     record = SimpleNamespace(token=CancellationToken(), future=future, conversation=Mock())
     coordinator._records = {"blocked": record}
     coordinator.context = SimpleNamespace(tool_tasks=ToolTaskSupervisor())

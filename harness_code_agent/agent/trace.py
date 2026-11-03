@@ -1,9 +1,13 @@
 """Agent trace writer."""
 from __future__ import annotations
 
-import contextlib
 import json
+import logging
+import re
+import threading
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import config
@@ -16,36 +20,47 @@ def _truncate(s: str, n: int) -> str:
 class TraceWriter:
     """Appends structured events to a JSONL trace file in the harness directory.
 
-    Each line is a JSON object with: timestamp, agent, event_type, and data.
-    Trace file: {WORKSPACE}/.harness/traces/trace_{agent_name}.jsonl
+    Each writer has its own file beneath the session's trace directory.
     """
 
-    def __init__(self, agent_name: str, *, workspace: str | Path | None = None):
+    def __init__(self, agent_name: str, *, workspace: str | Path | None = None,
+                 session_id: str | None = None, turn_id=None, request_id=None):
         self.agent_name = agent_name
-        self._start_time = time.time()
-        trace_dir = Path(workspace or Path.cwd()).resolve() / ".harness" / "traces"
+        self.session_id = session_id or "standalone_" + uuid.uuid4().hex
+        self._turn_id = turn_id or (lambda: None)
+        self._request_id = request_id or (lambda: None)
+        self._start_time = time.monotonic()
+        self._lock = threading.Lock()
+        self._path = None
+        safe = lambda value: re.sub(r"[^a-zA-Z0-9_-]", "_", value)
+        trace_dir = Path(workspace or Path.cwd()).resolve() / ".harness" / "traces" / safe(self.session_id)
         try:
             trace_dir.mkdir(parents=True, exist_ok=True)
-            test_file = trace_dir / f"trace_test_{agent_name}"
-            test_file.write_text("test")
-            test_file.unlink()
-            self._path = trace_dir / f"trace_{agent_name}.jsonl"
-        except OSError:
-            # Workspace not writable, use harness-agent dir
-            self._path = Path(__file__).parent / f"trace_{agent_name}.jsonl"
+            self._path = trace_dir / f"{safe(agent_name)}_{uuid.uuid4().hex}.jsonl"
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Cannot create session trace directory: %s", exc)
 
     def _write(self, event_type: str, data: dict):
-        with contextlib.suppress(Exception):  # never let tracing break the agent
+        with self._lock:
             entry = {
-                "t": round(time.time() - self._start_time, 2),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "t": round(time.monotonic() - self._start_time, 3),
                 "agent": self.agent_name,
                 "event": event_type,
+                "session_id": self.session_id,
+                "turn_id": self._turn_id(),
+                "ui_request_id": self._request_id(),
+                "tool_call_id": None,
                 **data,
             }
             line = json.dumps(entry, ensure_ascii=False)
-            # Write to file
-            with open(self._path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            if self._path is not None:
+                try:
+                    with self._path.open("a", encoding="utf-8") as stream:
+                        stream.write(line + "\n")
+                except OSError as exc:
+                    self._path = None
+                    logging.getLogger(__name__).warning("Session trace write failed: %s", exc)
             if config.TRACE_STDERR:
                 import sys
                 print(f"[TRACE] {line}", file=sys.stderr)
@@ -60,11 +75,13 @@ class TraceWriter:
             "finish_reason": finish_reason,
         })
 
-    def tool_call(self, name: str, args: dict, result: str):
+    def tool_call(self, name: str, args: dict, result: str, *, tool_call_id=None, shell_job_id=None):
         self._write("tool_call", {
             "tool": name,
             "args": _truncate(json.dumps(args, ensure_ascii=False), 300),
             "result": _truncate(result, 500),
+            "tool_call_id": tool_call_id,
+            "shell_job_id": shell_job_id,
         })
 
     def middleware_inject(self, source: str, hook: str, message: str):

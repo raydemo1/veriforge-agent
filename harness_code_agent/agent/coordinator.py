@@ -4,15 +4,16 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import wait
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .. import config
-from ..runtime.execution_planner import acquire_concurrency, workspace_claim
+from ..runtime.execution_planner import workspace_claim
 from ..runtime.middleware.stack import build_subagent_middlewares
 from ..runtime.output_artifacts import copy_artifact, file_digest
 from ..runtime.permissions import PermissionPolicy
@@ -31,17 +32,10 @@ READ_ONLY_ROLES = AGENT_ROLES - {"worker"}
 ACTIVE_STATES = {"queued", "running"}
 TERMINAL_STATES = {"completed", "blocked", "failed", "interrupted", "closed"}
 MAX_OPEN_AGENTS = max(1, int(config.MAX_OPEN_AGENTS))
-MAX_CONCURRENT_AGENTS = max(1, int(config.MAX_CONCURRENT_AGENTS))
 
 
 class SubagentCapacityError(ValueError):
-    """Raised when the open-agent slot cap (not a policy rule) is reached.
-
-    Subclasses ValueError so existing ``except ValueError`` callers keep
-    working; spawn_agent distinguishes it to emit a resource-class failure.
-    Note: the concurrency semaphore (MAX_CONCURRENT_AGENTS) blocks queued
-    workers rather than raising; this error covers the hard open cap.
-    """
+    """The maximum number of open agents has been reached."""
 
 @dataclass
 class AgentRecord:
@@ -77,7 +71,6 @@ class AgentCoordinator:
         parent_messages: Callable[[], list[dict]] | None = None,
         parent_system_prompt: Callable[[], str] | None = None,
         parent_message_sink: Callable[[str, str], None] | None = None,
-        max_concurrent: int = MAX_CONCURRENT_AGENTS,
     ) -> None:
         self.context = tool_context
         self._parent_messages = parent_messages or list
@@ -86,7 +79,8 @@ class AgentCoordinator:
         # topology is fixed Main <-> Child: this is the only upward path,
         # there is no child-to-child addressing.
         self._parent_message_sink = parent_message_sink
-        self._executor = ThreadPoolExecutor(max_workers=max(1, int(max_concurrent)), thread_name_prefix="hca-agent")
+        self._resources = tool_context.project_resources
+        self._resource_owner = weakref.finalize(self, self._resources.hold())
         self._condition = threading.Condition(threading.RLock())
         self._records: dict[str, AgentRecord] = {}
         self._names: dict[str, str] = {}
@@ -149,7 +143,7 @@ class AgentCoordinator:
                 parent_cancellation_token.check()
             self._records[agent_id] = record
             self._names[clean_name] = agent_id
-            record.future = self._executor.submit(self._run_record, agent_id)
+            record.future = self._submit_record(record)
             self._changed_locked()
         self._emit(record, "agent_spawned")
         return self._snapshot(record)
@@ -204,7 +198,7 @@ class AgentCoordinator:
                     record.conversation.add_user_turn(text)
                 record.error = None
                 record.state = "queued"
-                record.future = self._executor.submit(self._run_record, record.id)
+                record.future = self._submit_record(record)
             else:
                 raise ValueError(f"cannot follow up agent in state: {record.state}")
             self._changed_locked()
@@ -233,10 +227,12 @@ class AgentCoordinator:
             return {"agents": [self._snapshot(record) for record in records]}
 
     def interrupt(self, agent_id: str) -> dict:
-        record = self._record(agent_id)
-        token = record.token
-        if token is not None:
-            token.cancel()
+        with self._condition:
+            record = self._record(agent_id)
+            if record.token is not None:
+                record.token.cancel()
+            if record.future is not None and record.future.cancel():
+                self._finish(record, "interrupted", error="Agent cancelled before execution")
         return self._snapshot(record)
 
     def close_agent(self, agent_id: str, *, discard_changes: bool = False) -> dict:
@@ -289,7 +285,9 @@ class AgentCoordinator:
                 if record.token is not None:
                     record.token.cancel()
             self._changed_locked()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        for record in records:
+            if record.future is not None:
+                record.future.cancel()
         futures = [record.future for record in records
                    if record.future is not None and not record.future.done()]
         if futures:
@@ -303,52 +301,54 @@ class AgentCoordinator:
                 record.conversation.close()
             self._publish_outputs(record)
         self.changes.close()
+        self._resource_owner()
+
+    def _submit_record(self, record):
+        record.token = CancellationToken()
+        return self._resources.submit("agents", self._run_record, record.id,
+                                      session_id=self.context.session_id, label=record.name)
 
     def _run_record(self, agent_id: str) -> None:
         record = self._record(agent_id)
-        with acquire_concurrency("subagent"):
-            try:
-                self._ensure_conversation(record)
-                while True:
-                    with self._condition:
-                        if self._closed:
-                            return
-                        record.state = "running"
-                        record.started_at = record.started_at or time.time()
-                        record.ended_at = None
-                        previous_token = record.token
-                        record.token = CancellationToken()
-                        if previous_token is not None:
-                            previous_token.close()
-                        token = record.token
-                        self._changed_locked()
-                    self._emit(record, "agent_status", status="running")
-                    if record.conversation.messages[-1].get("role") != "user":
-                        next_task = self._take_followup(record)
-                        if next_task:
-                            record.conversation.add_user_turn(next_task)
-                    result = record.conversation.run_until_idle(cancellation_token=token)
-                    record.summary = str(result or "")
-                    with self._condition:
-                        if record.conversation.has_queued_messages():
-                            continue
-                    if record.role == "worker":
-                        proposal = self.changes.finalize(record.id, record.allowed_paths)
-                        record.proposal_id = proposal.id
-                        if proposal.invalid_reasons:
-                            self._finish(record, "failed", error="; ".join(proposal.invalid_reasons))
-                            return
-                    followup = self._take_followup(record)
-                    if followup:
-                        record.conversation.add_user_turn(followup)
+        try:
+            record.token.check()
+            self._ensure_conversation(record)
+            while True:
+                with self._condition:
+                    if self._closed:
+                        return
+                    record.state = "running"
+                    record.started_at = record.started_at or time.time()
+                    record.ended_at = None
+                    token = record.token
+                    token.check()
+                    self._changed_locked()
+                self._emit(record, "agent_status", status="running")
+                if record.conversation.messages[-1].get("role") != "user":
+                    next_task = self._take_followup(record)
+                    if next_task:
+                        record.conversation.add_user_turn(next_task)
+                result = record.conversation.run_until_idle(cancellation_token=token)
+                record.summary = str(result or "")
+                with self._condition:
+                    if record.conversation.has_queued_messages():
                         continue
-                    self._finish(record, "completed")
-                    return
-            except CancelledError as exc:
-                self._finish(record, "interrupted", error=str(exc))
-            except Exception as exc:  # noqa: BLE001 - thread boundary records failures
-                self._finish(record, "failed", error=f"{type(exc).__name__}: {exc}")
-
+                if record.role == "worker":
+                    proposal = self.changes.finalize(record.id, record.allowed_paths)
+                    record.proposal_id = proposal.id
+                    if proposal.invalid_reasons:
+                        self._finish(record, "failed", error="; ".join(proposal.invalid_reasons))
+                        return
+                followup = self._take_followup(record)
+                if followup:
+                    record.conversation.add_user_turn(followup)
+                    continue
+                self._finish(record, "completed")
+                return
+        except CancelledError as exc:
+            self._finish(record, "interrupted", error=str(exc))
+        except Exception as exc:  # noqa: BLE001 - thread boundary records failures
+            self._finish(record, "failed", error=f"{type(exc).__name__}: {exc}")
     def _ensure_conversation(self, record: AgentRecord) -> None:
         if record.conversation is not None:
             return
@@ -362,12 +362,21 @@ class AgentCoordinator:
         else:
             workspace = self.context.workspace
         registry = self._role_registry(record.role)
+
+        def discover_mcp(server_name=None):
+            self.context.discover_mcp_tools(server_name)
+            for spec in self._role_registry(record.role).specs():
+                registry.register_spec(spec)
+
         policy = PermissionPolicy.for_role(
             record.role,
             allowed_paths=record.allowed_paths,
         )
         sub_context = ToolContext(
             workspace=workspace,
+            project_resources=self.context.project_resources,
+            ui_request_id=self.context.ui_request_id,
+            discover_mcp_tools=discover_mcp if self.context.discover_mcp_tools is not None else None,
             permission_policy=policy,
             event_bus=self.context.event_bus,
             session_id=self.context.session_id,

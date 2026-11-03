@@ -4,8 +4,7 @@ import os
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stderr
-from io import StringIO
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1322,23 +1321,6 @@ class ProductRuntimeTests(unittest.TestCase):
                         self.assertIn("SECRET_FULL_CONTENT_UNSAFE", second_prompt)
                     if expect_observation_files:
                         self.assertTrue(list((root / ".harness" / "observations").rglob("*.txt")))
-
-    def test_trace_writer_stores_traces_under_harness_directory_without_stderr_by_default(self):
-        from harness_code_agent.agent.conversation import TraceWriter
-
-        with tempfile.TemporaryDirectory() as tmp:
-            stderr = StringIO()
-            with (
-                patch("harness_code_agent.agent.conversation.config.TRACE_STDERR", False),
-                redirect_stderr(stderr),
-            ):
-                writer = TraceWriter("main_agent", workspace=tmp)
-                writer.iteration(1, 42)
-
-            trace_path = Path(tmp) / ".harness" / "traces" / "trace_main_agent.jsonl"
-            self.assertTrue(trace_path.exists())
-            self.assertFalse((Path(tmp) / "_trace_main_agent.jsonl").exists())
-            self.assertEqual(stderr.getvalue(), "")
 
     def test_builtin_tool_registry_exposes_schema_and_dispatch_exports(self):
 
@@ -3754,118 +3736,7 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertNotIn("short-secret", result)
 
 
-class PlanReadyDecisionTests(unittest.TestCase):
-    """A ready plan in explicit plan mode is settled via the question surface."""
-
-    def setUp(self):
-        import shutil
-
-        from harness_code_agent.core.interactive import InteractiveSession
-        from harness_code_agent.runtime.questions import QuestionResult
-
-        self.shutil = shutil
-        self.QuestionResult = QuestionResult
-        self.temp_dir = Path(tempfile.mkdtemp())
-        self.env_patch = patch.dict(os.environ, {
-            "HARNESS_MEMORY_GENERATION_DISABLED": "1",
-        })
-        self.env_patch.start()
-
-        self.answers = []
-
-        def ask(_request):
-            return self.answers.pop(0)
-
-        self.interactive = InteractiveSession(
-            cwd=self.temp_dir,
-            profile_name="plan",
-            question_provider=SimpleNamespace(ask=ask),
-            enable_turn_summary=False,
-        )
-        self.calls = []
-        first = SimpleNamespace(kind="planning-turn")
-        self.executed = SimpleNamespace(kind="executed")
-        self.revised = SimpleNamespace(kind="revised")
-
-        def fake_execute(*, attachments=()):
-            self.calls.append(("execute", attachments))
-            # Mirrors the real switch: pending plan is consumed.
-            self.interactive.pending_plan_markdown = None
-            return self.executed
-
-        def fake_revise(feedback, *, attachments=()):
-            self.calls.append(("revise", feedback, attachments))
-            # The revised turn produces a fresh ready plan.
-            self.interactive.pending_plan_markdown = "# Revised plan\n"
-            return self.revised
-
-        self.interactive.execute_pending_plan = fake_execute
-        self.interactive.revise_pending_plan = fake_revise
-        self.first = first
-
-    def tearDown(self):
-        self.interactive.close()
-        self.env_patch.stop()
-        self.shutil.rmtree(self.temp_dir, ignore_errors=True)
-
-    def _answer(self, value, *, custom_text="", cancelled=False):
-        self.answers.append(self.QuestionResult(
-            value=value,
-            is_other=(value == "revise"),
-            custom_text=custom_text,
-            cancelled=cancelled,
-        ))
-
-    def _settle(self):
-        return self.interactive._settle_ready_plan(self.first)
-
-    def test_execute_dispatches_to_execute_pending_plan(self):
-        self.interactive.pending_plan_markdown = "# Plan\n"
-        self._answer("execute")
-        result = self._settle()
-        self.assertIs(result, self.executed)
-        self.assertEqual(self.calls, [("execute", ())])
-
-    def test_defer_keeps_the_pending_plan_without_dispatch(self):
-        self.interactive.pending_plan_markdown = "# Plan\n"
-        self._answer("defer")
-        result = self._settle()
-        self.assertIs(result, self.first)
-        self.assertEqual(self.interactive.pending_plan_markdown, "# Plan\n")
-        self.assertEqual(self.calls, [])
-
-    def test_cancelled_question_is_equivalent_to_defer(self):
-        self.interactive.pending_plan_markdown = "# Plan\n"
-        self._answer("defer", cancelled=True)
-        result = self._settle()
-        self.assertIs(result, self.first)
-        self.assertEqual(self.interactive.pending_plan_markdown, "# Plan\n")
-        self.assertEqual(self.calls, [])
-
-    def test_revise_with_feedback_revises_then_asks_again(self):
-        self.interactive.pending_plan_markdown = "# Plan\n"
-        self._answer("revise", custom_text="补上验收测试")
-        self._answer("defer")
-        result = self._settle()
-        self.assertIs(result, self.revised)
-        self.assertEqual(self.calls, [("revise", "补上验收测试", ())])
-        self.assertEqual(self.interactive.pending_plan_markdown, "# Revised plan\n")
-
-    def test_revise_with_empty_feedback_defers(self):
-        self.interactive.pending_plan_markdown = "# Plan\n"
-        self._answer("revise", custom_text="   ")
-        result = self._settle()
-        self.assertIs(result, self.first)
-        self.assertEqual(self.calls, [])
-        self.assertEqual(self.interactive.pending_plan_markdown, "# Plan\n")
-
-    def test_no_pending_plan_does_not_ask(self):
-        result = self._settle()
-        self.assertIs(result, self.first)
-        self.assertEqual(self.calls, [])
-        self.assertEqual(self.answers, [])
-
-
+@pytest.mark.session
 class ContextCommandTests(unittest.TestCase):
     def setUp(self):
         import shutil

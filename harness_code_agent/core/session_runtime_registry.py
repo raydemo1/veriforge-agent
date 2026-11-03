@@ -4,11 +4,13 @@ from __future__ import annotations
 import copy
 import threading
 import time
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..sessions.store import SessionStore
 from ..workspace.worktrees import WorktreeService
+from ..runtime.project_resources import ProjectResourceBudget
 
 
 @dataclass
@@ -20,6 +22,9 @@ class SessionRuntime:
     visible: bool = True
     status: str = "starting"
     host: object = None
+    lifecycle: str = "dormant"
+    last_error: str | None = None
+    waiting_reason: str | None = None
 
 
 class SessionRuntimeRegistry:
@@ -34,6 +39,77 @@ class SessionRuntimeRegistry:
         self._views = {}
         self.active_id = None
         self._closing = False
+        self.resources = ProjectResourceBudget.for_project(self.project)
+        self._resource_owner = weakref.finalize(self, self.resources.hold())
+        self._maintenance_stop = threading.Event()
+        self._maintenance = None
+        self.watch_resources = False
+
+    def start_maintenance(self):
+        self._maintenance = threading.Thread(target=self._maintenance_loop, name="workbench-resources", daemon=True)
+        self._maintenance.start()
+
+    def _maintenance_loop(self):
+        while not self._maintenance_stop.wait(1):
+            try:
+                self.maintain()
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("Workbench resource maintenance failed")
+
+    def maintain(self, *, now=None):
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            records = list(self._records.values())
+        budget = self.resources.snapshot()
+        for record in records:
+            if record.host is None:
+                continue
+            record.host.suspend_if_idle(now, 120)
+            state = record.host.resource_state()["state"]
+            if state != record.lifecycle:
+                self.publish(record.id, {"type": "runtime_state", "state": state})
+            waits = [row for row in budget["waiting"] if row["sessionId"] == record.id]
+            first = waits[0]["resource"] if waits else None
+            reason = ({"llm": "等待模型额度", "tools": "等待工具执行", "agents": "等待子代理执行",
+                       "network": "等待网络请求", "mcp_connect": "等待外部服务连接"}.get(first,
+                       f"等待外部工具：{first.split(':', 1)[-1]}" if first else None))
+            if reason != record.waiting_reason:
+                record.waiting_reason = reason
+                self.publish(record.id, {"type": "resource_wait", "reason": reason})
+        if self.watch_resources:
+            self.emit({"type": "resources", "snapshot": self.resource_snapshot()})
+
+    def resource_snapshot(self):
+        import psutil
+
+        with self._lock:
+            records = list(self._records.values())
+        sessions = []
+        for record in records:
+            if record.host is None:
+                continue
+            state = record.host.resource_state()
+            for job in state["jobs"]:
+                try:
+                    process = psutil.Process(job["pid"])
+                    processes = [process, *process.children(recursive=True)]
+                except psutil.Error:
+                    processes = []
+                rss, cpu, count = 0, 0, 0
+                for process in processes:
+                    try:
+                        with process.oneshot():
+                            rss += process.memory_info().rss
+                            times = process.cpu_times()
+                            cpu += times.user + times.system
+                            count += 1
+                    except psutil.Error:
+                        continue
+                job.update(processes=count, rssMiB=round(rss / 1048576, 1), cpuSeconds=round(cpu, 1))
+            sessions.append(dict(id=record.id, title=record.title, environment=record.environment,
+                                 lastError=record.last_error, waitingReason=record.waiting_reason, **state))
+        return dict(sessions=sessions, budget=self.resources.snapshot())
 
     def create(self, *, session_id=None, cwd=None, environment="local"):
         with self._lock:
@@ -49,7 +125,7 @@ class SessionRuntimeRegistry:
                 record.title = self.store.read_metadata(session_id).get("title", "新会话")
             self._records[session_id] = record
             self._views[session_id] = {"sequence": 0, "items": [], "snapshot": {}, "interaction": None,
-                                       "work": {}, "turnState": "idle", "queueDepth": 0, "commands": []}
+                                       "work": {}, "turnState": "idle", "queueDepth": 0, "commands": [], "waitingReason": None}
             previous_active_id = self.active_id
             self.active_id = session_id
         try:
@@ -135,6 +211,7 @@ class SessionRuntimeRegistry:
         with self._lock:
             sessions = [dict(id=r.id, title=r.title, environment=r.environment,
                              cwd=str(r.cwd), visible=r.visible, status=r.status,
+                             lifecycle=r.lifecycle,
                              pendingApproval=self._views[r.id]["interaction"] is not None)
                         for r in self._records.values()]
             self.emit({"type": "sessions", "sessions": sessions, "activeSessionId": self.active_id})
@@ -144,6 +221,10 @@ class SessionRuntimeRegistry:
             record = self._records[session_id]
             view = self._views[session_id]
             kind = event["type"]
+            if kind == "runtime_state":
+                record.lifecycle = event["state"]
+            if kind == "resource_wait":
+                view["waitingReason"] = event["reason"]
             if kind == "shutdown":
                 record.status = "closed"
                 self.announce()
@@ -180,6 +261,8 @@ class SessionRuntimeRegistry:
                 view["interaction"] = event
             elif kind == "notice":
                 failed = event.get("level") == "error"
+                if failed:
+                    record.last_error = event["text"]
                 view["items"].append(dict(id=f"notice-{view['sequence'] + 1}", kind="error" if failed else "status",
                                           title="错误" if failed else "提示", body=event["text"], state="failed" if failed else "success"))
             elif kind == "interaction_closed":
@@ -200,7 +283,7 @@ class SessionRuntimeRegistry:
                     view["work"][field] = event[field]
             view["sequence"] += 1
             self.emit(dict(event, sessionId=session_id, sequence=view["sequence"]))
-            if kind in {"progress", "turn_state", "interaction", "interaction_closed", "transcript"}:
+            if kind in {"progress", "turn_state", "interaction", "interaction_closed", "transcript", "runtime_state"}:
                 self.announce()
 
     def snapshot(self, session_id):
@@ -211,6 +294,11 @@ class SessionRuntimeRegistry:
         with self._lock:
             self._closing = True
             records = list(self._records.values())
+        self._maintenance_stop.set()
+        if self._maintenance is not None:
+            self._maintenance.join(5)
+            if self._maintenance.is_alive():
+                raise RuntimeError("会话资源管理尚未退出，依赖资源已保留")
         errors = []
         lock = threading.Lock()
         def close_one(record):
@@ -228,3 +316,4 @@ class SessionRuntimeRegistry:
             thread.join(timeout=max(0, deadline - time.monotonic()))
         if errors or any(t.is_alive() for t in threads):
             raise RuntimeError("部分会话清理未完成，依赖资源已保留：" + "; ".join(errors))
+        self._resource_owner()

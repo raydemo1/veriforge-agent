@@ -5,7 +5,7 @@ from pathlib import Path
 import logging
 import stat
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
@@ -13,7 +13,6 @@ from typing import Any
 from ..runtime.execution_planner import (
     CallEffect,
     ExecutionPlanner,
-    acquire_concurrency,
 )
 from ..runtime.tool_call_validation import ToolCall, validate_tool_call
 from ..runtime.tool_failures import FailureMode, ToolFailure, failure_batch_key
@@ -31,7 +30,6 @@ from .cancellation import CancellationToken, CancelledError, cancellation_scope
 log = logging.getLogger("harness")
 
 
-MAX_WORKERS = 8
 
 
 @dataclass
@@ -64,7 +62,7 @@ class ToolExecutor:
         self.runtime_state = conversation.runtime_state
         self.cancellation_token = cancellation_token
         self._tool_calls: list = []
-        self._executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        self._resources = conversation.project_resources
         self._deferred_user_messages: list[str] = []
         self._middleware_activity: dict[str, dict[str, Any]] = {}
         self._cancelled_results: dict[str, ToolResult] = {}
@@ -137,7 +135,6 @@ class ToolExecutor:
             raise
         finally:
             self.conversation.compaction_gate.end_tool_call()
-            self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _repair_orphaned_tool_calls(self, error: Exception) -> None:
         answered = {
@@ -335,7 +332,16 @@ class ToolExecutor:
                         agent_name=self.agent.name,
                     )
                 child_token = self._make_child_token()
-                future = self._executor.submit(self._execute_one, prepared, child_token)
+                if prepared.effect.kind in {"control", "agent_wait"}:
+                    future = Future()
+                    try:
+                        future.set_result(self._execute_one(prepared, child_token))
+                    except BaseException as exc:
+                        future.set_exception(exc)
+                else:
+                    future = self._resources.submit("tools", self._execute_one, prepared, child_token,
+                                                    session_id=self.runtime_state.session_id,
+                                                    turn_id=self.runtime_state.turn_id, label=prepared.name)
                 if child_token is not None:
                     child_tokens[future] = child_token
                     # Single lifecycle owner for the parent callback: the
@@ -457,7 +463,12 @@ class ToolExecutor:
         resource_guard = context.resource_coordinator.acquire(prepared.effect.resources, cancellation_token) if context is not None else nullcontext()
         project_claims = () if prepared.effect.kind in {"long_running", "native_shell"} else prepared.effect.resources
         project_guard = context.workspace.access.acquire(project_claims, cancellation_token) if context is not None else nullcontext()
-        with cancellation_scope(cancellation_token), acquire_concurrency(prepared.effect.concurrency_key, cancellation_token), resource_guard, project_guard as lease:
+        concurrency = self._resources.acquire(
+            prepared.effect.concurrency_key, session_id=getattr(context, "session_id", None),
+            turn_id=self.conversation.runtime_state.turn_id,
+            label=prepared.name, cancellation_token=cancellation_token,
+        ) if prepared.effect.concurrency_key == "network" else nullcontext()
+        with cancellation_scope(cancellation_token), concurrency, resource_guard, project_guard as lease:
             if cancellation_token is not None:
                 cancellation_token.check()
             claims = [claim for claim in prepared.effect.resources
@@ -569,7 +580,8 @@ class ToolExecutor:
                     agent_name=self.agent.name,
                 )
             result = tool_result.to_text()
-            self.conversation.trace.tool_call(prepared.name, prepared.args, result)
+            self.conversation.trace.tool_call(prepared.name, prepared.args, result,
+                                              tool_call_id=prepared.tool_call_id, shell_job_id=tool_result.metadata.get("job_id"))
             if failure is not None:
                 self._dispatch_tool_failure(prepared, failure)
             self._emit_middleware_activity(prepared, fallback_outcome="blocked")
@@ -587,7 +599,8 @@ class ToolExecutor:
             self.runtime_state.verification_stale = True
         result = tool_result.to_text()
         log.debug("[%s] tool result: %s", self.agent.name, result[:200])
-        self.conversation.trace.tool_call(prepared.name, prepared.args, result)
+        self.conversation.trace.tool_call(prepared.name, prepared.args, result,
+                                          tool_call_id=prepared.tool_call_id, shell_job_id=tool_result.metadata.get("job_id"))
         invalidation = self.conversation.fact_tracker.apply_mutation(
             tool=prepared.name,
             args=prepared.args,

@@ -201,6 +201,10 @@ veriforge --profile review "Review the current branch"
 
 路由器独立配置 API key、地址和模型，复用会话内的 HTTP 连接，会话关闭时释放连接。主模型和 `fast` 通道的配置不受影响。缺少路由配置、请求失败、响应无效或置信度低于 0.6 时保持当前模式，`profile_route_decision` 记录失败原因、实际模型、置信度和候选概率。路由模型仅判断工作模式，工具权限仍由 Runtime 控制。
 
+会话只在首次执行时初始化，切换标签只读取已保留的界面与历史。连续空闲两分钟后自动释放运行时，下次执行自动恢复；排队消息、审批、后台进程、子代理和未退出工具都会阻止休眠。项目内共享模型与工具执行额度，任务等待额度时可正常取消。MCP 目录缓存可复用，连接按会话隔离、按需建立。顶部「资源」可查看运行会话、等待原因、后台进程的内存与 CPU 累计时间及最近失败；关闭面板后停止进程资源采样。
+
+Trace 位于 `.harness/traces/<Session ID>/`，每个 Agent 实例单独写入文件，通过 `ui_request_id`、`turn_id`、`llm_call_id`、`tool_call_id`、`shell_job_id` 关联请求与执行。
+
 ## 测试
 
 安装 Python 测试依赖并运行日常测试：
@@ -210,9 +214,17 @@ python -m pip install -e ".[test]"
 python -m pytest -q
 ```
 
-默认排除标记为 `integration` 的外部工具测试；单元测试和使用仓库内假服务器的 LSP 协议测试不要求安装真实语言服务器。测试统一使用假模型凭据，不依赖开发机的 API key；搜索参数与过滤规则通过 mock 验证，不要求安装 `rg`。
+默认执行完整非外部测试，排除标记为 `integration` 的原生工具测试和 `external` 的外部服务验收；单元测试和使用仓库内假服务器的 LSP 协议测试不要求安装真实语言服务器。测试统一使用假模型凭据，不依赖开发机的 API key；搜索参数与过滤规则通过 mock 验证，不要求安装 `rg`。
 
-真实 LSP 与 Node.js 执行边界测试单独运行：
+日常可只跑快速回归；本轮涉及的 Session 集成测试按需追加，提交前仍跑完整非外部测试：
+
+```bash
+python -m pytest -q -m "not integration and not session and not external"
+python -m pytest -q tests/test_multi_session_workbench.py tests/test_project_resources.py
+python -m pytest -q --durations=30
+```
+
+真实 Windows ACL、LSP 与 Node.js 执行边界测试单独运行：
 
 ```bash
 python -m pytest -q -m integration -rs
@@ -223,7 +235,9 @@ python -m pytest -q -m integration -rs
 `.github/workflows/python-tests.yml` 在 Linux 和 Windows 分别运行日常测试与真实 LSP 测试。LSP 任务固定 Node.js `24.18.0`、Pyright `1.1.414`、typescript-language-server `6.0.1` 和 TypeScript `6.0.3`，在 runner 临时目录中安装，位于工作区之外。安装和版本检查在测试前完成；测试不自动下载工具。CI 使用严格命令，缺少工具直接失败：
 
 ```bash
-python -m pytest -q -m integration --require-integration-tools -rs
+python -m pytest tests/test_code_intelligence.py tests/test_language_service_integration.py -q -m integration --require-integration-tools -rs
+# Windows
+python -m pytest tests/test_native_shell.py -q -m integration --require-integration-tools -rs
 ```
 
 OpenTUI：

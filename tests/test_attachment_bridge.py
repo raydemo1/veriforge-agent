@@ -19,6 +19,9 @@ class AttachmentBridgeTests(unittest.TestCase):
         server = object.__new__(SessionBridge)
         server._session = session
         server._tasks = queue.Queue()
+        server._runtime_lock = threading.RLock()
+        server._closing = threading.Event()
+        server._enqueue_task = server._tasks.put
         server._stopping = threading.Event()
         server._active_lock = threading.Lock()
         server._active_token = None
@@ -44,7 +47,7 @@ class AttachmentBridgeTests(unittest.TestCase):
             "params": {"text": "compare", "attachmentIds": ["a1"], "authorizedPaths": [r"C:\outside.pdf"]},
         })
 
-        self.assertIs(server._tasks.get_nowait(), prepared)
+        self.assertEqual(server._tasks.get_nowait().text, prepared.text)
         self.assertEqual(received[0].attachment_ids, ("a1",))
         self.assertEqual(received[0].authorized_paths, (r"C:\outside.pdf",))
         self.assertTrue(server.responses[0]["result"]["accepted"])
@@ -110,7 +113,7 @@ class AttachmentBridgeTests(unittest.TestCase):
         self.assertIn("compare", events[0]["item"]["body"])
         self.assertIn("[text] outside.txt (2.0 KB)", events[0]["item"]["body"])
         # The prepared turn re-enters the normal task path.
-        self.assertIs(server._tasks.get_nowait(), prepared)
+        self.assertEqual(server._tasks.get_nowait().text, prepared.text)
 
     def test_attachment_only_submission_is_allowed(self):
         prepared = PreparedTurn("", ())

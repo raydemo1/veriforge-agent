@@ -14,6 +14,7 @@ from .execution_planner import ResourceCoordinator
 from .permissions import PermissionPolicy
 from .questions import NoQuestionProvider, QuestionProvider
 from .task_supervisor import ToolTaskSupervisor
+from .project_resources import ProjectResourceBudget
 
 if TYPE_CHECKING:
     from ..agent.coordinator import AgentCoordinator
@@ -28,6 +29,9 @@ class ToolContext:
     session_id: str | None = None
     session_root: Path | None = None
     environment: str = "local"
+    ui_request_id: str | None = None
+    project_resources: ProjectResourceBudget | None = None
+    discover_mcp_tools: Callable | None = field(default=None, repr=False)
     model_selection: ModelSelection = field(default_factory=ModelSelection)
     memory_use_enabled: bool = True
     memory_auto_extract_enabled: bool = True
@@ -56,6 +60,10 @@ class ToolContext:
     tool_output_artifact_sink: Callable[[dict], None] | None = field(default=None, repr=False)
     _language_service: object | None = field(default=None, init=False, repr=False)
     _language_service_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+
+    def __post_init__(self):
+        if self.project_resources is None:
+            self.project_resources = ProjectResourceBudget.for_project(self.workspace.root)
 
     def register_output_artifact(self, reference: dict) -> None:
         if self.tool_output_artifacts.get(reference["path"]) == reference:

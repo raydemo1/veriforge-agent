@@ -45,6 +45,9 @@ def search_tools(
     if not query:
         return _failure("missing_query", "search_tools requires a non-empty query.")
 
+    if tool_context.discover_mcp_tools is not None:
+        tool_context.discover_mcp_tools(server_name)
+
     registry = tool_context.tool_registry
     allowed_permissions = (
         set(tool_context.allowed_tool_permissions)

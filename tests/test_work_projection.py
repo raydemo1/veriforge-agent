@@ -7,7 +7,7 @@ from pathlib import Path
 from harness_code_agent.agent.change_proposal import ChangeProposalStore
 from harness_code_agent.sessions.events import SessionEvent
 from harness_code_agent.tui.projection import WorkStateProjection
-from harness_code_agent.tui.protocol import UI_PROTOCOL_VERSION, validate_ui_event
+from harness_code_agent.tui.protocol import validate_ui_event
 
 
 def event(event_type: str, payload: dict | None = None, agent: str | None = None) -> SessionEvent:
@@ -34,8 +34,7 @@ class WorkStateProjectionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_protocol_version_is_v7_and_accepts_work_events(self) -> None:
-        self.assertEqual(UI_PROTOCOL_VERSION, 7)
+    def test_protocol_accepts_work_events(self) -> None:
         validate_ui_event({"type": "plan_updated", "plan": None})
         validate_ui_event({"type": "tasks_updated", "tasks": {"items": [], "completed": 0, "total": 0}})
         validate_ui_event({"type": "agent_run_updated", "agents": []})

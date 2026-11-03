@@ -8,15 +8,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .. import config
-
-_CONCURRENCY_LIMITS = {
-    "network": 2,
-    "subagent": max(1, int(config.MAX_CONCURRENT_AGENTS)),
-}
-_CONCURRENCY_SEMAPHORES = {key: threading.Semaphore(value) for key, value in _CONCURRENCY_LIMITS.items()}
-
-
 @dataclass(frozen=True, order=True)
 class ResourceClaim:
     domain: str
@@ -135,20 +126,3 @@ class ResourceCoordinator:
             with self._condition:
                 self._active.pop(token, None)
                 self._condition.notify_all()
-
-
-@contextmanager
-def acquire_concurrency(key: str | None, cancellation_token=None):
-    semaphore = _CONCURRENCY_SEMAPHORES.get(key or "")
-    if semaphore is None:
-        yield
-        return
-    while not semaphore.acquire(timeout=0.05):
-        if cancellation_token is not None:
-            cancellation_token.check()
-    try:
-        if cancellation_token is not None:
-            cancellation_token.check()
-        yield
-    finally:
-        semaphore.release()
