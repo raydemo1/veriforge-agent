@@ -1784,6 +1784,8 @@ class InteractiveSession:
             if self._closed:
                 return
             with self._execution_condition:
+                if suspend and self.tool_context.agent_coordinator.changes.has_pending_changes():
+                    raise RuntimeError("尚有未应用的代码提案或待解决冲突，不能自动休眠")
                 self._closing = True
                 if self._turn_token is not None:
                     self._turn_token.cancel()

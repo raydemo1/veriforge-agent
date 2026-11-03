@@ -112,6 +112,11 @@ class ChangeProposalStore:
             raise KeyError(f"unknown proposal: {proposal_id}")
         return proposal
 
+    def has_pending_changes(self) -> bool:
+        with self._lock:
+            return (any(proposal.status in {"ready", "conflict"} for proposal in self._proposals.values())
+                    or any(conflict.status == "open" for conflict in self._conflicts.values()))
+
     def snapshot_proposals(self) -> list[dict]:
         """Plain serialisable view for the TUI Work State projection."""
 

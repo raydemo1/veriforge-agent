@@ -177,8 +177,8 @@ class SessionRuntimeRegistry:
         source = self.get(session_id)
         if source.environment == "worktree":
             raise ValueError("暂不支持从 Worktree 派生会话，请从 Local 会话创建分支")
-        runtime = source.host._require_session()
-        fork = self.store.fork(runtime.session.id)
+        with source.host._runtime_use() as runtime:
+            fork = self.store.fork(runtime.session.id)
         root = WorktreeService(self.project).create(fork.id) if worktree else source.cwd
         if root != source.cwd:
             from ..runtime.output_artifacts import copy_artifact

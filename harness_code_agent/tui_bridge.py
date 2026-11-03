@@ -20,6 +20,7 @@ import time
 import traceback
 import uuid
 from dataclasses import replace
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -297,6 +298,9 @@ class SessionBridge:
         self._session_action = session_action
         self.project_resources = project_resources
         self._runtime_lock = threading.RLock()
+        self._runtime_users = 0
+        self._worker_lock = threading.Lock()
+        self._suspend_retry_at = 0
         self._last_activity = time.monotonic()
         self.cwd = cwd.resolve()
         self.profile_name = profile_name
@@ -691,7 +695,7 @@ class SessionBridge:
         self._write(message)
 
     def _enqueue_task(self, task):
-        with self._runtime_lock:
+        with self._worker_lock:
             if self._closing.is_set():
                 raise RuntimeError("会话正在关闭")
             self._last_activity = time.monotonic()
@@ -702,7 +706,7 @@ class SessionBridge:
 
     def _worker_loop(self) -> None:
         while not self._closing.is_set():
-            with self._runtime_lock:
+            with self._worker_lock:
                 try:
                     task = self._tasks.get_nowait()
                 except queue.Empty:
@@ -726,8 +730,8 @@ class SessionBridge:
                             token.check()
                             self._closing.wait(.05)
                     if callable(task):
-                        task()
-                    else:
+                        task = task()
+                    if isinstance(task, PreparedTurn):
                         self._run_task(task, token)
             except CancelledError:
                 self._finish_interrupted_assistant()
@@ -1081,7 +1085,9 @@ class SessionBridge:
     def _queue_rewind(self, point_id: str) -> dict[str, Any]:
         session = self._require_session()
         with self._active_lock:
-            if self._active_token is not None or self._rewind_pending or self._tasks.unfinished_tasks or self._stopping.is_set():
+            own_request = threading.current_thread() is self._worker
+            if ((self._active_token is not None and not own_request) or self._rewind_pending
+                    or self._tasks.unfinished_tasks > int(own_request) or self._stopping.is_set()):
                 raise ValueError("请等待当前操作结束，再回撤")
             if point_id not in session.recovery_points():
                 raise ValueError("回撤点已失效，请重新选择")
@@ -1110,11 +1116,13 @@ class SessionBridge:
         interactions = bool(self._interactions._pending)
         jobs, agents = [], []
         tools = 0
+        pending_changes = False
         if session is not None:
             tools = session.tool_context.tool_tasks.pending_count
             managers = [session.conversation.runtime_state.shell_job_manager]
             coordinator = session.tool_context.agent_coordinator
             if coordinator is not None:
+                pending_changes = coordinator.changes.has_pending_changes()
                 with coordinator._condition:
                     records = list(coordinator._records.values())
                 agents = [record.id for record in records if record.future is not None and not record.future.done()]
@@ -1128,7 +1136,8 @@ class SessionBridge:
         resources = self.project_resources or (session.project_resources if session is not None else None)
         executing = resources.snapshot() if resources is not None else {"active": [], "waiting": []}
         occupied = any(entry["sessionId"] == self.runtime_id for entry in [*executing["active"], *executing["waiting"]])
-        active = bool(turn or pending or interactions or tools or jobs or agents or constructing or occupied)
+        active = bool(turn or pending or interactions or tools or jobs or agents or constructing or occupied
+                      or pending_changes or self._runtime_users)
         return dict(state="active" if active else "warm" if session is not None else "dormant",
                     turn=turn, queue=max(0, pending - int(turn)), approvals=int(interactions),
                     tools=tools, agents=len(agents),
@@ -1141,38 +1150,82 @@ class SessionBridge:
             if state == "active":
                 self._last_activity = now
                 return False
-            if state != "warm" or now - self._last_activity < idle_seconds:
+            if state != "warm" or now - self._last_activity < idle_seconds or now < self._suspend_retry_at:
                 return False
             session = self._session
             self._model_selection = session.model_selection
             self.profile_name = session.profile.name()
             self.profile_explicit = session.routing_mode == "pinned"
+            try:
+                session.close(suspend=True)
+            except Exception as exc:
+                self._suspend_retry_at = now + idle_seconds
+                self._notice("error", f"自动休眠未完成，运行时已保留：{exc}")
+                log.exception("Session %s suspension failed", self.runtime_id)
+                return False
             with self._session_lock:
                 self._session_generation += 1
-            session.close(suspend=True)
-            self._session = None
+                self._session = None
             self._session_thread = None
             self._session_error = None
             self._mention_index = None
             self._send_event({"type": "runtime_state", "state": "dormant"})
             return True
 
+    @contextmanager
+    def _runtime_use(self, *, wake=True):
+        acquired = self._runtime_lock.acquire(blocking=wake)
+        reserved = False
+        try:
+            if acquired:
+                if self._closing.is_set():
+                    raise RuntimeError("会话正在关闭")
+                constructing = self._session_thread is not None and self._session_thread.is_alive()
+                if wake or (self._session is not None and not constructing):
+                    self._runtime_users += 1
+                    reserved = True
+        finally:
+            if acquired:
+                self._runtime_lock.release()
+        if not reserved:
+            yield None
+            return
+        try:
+            yield self._require_session()
+        finally:
+            with self._runtime_lock:
+                self._runtime_users -= 1
+                self._last_activity = time.monotonic()
+
     def _require_session(self) -> InteractiveSession:
-        if self._closing.is_set():
-            raise RuntimeError("会话正在关闭")
-        if self._session is not None:
-            self._last_activity = time.monotonic()
-            return self._session
+        from .agent.cancellation import current_token
+        token = current_token.get()
+        with self._runtime_lock:
+            if token is not None:
+                token.check()
+            if self._closing.is_set():
+                raise RuntimeError("会话正在关闭")
+            thread = self._session_thread
+            if self._session is not None and (thread is None or not thread.is_alive()
+                                             or thread is threading.current_thread()):
+                self._last_activity = time.monotonic()
+                return self._session
+            if thread is None or not thread.is_alive():
+                self._session_error = None
+                self._send_event({"type": "progress", "status": "starting", "detail": "正在唤醒会话…"})
+                self._start_session_construction()
+                thread = self._session_thread
+        deadline = time.monotonic() + 30
+        while thread.is_alive() and time.monotonic() < deadline:
+            if token is not None:
+                token.check()
+            if self._closing.is_set():
+                raise CancelledError("会话正在关闭")
+            thread.join(.05)
         with self._runtime_lock:
             if self._closing.is_set():
                 raise RuntimeError("会话正在关闭")
-            if self._session is None:
-                if self._session_thread is None or not self._session_thread.is_alive():
-                    self._session_error = None
-                    self._send_event({"type": "progress", "status": "starting", "detail": "正在唤醒会话…"})
-                    self._start_session_construction()
-                self._session_thread.join(30)
-            if self._session is None:
+            if thread.is_alive() or self._session is None:
                 raise RuntimeError(self._session_error or "会话尚未准备好，请稍候")
             self._last_activity = time.monotonic()
             return self._session
@@ -1183,7 +1236,7 @@ class SessionBridge:
             and not (params.get("panel") == "mcp" and params.get("action") in {"add", "open_config"}))
         if changes_runtime:
             with self._active_lock:
-                if self._active_token is not None:
+                if self._active_token is not None and threading.current_thread() is not self._worker:
                     raise RuntimeError("当前回合仍在执行，暂时无法修改运行时")
             session = self._require_session()
             if session.tool_context.tool_tasks.pending_count:
@@ -1259,10 +1312,19 @@ class SessionBridge:
     def _handle_request(self, message: dict[str, Any]) -> bool:
         if message.get("method") in {"cancel", "resolve_interaction"}:
             return self._dispatch_request(message)
-        with self._runtime_lock:
-            return self._dispatch_request(message)
+        with self._runtime_use(wake=False) as session:
+            if session is not None:
+                return self._dispatch_request(message)
+        def request():
+            try:
+                with self._runtime_use():
+                    return self._dispatch_request(message)
+            except Exception as exc:
+                self._response(str(message.get("id") or ""), error=_localize_error(exc))
+        self._enqueue_task(request)
+        return True
 
-    def _dispatch_request(self, message: dict[str, Any]) -> bool:
+    def _dispatch_request(self, message: dict[str, Any]) -> bool | PreparedTurn:
         request_id = str(message.get("id") or "")
         method = str(message.get("method") or "")
         params = message.get("params") or {}
@@ -1310,6 +1372,11 @@ class SessionBridge:
                     "id": f"user-{uuid.uuid4().hex}", "kind": "user", "title": "你",
                     "body": _user_transcript_body(submission.text, prepared.attachments),
                 }})
+                if threading.current_thread() is self._worker:
+                    self._response(request_id, result={
+                        "accepted": True, "attachments": [item.public_dict() for item in prepared.attachments],
+                    })
+                    return prepared
                 self._enqueue_task(prepared)
                 with self._active_lock:
                     active = self._active_token is not None
@@ -1498,12 +1565,13 @@ class BridgeServer:
             record = self.registry.get(session_id)
             if record.environment != "worktree":
                 raise ValueError("当前会话不在 Worktree 中")
-            record.host._require_session()
             record.host._enqueue_task(lambda: self._apply_worktree(record))
             return {"ok": True, "message": "已排队应用到 Local"}
         if name == "sync_session":
             return {"ok": True, "sessionId": session_id, "view": self.registry.snapshot(session_id)}
-        return self.registry.get(session_id).host._action(name, params)
+        host = self.registry.get(session_id).host
+        with host._runtime_use():
+            return host._action(name, params)
 
     def _apply_worktree(self, record):
         from .workspace.worktrees import WorktreeService, WorktreeMergeConflict, prepare_merge_review
@@ -1573,12 +1641,17 @@ class BridgeServer:
                     raise ValueError("请求缺少 sessionId")
                 if method == "action":
                     name, action_params = params["name"], params.get("params") or {}
-                    slow = name in {"fork_session", "fork_worktree", "apply_worktree", "panel_action", "workbench_action"} or (
+                    slow_action = name in {"fork_session", "fork_worktree", "apply_worktree", "panel_action", "workbench_action"} or (
                         name == "open_panel" and action_params.get("panel") == "mcp")
-                    if slow:
+                    global_action = name in {"watch_resources", "new_session", "open_sessions", "switch_session",
+                                             "hide_session", "sync_session"} or (
+                        name == "open_panel" and action_params.get("panel") == "sessions")
+                    if slow_action:
                         self._start_control(request_id, session_id, name, action_params)
-                    else:
+                    elif global_action:
                         self._response(request_id, self._action(session_id, name, action_params))
+                    else:
+                        self.registry.get(session_id).host._handle_request(message)
                 else:
                     self.registry.get(session_id).host._handle_request(message)
         except Exception as exc:
