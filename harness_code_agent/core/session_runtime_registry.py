@@ -72,7 +72,8 @@ class SessionRuntimeRegistry:
             waits = [row for row in budget["waiting"] if row["sessionId"] == record.id]
             first = waits[0]["resource"] if waits else None
             reason = ({"llm": "等待模型额度", "tools": "等待工具执行", "agents": "等待子代理执行",
-                       "network": "等待网络请求", "mcp_connect": "等待外部服务连接"}.get(first,
+                       "network": "等待网络请求", "mcp_connect": "等待外部服务连接",
+                       "workspace": "等待其他会话释放写入目录"}.get(first,
                        f"等待外部工具：{first.split(':', 1)[-1]}" if first else None))
             if reason != record.waiting_reason:
                 record.waiting_reason = reason
@@ -177,9 +178,15 @@ class SessionRuntimeRegistry:
         source = self.get(session_id)
         if source.environment == "worktree":
             raise ValueError("暂不支持从 Worktree 派生会话，请从 Local 会话创建分支")
-        with source.host._runtime_use() as runtime:
-            fork = self.store.fork(runtime.session.id)
-        root = WorktreeService(self.project).create(fork.id) if worktree else source.cwd
+        if worktree:
+            # The worktree copies current Local files, so they must match the
+            # stable history boundary the fork starts from.
+            with source.host.turns_paused():
+                fork = self.store.fork(source.id)
+                root = WorktreeService(self.project).create(fork.id)
+        else:
+            fork = self.store.fork(source.id)
+            root = source.cwd
         if root != source.cwd:
             from ..runtime.output_artifacts import copy_artifact
             from ..sessions.journal import SessionJournal

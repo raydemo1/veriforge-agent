@@ -232,6 +232,7 @@ class InteractiveSession:
             self._bind_profile(self._pending_profile_name, source=self._profile_source)
             if saved:
                 self._restore_history()
+                self._restore_suspended_state()
             if self.memory_auto_extract_enabled:
                 open_memory_session(self.cwd, self.session.id, self.session.journal_path)
             self._report_startup("ready")
@@ -1779,13 +1780,53 @@ class InteractiveSession:
     def _append_conversation_message(self, message: dict) -> None:
         self.conversation._append_message(message)
 
+    def _suspend_blocker(self) -> str | None:
+        coordinator = self.tool_context.agent_coordinator
+        if coordinator.changes.has_pending_changes():
+            return "尚有未应用的代码提案或待解决冲突"
+        if self._turn_thread is not None:
+            return "回合仍在执行"
+        if self.tool_context.tool_tasks.pending_count:
+            return "工具仍在执行"
+        if coordinator.has_active_agents():
+            return "子代理仍在执行"
+        managers = [self.conversation.runtime_state.shell_job_manager]
+        with coordinator._condition:
+            managers += [record.conversation.runtime_state.shell_job_manager
+                         for record in coordinator._records.values() if record.conversation is not None]
+        if any(manager is not None and manager.running_jobs() for manager in managers):
+            return "后台进程仍在运行"
+        return None
+
+    @property
+    def _suspended_state_path(self) -> Path:
+        return self.session.root / "runtime" / "suspended.json"
+
+    def _restore_suspended_state(self) -> None:
+        """Bring back finished agents and shell jobs saved by an auto-suspension."""
+        path = self._suspended_state_path
+        if not path.exists():
+            return
+        state = json.loads(path.read_text(encoding="utf-8"))
+        self.conversation.runtime_state.shell_job_manager.import_jobs(state["shell_jobs"])
+        self.tool_context.agent_coordinator.import_state(state["agents"])
+        path.unlink()
+
     def close(self, *, suspend: bool = False) -> None:
         with self._close_lock:
             if self._closed:
                 return
+            suspended_state = None
             with self._execution_condition:
-                if suspend and self.tool_context.agent_coordinator.changes.has_pending_changes():
-                    raise RuntimeError("尚有未应用的代码提案或待解决冲突，不能自动休眠")
+                if suspend:
+                    # Check everything before touching state so a refused
+                    # suspension leaves the runtime fully usable.
+                    blocker = self._suspend_blocker()
+                    if blocker is not None:
+                        raise RuntimeError(f"{blocker}，不能自动休眠")
+                    suspended_state = dict(
+                        agents=self.tool_context.agent_coordinator.export_state(),
+                        shell_jobs=self.conversation.runtime_state.shell_job_manager.export_jobs())
                 self._closing = True
                 if self._turn_token is not None:
                     self._turn_token.cancel()
@@ -1803,7 +1844,9 @@ class InteractiveSession:
             return
         close_memory_session(self.cwd, self.session.id)
         if suspend:
+            atomic_json(self._suspended_state_path, suspended_state)
             return
+        self._suspended_state_path.unlink(missing_ok=True)
         try:
             metadata = self.session_store.read_metadata(self.session.id)
             events = self.session_store.read_events(self.session.id)

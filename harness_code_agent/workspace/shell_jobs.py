@@ -228,7 +228,7 @@ class ShellJobManager:
                 if background and root in directories and self.environment != "worktree":
                     raise ValueError("后台任务不能申请整个共享 Local 的写入许可；请缩小 write_paths，或由用户主动创建 Worktree")
                 access = WorkspaceAccessCoordinator(root)
-                lease = access.lease(write_claims(root, write_paths), cancellation_token)
+                lease = access.lease(write_claims(root, write_paths), cancellation_token, owner=self.session_id)
                 if directories and self.session_id is not None:
                     access.limit_recovery(self.session_id, turn_id, "Shell：目录内写入无法完整回撤")
                 for directory in directories:
@@ -333,6 +333,35 @@ class ShellJobManager:
         if self.running_jobs():
             raise RuntimeError("Shell processes have not exited; job resources retained")
         self._closed = True
+
+    def export_jobs(self) -> list[dict]:
+        """Finished jobs and their output, kept across a runtime suspension."""
+        exported = []
+        for job in self.list_jobs():
+            if job.status in {"running", "stopping"}:
+                raise RuntimeError("cannot export running shell jobs")
+            with job.output._lock:
+                exported.append(dict(
+                    job_id=job.job_id, command=job.command, pid=job.pid, status=job.status,
+                    background=job.background, exit_code=job.exit_code, started_at=job.started_at,
+                    ended_at=job.ended_at, error=job.error, output_error=job.output.error,
+                    output_path=str(job.output.path) if job.output.path is not None else None,
+                    output_text=job.output._text, output_chars=job.output.total_chars))
+        return exported
+
+    def import_jobs(self, entries: list[dict]) -> None:
+        for entry in entries:
+            output = ShellOutputBuffer(self.artifact_dir)
+            output.path = Path(entry["output_path"]) if entry["output_path"] else None
+            output._text = entry["output_text"]
+            output.total_chars = entry["output_chars"]
+            output.error = entry["output_error"]
+            job = ShellJob(job_id=entry["job_id"], command=entry["command"], pid=entry["pid"], process=None,
+                           status=entry["status"], background=entry["background"], exit_code=entry["exit_code"],
+                           started_at=entry["started_at"], ended_at=entry["ended_at"], output=output,
+                           error=entry["error"])
+            job._finished.set()
+            self._store(job)
 
     def _store(self, job: ShellJob) -> None:
         with self._lock:

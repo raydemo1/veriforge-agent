@@ -59,6 +59,8 @@ class AgentRecord:
     started_at: float | None = None
     ended_at: float | None = None
     output_artifacts: list[dict] = field(default_factory=list)
+    saved_messages: list[dict] | None = None
+    saved_shell_jobs: list[dict] = field(default_factory=list)
 
 
 class AgentCoordinator:
@@ -266,6 +268,32 @@ class AgentCoordinator:
             raise error
         return {"agent_id": record.id, "status": "closed"}
 
+    _SAVED_FIELDS = ("id", "name", "role", "task", "expected_output", "allowed_paths", "fork_turns",
+                     "model_intensity", "state", "summary", "error", "proposal_id", "created_at",
+                     "started_at", "ended_at", "output_artifacts")
+
+    def export_state(self) -> list[dict]:
+        """Finished agents, kept across a runtime suspension."""
+        with self._condition:
+            if any(record.state in ACTIVE_STATES for record in self._records.values()):
+                raise RuntimeError("cannot export running agents")
+            return [dict({name: getattr(record, name) for name in self._SAVED_FIELDS},
+                         messages=(record.conversation.messages if record.conversation is not None
+                                   else record.saved_messages),
+                         shell_jobs=(record.conversation.runtime_state.shell_job_manager.export_jobs()
+                                     if record.conversation is not None else record.saved_shell_jobs))
+                    for record in self._records.values()]
+
+    def import_state(self, entries: list[dict]) -> None:
+        with self._condition:
+            self._ensure_open()
+            for entry in entries:
+                record = AgentRecord(**{name: entry[name] for name in self._SAVED_FIELDS},
+                                     saved_messages=entry["messages"], saved_shell_jobs=entry["shell_jobs"])
+                self._records[record.id] = record
+                self._names[record.name] = record.id
+            self._changed_locked()
+
     def has_active_agents(self) -> bool:
         with self._condition:
             return any(record.state in ACTIVE_STATES for record in self._records.values())
@@ -415,12 +443,22 @@ class AgentCoordinator:
             model_intensity=record.model_intensity,
         )
         record.conversation = agent.start_conversation(_task_prompt(record))
+        saved, record.saved_messages = record.saved_messages, None
+        if saved:
+            # Restored after a suspension: continue the earlier conversation,
+            # and take follow-ups as new turns like a live finished agent does.
+            record.conversation._replace_messages(saved, reason="resume")
+            record.conversation.runtime_state.shell_job_manager.import_jobs(record.saved_shell_jobs)
+            record.saved_shell_jobs = []
         with self._condition:
             pending = list(record.followups)
             record.followups.clear()
         for message in pending:
             self._materialize_outputs(record, message)
-            record.conversation.queue_message(message)
+            if saved:
+                record.conversation.add_user_turn(message)
+            else:
+                record.conversation.queue_message(message)
 
     def _materialize_outputs(self, record: AgentRecord, text: str) -> None:
         if record.conversation is None or record.role != "worker":

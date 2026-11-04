@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -90,41 +90,50 @@ class WorkspaceAccessCoordinator:
         except psutil.NoSuchProcess:
             return False
 
-    def lease(self, claims, cancellation_token=None):
+    def lease(self, claims, cancellation_token=None, *, owner=None, on_blocked=None):
+        """Wait for a write lease. Leases sharing an owner never block each other.
+
+        ``on_blocked`` returns a context manager entered once the lease has to
+        wait and exited when the wait ends, so callers can report it.
+        """
         claims = tuple(claim for claim in claims if claim.access == "write")
-        owner = _owner.get() or uuid.uuid4().hex
+        owner = owner or _owner.get() or uuid.uuid4().hex
         key = uuid.uuid4().hex
         lease = WriteLease(self, key, owner)
-        while claims:
-            if cancellation_token is not None:
-                cancellation_token.check()
-            with self.connect() as db:
-                db.execute("BEGIN IMMEDIATE")
-                blocked = False
-                for lease_id, other_owner, pid, born, raw in db.execute("SELECT * FROM leases").fetchall():
-                    if not self._alive(pid, born):
-                        db.execute("DELETE FROM leases WHERE id=?", (lease_id,))
-                        continue
-                    if other_owner != owner and any(
-                        claims_conflict(wanted, ResourceClaim(**active))
-                        for wanted in claims for active in json.loads(raw)
-                    ):
-                        blocked = True
-                if not blocked:
-                    db.execute("INSERT INTO leases VALUES (?,?,?,?,?)", (
-                        key, owner, self.pid, self.born,
-                        json.dumps([dict(domain=c.domain, key=c.key, scope=c.scope, access=c.access) for c in claims]),
-                    ))
-                    break
-            if cancellation_token is not None:
-                cancellation_token.wait(0.05)
-            else:
-                time.sleep(0.05)
+        with ExitStack() as waiting:
+            while claims:
+                if cancellation_token is not None:
+                    cancellation_token.check()
+                with self.connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    blocked = False
+                    for lease_id, other_owner, pid, born, raw in db.execute("SELECT * FROM leases").fetchall():
+                        if not self._alive(pid, born):
+                            db.execute("DELETE FROM leases WHERE id=?", (lease_id,))
+                            continue
+                        if other_owner != owner and any(
+                            claims_conflict(wanted, ResourceClaim(**active))
+                            for wanted in claims for active in json.loads(raw)
+                        ):
+                            blocked = True
+                    if not blocked:
+                        db.execute("INSERT INTO leases VALUES (?,?,?,?,?)", (
+                            key, owner, self.pid, self.born,
+                            json.dumps([dict(domain=c.domain, key=c.key, scope=c.scope, access=c.access) for c in claims]),
+                        ))
+                        break
+                if on_blocked is not None:
+                    waiting.enter_context(on_blocked())
+                    on_blocked = None
+                if cancellation_token is not None:
+                    cancellation_token.wait(0.05)
+                else:
+                    time.sleep(0.05)
         return lease
 
     @contextmanager
-    def acquire(self, claims, cancellation_token=None):
-        lease = self.lease(claims, cancellation_token)
+    def acquire(self, claims, cancellation_token=None, *, owner=None, on_blocked=None):
+        lease = self.lease(claims, cancellation_token, owner=owner, on_blocked=on_blocked)
         binding = _owner.set(lease.owner)
         try:
             if cancellation_token is not None:

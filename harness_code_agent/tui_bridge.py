@@ -299,6 +299,10 @@ class SessionBridge:
         self.project_resources = project_resources
         self._runtime_lock = threading.RLock()
         self._runtime_users = 0
+        # Set while no suspension is closing the runtime; the close itself
+        # runs outside _runtime_lock so requests are never stuck behind it.
+        self._not_suspending = threading.Event()
+        self._not_suspending.set()
         self._worker_lock = threading.Lock()
         self._suspend_retry_at = 0
         self._last_activity = time.monotonic()
@@ -1144,6 +1148,18 @@ class SessionBridge:
                     jobs=[dict(id=job.job_id, pid=job.pid, status=job.status, command=job.command,
                                background=job.background) for job in jobs])
 
+    @contextmanager
+    def turns_paused(self):
+        """Hold off new turns; fails if one is already executing."""
+        session = self._session
+        if session is None:
+            yield
+            return
+        with session._execution_condition:
+            if session._turn_thread is not None:
+                raise ValueError("当前回合仍在执行，请等待回合结束或先停止，再创建隔离工作区")
+            yield
+
     def suspend_if_idle(self, now, idle_seconds):
         with self._runtime_lock:
             state = self.resource_state()["state"]
@@ -1156,37 +1172,43 @@ class SessionBridge:
             self._model_selection = session.model_selection
             self.profile_name = session.profile.name()
             self.profile_explicit = session.routing_mode == "pinned"
+            self._not_suspending.clear()
+        try:
             try:
                 session.close(suspend=True)
             except Exception as exc:
-                self._suspend_retry_at = now + idle_seconds
-                self._notice("error", f"自动休眠未完成，运行时已保留：{exc}")
+                with self._runtime_lock:
+                    self._suspend_retry_at = now + idle_seconds
+                if session._closing:
+                    self._notice("error", f"自动休眠未完成，部分资源仍在释放，稍后自动重试：{exc}")
+                else:
+                    self._notice("error", f"自动休眠未完成，运行时已保留：{exc}")
                 log.exception("Session %s suspension failed", self.runtime_id)
                 return False
-            with self._session_lock:
+            with self._runtime_lock, self._session_lock:
                 self._session_generation += 1
                 self._session = None
-            self._session_thread = None
-            self._session_error = None
-            self._mention_index = None
-            self._send_event({"type": "runtime_state", "state": "dormant"})
-            return True
+                self._session_thread = None
+                self._session_error = None
+                self._mention_index = None
+        finally:
+            self._not_suspending.set()
+        self._send_event({"type": "runtime_state", "state": "dormant"})
+        return True
 
     @contextmanager
     def _runtime_use(self, *, wake=True):
-        acquired = self._runtime_lock.acquire(blocking=wake)
+        # The lock is only ever held briefly, so waiting for it never stalls
+        # the stdin loop; a runtime that is dormant, starting or suspending
+        # is handed to the worker instead.
         reserved = False
-        try:
-            if acquired:
-                if self._closing.is_set():
-                    raise RuntimeError("会话正在关闭")
-                constructing = self._session_thread is not None and self._session_thread.is_alive()
-                if wake or (self._session is not None and not constructing):
-                    self._runtime_users += 1
-                    reserved = True
-        finally:
-            if acquired:
-                self._runtime_lock.release()
+        with self._runtime_lock:
+            if self._closing.is_set():
+                raise RuntimeError("会话正在关闭")
+            constructing = self._session_thread is not None and self._session_thread.is_alive()
+            if wake or (self._session is not None and not constructing and self._not_suspending.is_set()):
+                self._runtime_users += 1
+                reserved = True
         if not reserved:
             yield None
             return
@@ -1200,21 +1222,30 @@ class SessionBridge:
     def _require_session(self) -> InteractiveSession:
         from .agent.cancellation import current_token
         token = current_token.get()
-        with self._runtime_lock:
-            if token is not None:
-                token.check()
-            if self._closing.is_set():
-                raise RuntimeError("会话正在关闭")
-            thread = self._session_thread
-            if self._session is not None and (thread is None or not thread.is_alive()
-                                             or thread is threading.current_thread()):
-                self._last_activity = time.monotonic()
-                return self._session
-            if thread is None or not thread.is_alive():
-                self._session_error = None
-                self._send_event({"type": "progress", "status": "starting", "detail": "正在唤醒会话…"})
-                self._start_session_construction()
+        while True:
+            while not self._not_suspending.wait(.05):
+                if token is not None:
+                    token.check()
+                if self._closing.is_set():
+                    raise RuntimeError("会话正在关闭")
+            with self._runtime_lock:
+                if not self._not_suspending.is_set():
+                    continue
+                if token is not None:
+                    token.check()
+                if self._closing.is_set():
+                    raise RuntimeError("会话正在关闭")
                 thread = self._session_thread
+                if self._session is not None and (thread is None or not thread.is_alive()
+                                                 or thread is threading.current_thread()):
+                    self._last_activity = time.monotonic()
+                    return self._session
+                if thread is None or not thread.is_alive():
+                    self._session_error = None
+                    self._send_event({"type": "progress", "status": "starting", "detail": "正在唤醒会话…"})
+                    self._start_session_construction()
+                    thread = self._session_thread
+                break
         deadline = time.monotonic() + 30
         while thread.is_alive() and time.monotonic() < deadline:
             if token is not None:

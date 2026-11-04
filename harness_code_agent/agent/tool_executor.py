@@ -462,7 +462,14 @@ class ToolExecutor:
         context = self.agent.tool_context
         resource_guard = context.resource_coordinator.acquire(prepared.effect.resources, cancellation_token) if context is not None else nullcontext()
         project_claims = () if prepared.effect.kind in {"long_running", "native_shell"} else prepared.effect.resources
-        project_guard = context.workspace.access.acquire(project_claims, cancellation_token) if context is not None else nullcontext()
+        # Leases are owned by the session: its own background shells never
+        # block its own writes, while other sessions wait and see why.
+        session_id = getattr(context, "session_id", None)
+        project_guard = context.workspace.access.acquire(
+            project_claims, cancellation_token, owner=session_id,
+            on_blocked=lambda: self._resources.waiting(
+                "workspace", session_id=session_id, turn_id=self.runtime_state.turn_id, label=prepared.name),
+        ) if context is not None else nullcontext()
         concurrency = self._resources.acquire(
             prepared.effect.concurrency_key, session_id=getattr(context, "session_id", None),
             turn_id=self.conversation.runtime_state.turn_id,

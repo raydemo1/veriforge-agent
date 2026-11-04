@@ -15,11 +15,13 @@ try {
     }
   }
   const temporary = realpathSync.native(policy.temp);
-  const identity = JSON.stringify(roots.map(path => path.toLowerCase()).sort());
+  // Grants are standing ACL edits, so each directory keeps one stable SID:
+  // any combination of directories reuses the same ACEs, and a token only
+  // carries the SIDs of the directories this command declared.
   sandbox = new AclSandbox({
     writableDirs: roots,
     tempDir: temporary,
-    writeSid: workspaceWriteSid(`veriforge:write-paths:${identity}`),
+    writeSidsByDir: roots.map(root => workspaceWriteSid(`veriforge:write-path:${root.toLowerCase()}`)),
     tempWriteSid: tempWriteSid(temporary),
     mode: "workspace-write",
   });

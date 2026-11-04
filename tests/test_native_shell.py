@@ -126,3 +126,30 @@ def test_cancelled_native_output_keeps_full_unicode_artifact(native_manager, tmp
     content = Path(result.metadata["artifact_path"]).read_text(encoding="utf-8")
     assert "begin-" + "甲" * 10000 + "-end" in content
     assert result.metadata["cancelled"]
+
+
+def test_directory_grants_do_not_accumulate_across_combinations(native_manager, tmp_path):
+    import subprocess
+
+    from harness_code_agent.workspace.shell_environment import shell_executable
+
+    runtime = SimpleNamespace(shell_job_manager=native_manager)
+    for name in ("a", "b", "c"):
+        (tmp_path / name).mkdir()
+
+    def explicit_aces(name):
+        literal = str(tmp_path / name).replace("'", "''")
+        script = f"@((Get-Acl -LiteralPath '{literal}').Access | Where-Object {{ -not $_.IsInherited }}).Count"
+        result = subprocess.run([shell_executable(), "-NoProfile", "-Command", script],
+                                capture_output=True, encoding="utf-8", errors="replace", check=True)
+        return int(result.stdout.strip())
+
+    assert run_bash("Set-Content a/x.txt 1", write_paths=["a"], runtime_state=runtime).return_code == 0
+    baseline = explicit_aces("a")
+    for paths in (["a", "b"], ["a", "c"], ["a", "b", "c"], ["c", "a"]):
+        result = run_bash("Set-Content a/x.txt 2", write_paths=paths, runtime_state=runtime)
+        assert result.return_code == 0, result.output
+    assert explicit_aces("a") == baseline
+    result = run_bash("Set-Content b/y.txt 'bad'", write_paths=["a", "c"], runtime_state=runtime)
+    assert result.return_code != 0
+    assert not (tmp_path / "b" / "y.txt").exists()

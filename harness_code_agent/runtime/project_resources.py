@@ -88,6 +88,19 @@ class ProjectResourceBudget:
                 self._condition.notify_all()
             release_owner()
 
+    @contextmanager
+    def waiting(self, kind, *, session_id=None, turn_id=None, label=""):
+        """Report a wait for a resource this budget does not itself grant."""
+        key = uuid.uuid4().hex
+        with self._condition:
+            self._waiting[key] = dict(resource=kind, sessionId=session_id, turnId=turn_id,
+                                      label=label, since=time.time())
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._waiting.pop(key, None)
+
     def submit(self, kind, function, *args, session_id=None, turn_id=None, label=""):
         release_owner = self.hold()
         key = uuid.uuid4().hex

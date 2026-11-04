@@ -247,3 +247,92 @@ def test_rewind_failure_keeps_files_journal_and_runtime(runtime_factory, tmp_pat
     assert (tmp_path / "a").read_text(encoding="utf-8") == "later"
     assert runtime.session.journal_path.read_bytes() == journal
     assert runtime.session.metadata_path.read_bytes() == metadata
+
+
+def test_write_leases_are_shared_within_an_owner_and_waits_are_reported(tmp_path):
+    from contextlib import contextmanager
+
+    access = WorkspaceAccessCoordinator(tmp_path)
+    claim = access.write_claim(tmp_path / "dist")
+    background = access.lease([claim], owner="session-A")
+    try:
+        with access.acquire([access.write_claim(tmp_path / "dist")], owner="session-A"):
+            pass
+        reports = []
+
+        @contextmanager
+        def report():
+            reports.append("waiting")
+            try:
+                yield
+            finally:
+                reports.append("done")
+
+        token = CancellationToken()
+        timer = threading.Timer(0.2, token.cancel)
+        timer.start()
+        with pytest.raises(CancelledError), access.acquire([claim], token, owner="session-B", on_blocked=report):
+            pass
+        timer.join()
+        assert reports == ["waiting", "done"]
+    finally:
+        background.release()
+    with access.acquire([claim], owner="session-B"):
+        pass
+
+
+def test_refused_suspension_leaves_runtime_usable(runtime_factory):
+    create, _ = runtime_factory
+    runtime = create()
+    runtime.submit("第一轮")
+    coordinator = runtime.tool_context.agent_coordinator
+    with patch.object(coordinator.changes, "has_pending_changes", return_value=True):
+        with pytest.raises(RuntimeError, match="代码提案"):
+            runtime.close(suspend=True)
+    assert not runtime._closing and not coordinator._closed
+    assert runtime.submit("第二轮").text == "任务完成"
+
+
+def test_suspension_keeps_finished_agents_and_shell_jobs(runtime_factory):
+    from harness_code_agent.workspace.shell_jobs import ShellJob, ShellOutputBuffer
+
+    create, _ = runtime_factory
+    runtime = create()
+    runtime.submit("准备")
+    session_id = runtime.session.id
+    coordinator = runtime.tool_context.agent_coordinator
+    coordinator.spawn(name="scout", role="explorer", task="inspect")
+    assert not coordinator.wait(["scout"], timeout_seconds=10)["timed_out"]
+    output = ShellOutputBuffer()
+    output.append("构建完成\n")
+    job = ShellJob(job_id="shell-job-done", command="build", pid=None, process=None, output=output)
+    job.mark("exited", exit_code=0)
+    runtime.conversation.runtime_state.shell_job_manager._store(job)
+
+    runtime.close(suspend=True)
+    assert runtime._suspended_state_path.exists()
+    resumed = create(session_id=session_id)
+    assert not resumed._suspended_state_path.exists()
+    manager = resumed.conversation.runtime_state.shell_job_manager
+    assert manager.get("shell-job-done").exit_code == 0
+    assert manager.read_output("shell-job-done") == "构建完成\n"
+    agents = resumed.tool_context.agent_coordinator
+    [agent] = agents.list()["agents"]
+    assert (agent["name"], agent["status"], agent["summary"]) == ("scout", "completed", "任务完成")
+    agents.followup("scout", "继续检查")
+    assert not agents.wait(["scout"], timeout_seconds=10)["timed_out"]
+    messages = str(agents._record("scout").conversation.messages)
+    assert "inspect" in messages and "继续检查" in messages
+
+
+def test_worktree_fork_is_refused_while_a_turn_runs(tmp_path):
+    from types import SimpleNamespace
+    from harness_code_agent.tui_bridge import SessionBridge
+
+    bridge = SessionBridge.__new__(SessionBridge)
+    bridge._session = SimpleNamespace(_execution_condition=threading.Condition(threading.RLock()), _turn_thread=1)
+    with pytest.raises(ValueError, match="回合仍在执行"), bridge.turns_paused():
+        pass
+    bridge._session._turn_thread = None
+    with bridge.turns_paused():
+        assert bridge._session._execution_condition._is_owned()

@@ -21,6 +21,8 @@ class AttachmentBridgeTests(unittest.TestCase):
         server._tasks = queue.Queue()
         server._runtime_lock = threading.RLock()
         server._runtime_users = 0
+        server._not_suspending = threading.Event()
+        server._not_suspending.set()
         server._session_thread = None
         server._worker = None
         server._closing = threading.Event()
