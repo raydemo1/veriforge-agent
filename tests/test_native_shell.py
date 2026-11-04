@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import os
+import shutil
+import tempfile
 import threading
 import time
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,11 +14,27 @@ import pytest
 from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
 from harness_code_agent.runtime.builtins.shell import run_bash
 from harness_code_agent.workspace.access import WorkspaceAccessCoordinator
-from harness_code_agent.workspace.native_shell import validate_native_shell, write_claims
+from harness_code_agent.workspace.native_shell import (
+    validate_native_shell,
+    write_claims,
+)
 from harness_code_agent.workspace.shell_jobs import ShellJobManager
 
-
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+def tmp_path():
+    # Python 3.13+ implements mkdir(mode=0o700) with OWNER RIGHTS on Windows.
+    # Pytest uses that mode for its temp tree, but restricted tokens cannot
+    # use owner rights. Model a normal workspace with inherited user ACLs;
+    # do not alter pytest's shared directories or sandbox write permissions.
+    root = Path(tempfile.gettempdir()) / f"veriforge native '中文' {uuid.uuid4().hex}"
+    root.mkdir()
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root)
 
 
 @pytest.fixture

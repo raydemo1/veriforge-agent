@@ -181,19 +181,22 @@ describe("OpenTUI app interactions", () => {
       { width: 100, height: 30 }
     );
 
-    stream.push({
-      type: "panel",
-      panel: { kind: "observe", title: "运行观察", options: [{ id: "go", label: "切换到项目概览" }] },
+    // Commit the incoming event and keyboard effects before sending input.
+    await act(async () => {
+      stream.push({
+        type: "panel",
+        panel: { kind: "observe", title: "运行观察", options: [{ id: "go", label: "切换到项目概览" }] },
+      });
     });
     await setup.waitForFrame((frame) => frame.includes("切换到项目概览"));
 
-    setup.mockInput.pressEnter();
+    await act(async () => { setup.mockInput.pressEnter(); });
     await setup.waitForFrame((frame) => frame.includes("处理中"));
-    setup.mockInput.pressEnter();
-    await sleep(50);
+    await act(async () => { setup.mockInput.pressEnter(); });
+    await act(async () => { await sleep(50); });
 
     expect(panelActions).toEqual(["panel_action"]);
-    releaseHolder.release?.();
+    await act(async () => { releaseHolder.release?.(); });
   });
 
   test("mention completion fires once after rapid typing", async () => {
@@ -211,14 +214,16 @@ describe("OpenTUI app interactions", () => {
       { width: 100, height: 30 }
     );
 
-    stream.push({
-      type: "snapshot",
-      snapshot: { ...initialState.snapshot, sessionId: "session-1", status: "ready" },
+    await act(async () => {
+      stream.push({
+        type: "snapshot",
+        snapshot: { ...initialState.snapshot, sessionId: "test-session", status: "ready" },
+      });
     });
     await setup.waitForFrame((frame) => frame.includes("从这里开始"));
 
-    await setup.mockInput.typeText("@readme", 8);
-    await sleep(300);
+    await act(async () => { await setup.mockInput.typeText("@readme", 8); });
+    await act(async () => { await sleep(300); });
 
     expect(actions.filter((name) => name === "complete_mention").length).toBe(1);
   });

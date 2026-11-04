@@ -52,12 +52,14 @@ def launch_arguments(root, directories, temporary, command):
     from .shell_environment import shell_executable
 
     validate_native_shell()
+    working_directory = str(root).replace("'", "''")
     script = (
         "$ErrorActionPreference = 'Stop'; "
+        f"Set-Location -LiteralPath '{working_directory}'; "
         f"& {{ {command} }}; "
         "if ($global:LASTEXITCODE -is [int]) { exit $global:LASTEXITCODE } "
         "elseif ($?) { exit 0 } else { exit 1 }"
     )
-    policy = dict(cwd=str(root), write_paths=[str(path) for path in directories], temp=str(temporary))
+    policy = {"cwd": str(root), "write_paths": [str(path) for path in directories], "temp": str(temporary)}
     return [find_bun(), "run", str(helper_path()), json.dumps(policy, ensure_ascii=False),
             shell_executable(), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]
