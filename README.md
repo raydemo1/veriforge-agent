@@ -10,8 +10,8 @@ VeriForge 是一个面向真实代码仓库的可验证 Coding-Agent Runtime。
 
 ## 特性
 
-- Profile：`general`、`coding-agent`、`plan`、`review`、`app-builder`、`terminal`
-- 工具治理：文件、Shell、Web、浏览器、MCP 和 Agent 统一经过 registry、权限和 middleware
+- 单一通用 Agent：没有按任务类型切换的 profile，行为差异只来自权限模式和 `/plan` 显式计划流
+- 工具治理：文件、Shell、Web、MCP 和 Agent 统一经过 registry、权限和 middleware
 - 资源感知调度：无冲突调用可并行，冲突资源按顺序执行，结果按模型顺序回写
 - 安全修改：工作区路径保护、快照、审批、危险命令拦截和退出前验证
 - 代码理解：单一只读 `code_intelligence` 工具，支持定义、引用、文件符号和诊断
@@ -61,7 +61,7 @@ CLI `-p`、无 TTY 的批处理，以及 Terminal-Bench / Claw-SWE-Bench runner 
 ```python
 from harness_code_agent.headless import run_task
 
-result = run_task(cwd="/path/to/project", task="Fix the failing tests", profile="coding-agent")
+result = run_task(cwd="/path/to/project", task="Fix the failing tests")
 print(result.session_id, result.status)
 if result.turn_result is not None:
     print(result.turn_result.text)
@@ -78,6 +78,7 @@ raise SystemExit(result.exit_code)
 /mcp          管理 MCP 服务
 /compact      压缩上下文
 /context      查看上下文预算
+/plan         先规划，`/plan execute` 执行待审批的计划
 /memory       搜索、验证与管理长期记忆
 /fork         创建会话分支
 /observe      查看运行状态
@@ -97,7 +98,7 @@ raise SystemExit(result.exit_code)
 
 新会话加载统一的启动快照：个人默认最多 300 token，项目约定最多 500 token，导航说明及主题目录最多 400 token，头部和引用信息计入预算。正文只选择有效、无条件适用的偏好和规范；条件规则、项目事实、决定、经验和流程默认只提供主题入口。项目同事实键的全局约定覆盖个人默认，不改写原记录；过期、待确认和挂起的内容不会作为确定事实展示。目录优先列出范围和主题名称，在预算允许时补充事实键和适用条件；可用 `memory_read` 按范围和主题名称展开。各范围显示已展示和总主题数，未展示完时提供可直接用于 `memory_read` 的续读参数，不自动生成自由摘要或执行向量检索。
 
-启动快照按稳定事实键排序，在 Profile 切换和压缩时复用，恢复或回撤只在新的上下文边界刷新一次；原始日志保留。子代理沿用父会话的项目记忆身份。后续由模型在需要历史信息时主动调用 `memory_search` 或 `memory_read`，不逐轮自动检索或注入记忆正文。搜索支持分页、路径和类别筛选，读取支持展开主题、单条事实和修订历史。已经在上下文中的事实可直接复用。
+启动快照按稳定事实键排序，在 Agent 重建和压缩时复用，恢复或回撤只在新的上下文边界刷新一次；原始日志保留。子代理沿用父会话的项目记忆身份。后续由模型在需要历史信息时主动调用 `memory_search` 或 `memory_read`，不逐轮自动检索或注入记忆正文。搜索支持分页、路径和类别筛选，读取支持展开主题、单条事实和修订历史。已经在上下文中的事实可直接复用。
 
 明确保存通过 `memory_write` 即时完成，必须逐字引用当前原始用户输入作为证据；纠正使用原 ID 和版本，保留旧修订。自动提取只读取单独记录的原始用户输入和原生结构化验证，不读取回忆、模型推断或任意工具输出。每个成功主轮结束后立即安排后台增量提取，前台回答不等待；连续轮次合并尚未处理的范围，下一轮执行期间暂停相关会话的提取和整理。提取候选、跨会话整理和向量更新分别持久化、分阶段处理。关闭进程或会话不等待后台生成，未完成工作在后续启动时恢复；`/memory generate off` 取消当前会话尚未完成的生成任务，并撤销这些候选对旧事实的挂起；重新开启后恢复候选及任务，无需等待空闲期。关闭期间的输入不补做自动抽取。此开关不禁止显式保存、确认和遗忘，这些操作仍需原文证据并经过正常工具权限检查。
 
@@ -141,20 +142,26 @@ Python 通信与文件监听依赖 `pygls` 和 `watchfiles` 随 `pip install -e 
 
 ## 工作模式
 
-| Profile | 用途 |
-| --- | --- |
-| `general` | 普通问答和只读仓库检查 |
-| `coding-agent` | 修改代码、测试和验证 |
-| `plan` | 调查和生成计划，不直接修改代码 |
-| `review` | 只读代码审查 |
-| `app-builder` | 构建 Web 应用并进行浏览器验证 |
-| `terminal` | Terminal-Bench / Harbor 任务 |
+只有一个通用 Agent，没有按任务类型切换的 profile：system prompt、工具面、中间件和预算在整个会话内保持一致，不会因为"换个模式"而重建。行为差异只来自两处显式开关：
 
-```bash
-veriforge --profile coding-agent "Fix the parser bug"
-veriforge --profile plan "Design the parser migration"
-veriforge --profile review "Review the current branch"
+| 权限模式（`HARNESS_PERMISSION_MODE`） | 用途 |
+| --- | --- |
+| `workspace-write` | 默认。写工作区需要批准，危险删除、覆盖和系统命令直接拒绝 |
+| `read-only` | 只读检查与代码审查，写操作和风险命令一律拒绝 |
+| `llm-auto` | 由模型判断哪些操作需要批准 |
+| `danger-full-access` | 评测容器内使用，不做写范围限制 |
+| `terminal-eval` | Terminal-Bench / Harbor 任务的评测姿态 |
+
+需要先想清楚再动手时用显式计划流，而不是切换到另一个"模式"：
+
+```text
+/plan            # 只调查并产出计划，不修改代码
+/plan execute    # 执行已经批准的计划
 ```
+
+计划就绪后继续输入文字会被当作对计划的修改意见，不会隐式开始执行——执行只认 `/plan execute` 或计划面板上的确认。
+
+规划期间权限由 Runtime 收紧到 `read-only`，不是靠提示词约定：写文件、打补丁、会写入的 Shell 命令和 `dangerous` 类 MCP 工具都会在执行期被拒绝，委派出去的 worker 子代理也不会因为换了沙箱而获得写权限。执行计划时 `plan_mode` 关闭，会话原本的权限模式立即生效。
 
 ## Runtime 设计
 
@@ -165,7 +172,6 @@ veriforge --profile review "Review the current branch"
 | `workspace/` | 文件保护、快照、Shell 和后台任务 |
 | `sessions/` | session metadata、事件、逻辑消息手账和报告 |
 | `memory/` | SQLite 事实与修订、主题视图、向量＋全文检索、分阶段后台整理 |
-| `profiles/` | 不同任务模式的 prompt、工具面和验收策略 |
 | `frontend/opentui/` | Bun + React + TypeScript 终端界面 |
 | `eval/` | 基准任务、运行器和结果账本 |
 
@@ -188,18 +194,10 @@ veriforge --profile review "Review the current branch"
 | `OPENAI_BASE_URL` | OpenAI-compatible API 地址 |
 | `HARNESS_MODEL` | 默认模型 |
 | `HARNESS_MODEL_INTENSITY` | `fast` / `normal` / `hard` / `max` |
-| `HARNESS_ROUTER_API_KEY` | 丑橘 `jev` 分组的独立路由 key |
-| `HARNESS_ROUTER_BASE_URL` | 路由 API 根地址，默认 `https://chouju.best/v1` |
-| `HARNESS_ROUTER_MODEL` | 路由模型，默认 `jev-latest` |
-| `HARNESS_ROUTER_TIMEOUT_SECONDS` | 路由请求超时，默认 3 秒，不重试 |
 | `HARNESS_PERMISSION_MODE` | `workspace-write` / `llm-auto` / `danger-full-access` |
 | `HARNESS_MODEL_INPUT_MODE` | `text` 或 `multimodal` |
 
 完整配置见 `.env.template`。
-
-自动模式下，每个用户 turn 由 Jev 通过 `/v1/systemone` 的 Choice 问题选择工作模式，并参考上一轮任务和回答。选择 `auto` 时全部任务意图交给 Jev，不再使用关键词规则或 BM25；手动选择其他模式后固定执行，不请求路由模型。专用模式中的普通问答使用 `direct_answer`，保留当前工作上下文。
-
-路由器独立配置 API key、地址和模型，复用会话内的 HTTP 连接，会话关闭时释放连接。主模型和 `fast` 通道的配置不受影响。缺少路由配置、请求失败、响应无效或置信度低于 0.6 时保持当前模式，`profile_route_decision` 记录失败原因、实际模型、置信度和候选概率。路由模型仅判断工作模式，工具权限仍由 Runtime 控制。
 
 会话只在首次执行时初始化，切换标签只读取已保留的界面与历史。连续空闲两分钟后自动释放运行时，下次执行自动恢复；排队消息、审批、后台进程、子代理、未退出工具、未应用的代码提案和待解决冲突都会阻止休眠；已结束的子代理及其对话、已结束的 Shell 任务及输出在恢复后保留，可继续跟进或读取。项目内共享模型与工具执行额度，任务等待额度时可正常取消。MCP 目录缓存可复用，连接按会话隔离、按需建立。顶部「资源」可查看运行会话、等待原因、后台进程的内存与 CPU 累计时间及最近失败；关闭面板后停止进程资源采样。
 
@@ -251,13 +249,10 @@ bun run check
 ## 评测
 
 ```bash
-python eval/scripts/run_profile_router_eval.py
 python eval/scripts/run_basic_metrics_eval.py --dry-run
 python eval/scripts/run_terminal_bench_eval.py --dry-run
 python eval/scripts/rebuild_eval_results.py --results-root eval/results --jobs-root jobs
 ```
-
-Profile 路由评测会用真实接口检查 38 条固定用例，默认每 5.2 秒发起一次请求以满足丑橘每分钟 12 次的限制，结果保存到 `eval/local_results/profile_router_jev.json`。
 
 评测结果和运行说明：
 
@@ -267,12 +262,9 @@ Profile 路由评测会用真实接口检查 38 条固定用例，默认每 5.2 
 
 ## 相关文档
 
-- [面试问答](docs/interview-qa.md)
 - [环境变量模板](.env.template)
 
 ## 注意
 
 - 不要提交 `.env` 或 API key。
-- `app-builder` 的浏览器验证需要 Playwright Chromium。
-- `terminal` 仅用于显式 benchmark 任务，不参与普通 profile 自动路由。
 - 被中断的评测应标记为 interrupted/incomplete，不要当作最终结果。

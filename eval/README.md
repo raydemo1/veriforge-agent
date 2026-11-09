@@ -22,9 +22,9 @@ eval/
 - `tasks/memory_ab.json`, `tasks/latency_smoke.json`, `tasks/terminal_bench_8task.json`, and `tasks/terminal_bench_24task.json` define the lightweight interview-project eval workload.
 - `benchmarks/run_terminal_bench.py` launches the fixed Terminal-Bench subset through Harbor.
 - `benchmarks/run_claw_swe_bench.py` launches Claw-SWE-Bench through the upstream orchestrator with the local harness adapter.
-- `benchmarks/harbor_agent.py` is Harbor's installed-agent adapter for running VeriForge with the `terminal` profile inside task containers.
-- `benchmarks/harness_claw_adapter.py` runs VeriForge with the `coding-agent` profile inside each Claw-SWE-Bench container and lets the upstream runner collect patches. Claw remains an external evaluation scenario rather than a separate product profile.
-- `benchmarks/tb2_tasks.json` stores Terminal-Bench task metadata used by the terminal profile and launcher.
+- `benchmarks/harbor_agent.py` is Harbor's installed-agent adapter for running VeriForge inside Terminal-Bench task containers.
+- `benchmarks/harness_claw_adapter.py` runs VeriForge inside each Claw-SWE-Bench container and lets the upstream runner collect patches. Claw remains an external evaluation scenario, not a product mode.
+- `benchmarks/data/tb2_tasks.json` stores Terminal-Bench task metadata consumed by `benchmarks/tb2_metadata.py` and the launcher.
 
 ## Common Commands
 
@@ -63,8 +63,7 @@ archived from `b2391f3`. The checkout must include that commit. Each result
 records the full runtime revision alongside the model and container image.
 
 Each block pairs A (verifier disabled), B (evidence only), and C (current
-exit behavior) on a clean copy of the same fixture. All three run the pinned
-`coding-agent` profile with the same budgets and permissions inside Docker.
+exit behavior) on a clean copy of the same fixture. All three run the same agent with the same budgets and permissions inside Docker.
 The runner caps tool calls and trial wall time. There is no cumulative token cap.
 The agent container receives the fixture and prompt. The hidden tests run
 after it exits in a separate container with no network access.
@@ -78,18 +77,6 @@ intervention are observed overhead. The paired B/C comparison estimates the
 effect on total requests. In C, the first interrupted candidate is graded
 separately to flag already-passing code and possible rescues or regressions.
 These fixtures are a pilot for the measurement path and cover Python only.
-
-### Profile prompt pilot
-
-```powershell
-python eval/scripts/run_verifier_ablation.py --experiment profile-prompt --run --repeats 2 --rates 0.006 0.30 1.20
-```
-
-Both groups use passive verification and the same model, permissions, tools,
-and budgets. P0 uses the original `coding-agent` profile prompt. P1 compresses
-that prompt while keeping the todo policy and the shared runtime instructions.
-Results include the exact profile prompts, input tokens on the first model
-request, and its tool schema hash so the paired conditions can be audited.
 
 ### Model configuration
 
