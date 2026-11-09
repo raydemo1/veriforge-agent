@@ -29,9 +29,9 @@ def build_main_agent_middlewares(
 
     Order: user middlewares from ``~/.harness/middlewares.json`` (loaded
     once per session and shared across profile switches) first, then
-    structural guards, failure policy, permission enforcement, and finally
-    static verification. Memory is not middleware: its index is injected
-    into the system prompt by the interactive session.
+    structural guards, failure policy, permission enforcement, passive
+    turn-end diagnostics, and the proposal integration gate. The interactive
+    session injects the memory index into the system prompt separately.
     """
     middlewares: list[AgentMiddleware] = list(user_middlewares)
     middlewares.append(ToolGuardMiddleware())

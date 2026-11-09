@@ -823,6 +823,7 @@ class ExecutorFailureIntegrationTests(unittest.TestCase):
         self.assertTrue(state.fallback.stop_requested)
         self.assertEqual(state.fallback.stop_reason, "retry_budget_exhausted")
         self.assertEqual(state.fallback.stop_limit_type, "schema_failures")
+        self.assertEqual(conversation.last_text, "工具调用未能完成，本轮已停止。")
         injected = [
             str(message.get("content", ""))
             for message in conversation.messages

@@ -44,6 +44,55 @@ python eval/benchmarks/run_claw_swe_bench.py --limit 5
 
 ## A/B tests and final evaluation
 
+### Static verifier pilot
+
+```powershell
+python eval/scripts/run_verifier_ablation.py --repeats 2
+python eval/scripts/run_verifier_ablation.py --build-image
+python eval/scripts/run_verifier_ablation.py --run --repeats 2 --rates 0.006 0.30 1.20
+```
+
+The first command prints the plan. The last command uses the configured model
+and makes billable requests. Set `--rates` to the cache-hit input, cache-miss
+input, and output prices in USD per million tokens. The example applies one
+DeepSeek Flash price schedule to every trial. Local tool calls have zero
+marginal billing by default. `--tool-cost` can assign a flat USD rate per call.
+
+Both pilot commands reproduce the historical comparisons using the runtime
+archived from `b2391f3`. The checkout must include that commit. Each result
+records the full runtime revision alongside the model and container image.
+
+Each block pairs A (verifier disabled), B (evidence only), and C (current
+exit behavior) on a clean copy of the same fixture. All three run the pinned
+`coding-agent` profile with the same budgets and permissions inside Docker.
+The runner caps tool calls and trial wall time. There is no cumulative token cap.
+The agent container receives the fixture and prompt. The hidden tests run
+after it exits in a separate container with no network access.
+
+`ablation.json` contains the plan, group metrics, and per-trial evidence.
+Cost per success includes failed trials and is left blank if any usage or
+judge result is missing. Latency measures agent execution and excludes setup
+and hidden tests. Timed-out runs are counted separately. Repeated tests count
+exact command repeats among recognizable test commands. Requests after a C
+intervention are observed overhead. The paired B/C comparison estimates the
+effect on total requests. In C, the first interrupted candidate is graded
+separately to flag already-passing code and possible rescues or regressions.
+These fixtures are a pilot for the measurement path and cover Python only.
+
+### Profile prompt pilot
+
+```powershell
+python eval/scripts/run_verifier_ablation.py --experiment profile-prompt --run --repeats 2 --rates 0.006 0.30 1.20
+```
+
+Both groups use passive verification and the same model, permissions, tools,
+and budgets. P0 uses the original `coding-agent` profile prompt. P1 compresses
+that prompt while keeping the todo policy and the shared runtime instructions.
+Results include the exact profile prompts, input tokens on the first model
+request, and its tool schema hash so the paired conditions can be audited.
+
+### Model configuration
+
 The default `.env` remains the final-evaluation configuration. To run a local
 evaluation or tuning script with the separate `.env.ab` model profile, use:
 

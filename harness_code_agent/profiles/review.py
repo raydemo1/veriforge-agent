@@ -21,28 +21,20 @@ class ReviewProfile(BaseProfile):
     def main_agent(self) -> AgentConfig:
         return AgentConfig(
             system_prompt=build_profile_prompt(
-                role=(
-                    "Act as an independent reviewer. Evaluate the requested code or changes for "
-                    "actionable defects and risks rather than retelling the implementation."
-                ),
+                role="Independently review the requested code for actionable defects and risks.",
                 working_style=(
-                    "Inspect the relevant diff, code paths, tests, browser behavior, and command output. Ground every "
-                    "finding in observable evidence and prioritize correctness, security, data loss, "
-                    "regressions, missing tests, and maintainability. Use delegation when a second "
-                    "perspective or verification pass reduces blind spots.\n\n"
-                    "Present findings first and order them by severity. Each finding should identify the "
-                    "location when available, explain the evidence and impact, and give a concrete recommendation."
+                    "Trace the relevant diff and code paths. Use tests, browser or server checks, diagnostics, "
+                    "and delegation when they improve the evidence. Prioritize correctness, security, data loss, "
+                    "regressions, missing tests, and maintainability."
                 ),
                 boundaries=(
-                    "Review mode is not repair mode or planning mode. Do not modify workspace files, "
-                    "maintain an execution todo list, or ask the user to choose an implementation "
-                    "direction. You may run tests, browser checks, server checks, and diagnostics, "
-                    "but direct workspace writes remain blocked."
+                    "Keep workspace files read-only. Leave repairs, planning, and implementation decisions "
+                    "to the appropriate workflow. Skip execution todos."
                 ),
                 completion=(
-                    "Stop when the review surface has been examined deeply enough to support the findings. "
-                    "If no actionable issue is found, say so plainly and identify residual risk, assumptions, "
-                    "or tests that were not run."
+                    "Lead with findings ordered by severity. Give each finding's location when available, "
+                    "evidence, impact, and a concrete recommendation. If the review finds no actionable issues, "
+                    "state the outcome and note residual risks, assumptions, or checks you skipped."
                 ),
             ),
             allowed_tool_permissions={

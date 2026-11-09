@@ -1,4 +1,4 @@
-"""Turn-local verification gate and publication of check evidence."""
+"""Record static check evidence for source changes made during the turn."""
 
 from __future__ import annotations
 
@@ -12,15 +12,15 @@ from .base import AgentMiddleware
 class StaticVerifierMiddleware(AgentMiddleware):
     def __init__(self, workspace_root: str | None = None, workspace=None):
         self._root = Path(workspace_root or getattr(workspace, "root", ".")).resolve()
+        self._access = getattr(workspace, "access", None)
         self.engine = VerificationEngine()
         self._baseline = source_fingerprints(self._root)
-        self._reported_signatures: set[tuple] = set()
 
     def begin_turn(self, task, messages, runtime_state=None, agent_name=None):
         self._baseline = source_fingerprints(self._root)
-        self._reported_signatures.clear()
 
-    def pre_exit(self, messages, runtime_state=None, agent_name=None):
+    def after_turn(self, runtime_state=None, agent_name=None) -> None:
+        revision = self._access.cursor() if self._access is not None else None
         current = source_fingerprints(self._root)
         files = sorted(
             path
@@ -28,8 +28,12 @@ class StaticVerifierMiddleware(AgentMiddleware):
             if current.get(path) != self._baseline.get(path)
         )
         if not files:
-            return None
+            return
         results = self.engine.verify(files, self._root)
+        stale = bool(results) and (
+            current != source_fingerprints(self._root)
+            or (self._access is not None and revision != self._access.cursor())
+        )
         if runtime_state is not None:
             runtime_state.verification = {
                 "checks": [check.to_dict() for check in results],
@@ -38,52 +42,11 @@ class StaticVerifierMiddleware(AgentMiddleware):
                 "turn_id": getattr(runtime_state, "turn_id", None),
                 "sequence": getattr(runtime_state, "observation_sequence", None),
             }
-            runtime_state.verification_stale = False
+            runtime_state.verification_stale = stale
         bus = getattr(runtime_state, "event_bus", None)
         if bus is not None and results:
             bus.emit(
                 "checks_recorded",
                 agent=agent_name,
-                payload={"checks": [check.to_dict() for check in results]},
+                payload={"checks": [check.to_dict() for check in results], "stale": stale},
             )
-        blocks = [
-            f"  {detail}"
-            for check in results
-            if check.status == "failed"
-            for detail in check.details
-        ]
-        if blocks:
-            return (
-                "[SYSTEM] LINT CHECK FAILED -- fix these errors before stopping:\n"
-                + "\n".join(blocks[:20])
-            )
-        warns = [
-            f"  {detail}"
-            for check in results
-            if check.status == "warning"
-            for detail in check.details
-        ]
-        signature = tuple(warns[:20])
-        if warns and signature not in self._reported_signatures:
-            self._reported_signatures.add(signature)
-            return (
-                "[SYSTEM] Lint warnings (non-blocking):\n"
-                + "\n".join(warns[:20])
-                + "\nConsider fixing before stopping."
-            )
-        deferred = [
-            f"  {check.name}: {detail}"
-            for check in results
-            if check.status == "skipped"
-            for detail in check.details
-            if detail.startswith("Requires project-code execution")
-        ]
-        signature = tuple(deferred[:20])
-        if deferred and signature not in self._reported_signatures:
-            self._reported_signatures.add(signature)
-            return (
-                "[SYSTEM] Verification skipped (non-blocking):\n"
-                + "\n".join(deferred[:20])
-                + "\nThese checks did not run. Use run_bash if needed, or report them as unverified."
-            )
-        return None

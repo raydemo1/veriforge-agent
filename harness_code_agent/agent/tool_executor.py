@@ -15,7 +15,7 @@ from ..runtime.execution_planner import (
     ExecutionPlanner,
 )
 from ..runtime.tool_call_validation import ToolCall, validate_tool_call
-from ..runtime.tool_failures import FailureMode, ToolFailure, failure_batch_key
+from ..runtime.tool_failures import FailureMode, FailureVisibility, ToolFailure, failure_batch_key
 from ..runtime.tool_registry import tool_schemas_for_profile
 from ..runtime.tool_result import ToolResult
 from ..runtime.tool_runner import (
@@ -167,7 +167,9 @@ class ToolExecutor:
             registry = _registry_for_context(self.agent.tool_context)
             validation = validate_tool_call(call, registry, self.agent.tool_context)
             if validation.error is not None:
-                log.warning(
+                rejected = validation.error.to_result(fn_name)
+                report = log.debug if rejected.metadata.get("failure_visibility") == FailureVisibility.PROTOCOL else log.warning
+                report(
                     "[%s] Rejected tool call %s (%s): %s",
                     self.agent.name,
                     fn_name,
@@ -186,7 +188,7 @@ class ToolExecutor:
                         args=validation.arguments,
                         effect=CallEffect.global_exclusive(kind="blocked"),
                         raw=tc,
-                        blocked_result=validation.error.to_result(fn_name),
+                        blocked_result=rejected,
                     )
                 )
                 continue

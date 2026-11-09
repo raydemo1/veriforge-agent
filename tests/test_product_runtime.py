@@ -3385,12 +3385,16 @@ class ProductRuntimeTests(unittest.TestCase):
             (root / "ok.py").write_text("x = 1\n", encoding="utf-8")
             subprocess.run(["git", "add", "."], cwd=root, capture_output=True, check=False)
             subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, check=False)
-            (root / "ok.py").write_text("x = 2\n", encoding="utf-8")
-
             mw = StaticVerifierMiddleware(workspace_root=str(root))
-            result = mw.pre_exit(messages=[])
+            (root / "ok.py").write_text("x = 2\n", encoding="utf-8")
+            state = SimpleNamespace()
+            with patch(
+                "harness_code_agent.runtime.verification.python._check_ruff",
+                return_value=([], True),
+            ):
+                mw.after_turn(runtime_state=state)
 
-            self.assertIsNone(result)
+            self.assertEqual([check["status"] for check in state.verification["checks"]], ["passed", "passed"])
 
     def test_static_verifier_ignores_preexisting_dirty_python_files(self):
         from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
@@ -3403,9 +3407,10 @@ class ProductRuntimeTests(unittest.TestCase):
             workspace = WorkspaceService(root=root)
             mw = StaticVerifierMiddleware(workspace_root=str(root), workspace=workspace)
             mw.begin_turn("task", messages=[])
-            result = mw.pre_exit(messages=[])
+            state = SimpleNamespace(verification=None)
+            mw.after_turn(runtime_state=state)
 
-            self.assertIsNone(result)
+            self.assertIsNone(state.verification)
 
     def test_static_verifier_git_baseline_ignores_preexisting_dirty_files(self):
         import subprocess
@@ -3423,9 +3428,10 @@ class ProductRuntimeTests(unittest.TestCase):
 
             mw = StaticVerifierMiddleware(workspace_root=str(root))
             mw.begin_turn("task", messages=[])
-            result = mw.pre_exit(messages=[])
+            state = SimpleNamespace(verification=None)
+            mw.after_turn(runtime_state=state)
 
-            self.assertIsNone(result)
+            self.assertIsNone(state.verification)
 
     def test_static_verifier_catches_shell_edit_of_preexisting_dirty_file(self):
         import subprocess
@@ -3447,15 +3453,15 @@ class ProductRuntimeTests(unittest.TestCase):
             # baseline dirty set, so only content fingerprints can see it.
             (root / "good.py").write_text("def f(\n", encoding="utf-8")
 
+            state = SimpleNamespace()
             with patch(
                 "harness_code_agent.runtime.verification.python._check_ruff",
                 return_value=([], True),
             ):
-                result = mw.pre_exit(messages=[])
+                mw.after_turn(runtime_state=state)
 
-            self.assertIsNotNone(result)
-            self.assertIn("LINT CHECK FAILED", result)
-            self.assertIn("good.py", result)
+            self.assertEqual(state.verification["files"], ["good.py"])
+            self.assertEqual(state.verification["checks"][0]["status"], "failed")
 
     def test_static_verifier_catches_shell_written_file_via_git_delta(self):
         import subprocess
@@ -3475,17 +3481,17 @@ class ProductRuntimeTests(unittest.TestCase):
             # service, no change journal, only the git delta can see it.
             (root / "bad.py").write_text("def f(\n", encoding="utf-8")
 
+            state = SimpleNamespace()
             with patch(
                 "harness_code_agent.runtime.verification.python._check_ruff",
                 return_value=([], True),
             ):
-                result = mw.pre_exit(messages=[])
+                mw.after_turn(runtime_state=state)
 
-            self.assertIsNotNone(result)
-            self.assertIn("LINT CHECK FAILED", result)
-            self.assertIn("bad.py", result)
+            self.assertEqual(state.verification["files"], ["bad.py"])
+            self.assertEqual(state.verification["checks"][0]["status"], "failed")
 
-    def test_static_verifier_blocks_syntax_error_from_current_turn_workspace_change(self):
+    def test_static_verifier_records_syntax_error_from_current_turn_workspace_change(self):
         from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
         from harness_code_agent.workspace.service import WorkspaceService
 
@@ -3496,17 +3502,18 @@ class ProductRuntimeTests(unittest.TestCase):
             mw.begin_turn("task", messages=[])
             workspace.write_text("bad.py", "def f(\n")
 
+            state = SimpleNamespace()
             with patch(
                 "harness_code_agent.runtime.verification.python._check_ruff",
                 return_value=([], True),
             ):
-                result = mw.pre_exit(messages=[])
+                mw.after_turn(runtime_state=state)
 
-            self.assertIsNotNone(result)
-            self.assertIn("LINT CHECK FAILED", result)
-            self.assertIn("bad.py", result)
+            syntax = state.verification["checks"][0]
+            self.assertEqual(syntax["status"], "failed")
+            self.assertIn("bad.py", syntax["detail"])
 
-    def test_static_verifier_warns_only_once_then_allows_exit(self):
+    def test_static_verifier_records_warning_and_allows_exit(self):
         from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
         from harness_code_agent.workspace.service import WorkspaceService
 
@@ -3517,18 +3524,18 @@ class ProductRuntimeTests(unittest.TestCase):
             mw.begin_turn("task", messages=[])
             workspace.write_text("warn.py", "x = 1\n")
 
+            state = SimpleNamespace()
             with patch(
                 "harness_code_agent.runtime.verification.python._check_ruff",
                 return_value=([("warn.py", "W292", "no newline at end of file", 1)], True),
             ):
-                first = mw.pre_exit(messages=[])
-                second = mw.pre_exit(messages=[])
+                mw.after_turn(runtime_state=state)
 
-            self.assertIsNotNone(first)
-            self.assertIn("Lint warnings", first)
-            self.assertIsNone(second)
+            lint = state.verification["checks"][1]
+            self.assertEqual(lint["status"], "warning")
+            self.assertIn("W292", lint["detail"])
 
-    def test_static_verifier_ruff_blocks_error_findings_scoped_to_turn_files(self):
+    def test_static_verifier_records_ruff_errors_scoped_to_turn_files(self):
         import json
         from unittest.mock import MagicMock
 
@@ -3554,22 +3561,23 @@ class ProductRuntimeTests(unittest.TestCase):
             fake_run = MagicMock(return_value=SimpleNamespace(
                 returncode=1, stdout=payload, stderr="",
             ))
+            state = SimpleNamespace()
             with patch(
                 "harness_code_agent.runtime.verification.python.subprocess.run",
                 fake_run,
             ):
-                result = mw.pre_exit(messages=[])
+                mw.after_turn(runtime_state=state)
 
-            self.assertIsNotNone(result)
-            self.assertIn("LINT CHECK FAILED", result)
-            self.assertIn("F821", result)
-            self.assertIn("new.py:3", result)
+            lint = state.verification["checks"][1]
+            self.assertEqual(lint["status"], "failed")
+            self.assertIn("F821", lint["detail"])
+            self.assertIn("new.py:3", lint["detail"])
             # Ruff only ever sees the current-turn file, never the whole tree.
             argv = fake_run.call_args.args[0]
             self.assertIn("new.py", argv)
             self.assertNotIn("old.py", argv)
 
-    def test_static_verifier_ruff_unusable_output_does_not_block_exit(self):
+    def test_static_verifier_records_unusable_ruff_output_as_skipped(self):
         from unittest.mock import MagicMock
 
         from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
@@ -3585,13 +3593,15 @@ class ProductRuntimeTests(unittest.TestCase):
             fake_run = MagicMock(return_value=SimpleNamespace(
                 returncode=1, stdout="this is not json", stderr="",
             ))
+            state = SimpleNamespace()
             with patch(
                 "harness_code_agent.runtime.verification.python.subprocess.run",
                 fake_run,
             ):
-                self.assertIsNone(mw.pre_exit(messages=[]))
+                mw.after_turn(runtime_state=state)
+            self.assertEqual(state.verification["checks"][1]["status"], "skipped")
 
-    def test_static_verifier_skips_non_python_files(self):
+    def test_static_verifier_produces_no_checks_for_unsupported_files(self):
         import subprocess
 
         from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
@@ -3601,12 +3611,12 @@ class ProductRuntimeTests(unittest.TestCase):
             subprocess.run(["git", "init"], cwd=root, capture_output=True, check=False)
             subprocess.run(["git", "add", "."], cwd=root, capture_output=True, check=False)
             subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, check=False)
-            (root / "data.json").write_text("{}", encoding="utf-8")
-
             mw = StaticVerifierMiddleware(workspace_root=str(root))
-            result = mw.pre_exit(messages=[])
+            (root / "data.json").write_text("{}", encoding="utf-8")
+            state = SimpleNamespace(verification=None)
+            mw.after_turn(runtime_state=state)
 
-            self.assertIsNone(result)
+            self.assertIsNone(state.verification)
 
     def test_check_ruff_not_installed_gracefully_skips(self):
         from unittest.mock import patch as _patch
@@ -3668,7 +3678,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 "harness_code_agent.runtime.verification.python._check_ruff",
                 return_value=([], True),
             ):
-                mw.pre_exit(messages=[], runtime_state=SimpleNamespace(event_bus=bus))
+                mw.after_turn(runtime_state=SimpleNamespace(event_bus=bus))
 
         self.assertEqual(len(bus.events), 1)
         event_type, agent, payload = bus.events[0]

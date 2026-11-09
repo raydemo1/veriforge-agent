@@ -41,12 +41,14 @@ class SessionJournal:
         })
 
     def append_verification(self, *, summary: str, outcome: str, tool_call_id: str,
-                            memory_generation: str, files: list[dict] | None = None) -> JournalEntry:
+                            memory_generation: str, files: list[dict] | None = None,
+                            auto_extract: bool = True) -> JournalEntry:
         if outcome not in {"passed", "failed"} or not summary.strip() or not tool_call_id or not memory_generation:
             raise ValueError("verification requires a structured outcome, summary, tool call and generation")
         return self.append("verification", {
             "text": summary, "outcome": outcome, "tool_call_id": tool_call_id,
             "memory_generation": memory_generation, "files": _json_safe(files or []),
+            "auto_extract": auto_extract,
         })
 
     def append_compaction(

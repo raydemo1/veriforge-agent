@@ -169,18 +169,31 @@ class ToolExecutorTests(unittest.TestCase):
             conversation, context = _conversation_with_registry(
                 Path(tmp),
                 registry,
-                [_tool_call("tc_probe", "probe", {"value": 1})],
+                [
+                    _tool_call("wrong_type", "probe", {"value": 1}),
+                    _tool_call("duplicate_key", "probe", '{"value":"first","value":"second"}'),
+                    _tool_call("valid", "probe", {"value": "accepted"}),
+                ],
             )
             policy = SpyPermissionPolicy()
             context.permission_policy = policy
             conversation.run_until_idle()
 
-        self.assertEqual(executed, [])
-        self.assertEqual(policy.calls, 0)
-        tool_result = next(event for event in context.event_bus.events if event.type == "tool_result")
-        self.assertEqual(tool_result.payload["metadata"]["error_kind"], "invalid_arguments")
-        self.assertTrue(tool_result.payload["metadata"]["retryable"])
-        self.assertEqual(tool_result.payload["metadata"]["validation_phase"], "structural")
+        self.assertEqual(executed, ["accepted"])
+        self.assertEqual(policy.calls, 1)
+        results = [event.payload for event in context.event_bus.events if event.type == "tool_result"]
+        for result, kind, phase in zip(
+            results[:2], ("invalid_arguments", "invalid_json"), ("structural", "syntactic"), strict=True,
+        ):
+            self.assertEqual(result["metadata"]["error_kind"], kind)
+            self.assertTrue(result["metadata"]["retryable"])
+            self.assertEqual(result["metadata"]["validation_phase"], phase)
+        self.assertEqual(results[2]["status"], "success")
+        tool_messages = {message["tool_call_id"]: message for message in conversation.messages if message["role"] == "tool"}
+        self.assertIn("duplicate key", tool_messages["duplicate_key"]["content"])
+        self.assertEqual(conversation.last_text, "done")
+        calls = [event.payload for event in context.event_bus.events if event.type == "tool_call"]
+        self.assertEqual([call.get("failure_visibility") for call in calls], ["protocol", "protocol", None])
         self.assertIn("failure", [event.type for event in context.event_bus.events])
 
 

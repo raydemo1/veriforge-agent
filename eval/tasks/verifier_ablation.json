@@ -1,0 +1,31 @@
+[
+  {
+    "name": "slug-normalization",
+    "category": "simple",
+    "prompt": "Fix slugify(title) in slug.py. It should lowercase and transliterate accented Latin letters via Unicode NFKD followed by dropping non-ASCII characters. Then replace each run of characters other than ASCII letters and digits with one hyphen and remove leading and trailing hyphens. Preserve the function's signature and use the standard library.",
+    "files": {
+      "slug.py": "def slugify(title: str) -> str:\n    return title.strip().lower().replace(' ', '-')\n"
+    },
+    "hidden_test": "from slug import slugify\nfor title, expected in [\n    ('  Crème brûlée / Café 42  ', 'creme-brulee-cafe-42'),\n    ('A__B -- C\\tD', 'a-b-c-d'),\n    ('---', ''),\n    ('e\\u0301té', 'ete'),\n    ('12\\n34', '12-34'),\n    ('', ''),\n]:\n    assert slugify(title) == expected, repr(title)\n"
+  },
+  {
+    "name": "availability-windows",
+    "category": "complex-fix",
+    "prompt": "Repair available(window, busy) in schedule.py. Return ascending half-open free intervals inside the integer tuple window, after subtracting all half-open busy intervals. Busy input can be unsorted, nested, overlapping, adjacent, or extend outside the window. Ignore empty or reversed busy intervals. An empty or reversed window returns []. Do not mutate the caller's data. Use the standard library and keep the existing signature. Keep the existing schedule.ZoneInfo import available to downstream clients.",
+    "files": {
+      "schedule.py": "from zoneinfo import ZoneInfo\n\ndef available(window: tuple[int, int], busy: list[tuple[int, int]]) -> list[tuple[int, int]]:\n    left, right = window\n    result = []\n    for start, stop in busy:\n        if start > left:\n            result.append((left, start))\n        left = stop\n    if left < right:\n        result.append((left, right))\n    return result\n"
+    },
+    "hidden_test": "from random import Random\nfrom zoneinfo import ZoneInfo\nfrom schedule import ZoneInfo as ExportedZoneInfo, available\n\nassert ExportedZoneInfo is ZoneInfo\nassert available((0, 20), [(6, 11), (-3, 2), (12, 16), (2, 5), (10, 12), (22, 25), (17, 16)]) == [(5, 6), (16, 20)]\nassert available((10, 0), []) == []\nrng = Random(19)\nfor _ in range(150):\n    low, high = (rng.randrange(-8, 9) for _ in range(2))\n    busy = [(rng.randrange(-12, 13), rng.randrange(-12, 13)) for _ in range(rng.randrange(18))]\n    before = list(busy)\n    actual = available((low, high), busy)\n    assert busy == before\n    expected = [i for i in range(low, high) if not any(a <= i < b for a, b in busy)]\n    assert [i for a, b in actual for i in range(a, b)] == expected\n    assert all(low <= a < b <= high for a, b in actual)\n    assert all(b < c for (_, b), (c, _) in zip(actual, actual[1:]))\n"
+  },
+  {
+    "name": "expense-summary",
+    "category": "multi-file",
+    "prompt": "Extend the CSV expense reporter across its existing loader, report, and CLI. CSV still has category and cents columns. Accept an optional status column. Trim and lowercase status, defaulting to 'posted' if it is missing or blank. Add an optional keyword-only status filter to totals() that defaults to None (all rows) and compares normalized statuses. Add a --status VALUE CLI option that selects only that status, with case and surrounding whitespace ignored. Preserve current behavior and public call signatures for callers that omit the new option, including alphabetical output and support for old CSV files. Keep it standard-library only.",
+    "files": {
+      "records.py": "import csv\nfrom pathlib import Path\n\ndef load(path: Path) -> list[dict]:\n    with path.open(encoding=\"utf-8\", newline=\"\") as stream:\n        return [\n            {\"category\": row[\"category\"], \"cents\": int(row[\"cents\"])}\n            for row in csv.DictReader(stream)\n        ]\n",
+      "report.py": "def totals(records: list[dict]) -> dict[str, int]:\n    result: dict[str, int] = {}\n    for record in records:\n        category = record[\"category\"]\n        result[category] = result.get(category, 0) + record[\"cents\"]\n    return dict(sorted(result.items()))\n",
+      "cli.py": "import argparse\nfrom pathlib import Path\n\nfrom records import load\nfrom report import totals\n\ndef main() -> None:\n    parser = argparse.ArgumentParser()\n    parser.add_argument(\"path\", type=Path)\n    args = parser.parse_args()\n    for category, cents in totals(load(args.path)).items():\n        print(f\"{category}: {cents}\")\n\nif __name__ == \"__main__\":\n    main()\n"
+    },
+    "hidden_test": "import subprocess\nimport sys\nfrom pathlib import Path\nfrom tempfile import TemporaryDirectory\n\nfrom records import load\nfrom report import totals\n\nwith TemporaryDirectory() as directory:\n    path = Path(directory) / 'input.csv'\n    path.write_text('category,cents,status\\ntravel,100, Pending \\nfood,200,POSTED\\nfood,-50,\\ntravel,99,pEnDiNg\\n', encoding='utf-8')\n    rows = load(path)\n    assert [row['status'] for row in rows] == ['pending', 'posted', 'posted', 'pending']\n    assert totals(rows) == {'food': 150, 'travel': 199}\n    assert totals(rows, status=' PeNding ') == {'travel': 199}\n    assert totals(rows, status='unknown') == {}\n    assert totals([{'category': 'legacy', 'cents': 20}]) == {'legacy': 20}\n    def cli(*args):\n        return subprocess.check_output([sys.executable, '-B', 'cli.py', str(path), *args], text=True)\n    assert cli() == 'food: 150\\ntravel: 199\\n'\n    assert cli('--status', ' PeNding ') == 'travel: 199\\n'\n    path.write_text('category,cents\\nfood,20\\n', encoding='utf-8')\n    assert load(path)[0]['status'] == 'posted'\n    assert cli('--status', 'POSTED') == 'food: 20\\n'\n"
+  }
+]

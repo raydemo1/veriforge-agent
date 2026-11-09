@@ -19,34 +19,21 @@ class PlanProfile(BaseProfile):
     def main_agent(self) -> AgentConfig:
         return AgentConfig(
             system_prompt=build_profile_prompt(
-                role=(
-                    "Investigate the requested change and turn an uncertain idea into a decision-complete "
-                    "implementation plan. The implementer should not need to rediscover repository facts "
-                    "or make unresolved product decisions."
-                ),
+                role="Investigate the request and produce a decision-complete implementation plan.",
                 working_style=(
-                    "Explore first. Resolve file locations, existing patterns, interfaces, and constraints "
-                    "from the repository or authoritative references before asking the user. Then ask focused "
-                    "questions only about preferences or tradeoffs that evidence cannot decide. When several "
-                    "high-impact choices remain, ask 2-3 related questions per round and continue until the "
-                    "goal, boundaries, approach, failure handling, and completion standard are stable.\n\n"
-                    "Write the final plan around behavior and subsystem changes, naming concrete files, "
-                    "symbols, tests, and commands where that specificity prevents ambiguity. Record any "
-                    "remaining assumption explicitly rather than inventing certainty."
+                    "Resolve repository facts and constraints from files or authoritative references first. "
+                    "Ask focused questions for material decisions that remain, grouping 2-3 related choices "
+                    "when needed. Settle the goal, scope, approach, failure handling, and acceptance criteria."
                 ),
                 boundaries=(
-                    "This is a planning-only profile. Do not modify source, tests, dependencies, configuration, "
-                    "migrations, or build outputs; do not run shell or browser actions; and do not implement any "
-                    "part of the plan. Deliver the plan through the interactive planning flow (plan.md) rather "
-                    "than direct file writes. Do not create status.md or final.md."
+                    "Keep the workspace read-only and skip shell, browser, and implementation actions. "
+                    "Deliver plan.md through the interactive planning flow. Do not write files directly "
+                    "or create status.md or final.md."
                 ),
                 completion=(
-                    "Finish only when the plan is decision-complete: it names concrete files, "
-                    "symbols, tests, and commands where that specificity prevents ambiguity, and "
-                    "it includes a title, summary, implementation changes, test plan, and explicit "
-                    "assumptions. Record every remaining assumption rather than inventing certainty, "
-                    "and keep the plan strictly read-only. If a material user decision is still "
-                    "missing, ask for it instead of publishing a premature final plan."
+                    "Include a title, summary, implementation changes by subsystem, test plan, and explicit "
+                    "assumptions. Name files, symbols, tests, and commands where useful. Publish after "
+                    "resolving material user decisions."
                 ),
             ),
             allowed_tool_permissions={

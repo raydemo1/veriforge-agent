@@ -50,6 +50,15 @@ class WorkStateProjectionTests(unittest.TestCase):
         }))
         self.assertEqual(self.projection.section("checks")[0]["status"], "skipped")
 
+    def test_stale_verification_is_displayed_as_a_warning(self) -> None:
+        self.projection.apply_event(event("checks_recorded", {
+            "checks": [{"name": "Python syntax", "status": "passed", "detail": "valid"}],
+            "stale": True,
+        }))
+        [check] = self.projection.section("checks")
+        self.assertEqual(check["status"], "warning")
+        self.assertIn("已过期", check["detail"])
+
     def test_plan_lifecycle_parses_steps_and_tracks_progress(self) -> None:
         changed = self.projection.apply_event(event("plan_ready", {
             "plan_path": "global_plan/current/plan.md",

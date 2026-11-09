@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -206,7 +207,8 @@ def validate_tool_arguments(
     """Validate already-decoded arguments used by direct runtime callers."""
 
     return validate_tool_call(
-        ToolCall(index=-1, tool_call_id="direct", name=name, raw_arguments=arguments),
+        ToolCall(index=-1, tool_call_id="direct", name=name,
+                 raw_arguments={} if arguments is None else arguments),
         registry,
         tool_context,
     )
@@ -220,22 +222,39 @@ def _read_field(value: Any, key: str, default: Any = None) -> Any:
 
 def _decode_arguments(raw_arguments: Any) -> tuple[dict[str, Any], ToolError | None]:
     if raw_arguments is None:
-        return {}, None
+        return {}, ToolError(
+            kind="invalid_json",
+            message="arguments are required. Use {} for a tool with no arguments.",
+            retryable=True,
+            phase="syntactic",
+        )
     if isinstance(raw_arguments, str):
-        text = raw_arguments.strip()
-        if not text:
-            return {}, None
         try:
-            decoded = json.loads(text)
-        except json.JSONDecodeError as exc:
+            decoded = json.loads(raw_arguments, object_pairs_hook=_unique_json_object)
+            _check_json_values(decoded)
+        except (TypeError, ValueError, RecursionError) as exc:
+            detail = (
+                f"{exc.msg} at character {exc.pos}"
+                if isinstance(exc, json.JSONDecodeError)
+                else str(exc)
+            )
             return {}, ToolError(
                 kind="invalid_json",
-                message=f"arguments are not valid JSON ({exc.msg} at character {exc.pos})",
+                message=f"arguments are not valid JSON ({detail})",
                 retryable=True,
                 phase="syntactic",
             )
     elif isinstance(raw_arguments, Mapping):
         decoded = dict(raw_arguments)
+        try:
+            _check_json_values(decoded)
+        except (TypeError, ValueError, RecursionError) as exc:
+            return {}, ToolError(
+                kind="invalid_arguments",
+                message=f"arguments are not a valid JSON object ({exc})",
+                retryable=True,
+                phase="syntactic",
+            )
     else:
         return {}, ToolError(
             kind="invalid_arguments",
@@ -253,6 +272,38 @@ def _decode_arguments(raw_arguments: Any) -> tuple[dict[str, Any], ToolError | N
             phase="structural",
         )
     return decoded, None
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("object contains a duplicate key")
+        result[key] = value
+    return result
+
+
+def _check_json_values(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("object keys must be strings")
+            _check_json_values(key)
+            _check_json_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _check_json_values(item)
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("numbers must be finite")
+    elif isinstance(value, str):
+        if not value.isascii():
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError("strings must be valid Unicode") from None
+    elif value is not None and not isinstance(value, int):
+        raise TypeError("values must be JSON-compatible")
 
 
 def _parameters_schema(schema: Mapping[str, Any]) -> dict[str, Any] | None:

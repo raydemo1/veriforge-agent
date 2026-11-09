@@ -102,6 +102,8 @@ class WorkStateProjection:
         elif event_type == "checks_recorded":
             for check in payload.get("checks") or []:
                 if isinstance(check, dict):
+                    if payload.get("stale"):
+                        check = {**check, "status": "warning", "detail": "结果已过期，检查期间工作区发生变化。"}
                     changed |= self._upsert_check(check)
         return changed
 

@@ -886,6 +886,8 @@ class AgentConversation:
 
     def _fallback_text(self) -> str:
         fallback = self.runtime_state.fallback
+        if fallback.stop_limit_type == "schema_failures":
+            return "工具调用未能完成，本轮已停止。"
         details = [f"Agent fallback triggered: {fallback.stop_reason or 'unknown'}."]
         if fallback.stop_limit_type:
             used = "unknown" if fallback.stop_used is None else str(fallback.stop_used)
@@ -1109,6 +1111,11 @@ class AgentConversation:
                 break
 
         self._iteration_offset += local_iteration
+        self._check_cancelled(cancellation_token)
+        for middleware in agent.middlewares:
+            observer = getattr(middleware, "after_turn", None)
+            if observer is not None:
+                observer(runtime_state=self.runtime_state, agent_name=agent.name)
         return self.last_text
 
     def close(self) -> None:

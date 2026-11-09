@@ -202,6 +202,24 @@ class TerminalUiTests(unittest.TestCase):
         self.assertIn("ModuleNotFoundError", result.body)
         self.assertIn("退出码 1", result.body)
 
+    def test_model_protocol_errors_stay_out_of_the_transcript(self):
+        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state.snapshot.status = "thinking"
+        events = [
+            ("tool_call", {"tool": "write_file", "args": {}, "failure_visibility": "protocol"}),
+            ("tool_result", {"tool": "write_file", "status": "failed", "error": "invalid_json: duplicate key",
+                             "metadata": {"failure_visibility": "protocol"}}),
+            ("failure", {"tool": "write_file", "message": "invalid_json: duplicate key",
+                         "metadata": {"failure_visibility": "protocol"}}),
+        ]
+        for sequence, (kind, payload) in enumerate(events, 1):
+            self.assertIsNone(state.apply_event(SessionEvent(sequence, 0, kind, "main", payload)))
+        self.assertEqual(state.snapshot.status, "thinking")
+        self.assertEqual(state.active_tool_blocks, {})
+        self.assertIsNone(state.apply_event(SessionEvent(4, 0, "agent_fallback", "main", {
+            "reason": "retry_budget_exhausted", "limit_type": "schema_failures", "last_tool": "write_file",
+        })))
+
     def test_approval_and_policy_rejections_collapse_to_a_short_line(self):
         state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
         state.apply_event(SessionEvent(1, 0, "tool_call", "main", {

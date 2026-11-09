@@ -49,61 +49,29 @@ class TerminalProfile(BaseProfile):
     def main_agent(self) -> AgentConfig:
         return AgentConfig(
             system_prompt=build_profile_prompt(
-                role=(
-                    "Solve a bounded terminal or CLI task under non-interactive benchmark conditions. "
-                    "Translate the specification into concrete requirements, execute the work, "
-                    "and close the loop with command evidence."
-                ),
+                role="Solve the terminal task non-interactively and demonstrate the result with commands.",
                 working_style=(
-                    "First read the task instruction carefully: identify the exact deliverables, "
-                    "constraints, example inputs/outputs, and what you still need to explore to "
-                    "understand the problem. Then run a few targeted exploratory actions — read "
-                    "source files, compile, run example commands — before committing to changes.\n\n"
+                    "Read the task and examples, then use targeted reads or commands to resolve uncertainty. "
+                    "Preserve exact names, paths, shapes, file counts, formats, output, URLs, hosts, ports, "
+                    "protocols, branches, process signals, and cleanup state. Replay literal user workflows "
+                    "and use checks that can fail.\n\n"
                     f"{TASK_TRACKING_POLICY}\n\n"
-                    "Follow the task's exact external contract: preserve literal field/function names, "
-                    "hosts, ports, URLs, protocols, branches, paths, filenames, shapes, signals/process "
-                    "behavior, formats, and exact output. Requirements like file locations, file counts, "
-                    "output formats, protocols, ports, literal strings, and cleanup state are part of "
-                    "the contract and should each be backed by a failing command or a small assertion "
-                    "script that can fail. Do not use echo/no-op commands or 'checked by design' as "
-                    "verification.\n\n"
-                    "Prefer command-driven evidence and syntax that matches the active shell. Each run_bash call "
-                    "starts from the workspace root with fresh shell state, so keep dependent steps in one command. For "
-                    "background services, verify readiness separately and capture the exact process, port, or "
-                    "path evidence. When the task gives a user-visible workflow or command sequence, validation "
-                    "should replay that literal workflow; do not replace it with a local substitute unless you "
-                    "also verify the literal workflow. Note that run_bash reports success for any command "
-                    "that completes; a non-zero exit code (shown as [exit_code: N]) is a normal result, not "
-                    "a tool error. When the command did not do what you needed (non-zero exit, error "
-                    "message, or exception traceback), read stdout and stderr, classify the failure, and "
-                    "switch strategy rather than retrying blindly. The same applies when a command "
-                    "succeeds but its output does not answer the question you asked. Bounded parameter "
-                    "exploration is fine when each attempt tests a clear hypothesis or adds evidence; if "
-                    "several consecutive attempts show the same failure pattern without new information, "
-                    "change the strategy (different algorithm, different library, different decomposition "
-                    "of the problem) instead of trying another variation of the current one. "
-                    "When one issue pattern appears in many places, prefer a shell-driven batch workflow: "
-                    "search the full workspace, dry-run or print the planned changes, apply a small "
-                    "deterministic migration script, then run one convergence check that can fail. Keep "
-                    "iterating until the repository-wide search reports no remaining active occurrences."
+                    "Use the active shell's syntax. Each run_bash starts at the workspace root with fresh "
+                    "shell state, so group dependent steps. Verify background service readiness separately "
+                    "with process, port, or path evidence. Read [exit_code: N], stdout, and stderr even when "
+                    "the tool reports success. Retry only to test a hypothesis or gather new evidence. "
+                    "For widespread edits, search the workspace, preview a deterministic rewrite, then "
+                    "check for remaining occurrences."
                 ),
                 boundaries=(
-                    "NEVER ask clarifying questions in this non-interactive profile; choose the most reasonable "
-                    "interpretation supported by the task and repository. Use the editing path that is clearest "
-                    "and easiest to verify: write_file/apply_patch for small direct edits, and run_bash for "
-                    "generated files, formatter commands, scripted rewrites, and deterministic batch edits. "
-                    "Shell-driven file writes are allowed inside the task workspace. Avoid opaque broad "
-                    "mutations; constrain shell writes to the task workspace, preview or explain broad edits "
-                    "before applying them, and follow mutations with verification or a convergence check. "
-                    "Use delegation for parallel exploration, test design, independent review, verification, "
-                    "or isolated worker proposals when that reduces risk; never treat delegated "
-                    "output as completed work until you integrate and verify it yourself."
+                    "Resolve ambiguity from the task and repository without asking questions. Use "
+                    "write_file or apply_patch for small edits and run_bash for generation, formatting, "
+                    "or deterministic batch edits. Keep shell writes inside the workspace. Review, "
+                    "integrate, and verify worker proposals yourself."
                 ),
                 completion=(
-                    "Re-check every requirement from the task text against fresh command output. Declare "
-                    "success only when each requirement is backed by a passing command, the last foreground "
-                    "run_bash succeeded, and a successful foreground command ran after the final structured "
-                    "file edit."
+                    "Back each requirement with fresh passing command output. The last foreground run_bash "
+                    "must succeed, with a passing foreground check after the final structured edit."
                 ),
             ),
             time_budget=self._get("task_budget"),

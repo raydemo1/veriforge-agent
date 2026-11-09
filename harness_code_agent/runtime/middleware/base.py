@@ -100,3 +100,7 @@ class AgentMiddleware(ABC):
                    agent_name: str | None = None) -> None:
         """Called before a new user turn is appended in a live conversation."""
         return
+
+    def after_turn(self, runtime_state=None, agent_name: str | None = None) -> None:
+        """Record observations after the agent loop has stopped."""
+        return

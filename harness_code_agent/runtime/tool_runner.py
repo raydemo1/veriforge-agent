@@ -1,8 +1,6 @@
 """Tool execution and event finalization."""
 from __future__ import annotations
 
-from ..workspace.access import WorkspaceConflict
-
 import inspect
 from collections.abc import Callable
 from typing import Any
@@ -15,11 +13,11 @@ from ..sessions.events import (
     ToolResultEvent,
     classify_tool_failure,
 )
+from ..workspace.access import WorkspaceConflict
 from .tool_call_validation import validate_tool_arguments
 from .tool_context import ToolContext
 from .tool_registry import ToolRegistry
 from .tool_result import ToolResult, unstructured_tool_result_from_text
-
 
 TOOL_EVENT_OUTPUT_LIMIT = 2_000
 
@@ -59,16 +57,25 @@ def execute_tool_result(
     and public execution keeps the default and validates here.
     """
     registry = _registry_for_context(tool_context)
+    fn = registry.get(name)
+    has_schema = fn is not None and registry.schema_for(name) is not None
+    validation = (
+        validate_tool_arguments(name, arguments, registry, tool_context)
+        if fn is not None and has_schema and validate_arguments
+        else None
+    )
+    rejected = validation.error.to_result(name) if validation is not None and validation.error else None
 
     if emit_events and tool_context is not None:
+        event_args = validation.arguments if validation is not None else arguments
         emit_tool_call_started(
             name=name,
-            arguments=arguments if isinstance(arguments, dict) else {},
+            arguments=event_args if isinstance(event_args, dict) else {},
             tool_context=tool_context,
             agent_name=agent_name,
+            failure_visibility=rejected.metadata.get("failure_visibility") if rejected else None,
         )
 
-    fn = registry.get(name)
     if fn is None:
         return _finalize_tool_result_object(
             ToolResult(
@@ -83,18 +90,16 @@ def execute_tool_result(
             emit_events=emit_events,
         )
 
-    if registry.schema_for(name) is not None:
-        if validate_arguments:
-            validation = validate_tool_arguments(name, arguments, registry, tool_context)
-            if validation.error is not None:
-                return _finalize_tool_result_object(
-                    validation.error.to_result(name),
-                    tool_context=tool_context,
-                    agent_name=agent_name,
-                    emit_events=emit_events,
-                )
-            arguments = validation.arguments
-    else:
+    if rejected is not None:
+        return _finalize_tool_result_object(
+            rejected,
+            tool_context=tool_context,
+            agent_name=agent_name,
+            emit_events=emit_events,
+        )
+    if validation is not None:
+        arguments = validation.arguments
+    elif not has_schema:
         # Direct-call path for handlers injected by integrations that do not
         # register a schema. Model tool calls never use it: ToolExecutor
         # requires a registered schema first.
@@ -162,14 +167,13 @@ def finalize_intercepted_tool_result(
     agent_name: str | None,
 ) -> ToolResult:
     """Record a tool call that was intercepted before native execution."""
-    if tool_context is not None:
-        tool_context.event_bus.emit_event(
-            ToolCallEvent(
-                tool=tool_result.tool,
-                args=_redact_tool_args(arguments or {}),
-                agent=agent_name,
-            ).to_event()
-        )
+    emit_tool_call_started(
+        name=tool_result.tool,
+        arguments=arguments or {},
+        tool_context=tool_context,
+        agent_name=agent_name,
+        failure_visibility=tool_result.metadata.get("failure_visibility"),
+    )
     return _finalize_tool_result_object(
         tool_result,
         tool_context=tool_context,
@@ -183,6 +187,7 @@ def emit_tool_call_started(
     arguments: dict,
     tool_context: ToolContext | None,
     agent_name: str | None,
+    failure_visibility: str | None = None,
 ) -> None:
     if tool_context is None:
         return
@@ -191,6 +196,7 @@ def emit_tool_call_started(
             tool=name,
             args=_redact_tool_args(arguments),
             agent=agent_name,
+            failure_visibility=failure_visibility,
         ).to_event()
     )
 

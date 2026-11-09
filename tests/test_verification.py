@@ -17,6 +17,8 @@ from harness_code_agent.runtime.verification.languages import (
     RustProvider,
     TypeScriptProvider,
 )
+from harness_code_agent.sessions.events import EventBus
+from harness_code_agent.workspace.service import WorkspaceService
 
 
 def write(root, path, text=""):
@@ -33,11 +35,16 @@ def test_non_git_shell_change_is_turn_local(tmp_path, monkeypatch):
         "harness_code_agent.runtime.verification.python._check_ruff",
         lambda *_: ([], False),
     )
-    assert middleware.pre_exit([]) is None
+    state = SimpleNamespace(verification=None)
+    middleware.after_turn(runtime_state=state)
+    assert state.verification is None
     write(tmp_path, "edit.py", "def broken(\n")
-    result = middleware.pre_exit([])
-    assert "edit.py" in result
-    assert "old.py" not in result
+    middleware.after_turn(runtime_state=state)
+    assert state.verification["files"] == ["edit.py"]
+    syntax = state.verification["checks"][0]
+    assert syntax["status"] == "failed"
+    assert "edit.py" in syntax["detail"]
+    assert "old.py" not in syntax["detail"]
 
 
 @pytest.mark.parametrize("language", ["eslint", "go", "rust"])
@@ -89,7 +96,10 @@ def test_deleted_files_are_dispatched_but_removed_python_is_not_parsed(tmp_path)
     write(tmp_path, "old.py", "x = 1")
     middleware = StaticVerifierMiddleware(workspace_root=str(tmp_path))
     (tmp_path / "old.py").unlink()
-    assert middleware.pre_exit([]) is None
+    state = SimpleNamespace()
+    middleware.after_turn(runtime_state=state)
+    assert state.verification["files"] == ["old.py"]
+    assert state.verification["checks"] == []
 
 
 def test_skipped_tool_published_without_blocking(tmp_path, monkeypatch):
@@ -101,22 +111,75 @@ def test_skipped_tool_published_without_blocking(tmp_path, monkeypatch):
     state = SimpleNamespace(
         event_bus=SimpleNamespace(emit=lambda *a, **kw: events.append(kw["payload"]))
     )
-    assert middleware.pre_exit([], runtime_state=state) is None
+    middleware.after_turn(runtime_state=state)
     assert events[0]["checks"][0]["status"] == "skipped"
 
 
-def test_project_execution_skip_is_reported_once_without_blocking_exit(tmp_path):
+def test_project_execution_skip_records_command_without_blocking_exit(tmp_path):
     write(tmp_path, "Cargo.toml", "[package]")
     middleware = StaticVerifierMiddleware(workspace_root=str(tmp_path))
     write(tmp_path, "lib.rs", "fn main() {}")
-    notice = middleware.pre_exit([])
-    assert "non-blocking" in notice
-    assert "run_bash" in notice
-    assert "did not run" in notice
-    assert middleware.pre_exit([]) is None
-    middleware.begin_turn("next", [])
-    write(tmp_path, "lib.rs", "fn main() { let x = 1; }")
-    assert "run_bash" in middleware.pre_exit([])
+    state = SimpleNamespace()
+    middleware.after_turn(runtime_state=state)
+    check = state.verification["checks"][0]
+    assert check["status"] == "skipped"
+    assert "run_bash" in check["detail"]
+    assert '"cargo", "check"' in check["detail"]
+
+
+@pytest.mark.parametrize("restore_original", [False, True])
+def test_workspace_edit_during_diagnostics_marks_evidence_stale(tmp_path, monkeypatch, restore_original):
+    workspace = WorkspaceService(root=tmp_path, session_id="verifying-session")
+    other = WorkspaceService(root=tmp_path, session_id="writing-session")
+    middleware = StaticVerifierMiddleware(workspace=workspace)
+    write(tmp_path, "app.py", "x = 1\n")
+    state = SimpleNamespace(event_bus=EventBus())
+
+    def verify(*_):
+        original = other.read_text("app.py")
+        other.write_text("app.py", "x = 2\n")
+        if restore_original:
+            other.write_text("app.py", original)
+        return [CheckResult("Python syntax", "passed")]
+
+    monkeypatch.setattr(middleware.engine, "verify", verify)
+    middleware.after_turn(runtime_state=state)
+
+    assert state.verification_stale is True
+    [event] = state.event_bus.events
+    assert event.type == "checks_recorded"
+    assert event.payload["stale"] is True
+
+
+def test_stop_after_tool_persists_diagnostics_with_memory_disabled(runtime_factory, monkeypatch):
+    create, _ = runtime_factory
+    monkeypatch.setenv("HARNESS_PERMISSION_MODE", "workspace-write")
+    monkeypatch.setattr(
+        "harness_code_agent.runtime.verification.python._check_ruff", lambda *_: ([], False)
+    )
+    session = create(profile_name="coding-agent")
+    session.ensure_profile_bound_for_first_task("edit a source file")
+    requests = []
+
+    def reply(*_, **__):
+        requests.append(1)
+        return {
+            "role": "assistant", "content": "done",
+            "tool_calls": [{"id": "edit", "type": "function", "function": {
+                "name": "write_file", "arguments": json.dumps({"path": "broken.py", "content": "def broken(\n"}),
+            }}],
+        }, "stop"
+
+    monkeypatch.setattr(session.conversation.llm, "request_assistant_message", reply)
+    assert session.submit("edit a source file").text == "done"
+    assert len(requests) == 1
+    events = session.session_store.read_events(session.session_id)
+    [record] = [event for event in events if event["type"] == "checks_recorded"]
+    assert record["payload"]["checks"][0]["status"] == "failed"
+    assert record["payload"]["stale"] is False
+    [entry] = [entry for entry in session.conversation.journal.read() if entry.kind == "verification"]
+    assert entry.payload["outcome"] == "failed"
+    assert entry.payload["auto_extract"] is False
 
 
 def test_local_typescript_and_changed_file_eslint(tmp_path, monkeypatch):

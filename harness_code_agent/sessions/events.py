@@ -96,9 +96,13 @@ class ToolCallEvent:
     tool: str
     args: dict[str, Any]
     agent: str | None = "main_agent"
+    failure_visibility: str | None = None
 
     def to_event(self) -> StructuredEvent:
-        return StructuredEvent("tool_call", {"tool": self.tool, "args": self.args}, self.agent)
+        payload = {"tool": self.tool, "args": self.args}
+        if self.failure_visibility is not None:
+            payload["failure_visibility"] = self.failure_visibility
+        return StructuredEvent("tool_call", payload, self.agent)
 
 
 @dataclass(frozen=True)

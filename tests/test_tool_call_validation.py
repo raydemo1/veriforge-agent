@@ -13,6 +13,7 @@ from harness_code_agent.runtime.tool_call_validation import (
     validate_tool_call,
 )
 from harness_code_agent.runtime.tool_context import ToolContext
+from harness_code_agent.runtime.tool_runner import execute_tool_result
 from harness_code_agent.sessions.events import EventBus
 from harness_code_agent.workspace.service import WorkspaceService
 
@@ -102,6 +103,49 @@ class ToolCallValidationTests(unittest.TestCase):
         self.assertEqual(result.error.kind, "invalid_json")
         self.assertTrue(result.error.retryable)
         self.assertEqual(result.arguments, {})
+
+    def test_missing_and_blank_model_arguments_require_an_explicit_object(self):
+        for raw in (None, "", "  "):
+            with self.subTest(raw=raw):
+                result = validate_tool_call(ToolCall(0, "tc", "list_shell_jobs", raw), BUILTIN_TOOL_REGISTRY)
+                self.assertEqual(result.error.kind, "invalid_json")
+
+        self.assertTrue(validate_tool_call(ToolCall(0, "tc", "list_shell_jobs", "{}"), BUILTIN_TOOL_REGISTRY).valid)
+        self.assertTrue(validate_tool_arguments("list_shell_jobs", None, BUILTIN_TOOL_REGISTRY).valid)
+
+    def test_invalid_values_fail_during_decoding_before_schema_validation(self):
+        payloads = (
+            '{"path":"first.py","path":"second.py"}',
+            '{"nested":{"key":1,"key":2}}',
+            '{"timeout":NaN}',
+            '{"timeout":Infinity}',
+            '{"timeout":-Infinity}',
+            '{"timeout":1e1000}',
+            r'{"path":"\ud800"}',
+            '{"nested":' + '[' * 2000 + '0' + ']' * 2000 + '}',
+        )
+        for raw in payloads:
+            with self.subTest(raw=raw[:80]):
+                result = validate_tool_call(ToolCall(0, "tc", "read_file", raw), BUILTIN_TOOL_REGISTRY)
+                self.assertEqual(result.error.kind, "invalid_json")
+                self.assertEqual(result.error.phase, "syntactic")
+                self.assertEqual(result.arguments, {})
+
+    def test_direct_invalid_values_are_rejected_before_writing_call_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            context = ToolContext(
+                workspace=WorkspaceService(root=root),
+                permission_policy=PermissionPolicy(mode="workspace-write"),
+                event_bus=EventBus(root / "events.jsonl"),
+            )
+            result = execute_tool_result(
+                "run_bash", {"command": "echo unused", "timeout": float("inf")}, tool_context=context,
+            )
+
+        self.assertEqual(result.metadata["error_kind"], "invalid_arguments")
+        self.assertEqual(result.metadata["validation_phase"], "syntactic")
+        self.assertEqual(context.event_bus.events[0].payload["args"], {})
 
 
 if __name__ == "__main__":

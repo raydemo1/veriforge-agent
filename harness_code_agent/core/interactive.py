@@ -912,24 +912,24 @@ class InteractiveSession:
             task_text=user_prompt,
             cancellation_token=cancellation_token,
         )
-        if self.memory_auto_extract_enabled:
-            verification = getattr(self.conversation.runtime_state, "verification", None)
-            if (verification and verification.get("turn_id") == self.conversation.runtime_state.turn_id
-                    and not getattr(self.conversation.runtime_state, "verification_stale", True)):
-                checks = [c for c in verification.get("checks", []) if c.get("status") in {"passed", "failed"}]
-                if checks:
-                    self.conversation.journal.append_verification(
-                        summary=json.dumps(checks, ensure_ascii=False),
-                        outcome="failed" if any(c["status"] == "failed" for c in checks) else "passed",
-                        tool_call_id=f"native-checks:{self.session.id}:{self.turn_count}",
-                        memory_generation=self.memory_service.extraction.generation,
-                        files=[{"path": path, "fingerprint": fingerprint}
-                               for path, fingerprint in verification.get("fingerprints", {}).items()
-                               if path in verification.get("files", [])],
-                    )
         if cancellation_token is not None and cancellation_token.is_cancelled:
-            from ..agent.cancellation import CancelledError
             raise CancelledError("Turn cancelled by user")
+        state = self.conversation.runtime_state
+        verification = getattr(state, "verification", None)
+        if (verification and verification.get("turn_id") == state.turn_id
+                and not state.verification_stale):
+            checks = [c for c in verification.get("checks", []) if c.get("status") in {"passed", "failed"}]
+            if checks:
+                self.conversation.journal.append_verification(
+                    summary=json.dumps(checks, ensure_ascii=False),
+                    outcome="failed" if any(c["status"] == "failed" for c in checks) else "passed",
+                    tool_call_id=f"native-checks:{self.session.id}:{self.turn_count}",
+                    memory_generation=self.memory_service.extraction.generation,
+                    files=[{"path": path, "fingerprint": fingerprint}
+                           for path, fingerprint in verification.get("fingerprints", {}).items()
+                           if path in verification.get("files", [])],
+                    auto_extract=self.memory_auto_extract_enabled,
+                )
         streamed = bool(getattr(self.conversation, "last_run_streamed_text", False))
         self.event_bus.emit_event(
             AssistantMessageEvent(

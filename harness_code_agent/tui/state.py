@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..runtime.tool_failures import FailureVisibility
+
 
 @dataclass
 class SessionStatusSnapshot:
@@ -126,6 +128,8 @@ class TuiState:
             title = f"{verb} {path}  +{additions}  -{deletions}"
             return TranscriptBlock("file", title, diff, "changed", turn=self.snapshot.turn)
         if event_type == "failure":
+            if _is_protocol_failure(payload):
+                return None
             self.snapshot.status = "needs attention"
             return self._apply_failure(payload)
         if event_type == "agent_budget_warning":
@@ -134,6 +138,8 @@ class TuiState:
             self.snapshot.status = "blocked"
             self.snapshot.running_tool = ""
             reason = str(payload.get("reason") or "stopped")
+            if payload.get("limit_type") == "schema_failures":
+                return None
             if reason == "approval_denied":
                 # The user made this decision; the "操作已拒绝" tool result
                 # already says so — an extra "代理已停止" block would read
@@ -237,6 +243,8 @@ class TuiState:
         self.blocks.append(block)
 
     def _apply_tool_call(self, payload: dict[str, Any]) -> TranscriptBlock | None:
+        if payload.get("failure_visibility") == FailureVisibility.PROTOCOL:
+            return None
         tool = str(payload.get("tool", "tool"))
         self.snapshot.running_tool = tool
         self.snapshot.status = "tool"
@@ -257,6 +265,15 @@ class TuiState:
 
     def _apply_tool_result(self, payload: dict[str, Any]) -> TranscriptBlock | None:
         tool = str(payload.get("tool", "tool"))
+        if _is_protocol_failure(payload):
+            # Older persisted calls may already have created a visible row.
+            block = self._take_active_tool_block(tool)
+            if block is not None:
+                if self.snapshot.running_tool == tool:
+                    self.snapshot.running_tool = ""
+                self.snapshot.status = "running"
+                block.status = "failed"
+            return block
         if self.snapshot.running_tool == tool:
             self.snapshot.running_tool = ""
         status = str(payload.get("status", "unknown"))
@@ -351,6 +368,11 @@ _FILE_OPERATION_LABELS = {
     "rename": "已重命名",
     "changed": "已变更",
 }
+
+
+def _is_protocol_failure(payload: dict[str, Any]) -> bool:
+    metadata = payload.get("metadata")
+    return isinstance(metadata, dict) and metadata.get("failure_visibility") == FailureVisibility.PROTOCOL
 
 
 def _format_attachment_size(value: Any) -> str:

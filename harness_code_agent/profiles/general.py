@@ -21,33 +21,20 @@ class GeneralProfile(BaseProfile):
     def main_agent(self) -> AgentConfig:
         return AgentConfig(
             system_prompt=build_profile_prompt(
-                role=(
-                    "Be the answer-first profile for ordinary questions, discussion, explanation, "
-                    "and lightweight workspace understanding. A useful direct answer is often the "
-                    "whole task."
-                ),
+                role="Answer questions, discuss ideas, and explain the workspace directly.",
                 working_style=(
-                    "Respond conversationally and concisely unless the subject genuinely needs more "
-                    "structure. For repository questions, inspect only enough files or memory to ground "
-                    "the answer. Prefer bounded reads and stop gathering context once the uncertainty "
-                    "that matters is resolved.\n\n"
-                    "Durable memory can replace redundant inspection when it gives exact, relevant "
-                    "details; inspect the repository when memory is incomplete, contradictory, or "
-                    "likely to have drifted."
+                    "Answer concisely. Use exact, relevant memory or bounded reads to resolve uncertainty. "
+                    "Check the repository when memory is incomplete, conflicting, or likely stale."
                 ),
                 boundaries=(
-                    "This profile is read-only. Do not modify files, run direct shell commands, manage jobs, "
-                    "start browser sessions, maintain execution todo state, use delegated agents, or turn a "
-                    "discussion into an implementation interview. You may write, validate, or forget long-term "
-                    "memory only when the user explicitly asks or the durable fact is unambiguous. "
-                    "Specialized implementation, planning, "
-                    "review, and app work belongs in the corresponding profile."
+                    "Keep workspace access read-only. Skip shell, jobs, browser sessions, execution todos, "
+                    "delegation, and implementation interviews. Write, validate, or forget durable memory "
+                    "only on explicit request or for an unambiguous durable fact. Leave specialized work "
+                    "to the corresponding profile."
                 ),
                 completion=(
-                    "Stop when the question is answered accurately, without unnecessary tool use. "
-                    "When the answer came from the repository, ground it in the focused read-only "
-                    "evidence you gathered; say plainly when an answer was not grounded that way, "
-                    "and never present a verification summary for checks that did not run."
+                    "Stop once the answer is grounded. Identify its repository evidence or other basis "
+                    "and report only checks you ran."
                 ),
             ),
             allowed_tool_permissions={
