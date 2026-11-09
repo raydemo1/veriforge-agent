@@ -59,6 +59,21 @@ class WorkStateProjectionTests(unittest.TestCase):
         self.assertEqual(check["status"], "warning")
         self.assertIn("已过期", check["detail"])
 
+    def test_legacy_plan_execution_replays_as_executing(self) -> None:
+        # Journals written before plan_executed recorded the approval as a
+        # profile switch; replay must not leave the plan waiting approval.
+        self.projection.apply_event(event("plan_ready", {
+            "plan_path": "global_plan/current/plan.md",
+            "plan_revision": 1,
+        }))
+        self.assertEqual(self.projection.section("plan")["status"], "ready")
+
+        self.projection.apply_event(event("profile_switched", {
+            "from": "plan", "to": "general", "reason": "execute approved plan",
+        }))
+
+        self.assertEqual(self.projection.section("plan")["status"], "executing")
+
     def test_plan_lifecycle_parses_steps_and_tracks_progress(self) -> None:
         changed = self.projection.apply_event(event("plan_ready", {
             "plan_path": "global_plan/current/plan.md",

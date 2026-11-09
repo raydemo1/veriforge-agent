@@ -879,25 +879,41 @@ class InteractiveSession:
             ).to_event()
         )
 
+    @runtime_change
     def start_plan(self) -> str:
         """Enter an explicit planning flow.
 
         Planning is a workflow the user starts, not an agent identity: the
-        same agent writes the plan and later executes it.
+        same agent writes the plan and later executes it. The runtime refuses
+        the switch while a turn is active, so plan mode cannot race a tool
+        decision that was already prepared under write permissions.
         """
         if self.pending_plan_markdown:
             return "已有待审批的计划：用 /plan execute 执行，或直接发送修改意见。"
         self.plan_mode = True
         self._apply_permission_policy()
-        return "已进入规划：先调研并给出完整实现计划，不会改动工作区。计划就绪后可用 /plan execute 执行。"
+        notice = "已进入规划：先调研并给出完整实现计划，不会改动工作区。计划就绪后可用 /plan execute 执行。"
+        running = self._running_background_jobs()
+        if running:
+            notice += (
+                f"\n注意：仍有 {running} 个后台 Shell 任务在运行。规划期的只读限制只管新的工具调用，"
+                "这些任务会继续写工作区；需要时用 /observe 查看或 stop_shell_job 停止。"
+            )
+        return notice
+
+    def _running_background_jobs(self) -> int:
+        conversation = getattr(self, "conversation", None)
+        runtime_state = getattr(conversation, "runtime_state", None)
+        manager = getattr(runtime_state, "shell_job_manager", None)
+        if manager is None:
+            return 0
+        return len(manager.running_jobs())
 
     def execute_pending_plan(self, *, attachments: tuple[Attachment, ...] = ()) -> TurnResult:
         if not self.pending_plan_markdown:
             raise ValueError("No pending plan to execute. Start one with /plan first.")
         plan_markdown = self.pending_plan_markdown
         revision = self.pending_plan_revision
-        self.pending_plan_markdown = None
-        self.pending_plan_revision = 0
         self.plan_mode = False
         self._apply_permission_policy()
         self.event_bus.emit(
@@ -911,7 +927,21 @@ class InteractiveSession:
             "make the smallest appropriate code/test changes, and run verification before stopping.\n\n"
             f"Approved plan:\n{plan_markdown}"
         )
-        return self._run_turn(task, attachments=attachments)
+        try:
+            result = self._run_turn(task, attachments=attachments)
+        except BaseException:
+            # The approval was never consumed: nothing ran. Put the plan back
+            # so it can be retried instead of silently disappearing, and
+            # return to read-only planning while it waits.
+            self.pending_plan_markdown = plan_markdown
+            self.pending_plan_revision = revision
+            self.plan_mode = True
+            self._apply_permission_policy()
+            self._publish_plan_ready(plan_markdown, revision, approval_source="/plan")
+            raise
+        self.pending_plan_markdown = None
+        self.pending_plan_revision = 0
+        return result
 
     def revise_pending_plan(
         self,
@@ -985,21 +1015,31 @@ class InteractiveSession:
             return ""
         self.pending_plan_markdown = text.strip()
         self.pending_plan_revision += 1
-        plan_path = self._write_pending_plan_artifact(self.pending_plan_markdown)
-        self.event_bus.emit(
-            "plan_ready",
-            agent="main_agent",
-            payload={
-                "plan_path": str(plan_path.relative_to(self.cwd)),
-                "plan_revision": self.pending_plan_revision,
-                "plan_markdown": self.pending_plan_markdown,
-                "approval_source": "/plan",
-            },
+        plan_path = self._publish_plan_ready(
+            self.pending_plan_markdown,
+            self.pending_plan_revision,
+            approval_source="/plan",
         )
         return (
             f"计划已写入 `{plan_path.relative_to(self.cwd)}`，请选择下一步。"
             "审批请用 /plan execute，反馈则直接发送修改意见。"
         )
+
+    def _publish_plan_ready(
+        self, plan_markdown: str, revision: int, *, approval_source: str
+    ) -> Path:
+        plan_path = self._write_pending_plan_artifact(plan_markdown)
+        self.event_bus.emit(
+            "plan_ready",
+            agent="main_agent",
+            payload={
+                "plan_path": str(plan_path.relative_to(self.cwd)),
+                "plan_revision": revision,
+                "plan_markdown": plan_markdown,
+                "approval_source": approval_source,
+            },
+        )
+        return plan_path
 
     def _write_pending_plan_artifact(self, plan_markdown: str) -> Path:
         plan_path = self.cwd / ".harness" / "sessions" / self.session.id / "plan.md"

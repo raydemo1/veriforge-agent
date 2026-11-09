@@ -66,7 +66,13 @@ class WorkStateProjection:
         elif event_type == "plan_ready":
             self._apply_plan_ready(payload)
             changed.add("plan")
-        elif event_type == "plan_executed":
+        elif event_type == "plan_executed" or (
+            # Journals written before ``plan_executed`` existed recorded the
+            # same transition as a profile switch. Replay has to agree with
+            # session recovery, which still reads that shape.
+            event_type == "profile_switched"
+            and str(payload.get("reason") or "") == "execute approved plan"
+        ):
             if self._plan is not None:
                 self._plan["status"] = "executing"
                 changed.add("plan")

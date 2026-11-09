@@ -49,6 +49,47 @@ def test_plan_mode_denies_writes_and_restores_after_execute(session, tmp_path, m
     assert session.tool_context.permission_policy.mode == PermissionPolicy.WORKSPACE_WRITE
 
 
+def test_failed_execution_keeps_the_plan_for_retry(session, monkeypatch):
+    session.start_plan()
+    session.pending_plan_markdown = "# Plan\n\n1. Do the thing."
+    session.pending_plan_revision = 3
+    emitted = len(session.event_bus.events)
+
+    def failing_run(*args, **kwargs):
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(session, "_run_turn", failing_run)
+    with pytest.raises(RuntimeError, match="model unavailable"):
+        session.execute_pending_plan()
+
+    assert session.pending_plan_markdown == "# Plan\n\n1. Do the thing."
+    assert session.pending_plan_revision == 3
+    assert session.plan_mode is True
+    assert session.tool_context.permission_policy.mode == PermissionPolicy.READ_ONLY
+    new_events = [event.type for event in session.event_bus.events[emitted:]]
+    assert "plan_ready" in new_events
+
+
+def test_start_plan_is_refused_while_a_turn_is_running(session):
+    session._turn_thread = 1  # a thread that is not this one
+    try:
+        with pytest.raises(RuntimeError, match="当前回合仍在执行"):
+            session.start_plan()
+    finally:
+        session._turn_thread = None
+
+    assert session.plan_mode is False
+    assert session.tool_context.permission_policy.mode == PermissionPolicy.WORKSPACE_WRITE
+
+
+def test_start_plan_warns_about_background_jobs_that_keep_writing(session, monkeypatch):
+    monkeypatch.setattr(session, "_running_background_jobs", lambda: 2)
+
+    notice = session.start_plan()
+
+    assert "2 个后台 Shell 任务" in notice
+
+
 def test_restored_pending_plan_resumes_plan_mode(session, tmp_path):
     session.plan_mode = False
     session._restore_pending_plan([
