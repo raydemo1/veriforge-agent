@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
-from contextlib import nullcontext
 
 from harness_code_agent.agent import llm_channel as ch
 

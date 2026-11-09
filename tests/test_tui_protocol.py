@@ -26,6 +26,7 @@ class TuiProtocolTests(unittest.TestCase):
 
     def test_stop_preserves_queued_messages_and_resets_idle_flag(self):
         import queue
+
         from harness_code_agent.agent.cancellation import CancellationToken
         for active in (False, True):
             server = self._server()
@@ -89,8 +90,6 @@ class TuiProtocolTests(unittest.TestCase):
     def test_stale_session_construction_closes_without_publishing(self):
         server = object.__new__(SessionBridge)
         server.cwd = Path("workspace")
-        server.profile_name = "general"
-        server.profile_explicit = False
         server.runtime_id = "test"
         server.state_root = Path("workspace/.harness")
         server.environment = "local"

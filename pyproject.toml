@@ -14,7 +14,6 @@ dependencies = [
     "jsonschema>=4.23.0,<5",
     "sqlite-vec>=0.1.9,<0.2",
     "tiktoken>=0.5.0",
-    "playwright>=1.40.0",
     "psutil>=5.9.8,<8",
     "mcp>=1.0.0,<2",
     "pygls>=2.1,<3",
@@ -54,7 +53,6 @@ include = ["harness_code_agent*"]
 
 [tool.setuptools.package-data]
 "harness_code_agent.skills" = ["catalog/**/*"]
-"harness_code_agent.profiles" = ["*.json"]
 
 [tool.ruff.lint.per-file-ignores]
 # These files sit on deliberate failure boundaries: any exception from a tool

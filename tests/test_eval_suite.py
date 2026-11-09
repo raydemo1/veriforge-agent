@@ -37,7 +37,7 @@ class EvalSuiteTests(unittest.TestCase):
 
     def test_terminal_bench_24task_subset_is_fixed_and_bounded(self):
         payload = json.loads(Path("eval/tasks/terminal_bench_24task.json").read_text(encoding="utf-8"))
-        metadata = json.loads(Path("harness_code_agent/profiles/tb2_tasks.json").read_text(encoding="utf-8"))
+        metadata = json.loads(Path("eval/benchmarks/data/tb2_tasks.json").read_text(encoding="utf-8"))
 
         self.assertEqual(payload["suite"], "terminal_bench_24task")
         self.assertEqual(payload["task_set"], "24task")
@@ -436,7 +436,7 @@ class EvalSuiteTests(unittest.TestCase):
         self.assertNotIn("MAX_AGENT_ITERATIONS", joined)
 
         command = _agent_command(timeout=120)
-        self.assertIn("PROFILE_CODING_AGENT_TASK_BUDGET=120", command)
+        self.assertIn("HARNESS_TASK_BUDGET=120", command)
         self.assertIn("hca_claw_runner.py", command)
 
     def test_eval_scripts_self_test(self):

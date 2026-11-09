@@ -73,10 +73,7 @@ class WorkStateProjectionTests(unittest.TestCase):
             "First step", "Second step", "Third step",
         ])
 
-        self.projection.apply_event(event("profile_switched", {
-            "profile": "coding-agent",
-            "reason": "execute approved plan",
-        }))
+        self.projection.apply_event(event("plan_executed", {"plan_revision": 2}))
         self.assertEqual(self.projection.section("plan")["status"], "executing")
 
         # Todo progress with matching length drives plan step statuses.
@@ -129,7 +126,7 @@ class WorkStateProjectionTests(unittest.TestCase):
             "plan_revision": 1,
             "plan_markdown": "# Plan\n\n1. Do the work\n2. Verify\n",
         }))
-        self.projection.apply_event(event("profile_switched", {"reason": "execute approved plan"}))
+        self.projection.apply_event(event("plan_executed", {"plan_revision": 1}))
         self.projection.apply_event(event("turn_finished", {}))
         plan = self.projection.section("plan")
         self.assertEqual(plan["status"], "incomplete")
@@ -213,39 +210,33 @@ class WorkStateProjectionTests(unittest.TestCase):
         self.assertEqual((changes["additions"], changes["deletions"]), (7, 1))
 
     def test_checks_upsert_and_turn_reset_with_artifacts_persisting(self) -> None:
-        self.projection.apply_event(event("tool_call", {
-            "tool": "browser_test",
-            "args": {"url": "http://localhost:5173"},
-        }))
-        browser = next(item for item in self.projection.section("checks") if item["id"] == "browser-verification")
-        self.assertEqual(browser["status"], "running")
-
-        self.projection.apply_event(event("tool_result", {
-            "tool": "browser_test",
-            "status": "success",
-            "metadata": {
-                "url": "http://localhost:5173",
-                "artifacts": [{
-                    "kind": "image",
-                    "path": ".harness/artifacts/browser.png",
-                    "title": "browser.png",
-                    "detail": "http://localhost:5173",
-                }],
-            },
-        }))
-        checks = {item["id"]: item for item in self.projection.section("checks")}
-        self.assertEqual(checks["browser-verification"]["status"], "passed")
-        artifact = self.projection.section("artifacts")[0]
-        self.assertEqual(artifact["kind"], "image")
-
         # Static verifier evidence upserts by check name.
         self.projection.apply_event(event("checks_recorded", {"checks": [
             {"name": "Python syntax", "status": "passed", "detail": "2 files parsed"},
             {"name": "Ruff lint", "status": "failed", "detail": "[F811] x.py:1"},
         ]}))
+        checks = {item["id"]: item for item in self.projection.section("checks")}
+        self.assertEqual(checks["python-syntax"]["status"], "passed")
+        self.assertEqual(checks["ruff-lint"]["status"], "failed")
+
+        # Tool results contribute artifacts without inventing checks.
+        self.projection.apply_event(event("tool_result", {
+            "tool": "run_bash",
+            "status": "success",
+            "metadata": {
+                "artifacts": [{
+                    "kind": "image",
+                    "path": ".harness/artifacts/screenshot.png",
+                    "title": "screenshot.png",
+                    "detail": "captured by a script",
+                }],
+            },
+        }))
         self.assertEqual({item["id"] for item in self.projection.section("checks")}, {
-            "browser-verification", "python-syntax", "ruff-lint",
+            "python-syntax", "ruff-lint",
         })
+        artifact = self.projection.section("artifacts")[0]
+        self.assertEqual(artifact["kind"], "image")
 
         # A new turn clears checks but keeps artifacts.
         self.projection.apply_event(event("turn_started", {"turn": 2}))

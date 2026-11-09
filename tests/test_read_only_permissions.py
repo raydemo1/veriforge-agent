@@ -1,20 +1,15 @@
-"""Characterization for the review profile read-only boundary.
+"""Read-only shell boundary for permission presets.
 
-The golden table below was captured empirically from the old composition
-(per-mode ``PermissionPolicy`` + the deleted ``ReviewOnlyMiddleware``) during
-the migration that moved that boundary into
-``PermissionPreset.NO_WORKSPACE_WRITES``.  The preset policy wrapper must keep
-producing exactly these effective actions.
+The golden table was captured empirically from the composition of a session
+``PermissionPolicy`` with a read-only preset, and is now a plain permission
+regression: the preset may only tighten the session mode, never loosen it.
 
-The four structured tools (write_file / apply_patch / update_todo / ask_user)
-are not part of the policy boundary: the profile hides them via
-``blocked_tool_names``, so the executor capability gate rejects them before
-any permission decision.  The preset intentionally does not duplicate that
-list.
+Structured tools (write_file / apply_patch / update_todo / ask_user) are not
+part of this boundary. A read-only workflow removes them from the tool surface
+instead, so the executor rejects them before any permission decision.
 """
 from __future__ import annotations
 
-from harness_code_agent.profiles import get_profile
 from harness_code_agent.runtime.permissions import (
     TOOL_PERMISSION_SHELL,
     PermissionPolicy,
@@ -121,74 +116,3 @@ def test_preset_mode_stays_session_mode():
     assert policy.mode == "danger-full-access"
 
 
-def test_review_profile_owns_structured_tools_via_blocked_names():
-    config = get_profile("review").main_agent()
-    assert config.permission_preset is PermissionPreset.NO_WORKSPACE_WRITES
-    assert config.blocked_tool_names == {
-        "write_file",
-        "apply_patch",
-        "update_todo",
-        "ask_user",
-    }
-
-
-def _session_with_profile(profile_name: str, mode: str):
-    # InteractiveSession pulls in skills/approval/session-store machinery in
-    # __init__; the preset composition only needs profile + mode, so bypass it.
-    from harness_code_agent.core.interactive import InteractiveSession
-
-    session = object.__new__(InteractiveSession)
-    session.profile = get_profile(profile_name)
-    session.permission_mode = mode
-    return session
-
-
-def test_effective_policy_review_applies_preset_even_under_full_access(tmp_path):
-    session = _session_with_profile("review", "danger-full-access")
-    policy = session._effective_permission_policy()
-    decision = policy.decide_tool_call(
-        "run_bash",
-        {"command": "echo hi > out.txt"},
-        TOOL_PERMISSION_SHELL,
-        str(tmp_path),
-    )
-    assert decision.action == "deny"
-    assert policy.mode == "danger-full-access"
-
-
-def test_effective_policy_leaving_review_restores_session_authority(tmp_path):
-    session = _session_with_profile("general", "danger-full-access")
-    policy = session._effective_permission_policy()
-    decision = policy.decide_tool_call(
-        "run_bash",
-        {"command": "echo hi > out.txt"},
-        TOOL_PERMISSION_SHELL,
-        str(tmp_path),
-    )
-    assert decision.action == "allow"
-
-
-def test_effective_policy_tracks_permission_mode_changes(tmp_path):
-    session = _session_with_profile("review", "danger-full-access")
-    assert (
-        session._effective_permission_policy()
-        .decide_tool_call(
-            "run_bash", {"command": "ls"}, TOOL_PERMISSION_SHELL, str(tmp_path)
-        )
-        .action
-        == "allow"
-    )
-    session.permission_mode = "read-only"
-    policy = session._effective_permission_policy()
-    assert policy.mode == "read-only"
-    # External write stays governed by the read-only session mode (deny)...
-    assert (
-        policy.decide_tool_call(
-            "run_bash",
-            {"command": "echo hi > /tmp/hca_mode_switch.txt"},
-            TOOL_PERMISSION_SHELL,
-            str(tmp_path),
-        )
-        .action
-        == "deny"
-    )

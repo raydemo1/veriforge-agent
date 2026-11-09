@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+
 @dataclass(frozen=True, order=True)
 class ResourceClaim:
     domain: str

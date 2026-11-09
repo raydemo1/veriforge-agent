@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from harness_code_agent import config
 from harness_code_agent.agent import llm_channel
-from harness_code_agent.agent.cancellation import CancelledError, CancellationToken
+from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
 from harness_code_agent.agent.coordinator import AgentCoordinator
 from harness_code_agent.runtime.builtins.filesystem import write_file
 from harness_code_agent.runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
@@ -47,9 +47,8 @@ class LlmRetryHelperTests(unittest.TestCase):
             calls += 1
             raise ValueError("bad request")
 
-        with patch.object(llm_channel.time, "sleep") as slept:
-            with self.assertRaises(ValueError):
-                llm_channel._call_with_retry(action, operation="test", attempts=3)
+        with patch.object(llm_channel.time, "sleep") as slept, self.assertRaises(ValueError):
+            llm_channel._call_with_retry(action, operation="test", attempts=3)
 
         self.assertEqual(calls, 1)
         slept.assert_not_called()
@@ -115,9 +114,8 @@ class WorkspaceQuotaTests(unittest.TestCase):
         usage = SimpleNamespace(total=1000, used=995, free=5)
         with patch.object(config, "MIN_FREE_DISK_BYTES", 100), patch(
             "harness_code_agent.workspace.service.shutil.disk_usage", return_value=usage
-        ):
-            with self.assertRaises(WorkspaceQuotaError):
-                self.workspace.write_text("a.txt", "x" * 10)
+        ), self.assertRaises(WorkspaceQuotaError):
+            self.workspace.write_text("a.txt", "x" * 10)
 
     def test_write_file_tool_returns_structured_quota_result(self):
         context = ToolContext(

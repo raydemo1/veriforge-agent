@@ -33,13 +33,10 @@ class SessionStore:
     def create(
         self,
         *,
-        profile: str,
         cwd: str | Path,
         model: str,
         permission_mode: str,
-        profile_source: str | None = None,
         session_id: str | None = None,
-        routing_mode: str = "auto",
         environment: str = "local",
     ) -> Session:
         session_id = session_id or self._new_session_id()
@@ -65,13 +62,9 @@ class SessionStore:
             "id": session.id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "cwd": str(Path(cwd).resolve()),
-            "profile": profile,
-            "initial_profile": profile,
-            "profile_source": profile_source or "explicit",
             "model": model,
             "permission_mode": permission_mode,
             "status": "running",
-            "routing_mode": routing_mode,
             "environment": environment,
         }
         session.metadata_path.write_text(
@@ -89,13 +82,14 @@ class SessionStore:
                        root / "snapshots", root / "summary.md", root / "compacted", root / "journal.jsonl")
 
     def fork(self, source_session_id: str) -> Session:
-        from ..runtime.recovery import atomic_json, atomic_bytes
+        from ..runtime.recovery import atomic_bytes, atomic_json
         source = self.read_metadata(source_session_id)
         boundary = source.get("fork_boundary")
         if boundary is None:
             raise ValueError("会话尚无完整、稳定的回合，暂时无法创建分支")
-        fork = self.create(profile=source["profile"], cwd=source["cwd"], model=source["model"],
-                           permission_mode=source["permission_mode"], profile_source=source["profile_source"])
+        fork = self.create(cwd=source["cwd"], model=source["model"],
+                           permission_mode=source["permission_mode"],
+                           environment=source.get("environment", "local"))
         journal = []
         source_path = self._session_root(source_session_id) / "journal.jsonl"
         with source_path.open(encoding="utf-8") as handle:
@@ -116,7 +110,7 @@ class SessionStore:
                     events.append(line)
         atomic_bytes(fork.events_path, "".join(events).encode("utf-8"))
         metadata = self.read_metadata(fork.id)
-        for key in ("model_selection", "routing_mode", "environment"):
+        for key in ("model_selection", "environment"):
             if key in source:
                 metadata[key] = source[key]
         metadata.update(forked_from=source_session_id,
@@ -176,29 +170,6 @@ class SessionStore:
     def update_permission_mode(self, session_id: str, permission_mode: str) -> dict[str, Any]:
         metadata = self.read_metadata(session_id)
         metadata["permission_mode"] = permission_mode
-        metadata_path = self._session_root(session_id) / "session.json"
-        metadata_path.write_text(
-            json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        return metadata
-
-    def update_profile(self, session_id: str, profile: str, profile_source: str | None = None) -> dict[str, Any]:
-        metadata = self.read_metadata(session_id)
-        metadata.setdefault("initial_profile", metadata.get("profile", profile))
-        metadata["profile"] = profile
-        if profile_source:
-            metadata["profile_source"] = profile_source
-        metadata_path = self._session_root(session_id) / "session.json"
-        metadata_path.write_text(
-            json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        return metadata
-
-    def update_routing_mode(self, session_id: str, routing_mode: str) -> dict[str, Any]:
-        metadata = self.read_metadata(session_id)
-        metadata["routing_mode"] = routing_mode
         metadata_path = self._session_root(session_id) / "session.json"
         metadata_path.write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",

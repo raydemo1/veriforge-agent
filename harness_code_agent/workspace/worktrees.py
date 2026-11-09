@@ -9,9 +9,9 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .access import WorkspaceAccessCoordinator, WorkspaceConflict, fingerprint
-from ..runtime.recovery import RecoveryStore, atomic_json
 from ..agent.cancellation import current_token
+from ..runtime.recovery import RecoveryStore, atomic_json
+from .access import WorkspaceAccessCoordinator, WorkspaceConflict, fingerprint
 
 
 @dataclass(frozen=True)
@@ -111,7 +111,7 @@ class WorktreeService:
             for name in filter(None, tracked):
                 if name not in files:
                     (destination / name).unlink(missing_ok=True)
-            for name, data in files.items():
+            for name in files:
                 path = destination / name
                 if path.is_symlink():
                     path.unlink()
@@ -148,20 +148,20 @@ class WorktreeService:
                     continue
                 if current != before and name not in (approved or {}):
                     if any(data is None or b"\0" in data for data in (current, before, desired)):
-                        conflicts[name] = dict(base=before, local=current, task=desired)
+                        conflicts[name] = {"base": before, "local": current, "task": desired}
                         continue
                     try:
                         merged, conflict = _git_merge_text(current.decode("utf-8"), before.decode("utf-8"), desired.decode("utf-8"))
                     except UnicodeDecodeError:
-                        conflicts[name] = dict(base=before, local=current, task=desired)
+                        conflicts[name] = {"base": before, "local": current, "task": desired}
                         continue
                     if conflict:
-                        conflicts[name] = dict(base=before, local=current, task=desired)
+                        conflicts[name] = {"base": before, "local": current, "task": desired}
                         continue
                     desired = merged.encode("utf-8")
                     valid, _ = validate_merge(name, desired)
                     if not valid:
-                        conflicts[name] = dict(base=before, local=current, task=after.get(name))
+                        conflicts[name] = {"base": before, "local": current, "task": after.get(name)}
                         continue
                 changes[name] = desired
             if conflicts:

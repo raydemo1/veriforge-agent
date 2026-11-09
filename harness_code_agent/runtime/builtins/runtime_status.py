@@ -86,12 +86,12 @@ def get_runtime_status(
         )
     elif section == "environment":
         agent_config = state.agent_config
+        policy = getattr(tool_context, "permission_policy", None) if tool_context else None
         profile = config.resolve_model_profile(
             getattr(agent_config, "model_intensity", None) or config.MODEL_INTENSITY,
             tool_context.model_selection if tool_context else None
         )
         result.update(
-            profile=getattr(agent_config, "name", None),
             model=profile.model,
             provider=profile.provider,
             thinking=profile.thinking,
@@ -99,7 +99,8 @@ def get_runtime_status(
             input_mode=profile.input_mode,
             cwd=str(tool_context.workspace.root) if tool_context else None,
             agent=agent_name,
-            permission_mode=state.permission_mode or None,
+            # The enforced mode, which an active plan narrows to read-only.
+            permission_mode=policy.mode if policy is not None else (state.permission_mode or None),
         )
     elif section == "agents":
         coordinator = getattr(tool_context, "agent_coordinator", None)

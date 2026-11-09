@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-from functools import wraps
-from concurrent.futures import TimeoutError as FutureTimeout
-from contextlib import contextmanager
-from ..agent.cancellation import current_token
-from ..agent.cancellation import CancellationToken, CancelledError, cancellation_scope
 import hashlib
 import json
 import logging
@@ -14,11 +9,20 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import TimeoutError as FutureTimeout
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 from .. import config
+from ..agent.cancellation import (
+    CancellationToken,
+    CancelledError,
+    cancellation_scope,
+    current_token,
+)
 from ..agent.conversation import AgentConversation
 from ..agent.coordinator import AgentCoordinator
 from ..agent.prompts import GlobalRulesDoc, PromptPrefixBuilder
@@ -40,17 +44,7 @@ from ..memory.background import (
     open_memory_session,
     start_memory_worker,
 )
-from ..profiles import get_profile
-from ..profiles.base import BaseProfile
-from ..profiles.router import (
-    ROUTE_ACTION_SWITCH_PROFILE,
-    ROUTING_MODE_AUTO,
-    ROUTING_MODE_PINNED,
-    TURN_MODE_DIRECT_ANSWER,
-    JevRouteClassifier,
-    RouteDecision,
-    route_profile_for_turn,
-)
+from ..runtime.agent_config import RuntimeOptions
 from ..runtime.approvals import (
     ApprovalProvider,
     ApprovalRequest,
@@ -62,7 +56,14 @@ from ..runtime.lifecycle import LifecycleScope
 from ..runtime.mcp import McpClientManager, McpConfigError, build_server_config
 from ..runtime.middleware.loader import load_user_middlewares
 from ..runtime.middleware.stack import build_main_agent_middlewares
-from ..runtime.permissions import PermissionPolicy
+from ..runtime.permissions import (
+    TOOL_PERMISSION_CONTROL,
+    TOOL_PERMISSION_EDIT,
+    TOOL_PERMISSION_NETWORK_READ,
+    TOOL_PERMISSION_READ,
+    TOOL_PERMISSION_SHELL,
+    PermissionPolicy,
+)
 from ..runtime.questions import (
     ConsoleQuestionProvider,
     QuestionOption,
@@ -94,15 +95,32 @@ from .mentions import (
     resolve_mentions,
 )
 
-PRODUCT_DEFAULT_PROFILE = "general"
-DIRECT_ANSWER_TURN_INSTRUCTION = (
-    "Turn handling instruction: answer this turn directly and briefly. "
-    "Do not create or edit files, run commands, launch browsers, or continue prior implementation work "
-    "unless the user explicitly asks for that in this turn."
-)
 TURN_INLINE_CHAR_LIMIT = 40_000
 TURN_EXCERPT_CHARS = 2_000
 log = logging.getLogger("harness")
+
+# The product tool baseline: what the single agent may see and call. This is a
+# safety and availability floor, not a task identity. The session permission
+# mode still decides what each call is allowed to do.
+PRODUCT_TOOL_PERMISSIONS = frozenset({
+    TOOL_PERMISSION_READ,
+    TOOL_PERMISSION_NETWORK_READ,
+    TOOL_PERMISSION_EDIT,
+    TOOL_PERMISSION_CONTROL,
+    TOOL_PERMISSION_SHELL,
+})
+
+#: Planning turns produce a document, not a diff. The runtime also denies
+#: writes while ``plan_mode`` is on, so this only removes the wasted attempt.
+PLAN_TURN_INSTRUCTION = """\
+This is a planning turn. Investigate the repository and return one complete
+implementation plan as your final answer: what you will change, in which files,
+in what order, how it will be verified, and the risks that need a decision.
+
+Do not modify the workspace. During planning the runtime denies file edits,
+patches and mutating shell commands, so the proposal is the deliverable and
+applying it is a later turn after the user approves the plan.
+"""
 
 
 @dataclass
@@ -110,13 +128,6 @@ class TurnResult:
     text: str
     notice: str = ""
     streamed: bool = False
-
-
-@dataclass
-class ProfileSwitchEvent:
-    previous: str
-    current: str
-    reason: str
 
 
 def runtime_change(method):
@@ -138,20 +149,20 @@ class InteractiveSession:
         self,
         *,
         cwd: str | Path,
-        profile_name: str = PRODUCT_DEFAULT_PROFILE,
         stream_sink: Callable[[str], None] | None = None,
         event_listener: Callable[[object], None] | None = None,
         approval_provider: ApprovalProvider | None = None,
         question_provider: QuestionProvider | None = None,
         output_sink: Callable[[str], None] | None = None,
         stream_callback=None,
-        profile_explicit: bool | None = None,
         enable_turn_summary: bool = True,
         startup_sink: Callable[[str], None] | None = None,
         session_id: str | None = None,
         state_root: str | Path | None = None,
         environment: str = "local",
         project_resources=None,
+        time_budget: float | None = None,
+        task_metadata: dict | None = None,
     ):
         self.cwd = Path(cwd).resolve()
         self._requested_session_id = session_id
@@ -167,8 +178,6 @@ class InteractiveSession:
         self._turn_thread = None
         self._turn_token = None
         try:
-            self.profile_router = JevRouteClassifier()
-            self.lifecycle.register("profile_router", self.profile_router.close, order=40)
             self.startup_sink = startup_sink
             self._report_startup("checking workspace")
             validate_shell_configuration()
@@ -194,17 +203,12 @@ class InteractiveSession:
             saved = None
             if session_id and (self.session_store.sessions_dir / session_id / "session.json").exists():
                 saved = self.session_store.read_metadata(session_id)
-                profile_name = saved["profile"]
-                profile_explicit = saved["routing_mode"] == "pinned"
-                self.permission_mode = saved["permission_mode"]
+                # Older sessions recorded a task profile and routing mode.
+                # They are still readable history; they no longer drive
+                # behaviour, so nothing here restores or validates them.
+                self.permission_mode = saved.get("permission_mode", self.permission_mode)
                 self.approval_provider = self._approval_provider_for_mode(self.permission_mode)
                 self.model_selection.select(**saved.get("model_selection", {}))
-            inferred_explicit = profile_name != PRODUCT_DEFAULT_PROFILE
-            self.profile_explicit = inferred_explicit if profile_explicit is None else profile_explicit
-            self.routing_mode = ROUTING_MODE_PINNED if self.profile_explicit else ROUTING_MODE_AUTO
-            self._pending_profile_name = profile_name
-            self._profile_source = "explicit" if self.profile_explicit else "default"
-            self.profile = get_profile(self._pending_profile_name)
             self.session: Session | None = None
             self.attachment_manager: AttachmentManager | None = None
             self.event_bus = None
@@ -219,17 +223,19 @@ class InteractiveSession:
             self.turn_count = 0
             self.pending_plan_markdown: str | None = None
             self.pending_plan_revision = 0
+            self.plan_mode = False
             self.last_user_task: str = ""
             self.last_assistant_text: str = ""
-            self.profile_history: list[ProfileSwitchEvent] = []
-            self._resolved_task_timeout: float | None = None
+            self.runtime_options = RuntimeOptions(
+                time_budget=time_budget,
+                task_metadata=dict(task_metadata) if task_metadata else None,
+            )
             self._closed = False
             self._close_lock = threading.Lock()
-            # User middlewares are loaded exactly once per session; profile
-            # switches reuse the same instances.
+            # User middlewares are loaded exactly once per session.
             self.user_middlewares = load_user_middlewares()
             self._report_startup("connecting tools")
-            self._bind_profile(self._pending_profile_name, source=self._profile_source)
+            self._bind_session()
             if saved:
                 self._restore_history()
                 self._restore_suspended_state()
@@ -259,27 +265,17 @@ class InteractiveSession:
     def session_id(self) -> str | None:
         return self.session.id if self.session is not None else None
 
-    @property
-    def display_profile(self) -> str:
-        return self.profile.name()
-
-    @property
-    def display_routing_mode(self) -> str:
-        return self.routing_mode
-
-    def _build_agent(self, profile: BaseProfile, tool_context=None):
+    def _build_agent(self, tool_context=None):
         from ..agent.conversation import Agent
 
         context = tool_context or self.tool_context
         if context is None:
             raise RuntimeError("Cannot build agent before the session is bound.")
-        cfg = profile.main_agent()
-        context.allowed_tool_permissions = set(cfg.allowed_tool_permissions)
-        context.blocked_tool_names = set(cfg.blocked_tool_names)
+        context.allowed_tool_permissions = set(PRODUCT_TOOL_PERMISSIONS)
+        context.blocked_tool_names = set()
         harness_rules = _load_harness_rules(self.cwd)
         catalog = self.skill_registry.catalog_listing()
         prefix = PromptPrefixBuilder().build(
-            profile_prompt=cfg.system_prompt,
             global_rules_docs=[harness_rules] if harness_rules is not None else [],
             skill_catalog=catalog,
         )
@@ -289,17 +285,20 @@ class InteractiveSession:
             tool_registry=self.tool_registry,
             workspace=self.cwd,
         )
-        return Agent(
+        agent = Agent(
             "main_agent",
             prefix.content,
             use_tools=True,
-            tool_schemas=self._tool_schemas_for_agent_config(cfg, tool_context=context),
+            tool_schemas=self._tool_schemas(tool_context=context),
             middlewares=middlewares,
-            time_budget=cfg.time_budget,
+            time_budget=self.runtime_options.time_budget,
             tool_context=context,
             stream_callback=self.stream_sink,
             prompt_cache_identity=prefix.cache_identity,
         )
+        if self.runtime_options.task_metadata:
+            agent.current_task_metadata = dict(self.runtime_options.task_metadata)
+        return agent
 
     def _load_mcp_tools(self) -> None:
         if self.tool_registry is None or self.mcp_manager is None:
@@ -330,17 +329,16 @@ class InteractiveSession:
         self._mcp_connection_revision = self.mcp_manager.connection_revision
         self._refresh_mcp_catalog()
 
-    def _tool_schemas_for_agent_config(self, cfg, *, update_context: bool = True, tool_context=None) -> list[dict]:
+    def _tool_schemas(self, *, update_context: bool = True, tool_context=None) -> list[dict]:
         context = tool_context or self.tool_context
         core_schemas = tool_schemas_for_profile(
-            allowed_permissions=cfg.allowed_tool_permissions,
-            exclude_names=cfg.blocked_tool_names,
+            allowed_permissions=PRODUCT_TOOL_PERMISSIONS,
             registry=self.tool_registry,
         )
         discovered = set()
         if context is not None and update_context:
-            context.allowed_tool_permissions = set(cfg.allowed_tool_permissions)
-            context.blocked_tool_names = set(cfg.blocked_tool_names)
+            context.allowed_tool_permissions = set(PRODUCT_TOOL_PERMISSIONS)
+            context.blocked_tool_names = set()
             discovered = set(context.discovered_tool_names)
         if not discovered:
             if update_context and context is not None:
@@ -349,16 +347,14 @@ class InteractiveSession:
                 context.revealed_tool_names = set()
             return core_schemas
         revealed_schemas = tool_schemas_for_profile(
-            allowed_permissions=cfg.allowed_tool_permissions,
+            allowed_permissions=PRODUCT_TOOL_PERMISSIONS,
             include_names=discovered,
-            exclude_names=cfg.blocked_tool_names,
             registry=self.tool_registry,
             disclosure={"deferred"},
         )
         if update_context and context is not None:
-            # A profile switch only recomputes the callable view; discovery is
-            # history and must survive, otherwise switching away and back would
-            # make the repeat-query guard permanently block remounting.
+            # Discovery is history: recomputing the callable view must not
+            # drop tools the model already revealed.
             context.revealed_tool_names = {
                 schema.get("function", {}).get("name")
                 for schema in revealed_schemas
@@ -377,70 +373,11 @@ class InteractiveSession:
 
     def _refresh_agent_tool_schemas(self) -> None:
         if self.agent is not None:
-            self.agent.update_tool_schemas(self._tool_schemas_for_agent_config(self.profile.main_agent()))
+            self.agent.update_tool_schemas(self._tool_schemas())
 
     def _refresh_mcp_catalog(self) -> None:
         if self.mcp_manager is not None and self.agent is not None:
             self.agent.set_mcp_catalog(self.mcp_manager.catalog_prompt())
-
-    def _apply_profile_task_timeout(self, user_prompt: str) -> None:
-        if self.agent is None:
-            return
-        metadata = self._resolve_profile_task_metadata(user_prompt)
-        self.agent.current_task_metadata = metadata
-        resolver = getattr(self.profile, "resolve_task_timeout", None)
-        if resolver is None:
-            timeout = metadata.get("agent_timeout_sec") if metadata else None
-        else:
-            try:
-                timeout = resolver(user_prompt)
-            except Exception as exc:
-                log.debug("Failed to resolve task timeout for profile %s: %s", self.profile.name(), exc)
-                timeout = None
-            if timeout is None and metadata:
-                timeout = metadata.get("agent_timeout_sec")
-        if metadata and self.event_bus is not None:
-            payload = {
-                "profile": self.profile.name(),
-                "task_metadata": metadata,
-            }
-            self.event_bus.emit("task_metadata_resolved", agent="main_agent", payload=payload)
-        if timeout is None:
-            return
-        try:
-            timeout = float(timeout)
-        except (TypeError, ValueError):
-            return
-        if timeout <= 0:
-            return
-        if self._resolved_task_timeout == timeout:
-            return
-        self._resolved_task_timeout = timeout
-        self.agent.time_budget = timeout
-        if self.event_bus is not None:
-            self.event_bus.emit(
-                "task_timeout_resolved",
-                agent="main_agent",
-                payload={
-                    "profile": self.profile.name(),
-                    "timeout_seconds": timeout,
-                },
-            )
-
-    def _resolve_profile_task_metadata(self, user_prompt: str) -> dict:
-        resolver = getattr(self.profile, "resolve_task_metadata", None)
-        if resolver is None:
-            return {}
-        try:
-            metadata = resolver(user_prompt)
-        except Exception as exc:
-            log.debug("Failed to resolve task metadata for profile %s: %s", self.profile.name(), exc)
-            return {}
-        if not isinstance(metadata, dict):
-            return {}
-        resolved = dict(metadata)
-        resolved["permission_mode"] = self.permission_mode
-        return resolved
 
     def format_task(self, user_prompt: str) -> str:
         return f"Task:\n{user_prompt}"
@@ -449,14 +386,14 @@ class InteractiveSession:
         if isinstance(submission, str):
             submission = TurnSubmission(submission)
         if self.attachment_manager is None:
-            self.ensure_profile_bound_for_first_task(submission.text)
+            self._ensure_bound()
         if self.attachment_manager is None:
             raise RuntimeError("附件模块尚未准备好，请稍候")
         return replace(self.attachment_manager.prepare(submission), session_id=self.session.id)
 
     def stage_attachment_path(self, path: str | Path, *, source: str = "picker") -> Attachment:
         if self.attachment_manager is None:
-            self.ensure_profile_bound_for_first_task("")
+            self._ensure_bound()
         if self.attachment_manager is None:
             raise RuntimeError("附件模块尚未准备好，请稍候")
         return self.attachment_manager.stage_path(
@@ -474,7 +411,7 @@ class InteractiveSession:
         source: str = "clipboard",
     ) -> Attachment:
         if self.attachment_manager is None:
-            self.ensure_profile_bound_for_first_task("")
+            self._ensure_bound()
         if self.attachment_manager is None:
             raise RuntimeError("附件模块尚未准备好，请稍候")
         return self.attachment_manager.stage_bytes(
@@ -536,9 +473,8 @@ class InteractiveSession:
                     session_id=self.session.id, turn=self.turn_count - 1,
                     journal_sequence=self.conversation.journal.sequence,
                     event_count=len(self.session_store.read_events(self.session.id)),
-                    profile=self.profile.name(), permission_mode=self.permission_mode,
-                    routing_mode=self.routing_mode,
-                    model_selection=dict(model=self.model_selection.model, reasoning_effort=self.model_selection.reasoning_effort),
+                    permission_mode=self.permission_mode,
+                    model_selection={"model": self.model_selection.model, "reasoning_effort": self.model_selection.reasoning_effort},
                 )
                 self._announce_recovery_origin()
                 self.event_bus.emit("turn_started", agent="main_agent", payload={"turn": self.turn_count})
@@ -584,7 +520,7 @@ class InteractiveSession:
         user_prompt = prepared.text
         self._sync_mcp_connections()
         self._refresh_skill_catalog()
-        self.ensure_profile_bound_for_first_task(user_prompt)
+        self._ensure_bound()
         cancellation_token.check()
         skill_invocation = self.skill_registry.build_user_invocation(user_prompt)
         if skill_invocation is not None:
@@ -594,40 +530,40 @@ class InteractiveSession:
                 turn_instruction=skill_invocation.prompt,
                 attachments=prepared.attachments,
             )
-        elif self.pending_plan_markdown and self.profile.name() == "plan":
-            # Text entry after deferring the question still works: an
-            # explicit confirmation executes; anything else is revision
-            # feedback, which produces a fresh ready plan -> ask again.
-            if _is_plan_execution_confirmation(user_prompt):
-                result = self.execute_pending_plan(attachments=prepared.attachments)
-            else:
-                result = self.revise_pending_plan(user_prompt, attachments=prepared.attachments)
-        else:
-            route_decision = self._maybe_auto_route_profile(user_prompt)
-            turn_instruction = _turn_instruction_for_route(route_decision)
+        elif self.pending_plan_markdown:
+            # Text after a ready plan is revision feedback, never approval.
+            # Execution needs an explicit /plan execute or the plan panel.
+            result = self.revise_pending_plan(user_prompt, attachments=prepared.attachments)
+        elif self.plan_mode:
             result = self._run_turn(
                 user_prompt,
                 cancellation_token=cancellation_token,
-                turn_instruction=turn_instruction,
+                turn_instruction=PLAN_TURN_INSTRUCTION,
                 attachments=prepared.attachments,
             )
-        # Explicit plan mode is the one case where runtime cannot continue
+        else:
+            result = self._run_turn(
+                user_prompt,
+                cancellation_token=cancellation_token,
+                attachments=prepared.attachments,
+            )
+        # An explicit plan is the one case where runtime cannot continue
         # without a user decision. Route it through the single interaction
         # surface (question), never through Workbench buttons.
         return self._settle_ready_plan(result)
 
-    def ensure_profile_bound_for_first_task(self, user_prompt: str) -> None:
+    def _ensure_bound(self) -> None:
         if self.is_bound:
             return
-        self._bind_profile(self._pending_profile_name, source=self._profile_source)
+        self._bind_session()
 
     def _refresh_skill_catalog(self) -> None:
         """Rebuild the prompt and Slash registry when the catalog changed on disk."""
         if not self.skill_registry.refresh_if_changed():
             return
         self._slash_registry = None
-        if self.is_bound and self.profile is not None:
-            self._activate_profile(self.profile.name())
+        if self.is_bound:
+            self._activate_agent()
 
     def _wait_session_future(self, future):
         token = current_token.get()
@@ -640,82 +576,16 @@ class InteractiveSession:
                 if future.done():
                     return future.result()
 
-    def _maybe_auto_route_profile(self, user_prompt: str) -> RouteDecision | None:
-        if (
-            not self.is_bound
-            or self.event_bus is None
-            or self.routing_mode != ROUTING_MODE_AUTO
-        ):
-            return None
-        current = self.profile.name()
-        token = current_token.get()
-
-        def classify(**kwargs):
-            with self.project_resources.acquire("llm", session_id=self.session.id,
-                                                label="选择 Agent", cancellation_token=token):
-                return self.profile_router(**kwargs)
-
-        def route():
-            with cancellation_scope(token):
-                return route_profile_for_turn(user_prompt, current_profile=current,
-                    routing_mode=self.routing_mode, previous_user_task=self.last_user_task,
-                    previous_assistant_text=self.last_assistant_text, llm_classifier=classify)
-
-        future = self.project_resources.submit("tools", route, session_id=self.session.id, label="选择 Agent")
-        self.tool_context.tool_tasks.track(future)
-        decision = self._wait_session_future(future)
-        switched = decision.action == ROUTE_ACTION_SWITCH_PROFILE and decision.profile_name != current
-        self.event_bus.emit(
-            "profile_route_decision",
-            agent="main_agent",
-            payload={
-                "profile": decision.profile_name,
-                "current_profile": current,
-                "matched_profile": decision.matched_profile,
-                "action": decision.action,
-                "turn_mode": decision.turn_mode,
-                "confidence": decision.confidence,
-                "margin": decision.margin,
-                "reason": decision.reason,
-                "fallback_used": decision.fallback_used,
-                "fallback_reason": decision.fallback_reason,
-                "elapsed_ms": round(float(getattr(decision, "elapsed_ms", 0.0)), 1),
-                "source": decision.source,
-                "switched": switched,
-                "routing_mode": self.routing_mode,
-                "decisive_signal": getattr(decision, "decisive_signal", ""),
-                "probabilities": decision.probabilities,
-                "llm_called": getattr(decision, "llm_called", False),
-                "llm_confidence": getattr(decision, "llm_confidence", 0.0),
-                "llm_provider": getattr(decision, "llm_provider", ""),
-                "llm_model": getattr(decision, "llm_model", ""),
-                "failure_type": getattr(decision, "failure_type", ""),
-            },
-        )
-        if switched:
-            self._switch_profile(decision.profile_name, reason="auto route")
-        return decision
-
-    def _bind_profile(
-        self,
-        profile_name: str,
-        *,
-        source: str,
-    ) -> None:
+    def _bind_session(self) -> None:
         if self.is_bound:
             return
-        self.profile = get_profile(profile_name)
-        self._pending_profile_name = self.profile.name()
-        self._profile_source = source
         if self._requested_session_id and (self.session_store.sessions_dir / self._requested_session_id / "session.json").exists():
             self.session = self.session_store.load(self._requested_session_id)
         else:
             self.session = self.session_store.create(
-                profile=self.profile.name(),
                 cwd=self.cwd,
                 model=config.MODEL,
                 permission_mode=self.permission_mode,
-                profile_source=source,
                 session_id=self._requested_session_id,
             )
         self.attachment_manager = AttachmentManager(
@@ -724,7 +594,6 @@ class InteractiveSession:
             model_input_mode(),
         )
         metadata = self.session_store.read_metadata(self.session.id)
-        metadata["routing_mode"] = self.routing_mode
         metadata["environment"] = self.environment
         self.session.metadata_path.write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
@@ -771,23 +640,33 @@ class InteractiveSession:
             lambda: self.tool_context.agent_coordinator.close(),
             order=30,
         )
-        self._activate_profile(self.profile.name())
+        self._activate_agent()
         self.event_bus.emit(
             "session_started",
             agent="main_agent",
             payload={
                 "session_id": self.session.id,
-                "profile": self.profile.name(),
-                "profile_source": source,
                 "workspace": str(self.cwd),
                 "interactive": True,
             },
         )
 
     def _effective_permission_policy(self) -> PermissionPolicy:
-        """Session permission mode tightened by the active profile preset."""
-        preset = self.profile.main_agent().permission_preset
-        return PermissionPolicy(mode=self.permission_mode).restricted_by(preset)
+        """The session permission mode, narrowed to read-only while planning.
+
+        An active planning flow is a runtime-enforced boundary: the tool
+        surface stays visible, but every call that would write, delete or run
+        a mutating command is denied by this policy. Execution clears
+        ``plan_mode`` and the session mode applies again.
+        """
+        if self.plan_mode:
+            return PermissionPolicy(mode=PermissionPolicy.READ_ONLY)
+        return PermissionPolicy(mode=self.permission_mode)
+
+    def _apply_permission_policy(self) -> None:
+        """Push the effective policy into the live tool context."""
+        if self.tool_context is not None:
+            self.tool_context.permission_policy = self._effective_permission_policy()
 
     def _queue_parent_message(self, text: str, tag: str) -> None:
         # Child -> Main upward channel. The message is queued on the main
@@ -797,18 +676,18 @@ class InteractiveSession:
             raise RuntimeError("main conversation is unavailable")
         conversation.queue_message(text, tag=tag)
 
-    def _activate_profile(self, profile_name: str) -> bool:
-        profile = get_profile(profile_name)
-        agent = self._build_agent(profile)
+    def _activate_agent(self) -> bool:
+        """Build the session's single agent, or rebuild it after a prompt change."""
+        agent = self._build_agent()
         created = self.conversation is None
         if created:
             self.conversation = agent.start_conversation()
             self.lifecycle.register("conversation", lambda: self.conversation.close(), order=40)
         else:
             self.conversation.rebind_agent(agent)
-        self.profile, self.agent = profile, agent
+        self.agent = agent
         self._refresh_mcp_catalog()
-        self.tool_context.permission_policy = self._effective_permission_policy()
+        self._apply_permission_policy()
         return created
 
     def _run_turn(self, user_prompt: str, cancellation_token=None,
@@ -855,7 +734,6 @@ class InteractiveSession:
         attachments: tuple[Attachment, ...] = (),
     ) -> TurnResult:
         turn_started_at = time.time()
-        self._apply_profile_task_timeout(user_prompt)
         resolved = resolve_mentions(
             user_prompt,
             workspace_root=self.cwd,
@@ -962,9 +840,8 @@ class InteractiveSession:
             event_count=len(self.session_store.read_events(self.session.id)),
         )
         metadata = self.session_store.read_metadata(self.session.id)
-        point.update(profile=self.profile.name(), permission_mode=self.permission_mode,
-                     routing_mode=self.routing_mode,
-                     model_selection=dict(model=self.model_selection.model, reasoning_effort=self.model_selection.reasoning_effort))
+        point.update(permission_mode=self.permission_mode,
+                     model_selection={"model": self.model_selection.model, "reasoning_effort": self.model_selection.reasoning_effort})
         atomic_json(self.recovery.store.root / "points" / f"{point['id']}.json", point)
         metadata["checkpoint"] = point
         atomic_json(self.session.metadata_path, metadata)
@@ -989,7 +866,6 @@ class InteractiveSession:
         ]
         if not should_summarize_turn(
             events,
-            profile_name=self.profile.name(),
             duration_seconds=duration_seconds,
         ):
             return
@@ -1009,18 +885,34 @@ class InteractiveSession:
             ).to_event()
         )
 
+    def start_plan(self) -> str:
+        """Enter an explicit planning flow.
+
+        Planning is a workflow the user starts, not an agent identity: the
+        same agent writes the plan and later executes it.
+        """
+        if self.pending_plan_markdown:
+            return "已有待审批的计划：用 /plan execute 执行，或直接发送修改意见。"
+        self.plan_mode = True
+        self._apply_permission_policy()
+        return "已进入规划：先调研并给出完整实现计划，不会改动工作区。计划就绪后可用 /plan execute 执行。"
+
     def execute_pending_plan(self, *, attachments: tuple[Attachment, ...] = ()) -> TurnResult:
         if not self.pending_plan_markdown:
-            raise ValueError("No pending plan to execute. Switch to /plan and create a plan first.")
+            raise ValueError("No pending plan to execute. Start one with /plan first.")
         plan_markdown = self.pending_plan_markdown
+        revision = self.pending_plan_revision
         self.pending_plan_markdown = None
         self.pending_plan_revision = 0
-        self._switch_profile(
-            "coding-agent",
-            reason="execute approved plan",
+        self.plan_mode = False
+        self._apply_permission_policy()
+        self.event_bus.emit(
+            "plan_executed",
+            agent="main_agent",
+            payload={"plan_revision": revision, "approval_source": "explicit"},
         )
         task = (
-            "Execute the approved implementation plan below in coding-agent mode.\n\n"
+            "Execute the approved implementation plan below.\n\n"
             "Use the plan as the source of truth, but still inspect the repository, "
             "make the smallest appropriate code/test changes, and run verification before stopping.\n\n"
             f"Approved plan:\n{plan_markdown}"
@@ -1057,14 +949,14 @@ class InteractiveSession:
         feedback in the composer.
         """
         result = first_result
-        while self.pending_plan_markdown and self.profile.name() == "plan":
+        while self.pending_plan_markdown and self.plan_mode:
             answer = self.question_provider.ask(QuestionRequest(
                 question="计划已经准备好，下一步？",
                 options=[
                     QuestionOption(
                         label="执行计划",
                         value="execute",
-                        description="切换到 coding-agent 并执行该计划",
+                        description="按计划开始实施",
                     ),
                     QuestionOption(
                         label="修改计划",
@@ -1095,7 +987,7 @@ class InteractiveSession:
         return result
 
     def _capture_plan_handoff(self, text: str) -> str:
-        if self.profile.name() != "plan" or not text.strip():
+        if not self.plan_mode or not text.strip():
             return ""
         self.pending_plan_markdown = text.strip()
         self.pending_plan_revision += 1
@@ -1104,7 +996,6 @@ class InteractiveSession:
             "plan_ready",
             agent="main_agent",
             payload={
-                "profile": self.profile.name(),
                 "plan_path": str(plan_path.relative_to(self.cwd)),
                 "plan_revision": self.pending_plan_revision,
                 "plan_markdown": self.pending_plan_markdown,
@@ -1113,7 +1004,7 @@ class InteractiveSession:
         )
         return (
             f"计划已写入 `{plan_path.relative_to(self.cwd)}`，请选择下一步。"
-            "非交互入口可回复 continue/继续 执行，或直接发送修改意见。"
+            "审批请用 /plan execute，反馈则直接发送修改意见。"
         )
 
     def _write_pending_plan_artifact(self, plan_markdown: str) -> Path:
@@ -1121,45 +1012,6 @@ class InteractiveSession:
         plan_path.parent.mkdir(parents=True, exist_ok=True)
         plan_path.write_text(plan_markdown.rstrip() + "\n", encoding="utf-8")
         return plan_path
-
-    @runtime_change
-    def _switch_profile(
-        self,
-        profile_name: str,
-        *,
-        reason: str = "profile picker",
-    ) -> None:
-        previous = self.profile.name()
-        if previous == profile_name:
-            return
-        if not self.is_bound:
-            self.profile = get_profile(profile_name)
-            self._pending_profile_name = self.profile.name()
-            self._profile_source = "explicit"
-            return
-        self._activate_profile(
-            profile_name,
-        )
-        self.profile_history.append(ProfileSwitchEvent(
-            previous=previous,
-            current=self.profile.name(),
-            reason=reason,
-        ))
-        if self.session is not None:
-            self.session_store.update_profile(
-                self.session.id,
-                self.profile.name(),
-                profile_source=reason,
-            )
-        self.event_bus.emit(
-            "profile_switched",
-            agent="main_agent",
-            payload={
-                "previous_profile": previous,
-                "profile": self.profile.name(),
-                "reason": reason,
-            },
-        )
 
     def handle_slash_command(self, line: str) -> bool:
         from ..tui.commands import default_command_registry
@@ -1281,32 +1133,6 @@ class InteractiveSession:
         return self.submit(line)
 
     @runtime_change
-    def switch_profile(self, profile_name: str) -> str:
-        previous = self.profile.name()
-        self.pending_plan_markdown = None
-        self.pending_plan_revision = 0
-        self.routing_mode = ROUTING_MODE_PINNED
-        self._switch_profile(profile_name)
-        current = self.profile.name()
-        if self.session is not None:
-            self.session_store.update_routing_mode(self.session.id, self.routing_mode)
-        if current == previous:
-            return f"profile already active: {current}"
-        if not self.is_bound:
-            return f"profile selected: {current}"
-        return f"profile switched: {previous} -> {current}"
-
-    @runtime_change
-    def enable_auto_profile_routing(self) -> str:
-        previous_mode = self.routing_mode
-        self.routing_mode = ROUTING_MODE_AUTO
-        if self.session is not None:
-            self.session_store.update_routing_mode(self.session.id, self.routing_mode)
-        if previous_mode == ROUTING_MODE_AUTO:
-            return f"auto profile routing already active: {self.profile.name()}"
-        return f"auto profile routing enabled: {self.profile.name()}"
-
-    @runtime_change
     def set_permission_mode(self, permission_mode: str) -> str:
         PermissionPolicy(mode=permission_mode)
         previous = self.permission_mode
@@ -1315,7 +1141,7 @@ class InteractiveSession:
         self.permission_mode = permission_mode
         self.approval_provider = self._approval_provider_for_mode(permission_mode)
         if self.tool_context is not None:
-            self.tool_context.permission_policy = self._effective_permission_policy()
+            self._apply_permission_policy()
             self.tool_context.approval_provider = self.approval_provider
         if self.conversation is not None and getattr(self.conversation, "runtime_state", None) is not None:
             self.conversation.runtime_state.permission_mode = permission_mode
@@ -1347,7 +1173,7 @@ class InteractiveSession:
         """
         self.model_selection.select(model=model, reasoning_effort=reasoning_effort)
         metadata = self.session_store.read_metadata(self.session.id)
-        metadata["model_selection"] = dict(model=self.model_selection.model, reasoning_effort=self.model_selection.reasoning_effort)
+        metadata["model_selection"] = {"model": self.model_selection.model, "reasoning_effort": self.model_selection.reasoning_effort}
         metadata["model"] = config.resolve_model_profile(config.MODEL_INTENSITY, self.model_selection).model
         atomic_json(self.session.metadata_path, metadata)
         if self.conversation is not None:
@@ -1479,9 +1305,9 @@ class InteractiveSession:
             self.mcp_manager.register_tools(self.tool_registry, snapshot=snapshot)
         if self.tool_context is not None:
             self.tool_context.tool_registry = self.tool_registry
-            # Discovery history survives profile switches, but a tool that no
+            # Discovery history survives an agent rebuild, but a tool that no
             # longer exists in the rebuilt catalog is dropped: it is gone, not
-            # merely disallowed by the current profile.
+            # merely disallowed by the current tool surface.
             existing = {spec.name for spec in self.tool_registry.specs()}
             removed = self.tool_context.discovered_tool_names - existing
             self.tool_context.discovered_tool_names &= existing
@@ -1564,13 +1390,14 @@ class InteractiveSession:
     def _restore_pending_plan(self, events: list[dict[str, Any]]) -> None:
         """Rebuild in-memory pending plan state from the forked journal.
 
-        The latest ``plan_ready`` snapshot is pending unless execution
-        already started afterwards (``profile_switched`` with the execute
-        reason). Without this, the Workbench would offer "执行计划" for a
-        resumed session while ``execute_pending_plan`` had nothing to run.
+        The latest ``plan_ready`` snapshot is pending unless a
+        ``plan_executed`` event follows it. Older journals recorded that
+        transition as ``profile_switched`` with the execute reason, so both
+        shapes are read; only the new shape is written.
         """
         self.pending_plan_markdown = None
         self.pending_plan_revision = 0
+        self.plan_mode = False
         latest: dict[str, Any] | None = None
         executed = False
         for item in events:
@@ -1581,7 +1408,7 @@ class InteractiveSession:
             if event_type == "plan_ready":
                 latest = payload
                 executed = False
-            elif (
+            elif event_type == "plan_executed" or (
                 event_type == "profile_switched"
                 and str(payload.get("reason") or "") == "execute approved plan"
             ):
@@ -1595,6 +1422,11 @@ class InteractiveSession:
             self.pending_plan_markdown = markdown.strip()
             revision = latest.get("plan_revision")
             self.pending_plan_revision = int(revision) if isinstance(revision, int) else 1
+            # A pending plan is an active planning flow, not just a document:
+            # feedback has to reach the revision path and writes stay denied
+            # until the user executes it.
+            self.plan_mode = True
+            self._apply_permission_policy()
 
     def _announce_recovery_origin(self) -> None:
         origin = self.recovery.origin
@@ -1637,15 +1469,14 @@ class InteractiveSession:
             session_id=self.session.id, agent_name="main_agent"))
         if answer.cancelled or answer.value != "rewind":
             return False
-        from ..runtime.recovery import atomic_bytes
         from ..agent.history import ContextHistory
+        from ..runtime.recovery import atomic_bytes
         staged_root = self.state_root / "staging" / ("rewind-" + uuid.uuid4().hex)
-        target_profile = get_profile(point["profile"])
         context = replace(self.tool_context, session_root=staged_root,
                           model_selection=config.ModelSelection(**point["model_selection"]),
                           approval_provider=self._approval_provider_for_mode(point["permission_mode"]))
-        context.permission_policy = PermissionPolicy(mode=point["permission_mode"]).restricted_by(target_profile.main_agent().permission_preset)
-        agent = self._build_agent(target_profile, tool_context=context)
+        context.permission_policy = PermissionPolicy(mode=point["permission_mode"])
+        agent = self._build_agent(tool_context=context)
         replacement = agent.start_conversation()
         events = self.session_store.read_history_events(self.session.id, event_count=point["event_count"])
         messages = SessionJournal(self.session.journal_path).recovery_messages(
@@ -1671,12 +1502,11 @@ class InteractiveSession:
                 self.event_bus.emit("session_rewound", payload={"point_id": point_id, "turn": point["turn"],
                                    "event_count": point["event_count"], "journal_sequence": replacement.journal.sequence})
                 metadata = self.session_store.read_metadata(self.session.id)
-                metadata.update(checkpoint=point, profile=target_profile.name(),
-                                routing_mode=point["routing_mode"],
+                metadata.update(checkpoint=point,
                                 permission_mode=point["permission_mode"], model_selection=point["model_selection"],
-                                history_boundary=dict(turn=point["turn"], journal_sequence=replacement.journal.sequence,
-                                                      event_count=len(self.session_store.read_events(self.session.id)),
-                                                      change_cursor=point["change_cursor"]))
+                                history_boundary={"turn": point["turn"], "journal_sequence": replacement.journal.sequence,
+                                                      "event_count": len(self.session_store.read_events(self.session.id)),
+                                                      "change_cursor": point["change_cursor"]})
                 metadata["fork_boundary"] = dict(metadata["history_boundary"])
                 atomic_json(self.session.metadata_path, metadata)
                 if todo_payload is not None:
@@ -1697,8 +1527,6 @@ class InteractiveSession:
             raise
         context.session_root = self.session.root
         self.conversation, self.agent, self.tool_context = replacement, agent, context
-        self.profile = target_profile
-        self.routing_mode = point["routing_mode"]
         self.model_selection = context.model_selection
         self.permission_mode = point["permission_mode"]
         self.approval_provider = context.approval_provider
@@ -1712,7 +1540,6 @@ class InteractiveSession:
         context.workspace._versions.clear()
         replacement.runtime_state.shell_job_manager.close()
         replacement.runtime_state.shell_job_manager = old.runtime_state.shell_job_manager
-        replacement.runtime_state.browser_job_id = old.runtime_state.browser_job_id
         old.runtime_state.shell_job_manager = None
         previous_context.agent_coordinator.close()
         old.close()
@@ -1824,9 +1651,9 @@ class InteractiveSession:
                     blocker = self._suspend_blocker()
                     if blocker is not None:
                         raise RuntimeError(f"{blocker}，不能自动休眠")
-                    suspended_state = dict(
-                        agents=self.tool_context.agent_coordinator.export_state(),
-                        shell_jobs=self.conversation.runtime_state.shell_job_manager.export_jobs())
+                    suspended_state = {
+                        "agents": self.tool_context.agent_coordinator.export_state(),
+                        "shell_jobs": self.conversation.runtime_state.shell_job_manager.export_jobs()}
                 self._closing = True
                 if self._turn_token is not None:
                     self._turn_token.cancel()
@@ -1914,35 +1741,6 @@ def _format_turn_with_mentions(
         return user_text
     parts.append(f"User turn:\n{user_text}")
     return "\n\n".join(parts)
-
-
-def _turn_instruction_for_route(decision: RouteDecision | None) -> str | None:
-    if decision is None or decision.turn_mode != TURN_MODE_DIRECT_ANSWER:
-        return None
-    return DIRECT_ANSWER_TURN_INSTRUCTION
-
-
-def _is_plan_execution_confirmation(text: str) -> bool:
-    normalized = " ".join(text.strip().lower().split())
-    return normalized in {
-        "continue",
-        "go ahead",
-        "proceed",
-        "execute",
-        "implement",
-        "start",
-        "yes",
-        "ok",
-        "继续",
-        "执行",
-        "开始",
-        "实施",
-        "可以",
-        "好",
-        "好的",
-        "按计划执行",
-        "继续执行",
-    }
 
 
 def _load_harness_rules(workspace: Path) -> GlobalRulesDoc | None:

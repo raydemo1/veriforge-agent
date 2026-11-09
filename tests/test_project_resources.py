@@ -6,11 +6,13 @@ from unittest.mock import patch
 
 import pytest
 
-
-from harness_code_agent.agent.cancellation import CancellationToken, CancelledError, cancellation_scope
+from harness_code_agent.agent.cancellation import (
+    CancellationToken,
+    CancelledError,
+    cancellation_scope,
+)
 from harness_code_agent.agent.trace import TraceWriter
 from harness_code_agent.tui_bridge import BridgeServer
-
 
 pytestmark = pytest.mark.session
 
@@ -65,7 +67,7 @@ def test_sessions_limit_actual_streams_and_cancel_waiters(runtime_factory):
 
 def test_automatic_dormancy_preserves_history_and_waits_for_tool_exit(runtime_factory, tmp_path):
     with patch.object(BridgeServer, "_write"):
-        bridge = BridgeServer(cwd=tmp_path, profile_name="general", profile_explicit=True)
+        bridge = BridgeServer(cwd=tmp_path)
         try:
             record = bridge.registry.get(bridge.registry.active_id)
             host = record.host
@@ -126,6 +128,7 @@ def test_queued_agent_can_be_cancelled_before_initialization(runtime_factory):
 
 def test_mcp_cached_catalog_connects_separate_sessions_only_on_call(tmp_path):
     import sys
+
     from harness_code_agent.runtime.mcp import McpClientManager
 
     server = tmp_path / "server.py"

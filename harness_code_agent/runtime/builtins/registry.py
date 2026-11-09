@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+
 from ..execution_planner import CallEffect, ResourceClaim, workspace_claim
 from ..permissions import (
     TOOL_PERMISSION_CONTROL,
@@ -40,7 +41,6 @@ from .agents import (
     spawn_agent,
     wait_agents,
 )
-from .browser import browser_test, stop_dev_server
 from .code_intelligence import code_intelligence
 from .discovery import search_tools
 from .filesystem import (
@@ -60,7 +60,7 @@ from .memory_tools import (
     memory_write,
 )
 from .runtime_status import get_runtime_status
-from .schemas import BROWSER_TOOL_SCHEMAS, CORE_TOOL_SCHEMAS
+from .schemas import CORE_TOOL_SCHEMAS
 from .shell import list_shell_jobs, read_shell_output, run_bash, stop_shell_job
 from .todo import update_todo
 from .web import web_fetch, web_search
@@ -68,10 +68,7 @@ from .web import web_fetch, web_search
 
 def _build_builtin_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
-    schemas = {
-        schema["function"]["name"]: schema
-        for schema in CORE_TOOL_SCHEMAS + BROWSER_TOOL_SCHEMAS
-    }
+    schemas = {schema["function"]["name"]: schema for schema in CORE_TOOL_SCHEMAS}
     main = {TOOL_CAPABILITY_MAIN}
     all_agents = main | {TOOL_CAPABILITY_READONLY_AGENT, TOOL_CAPABILITY_WORKER_AGENT}
     worker_agents = main | {TOOL_CAPABILITY_WORKER_AGENT}
@@ -150,7 +147,6 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         _shell_effect,
         capabilities=all_agents,
     )
-    add("browser_test", browser_test, TOOL_PERMISSION_SHELL, _browser_effect, capabilities=all_agents)
     add(
         "write_file",
         write_file,
@@ -280,7 +276,6 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         TOOL_PERMISSION_CONTROL,
         CallEffect(barrier=True, kind="control"),
     )
-    add("stop_dev_server", stop_dev_server, TOOL_PERMISSION_SHELL)
     return registry
 
 
@@ -351,13 +346,6 @@ def _conflict_effect(args, context):
         ),
         kind="agent_conflict",
     )
-
-
-def _browser_effect(args, context):
-    if os.name == "nt":
-        key = str(getattr(context, "session_id", None) or id(context))
-        return CallEffect((ResourceClaim("browser", key, "exact", "write"),), kind="browser")
-    return CallEffect.global_exclusive()
 
 
 def _shell_effect(args, context):

@@ -10,7 +10,6 @@ from ..runtime.tool_failures import FailureVisibility
 
 @dataclass
 class SessionStatusSnapshot:
-    profile: str
     model: str
     provider: str
     permission_mode: str
@@ -53,7 +52,6 @@ class TuiState:
 
         if event_type == "session_started":
             self.snapshot.status = "ready"
-            self.snapshot.profile = str(payload.get("profile") or self.snapshot.profile)
             if payload.get("session_id"):
                 self.snapshot.session_id = str(payload.get("session_id"))
             return None
@@ -155,16 +153,9 @@ class TuiState:
             return None
         if event_type == "approval_decided":
             return None
-        if event_type == "profile_switched":
-            self.snapshot.profile = str(payload.get("profile") or self.snapshot.profile)
+        if event_type == "plan_executed":
             self.snapshot.pending_plan = False
             return None
-        if event_type == "profile_route_decision":
-            if not bool(payload.get("switched")):
-                return None
-            profile = str(payload.get("profile") or "")
-            body = f"已切换到 {profile}" if profile else "工作模式已切换"
-            return TranscriptBlock("profile", "工作模式", body, turn=self.snapshot.turn)
         if event_type == "permission_mode_switched":
             self.snapshot.permission_mode = str(payload.get("permission_mode") or self.snapshot.permission_mode)
             return None
@@ -461,9 +452,7 @@ _TOOL_PRIMARY_ARGS = {
     "read_file": "path",
     "write_file": "path",
     "apply_patch": "path",
-    "edit_file": "path",
     "list_files": "directory",
-    "search_files": "query",
     "spawn_agent": "task",
     "send_agent_message": "message",
     "followup_agent": "task",
@@ -472,7 +461,6 @@ _TOOL_PRIMARY_ARGS = {
     "read_agent_conflicts": "conflict_id",
     "resolve_agent_conflicts": "conflict_id",
     "close_agent": "agent_id",
-    "browser_test": "url",
     "read_skill_file": "path",
     "repo_search": "query",
     "web_search": "query",
@@ -486,11 +474,7 @@ _TOOL_DISPLAY_LABELS = {
     "read_file": "阅读文件",
     "write_file": "写入文件",
     "apply_patch": "修改文件",
-    "edit_file": "修改文件",
-    "delete_file": "删除文件",
-    "rename_file": "重命名文件",
     "repo_search": "搜索代码",
-    "search_files": "搜索文件",
     "run_bash": "执行命令",
     "spawn_agent": "启动子代理",
     "send_agent_message": "补充子代理消息",
@@ -505,7 +489,6 @@ _TOOL_DISPLAY_LABELS = {
     "close_agent": "关闭子代理",
     "web_search": "搜索网页",
     "web_fetch": "阅读网页",
-    "browser_test": "测试页面",
     "read_skill_file": "阅读技能说明",
     "search_tools": "查找工具",
     "memory_search": "搜索记忆",
@@ -516,7 +499,6 @@ _TOOL_DISPLAY_LABELS = {
     "list_shell_jobs": "查看后台任务",
     "read_shell_output": "读取后台输出",
     "stop_shell_job": "停止后台任务",
-    "stop_dev_server": "停止开发服务",
 }
 
 _TOOL_RESULT_LABELS = {
@@ -524,11 +506,7 @@ _TOOL_RESULT_LABELS = {
     "read_file": "文件已阅读",
     "write_file": "文件已写入",
     "apply_patch": "文件已修改",
-    "edit_file": "文件已修改",
-    "delete_file": "文件已删除",
-    "rename_file": "文件已重命名",
     "repo_search": "代码已搜索",
-    "search_files": "文件已搜索",
     "run_bash": "命令已执行",
     "spawn_agent": "子代理已启动",
     "send_agent_message": "消息已补充",
@@ -543,7 +521,6 @@ _TOOL_RESULT_LABELS = {
     "close_agent": "子代理已关闭",
     "web_search": "网页已搜索",
     "web_fetch": "网页已阅读",
-    "browser_test": "页面已测试",
     "read_skill_file": "技能说明已阅读",
     "search_tools": "工具已查找",
     "memory_search": "记忆已搜索",
@@ -554,7 +531,6 @@ _TOOL_RESULT_LABELS = {
     "list_shell_jobs": "后台任务已查看",
     "read_shell_output": "后台输出已读取",
     "stop_shell_job": "后台任务已停止",
-    "stop_dev_server": "开发服务已停止",
 }
 
 
@@ -673,7 +649,7 @@ def _context_window_tokens() -> int:
         from ..config import CONTEXT_WINDOW_TOKENS
 
         return int(CONTEXT_WINDOW_TOKENS)
-    except Exception:
+    except (ImportError, TypeError, ValueError):
         return 200_000
 
 

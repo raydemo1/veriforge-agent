@@ -100,8 +100,8 @@ class ObservabilityAggregationTests(unittest.TestCase):
         )
 
         store = SessionStore(self.root / ".harness")
-        first = store.create(profile="coding-agent", cwd=self.root, model="model-a", permission_mode="workspace-write")
-        second = store.create(profile="plan", cwd=self.root, model="model-a", permission_mode="workspace-write")
+        first = store.create(cwd=self.root, model="model-a", permission_mode="workspace-write")
+        second = store.create(cwd=self.root, model="model-a", permission_mode="workspace-write")
         store.event_bus(first).emit("llm_usage", payload={"prompt_tokens": 100, "cached_tokens": 50, "total_tokens": 150})
         store.event_bus(first).emit("tool_result", payload={"tool": "run_bash", "status": "failed"})
         store.event_bus(first).emit("failure", payload={"category": "runtime_error", "message": "failed"})
@@ -129,7 +129,7 @@ class ObservabilityAggregationTests(unittest.TestCase):
         )
 
         store = SessionStore(self.root / ".harness")
-        session = store.create(profile="coding-agent", cwd=self.root, model="model-a", permission_mode="workspace-write")
+        session = store.create(cwd=self.root, model="model-a", permission_mode="workspace-write")
         store.event_bus(session).emit("llm_usage", payload={"prompt_tokens": 100, "cached_tokens": 75, "total_tokens": 120})
         store.event_bus(session).emit("tool_result", payload={"tool": "read_file", "status": "success"})
 

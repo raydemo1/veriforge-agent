@@ -4,16 +4,16 @@ import os
 import tempfile
 import threading
 import unittest
-import pytest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from harness_code_agent.runtime.builtins.registry import (
     BUILTIN_TOOL_REGISTRY,
     TOOL_SCHEMAS,
 )
-from harness_code_agent.runtime.builtins.schemas import BROWSER_TOOL_SCHEMAS
 from harness_code_agent.runtime.builtins.shell import (
     list_shell_jobs,
     read_shell_output,
@@ -599,42 +599,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", completions.calls[0])
         self.assertEqual(completions.calls[0]["extra_body"], {"thinking": {"type": "disabled"}})
 
-    def test_model_router_applies_profile_transitions(self):
-        from harness_code_agent.profiles import router
-
-        cases = [
-            ("general", "general", "general", "stay", "normal"),
-            ("general", "coding-agent", "coding-agent", "switch_profile", "normal"),
-            ("coding-agent", "general", "coding-agent", "direct_answer", "direct_answer"),
-            ("plan", "coding-agent", "coding-agent", "switch_profile", "normal"),
-            ("coding-agent", "review", "review", "switch_profile", "normal"),
-        ]
-        for current, matched, expected, action, turn_mode in cases:
-            with self.subTest(current=current, matched=matched):
-                decision = router.route_profile_for_turn(
-                    "本轮任务", current_profile=current,
-                    llm_classifier=lambda matched=matched, **_: router.LlmRouteResult(profile_name=matched, confidence=0.96),
-                )
-                self.assertEqual(decision.profile_name, expected)
-                self.assertEqual(decision.action, action)
-                self.assertEqual(decision.turn_mode, turn_mode)
-                self.assertEqual(decision.source, "llm")
-                self.assertFalse(decision.fallback_used)
-                self.assertTrue(decision.llm_called)
-
-    def test_model_route_hops_between_specialized_profiles(self):
-        from harness_code_agent.profiles import router
-
-        decision = router.route_profile_for_turn(
-            "帮我 review 这段代码", current_profile="coding-agent",
-            llm_classifier=lambda **_: router.LlmRouteResult(profile_name="review", confidence=0.96),
-        )
-        self.assertEqual(decision.profile_name, "review")
-        self.assertEqual(decision.action, "switch_profile")
-        self.assertFalse(decision.fallback_used)
-        self.assertEqual(decision.source, "llm")
-        self.assertTrue(decision.llm_called)
-
     def test_permission_policy_does_not_block_format_substrings_in_safe_commands(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy
 
@@ -681,13 +645,12 @@ class ProductRuntimeTests(unittest.TestCase):
             {"type": "tool_result", "payload": {"tool": "read_file"}},
         ]
 
-        self.assertFalse(should_summarize_turn(simple, profile_name="coding-agent", duration_seconds=1))
-        self.assertFalse(should_summarize_turn(three_tools, profile_name="plan", duration_seconds=1))
-        self.assertTrue(should_summarize_turn(three_tools, profile_name="coding-agent", duration_seconds=1))
-        self.assertTrue(should_summarize_turn([{"type": "file_change", "payload": {"path": "app.py"}}], profile_name="coding-agent", duration_seconds=1))
-        self.assertTrue(should_summarize_turn([{"type": "tool_result", "payload": {"tool": "run_bash"}}], profile_name="coding-agent", duration_seconds=1))
-        self.assertTrue(should_summarize_turn([{"type": "agent_fallback", "payload": {"reason": "tool_call_budget_exceeded"}}], profile_name="coding-agent", duration_seconds=1))
-        self.assertTrue(should_summarize_turn(simple, profile_name="coding-agent", duration_seconds=45))
+        self.assertFalse(should_summarize_turn(simple, duration_seconds=1))
+        self.assertTrue(should_summarize_turn(three_tools, duration_seconds=1))
+        self.assertTrue(should_summarize_turn([{"type": "file_change", "payload": {"path": "app.py"}}], duration_seconds=1))
+        self.assertTrue(should_summarize_turn([{"type": "tool_result", "payload": {"tool": "run_bash"}}], duration_seconds=1))
+        self.assertTrue(should_summarize_turn([{"type": "agent_fallback", "payload": {"reason": "tool_call_budget_exceeded"}}], duration_seconds=1))
+        self.assertTrue(should_summarize_turn(simple, duration_seconds=45))
 
     def test_generate_turn_summary_uses_configured_fast_profile(self):
         from harness_code_agent import config
@@ -1328,10 +1291,7 @@ class ProductRuntimeTests(unittest.TestCase):
             schema["function"]["name"]
             for schema in BUILTIN_TOOL_REGISTRY.schemas()
         }
-        exported_schema_names = {
-            schema["function"]["name"]
-            for schema in TOOL_SCHEMAS + BROWSER_TOOL_SCHEMAS
-        }
+        exported_schema_names = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
 
         self.assertEqual(registry_names, exported_schema_names)
         self.assertEqual(BUILTIN_TOOL_REGISTRY.permission_for("web_search"), "network_read")
@@ -1990,7 +1950,6 @@ class ProductRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / ".harness")
             session = store.create(
-                profile="terminal",
                 cwd=Path(tmp),
                 model="test-model",
                 permission_mode="workspace-write",
@@ -2003,8 +1962,6 @@ class ProductRuntimeTests(unittest.TestCase):
                 json.loads(line)
                 for line in session.events_path.read_text(encoding="utf-8").splitlines()
             ]
-
-            self.assertEqual(metadata["profile"], "terminal")
             self.assertEqual(metadata["model"], "test-model")
             self.assertEqual(metadata["permission_mode"], "workspace-write")
             self.assertEqual(events[0]["type"], "session_started")
@@ -2016,13 +1973,11 @@ class ProductRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / ".harness")
             first = store.create(
-                profile="terminal",
                 cwd=Path(tmp),
                 model="model-a",
                 permission_mode="workspace-write",
             )
             second = store.create(
-                profile="plan",
                 cwd=Path(tmp),
                 model="model-b",
                 permission_mode="read-only",
@@ -2030,11 +1985,10 @@ class ProductRuntimeTests(unittest.TestCase):
             store.event_bus(second).emit("session_finished", agent="main_agent", payload={})
 
             sessions = store.list_sessions()
-            metadata = store.read_metadata(second.id)
+            store.read_metadata(second.id)
             events = store.read_events(second.id)
 
             self.assertEqual([item["id"] for item in sessions], [second.id, first.id])
-            self.assertEqual(metadata["profile"], "plan")
             self.assertEqual(events[0]["type"], "session_finished")
 
     def test_session_store_forks_session_metadata_and_lineage_event(self):
@@ -2043,7 +1997,6 @@ class ProductRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / ".harness")
             source = store.create(
-                profile="coding-agent",
                 cwd=Path(tmp),
                 model="model-a",
                 permission_mode="workspace-write",
@@ -2053,14 +2006,13 @@ class ProductRuntimeTests(unittest.TestCase):
 
             from harness_code_agent.runtime.recovery import atomic_json
             source_metadata = store.read_metadata(source.id)
-            source_metadata["fork_boundary"] = dict(turn=0, journal_sequence=0, event_count=2, change_cursor=0)
+            source_metadata["fork_boundary"] = {"turn": 0, "journal_sequence": 0, "event_count": 2, "change_cursor": 0}
             atomic_json(source.metadata_path, source_metadata)
             fork = store.fork(source.id)
             metadata = store.read_metadata(fork.id)
             events = store.read_events(fork.id)
 
             self.assertNotEqual(fork.id, source.id)
-            self.assertEqual(metadata["profile"], "coding-agent")
             self.assertEqual(metadata["model"], "model-a")
             self.assertEqual(metadata["permission_mode"], "workspace-write")
             self.assertEqual(metadata["forked_from"], source.id)
@@ -2073,7 +2025,6 @@ class ProductRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / ".harness")
             source = store.create(
-                profile="coding-agent",
                 cwd=Path(tmp),
                 model="model-a",
                 permission_mode="workspace-write",
@@ -2082,7 +2033,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 store.fork(source.id)
             from harness_code_agent.runtime.recovery import atomic_json
             metadata = store.read_metadata(source.id)
-            metadata["fork_boundary"] = dict(turn=0, journal_sequence=0, event_count=0, change_cursor=0)
+            metadata["fork_boundary"] = {"turn": 0, "journal_sequence": 0, "event_count": 0, "change_cursor": 0}
             atomic_json(source.metadata_path, metadata)
             fork = store.fork(source.id)
             lineage = store.read_lineage(fork.id)
@@ -2095,13 +2046,11 @@ class ProductRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / ".harness")
             store.create(
-                profile="coding-agent",
                 cwd=Path(tmp),
                 model="model-a",
                 permission_mode="workspace-write",
             )
             second = store.create(
-                profile="plan",
                 cwd=Path(tmp),
                 model="model-b",
                 permission_mode="read-only",
@@ -2113,7 +2062,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
             self.assertEqual(latest["id"], second.id)
             self.assertIn("Session summary", summary)
-            self.assertIn("profile: plan", summary)
+    
 
     def test_session_summary_formats_human_readable_event_overview(self):
         from harness_code_agent.sessions.summary import format_session_summary
@@ -2157,7 +2106,7 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn("tools: 1 call(s): write_file=1", summary)
         self.assertIn("changed_files: app.py", summary)
         self.assertIn("approvals: 1 requested, 0 approved, 1 denied", summary)
-        self.assertIn("profile_switches: coding-agent -> plan (slash command)", summary)
+
         self.assertIn("plans_ready: 1", summary)
         self.assertIn("fallbacks: 1 (latest: loop_detected)", summary)
         self.assertIn("task_outcome: success - done", summary)
@@ -2209,7 +2158,7 @@ class ProductRuntimeTests(unittest.TestCase):
         )
 
         self.assertIn("id: empty-session", summary)
-        self.assertIn("profile: plan", summary)
+
         self.assertIn("events: 1", summary)
         self.assertIn("tools: 1 call(s): unknown=1", summary)
         self.assertIn("changed_files: unknown", summary)

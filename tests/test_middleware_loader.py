@@ -267,7 +267,7 @@ class MiddlewareLifecycleContractTests(unittest.TestCase):
 
 
 class UserMiddlewareSessionCachingTests(unittest.TestCase):
-    """User middlewares load once per session and survive profile switches."""
+    """User middlewares load once per session and survive an agent rebuild."""
 
     def setUp(self):
         self.env_patch = patch.dict(os.environ, {
@@ -283,7 +283,7 @@ class UserMiddlewareSessionCachingTests(unittest.TestCase):
         self.env_patch.stop()
         self._tmp.cleanup()
 
-    def test_profile_switch_reuses_same_middleware_instances(self):
+    def test_agent_rebuild_reuses_same_middleware_instances(self):
         from harness_code_agent.core.interactive import InteractiveSession
 
         recorders = [RecordingMiddleware(), RecordingMiddleware()]
@@ -300,7 +300,7 @@ class UserMiddlewareSessionCachingTests(unittest.TestCase):
                 all(any(m is r for m in first_agent.middlewares) for r in recorders)
             )
 
-            self.interactive._switch_profile("plan")
+            self.interactive._activate_agent()
 
             second_agent = self.interactive.agent
             self.assertIsNot(second_agent, first_agent)

@@ -92,7 +92,7 @@ def main():
                 "不需要其他工具，保存后简短回复。"),
                 "我之前要求你用哪种语言和我交流？只回答语言，不调用工具，不保存新记忆。",
             ]):
-                session = InteractiveSession(cwd=workspace, profile_name="general", profile_explicit=True,
+                session = InteractiveSession(cwd=workspace,
                                              approval_provider=NoApprovalProvider(), enable_turn_summary=False)
                 try:
                     response = session.submit(task)

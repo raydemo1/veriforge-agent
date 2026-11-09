@@ -69,7 +69,6 @@ function markerFor(item: TranscriptItem, icons: IconSet): string {
   if (item.state === "pending") return icons.pending;
   if (item.kind === "file") return icons.file;
   if (item.kind === "tool") return icons.tool;
-  if (item.kind === "profile") return icons.profile;
   if (item.kind === "thought") return icons.question;
   return icons.running;
 }
@@ -544,11 +543,11 @@ function panelIcon(kind: PanelSpec["kind"], icons: IconSet): string {
   return icons.profile;
 }
 
-type PanelAnchor = "history" | "profile" | "permission" | "model" | "effort" | "top-right";
+type PanelAnchor = "history" | "permission" | "model" | "effort" | "top-right";
 
-// Profile/permission buttons sit in the composer's left group; their panels
-// anchor to the bottom-left like the buttons they belong to.
-const LEFT_PANEL_ANCHORS: ReadonlySet<PanelAnchor> = new Set(["profile", "permission"]);
+// The permission button sits in the composer's left group, so its panel
+// anchors to the bottom-left like the button it belongs to.
+const LEFT_PANEL_ANCHORS: ReadonlySet<PanelAnchor> = new Set(["permission"]);
 
 // Model/effort buttons sit in the composer's right group, so their panels
 // pop from the right screen edge like the buttons they belong to.
@@ -556,7 +555,6 @@ const RIGHT_PANEL_ANCHORS: ReadonlySet<PanelAnchor> = new Set(["model", "effort"
 
 function defaultPanelAnchor(panel: PanelSpec): PanelAnchor {
   if (panel.kind === "sessions") return "history";
-  if (panel.kind === "profile") return "profile";
   if (panel.kind === "permission") return "permission";
   if (panel.kind === "model") return "model";
   if (panel.kind === "effort") return "effort";
@@ -1071,7 +1069,7 @@ function CompletionOverlay({ theme, title, footer, bottomOffset, maxHeight, narr
   );
 }
 
-function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queueDepth, waitingReason, commands, theme, icons, compact, narrow, terminalWidth, terminalHeight, disabled, sessionReady, onAction, attachments, onAddFiles, onStagePaths, onPaste, onRemoveAttachment, snapshot, onOpenPanel }: { value: string; onChange: (value: string) => void; onSubmit: () => void; onCancel: () => void; running: boolean; stopping: boolean; queueDepth: number; waitingReason: string | null; commands: CommandItem[]; theme: Theme; icons: IconSet; compact: boolean; narrow: boolean; terminalWidth: number; terminalHeight: number; disabled: boolean; sessionReady: boolean; onAction?: AppProps["onAction"]; attachments: AttachmentItem[]; onAddFiles: () => void; onStagePaths: (paths: string[], source: "mention" | "clipboard") => Promise<boolean>; onPaste: (editor: TextareaRenderable | null) => void; onRemoveAttachment: (id: string) => void; snapshot: typeof initialState.snapshot; onOpenPanel: (panel: "profile" | "permission" | "model" | "effort") => void }) {
+function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queueDepth, waitingReason, commands, theme, icons, compact, narrow, terminalWidth, terminalHeight, disabled, sessionReady, onAction, attachments, onAddFiles, onStagePaths, onPaste, onRemoveAttachment, snapshot, onOpenPanel }: { value: string; onChange: (value: string) => void; onSubmit: () => void; onCancel: () => void; running: boolean; stopping: boolean; queueDepth: number; waitingReason: string | null; commands: CommandItem[]; theme: Theme; icons: IconSet; compact: boolean; narrow: boolean; terminalWidth: number; terminalHeight: number; disabled: boolean; sessionReady: boolean; onAction?: AppProps["onAction"]; attachments: AttachmentItem[]; onAddFiles: () => void; onStagePaths: (paths: string[], source: "mention" | "clipboard") => Promise<boolean>; onPaste: (editor: TextareaRenderable | null) => void; onRemoveAttachment: (id: string) => void; snapshot: typeof initialState.snapshot; onOpenPanel: (panel: "permission" | "model" | "effort") => void }) {
   const [selected, setSelected] = useState(0);
   const [mentions, setMentions] = useState<Completion[]>([]);
   const [dismissedCompletionValue, setDismissedCompletionValue] = useState<string | null>(null);
@@ -1226,7 +1224,6 @@ function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queu
         <box style={{ flexDirection: narrow ? "column" : "row", alignItems: narrow ? "flex-start" : "center", justifyContent: "space-between", paddingLeft: 1, paddingRight: 1, marginTop: 1 }}>
           <box style={{ flexDirection: "row", alignItems: "center", flexShrink: 1, minWidth: 0 }}>
             <AttachAction theme={theme} onAddFiles={onAddFiles} />
-            <ToolbarAction label={`${snapshot.routingMode === "auto" ? "自动" : profileLabel(snapshot.profile)} ▾`} theme={theme} tone={theme.text} onInvoke={() => onOpenPanel("profile")} />
             <ToolbarAction label={`${compact ? "审批" : permissionLabel(snapshot.permissionMode)} ▾`} theme={theme} tone={snapshot.permissionMode === "danger-full-access" ? theme.error : theme.text} onInvoke={() => onOpenPanel("permission")} />
           </box>
           <box style={{ flexDirection: "row", alignItems: "center", flexGrow: narrow ? 1 : 0, flexShrink: 1, minWidth: 0, justifyContent: narrow ? "space-between" : "flex-start", width: narrow ? "100%" : undefined, marginLeft: narrow ? 0 : 2 }}>
@@ -1251,16 +1248,6 @@ function Composer({ value, onChange, onSubmit, onCancel, running, stopping, queu
       ) : null}
     </box>
   );
-}
-
-function profileLabel(profile: string): string {
-  return ({
-    general: "通用",
-    "coding-agent": "编码",
-    plan: "规划",
-    "app-builder": "应用构建",
-    review: "审查",
-  } as Record<string, string>)[profile] ?? profile;
 }
 
 function permissionLabel(permissionMode: string): string {

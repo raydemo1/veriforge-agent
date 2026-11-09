@@ -4,13 +4,13 @@ import shutil
 import threading
 import time
 from contextlib import ExitStack, contextmanager
-from .access import WorkspaceAccessCoordinator, WorkspaceConflict, fingerprint
-from ..agent.cancellation import current_token
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
 from .. import config
+from ..agent.cancellation import current_token
+from .access import WorkspaceAccessCoordinator, WorkspaceConflict, fingerprint
 from .change_journal import WorkspaceChangeJournal
 
 _UNOBSERVED = object()

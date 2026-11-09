@@ -118,7 +118,7 @@ class ToolExecutorTests(unittest.TestCase):
         registry.register(_schema("read"), lambda: "unused", permission="read", effect=_READ_EFFECT)
         calls = [_tool_call("first", "read"), _tool_call("second", "read")]
         with tempfile.TemporaryDirectory() as tmp:
-            conversation, context = _conversation_with_registry(Path(tmp), registry, calls, [Broken()])
+            conversation, _context = _conversation_with_registry(Path(tmp), registry, calls, [Broken()])
             with self.assertRaisesRegex(ValueError, "middleware exploded"):
                 conversation.submit("inspect")
             results = [message for message in conversation.messages if message.get("role") == "tool"]
@@ -454,7 +454,7 @@ class ToolExecutorTests(unittest.TestCase):
                 event_bus=EventBus(),
                 tool_registry=registry,
                 allowed_tool_permissions={"read", "network_read", "edit", "control", "shell"},
-                blocked_tool_names={"browser_test", "stop_dev_server"},
+                blocked_tool_names=set(),
                 revealed_tool_names=set(),
             )
             initial_schemas = tool_schemas_for_profile(

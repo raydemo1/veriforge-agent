@@ -4,8 +4,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 class ShellJobManagerTests(unittest.TestCase):
@@ -176,6 +176,7 @@ if __name__ == "__main__":
 
 def test_stop_keeps_stopping_until_exit_is_confirmed(tmp_path):
     import threading
+
     from harness_code_agent.workspace.shell_jobs import ShellJob, ShellJobManager
     released = threading.Event()
     process = SimpleNamespace(poll=lambda: -9 if released.is_set() else None, wait=lambda: -9)

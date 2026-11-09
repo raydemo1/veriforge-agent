@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import logging
 import stat
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 from ..runtime.execution_planner import (
@@ -15,7 +14,12 @@ from ..runtime.execution_planner import (
     ExecutionPlanner,
 )
 from ..runtime.tool_call_validation import ToolCall, validate_tool_call
-from ..runtime.tool_failures import FailureMode, FailureVisibility, ToolFailure, failure_batch_key
+from ..runtime.tool_failures import (
+    FailureMode,
+    FailureVisibility,
+    ToolFailure,
+    failure_batch_key,
+)
 from ..runtime.tool_registry import tool_schemas_for_profile
 from ..runtime.tool_result import ToolResult
 from ..runtime.tool_runner import (
@@ -196,7 +200,7 @@ class ToolExecutor:
             fn_args = validation.arguments
             effect = self._classify_call(fn_name, fn_args)
             blocked = None
-            blocked_reason = self._profile_block_reason(fn_name, registry)
+            blocked_reason = self._tool_surface_block_reason(fn_name, registry)
             if blocked_reason is not None:
                 output = f"[blocked] {blocked_reason}"
                 blocked = ToolResult(
@@ -239,21 +243,21 @@ class ToolExecutor:
             workspace_root=root,
         )
 
-    def _profile_block_reason(self, name: str, registry) -> str | None:
-        """Enforce profile tool policy at execution time, not only via schemas."""
+    def _tool_surface_block_reason(self, name: str, registry) -> str | None:
+        """Enforce the product tool surface at execution time, not only via schemas."""
         context = self.agent.tool_context
         if context is not None:
             if name in (context.blocked_tool_names or set()):
-                return f"Tool '{name}' is blocked for this agent profile."
+                return f"Tool '{name}' is blocked by the product tool surface."
             allowed = context.allowed_tool_permissions
             if allowed is not None:
                 permission = registry.permission_for(name)
                 if permission is not None and permission not in set(allowed):
                     return (
-                        f"Tool '{name}' permission '{permission}' is not allowed for this agent profile."
+                        f"Tool '{name}' permission '{permission}' is not allowed for this agent."
                     )
         if self.agent.allowed_tool_names is not None and name not in self.agent.allowed_tool_names:
-            return f"Tool '{name}' is not available to this agent profile."
+            return f"Tool '{name}' is not available to this agent."
         return None
 
     def _requires_approval(self, prepared: PreparedToolCall) -> bool:
@@ -559,7 +563,7 @@ class ToolExecutor:
             self.runtime_state.failures.observe_success(prepared.name)
 
         if tool_result.metadata.get("status_source") == "workspace_conflict":
-            from ..runtime.questions import QuestionRequest, QuestionOption
+            from ..runtime.questions import QuestionOption, QuestionRequest
             key = str(prepared.args.get("path", "workspace"))
             attempts = self.runtime_state.workspace_conflict_attempts
             attempts[key] = attempts.get(key, 0) + 1

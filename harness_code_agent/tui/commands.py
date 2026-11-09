@@ -88,6 +88,7 @@ def default_command_registry(skill_registry=None) -> SlashCommandRegistry:
         CommandSpec("/memory", "会话", "/memory", "查看与管理长期记忆", _memory_command),
         CommandSpec("/fork", "会话", "/fork", "从当前会话创建并进入分支", _fork_current),
         CommandSpec("/observe", "会话", "/observe", "打开当前项目的运行观察", _observe_panel),
+        CommandSpec("/plan", "工作流", "/plan [execute]", "先规划再审批，或执行待审批的计划", _plan_command),
     ]
     if skill_registry is None:
         from ..skills import SkillRegistry
@@ -256,6 +257,15 @@ def _fork_current(session: Any, args: list[str], registry: SlashCommandRegistry)
 
 def _observe_panel(session: Any, args: list[str], registry: SlashCommandRegistry) -> CommandResult:
     return _panel_action("observe", args, "/observe")
+
+
+def _plan_command(session: Any, args: list[str], registry: SlashCommandRegistry) -> CommandResult:
+    if not args:
+        return CommandResult(session.start_plan())
+    if args == ["execute"]:
+        _require_bound(session)
+        return CommandResult(session.execute_pending_plan().text)
+    raise ValueError("用法：/plan 或 /plan execute")
 
 
 def _no_args(args: list[str], usage: str) -> None:

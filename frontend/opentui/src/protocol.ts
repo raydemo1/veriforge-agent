@@ -1,10 +1,9 @@
 export type ThemePreference = "auto" | "dark" | "light";
 export type IconPreference = "auto" | "nerd" | "unicode";
 
-export const UI_PROTOCOL_VERSION = 8;
+export const UI_PROTOCOL_VERSION = 9;
 
 export type Snapshot = {
-  profile: string;
   permissionMode: string;
   model: string;
   reasoningEffort?: string | null;
@@ -15,7 +14,6 @@ export type Snapshot = {
   status: string;
   cwd: string;
   sessionId?: string;
-  routingMode?: "auto" | "pinned";
   dirtyCount?: number;
   inputMode?: "text" | "multimodal";
 };
@@ -41,7 +39,7 @@ export type SubmitResult = {
 export type CommandItem = { name: string; description: string; category?: string };
 export type TranscriptItem = {
   id: string;
-  kind: "user" | "assistant" | "tool" | "status" | "plan" | "error" | "file" | "thought" | "profile" | "agent";
+  kind: "user" | "assistant" | "tool" | "status" | "plan" | "error" | "file" | "thought" | "agent";
   title: string;
   body: string;
   state?: "running" | "success" | "failed" | "pending" | "changed";
@@ -68,7 +66,7 @@ export type Interaction = ApprovalInteraction | QuestionInteraction;
 
 export type PanelOption = { id: string; label: string; description?: string; badge?: string; tone?: "default" | "success" | "warning" | "danger"; selected?: boolean };
 export type PanelSpec = {
-  kind: "sessions" | "profile" | "permission" | "model" | "effort" | "mcp" | "observe" | "help";
+  kind: "sessions" | "permission" | "model" | "effort" | "mcp" | "observe" | "help";
   title: string;
   body?: string;
   options?: PanelOption[];

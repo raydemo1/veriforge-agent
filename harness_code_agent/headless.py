@@ -37,8 +37,7 @@ def run_task(
     *,
     cwd: str | Path,
     task: str,
-    profile: str = "general",
-    profile_explicit: bool | None = None,
+    time_budget: float | None = None,
     stream_sink: Callable[[str], None] | None = None,
     on_session_started: Callable[[SessionInfo], None] | None = None,
 ) -> RunResult:
@@ -60,8 +59,7 @@ def run_task(
             raise ValueError("No task provided")
         session = InteractiveSession(
             cwd=workspace,
-            profile_name=profile,
-            profile_explicit=profile_explicit,
+            time_budget=time_budget,
             stream_sink=stream_sink,
             approval_provider=NoApprovalProvider(),
             question_provider=NoQuestionProvider(),

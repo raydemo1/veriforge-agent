@@ -117,7 +117,7 @@ def test_user_turns_do_not_search_or_inject_memory_bodies(tmp_path, monkeypatch)
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=Mock(return_value=completion))),
                              close=lambda: None)
     with patch("harness_code_agent.agent.conversation.get_client", return_value=client):
-        session = InteractiveSession(cwd=tmp_path, profile_name="general", profile_explicit=True,
+        session = InteractiveSession(cwd=tmp_path,
                                      approval_provider=NoApprovalProvider(), enable_turn_summary=False)
         try:
             with patch.object(session.memory_service, "search", side_effect=AssertionError("automatic recall")):

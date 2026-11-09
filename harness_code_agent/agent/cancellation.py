@@ -8,17 +8,17 @@ parents do not accumulate callbacks to finished turns/calls.
 """
 from __future__ import annotations
 
-import threading
 import logging
-from contextvars import ContextVar
-from contextlib import contextmanager
+import threading
 from collections.abc import Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 
 class CancellationToken:
     """Thread-safe cancellation token passed through the agent loop."""
 
-    def __init__(self, parent: "CancellationToken | None" = None) -> None:
+    def __init__(self, parent: CancellationToken | None = None) -> None:
         self._event = threading.Event()
         self._callbacks: list[Callable[[], None]] = []
         self._lock = threading.Lock()
@@ -28,7 +28,7 @@ class CancellationToken:
             # is already cancelled, so the child is born cancelled.
             self._detach_parent = parent.add_callback(self.cancel)
 
-    def create_child(self) -> "CancellationToken":
+    def create_child(self) -> CancellationToken:
         return CancellationToken(parent=self)
 
     def cancel(self) -> None:

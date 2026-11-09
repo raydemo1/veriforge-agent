@@ -119,7 +119,7 @@ class WorkspaceAccessCoordinator:
                     if not blocked:
                         db.execute("INSERT INTO leases VALUES (?,?,?,?,?)", (
                             key, owner, self.pid, self.born,
-                            json.dumps([dict(domain=c.domain, key=c.key, scope=c.scope, access=c.access) for c in claims]),
+                            json.dumps([{"domain": c.domain, "key": c.key, "scope": c.scope, "access": c.access} for c in claims]),
                         ))
                         break
                 if on_blocked is not None:

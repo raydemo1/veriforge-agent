@@ -4,52 +4,42 @@
   "tasks": [
     {
       "id": "summarize_readme",
-      "profile": "general",
       "prompt": "Read README.md and summarize the agent profiles in three bullets."
     },
     {
       "id": "list_eval_files",
-      "profile": "general",
       "prompt": "Inspect the eval directory and explain what each script or result folder is for in one paragraph."
     },
     {
       "id": "find_memory_config",
-      "profile": "general",
       "prompt": "Find the memory-related environment variables and summarize their defaults."
     },
     {
       "id": "context_constants",
-      "profile": "general",
       "prompt": "Inspect the context lifecycle constants and explain the compaction thresholds in two sentences."
     },
     {
       "id": "observe_usage",
-      "profile": "general",
       "prompt": "Inspect sessions observability and list the token metrics it aggregates."
     },
     {
       "id": "tool_registry",
-      "profile": "general",
       "prompt": "Inspect the builtin tool registry and name five available tools."
     },
     {
       "id": "profile_names",
-      "profile": "general",
       "prompt": "List the built-in profiles and describe when terminal profile is used."
     },
     {
       "id": "cache_eval_result",
-      "profile": "general",
       "prompt": "Inspect the latest DeepSeek context eval summary and report the stable warmup cache hit ratio."
     },
     {
       "id": "benchmark_subset",
-      "profile": "general",
       "prompt": "Inspect the Terminal-Bench subset task file and explain why it is lightweight."
     },
     {
       "id": "final_resume_metrics",
-      "profile": "general",
       "prompt": "Explain which eval metrics are suitable for a resume bullet in four concise bullets."
     }
   ]

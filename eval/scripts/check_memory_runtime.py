@@ -66,7 +66,7 @@ def checks(root):
           patch("harness_code_agent.agent.conversation.get_client", return_value=client),
           patch.object(extraction, "_call_model", return_value=response({"complete": True, "candidates": [], "episode": ""})),
           patch.object(SiliconFlowEmbeddings, "embed", lambda self, texts: LocalVectors().embed(texts))):
-        first = InteractiveSession(cwd=workspace, profile_name="general", profile_explicit=True,
+        first = InteractiveSession(cwd=workspace,
                                    approval_provider=NoApprovalProvider(), enable_turn_summary=False)
         try:
             first.memory_command(["generate", "off"])
@@ -88,7 +88,7 @@ def checks(root):
         finally:
             first.close()
         wait_workers()
-        second = InteractiveSession(cwd=workspace, profile_name="general", profile_explicit=True,
+        second = InteractiveSession(cwd=workspace,
                                     approval_provider=NoApprovalProvider(), enable_turn_summary=False)
         try:
             assert "用户偏好简体中文交流。" in str(second.conversation.messages[0]["content"])

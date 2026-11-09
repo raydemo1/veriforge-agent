@@ -21,7 +21,6 @@ function mockSessionEvents(): AsyncIterable<SessionEvent> {
       yield {
         type: "snapshot",
         snapshot: {
-          profile: "coding-agent",
           permissionMode: "workspace-write",
           model: "deepseek-v4-flash",
           provider: "deepseek",
@@ -172,17 +171,13 @@ function terminateBridgeTree(child: ReturnType<typeof Bun.spawn>): void {
 function createBridgeClient(): BridgeClient {
   const python = option("--python") ?? "python";
   const cwd = option("--cwd") ?? process.cwd();
-  const profile = option("--profile") ?? "general";
   const args = [
     python,
     "-m",
     "harness_code_agent.tui_bridge",
     "--cwd",
     cwd,
-    "--profile",
-    profile,
   ];
-  if (flag("--profile-explicit")) args.push("--profile-explicit");
 
   const child = Bun.spawn(args, {
     stdin: "pipe",
@@ -328,7 +323,7 @@ function mockAction(name: ActionName, params?: Record<string, unknown>, sessionI
     const id = `preview-${Date.now()}`;
     previewSessions.push({ ...previewSessions[0]!, id, title: "新会话", environment: name === "fork_worktree" ? "worktree" : "local" });
     previewActive = id; announcePreview();
-    updatePreview(previewEvent(id, { type: "snapshot", snapshot: { sessionId: id, profile: "coding-agent", permissionMode: "workspace-write", model: "deepseek-flash", provider: "deepseek", contextPercent: 100, status: "ready", cwd: "veriforge-agent" } }));
+    updatePreview(previewEvent(id, { type: "snapshot", snapshot: { sessionId: id, permissionMode: "workspace-write", model: "deepseek-flash", provider: "deepseek", contextPercent: 100, status: "ready", cwd: "veriforge-agent" } }));
     updatePreview(previewEvent(id, { type: "progress", status: "ready", detail: "" }));
     return Promise.resolve({ ok: true, sessionId: id });
   }
@@ -348,15 +343,6 @@ function mockAction(name: ActionName, params?: Record<string, unknown>, sessionI
   if (name === "open_sessions") return Promise.resolve({ ok: true, panel: { kind: "sessions", title: "会话", searchable: true, options: previewSessions.map((item) => ({ id: item.id, label: item.title, selected: item.id === previewActive })) } });
   if (name === "open_panel") {
     const panel = String(params?.panel ?? "help");
-    if (panel === "profile") return Promise.resolve({ ok: true, panel: {
-      kind: "profile",
-      title: "工作模式",
-      options: [
-        { id: "auto", label: "自动路由", description: "根据当前任务选择工作模式" },
-        { id: "general", label: "通用", description: "适合一般问答、分析和轻量任务" },
-        { id: "coding-agent", label: "工作区可写", description: "允许模型直接修改工作区文件", selected: true },
-      ],
-    } });
     if (panel === "permission") return Promise.resolve({ ok: true, panel: {
       kind: "permission",
       title: "审批模式",

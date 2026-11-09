@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 TASKS = ROOT / "eval" / "tasks" / "verifier_ablation.json"
 IMAGE = "veriforge-verifier-eval:local"
 PILOT_RUNTIME_REVISION = "b2391f303663549903b8d578f71da2016e0826d6"
-EXPERIMENT_GROUPS = {"verifier": ("A", "B", "C"), "profile-prompt": ("P0", "P1")}
+EXPERIMENT_GROUPS = {"verifier": ("A", "B", "C")}
 TEST_COMMAND = re.compile(
     r"\b(?:pytest|unittest|ctest)\b|\b(?:python\S*\s+\S*test\S*\.py|(?:npm|cargo|go)\s+test)\b"
     r"|\bpython\S*\s+.*(?:\n|;|\s)\s*assert\s",
@@ -36,41 +36,11 @@ def write_json(path, value):
     )
 
 
-def compact_profile_prompt():
-    """The P1 prompt from the original pilot."""
-    from harness_code_agent.profiles.base import build_profile_prompt
-    from harness_code_agent.tracking_policy import TASK_TRACKING_POLICY
-
-    return build_profile_prompt(
-        role="Implement the user's request in the repository and own the result.",
-        working_style=(
-            "Inspect relevant code before editing. Reuse existing abstractions and make the "
-            "smallest complete change. Prefer code_intelligence when semantic navigation helps. "
-            "Reproduce bugs with tests before fixing them and cover changed behavior when the "
-            "repository has a suitable test seam.\n\n"
-            f"{TASK_TRACKING_POLICY}\n\n"
-            "Use repository tools to inspect and the shell to run code. Diagnose command failures "
-            "and adjust your approach. Review and apply worker proposals before integration."
-        ),
-        boundaries=(
-            "Preserve existing user changes. Keep changes in scope, avoid speculative extensions, "
-            "and avoid destructive Git operations unless the user requests them."
-        ),
-        completion=(
-            "Verify the requested behavior in proportion to risk. Fix in-scope failures and "
-            "report what changed, what you tested, and what remains unverified."
-        ),
-    )
-
-
 def worker(group, prompt):
     import shutil
-    from contextlib import nullcontext
-    from dataclasses import replace
     from unittest.mock import patch
 
     from harness_code_agent.core import interactive
-    from harness_code_agent.profiles.coding_agent import CodingAgentProfile
     from harness_code_agent.runtime.approvals import NoApprovalProvider
     from harness_code_agent.runtime.middleware.verification import (
         StaticVerifierMiddleware,
@@ -80,20 +50,7 @@ def worker(group, prompt):
     interventions = []
     capture_seconds = 0.0
     build_stack = interactive.build_main_agent_middlewares
-    verifier_group = "B" if group in EXPERIMENT_GROUPS["profile-prompt"] else group
-
-    profile_override = nullcontext()
-    if group == "P1":
-        original_config = CodingAgentProfile.main_agent
-
-        def compact_config(profile):
-            return replace(
-                original_config(profile), system_prompt=compact_profile_prompt()
-            )
-
-        profile_override = patch.object(
-            CodingAgentProfile, "main_agent", compact_config
-        )
+    verifier_group = group
 
     def stack(**kwargs):
         if verifier_group == "A":
@@ -151,14 +108,9 @@ def worker(group, prompt):
         ],
         check=True,
     )
-    with (
-        patch.object(interactive, "build_main_agent_middlewares", stack),
-        profile_override,
-    ):
+    with patch.object(interactive, "build_main_agent_middlewares", stack):
         session = interactive.InteractiveSession(
             cwd=Path.cwd(),
-            profile_name="coding-agent",
-            profile_explicit=True,
             enable_turn_summary=False,
             approval_provider=NoApprovalProvider(),
             question_provider=NoQuestionProvider(),
@@ -494,7 +446,7 @@ def main():
     if not args.run:
         print(
             json.dumps(
-                {"plan": plan, "profile": "coding-agent", "settings": vars(args)},
+                {"plan": plan, "settings": vars(args)},
                 indent=2,
             )
         )
@@ -553,7 +505,6 @@ def main():
         archive.extractall(runtime)
     metadata = {
         "settings": vars(args),
-        "profile": "coding-agent",
         "runtime_revision": PILOT_RUNTIME_REVISION,
         "permission_mode": settings["HARNESS_PERMISSION_MODE"],
         "cumulative_token_budget": None,
@@ -563,24 +514,6 @@ def main():
             ["docker", "image", "inspect", IMAGE, "--format", "{{.Id}}"], text=True
         ).strip(),
     }
-    if args.experiment == "profile-prompt":
-        metadata["verifier_mode"] = "passive"
-        metadata["profile_prompts"] = {
-            "P0": subprocess.check_output(
-                [
-                    sys.executable,
-                    "-c",
-                    (
-                        "import sys\n"
-                        "from harness_code_agent.profiles.coding_agent import CodingAgentProfile\n"
-                        "sys.stdout.write(CodingAgentProfile().main_agent().system_prompt)"
-                    ),
-                ],
-                cwd=runtime,
-                encoding="utf-8",
-            ),
-            "P1": compact_profile_prompt(),
-        }
     write_json(run_root / "protocol.json", metadata)
     for name, task in tasks.items():
         baseline = run_root / "baseline" / name

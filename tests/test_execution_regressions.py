@@ -1,8 +1,8 @@
+import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import Mock
-import threading
-import time
 
 import pytest
 
@@ -20,9 +20,8 @@ def test_lingering_foreground_future_blocks_next_turn(runtime_factory):
     future.set_running_or_notify_cancel()
     session.tool_context.tool_tasks.track(future, turn_id="previous")
     try:
-        with pytest.raises(RuntimeError, match="前台工具尚未退出"):
-            with session._turn_scope():
-                pytest.fail("new turn shared state with lingering tool")
+        with pytest.raises(RuntimeError, match="前台工具尚未退出"), session._turn_scope():
+            pytest.fail("new turn shared state with lingering tool")
         assert session.turn_count == 0
         assert session.recovery.origin is None
     finally:

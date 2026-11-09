@@ -10,20 +10,23 @@ import pytest
 
 from harness_code_agent import config
 from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
-from harness_code_agent.workspace.access import WorkspaceAccessCoordinator, WorkspaceConflict
+from harness_code_agent.workspace.access import (
+    WorkspaceAccessCoordinator,
+    WorkspaceConflict,
+)
 from harness_code_agent.workspace.service import WorkspaceService
 from harness_code_agent.workspace.worktrees import WorktreeService
 
 pytestmark = pytest.mark.session
 
 
-def test_profiles_models_and_histories_are_session_owned(runtime_factory):
-    create, clients = runtime_factory
+def test_models_and_histories_are_session_owned(runtime_factory):
+    create, _clients = runtime_factory
     first, second = create(), create()
     second_model = config.resolve_model_profile(config.MODEL_INTENSITY, second.model_selection)
     first.apply_model_override(model="deepseek-flash", reasoning_effort="max")
-    first.switch_profile("review")
-    assert second.profile.name() == "general"
+    first.set_permission_mode("read-only")
+    assert second.permission_mode == "workspace-write"
     assert config.resolve_model_profile(config.MODEL_INTENSITY, second.model_selection) == second_model
     assert first.submit("分析 A").text == "任务完成"
     assert second.submit("分析 B").text == "任务完成"
@@ -54,6 +57,7 @@ def test_resume_preserves_id_and_fork_uses_stable_boundary(runtime_factory):
 
 def test_registry_creation_failure_preserves_active_session_and_rejects_worktree_forks(tmp_path):
     from types import SimpleNamespace
+
     from harness_code_agent.core.session_runtime_registry import SessionRuntimeRegistry
 
     events = []
@@ -62,9 +66,11 @@ def test_registry_creation_failure_preserves_active_session_and_rejects_worktree
     for isolated in (False, True):
         with pytest.raises(ValueError, match="Worktree"):
             registry.fork(first, worktree=isolated)
-    with patch.object(registry, "factory", side_effect=RuntimeError("初始化失败")):
-        with pytest.raises(RuntimeError, match="初始化失败"):
-            registry.create()
+    with (
+        patch.object(registry, "factory", side_effect=RuntimeError("初始化失败")),
+        pytest.raises(RuntimeError, match="初始化失败"),
+    ):
+        registry.create()
     assert registry.active_id == first
     assert events[-1]["activeSessionId"] == first
     assert [record["id"] for record in events[-1]["sessions"]] == [first]
@@ -155,7 +161,10 @@ def test_worktree_inherits_dirty_local_and_applies_only_task_delta(tmp_path):
     assert (tmp_path / "tracked").read_text(encoding="utf-8") == "later Local"
     assert (tmp_path / "task").read_text(encoding="utf-8") == "new task"
 
-    from harness_code_agent.workspace.worktrees import WorktreeMergeConflict, prepare_merge_review
+    from harness_code_agent.workspace.worktrees import (
+        WorktreeMergeConflict,
+        prepare_merge_review,
+    )
     (tree / "tracked").write_text("agent candidate", encoding="utf-8")
     with pytest.raises(WorktreeMergeConflict) as caught:
         service.apply("isolated")
@@ -172,8 +181,8 @@ def test_worktree_inherits_dirty_local_and_applies_only_task_delta(tmp_path):
 
 
 def test_bridge_parallel_turns_switch_cancel_and_independent_approval(runtime_factory, tmp_path):
-    from harness_code_agent.tui_bridge import BridgeServer
     from harness_code_agent.runtime.approvals import ApprovalRequest
+    from harness_code_agent.tui_bridge import BridgeServer
     condition = threading.Condition()
     messages = []
     class Workbench(BridgeServer):
@@ -184,7 +193,7 @@ def test_bridge_parallel_turns_switch_cancel_and_independent_approval(runtime_fa
     def wait(predicate):
         with condition:
             assert condition.wait_for(lambda: predicate(messages), timeout=10), json.dumps([row for row in messages if row.get("event", {}).get("type") == "progress"], ensure_ascii=False, indent=2)
-    server = Workbench(cwd=tmp_path, profile_name="general", profile_explicit=True)
+    server = Workbench(cwd=tmp_path)
     try:
         first_id = server.registry.active_id
         second_id = server.registry.create()
@@ -286,9 +295,11 @@ def test_refused_suspension_leaves_runtime_usable(runtime_factory):
     runtime = create()
     runtime.submit("第一轮")
     coordinator = runtime.tool_context.agent_coordinator
-    with patch.object(coordinator.changes, "has_pending_changes", return_value=True):
-        with pytest.raises(RuntimeError, match="代码提案"):
-            runtime.close(suspend=True)
+    with (
+        patch.object(coordinator.changes, "has_pending_changes", return_value=True),
+        pytest.raises(RuntimeError, match="代码提案"),
+    ):
+        runtime.close(suspend=True)
     assert not runtime._closing and not coordinator._closed
     assert runtime.submit("第二轮").text == "任务完成"
 
@@ -327,6 +338,7 @@ def test_suspension_keeps_finished_agents_and_shell_jobs(runtime_factory):
 
 def test_worktree_fork_is_refused_while_a_turn_runs(tmp_path):
     from types import SimpleNamespace
+
     from harness_code_agent.tui_bridge import SessionBridge
 
     bridge = SessionBridge.__new__(SessionBridge)

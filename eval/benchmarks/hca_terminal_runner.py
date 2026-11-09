@@ -13,6 +13,12 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+try:  # imported as a module (tests, eval scripts)
+    from eval.benchmarks.tb2_metadata import resolve_task_budget
+except ImportError:  # Harbor runs this file by path, with no package context
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from eval.benchmarks.tb2_metadata import resolve_task_budget
+
 
 def export_session_artifacts(
     *,
@@ -272,11 +278,11 @@ def main(argv: list[str] | None = None) -> int:
                 print("Failed to write early VeriForge artifact manifest:", file=sys.stderr)
                 traceback.print_exc()
 
+        budget, _metadata = resolve_task_budget(args.prompt, workspace=str(workspace))
         result = run_task(
             cwd=workspace,
             task=args.prompt,
-            profile="terminal",
-            profile_explicit=True,
+            time_budget=budget,
             on_session_started=on_session_started,
         )
         hook_state["runner_error"] = result.error
@@ -318,7 +324,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--task-name",
         default=os.environ.get("HARNESS_TERMINAL_TASK_NAME", ""),
-        help="Terminal-Bench task name used for profile metadata such as per-task timeout.",
+        help="Terminal-Bench task name used to look up the per-task timeout.",
     )
     return parser.parse_args(argv)
 

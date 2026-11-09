@@ -254,7 +254,6 @@ class AuditMetrics:
 @dataclass
 class SessionObservability:
     session_id: str
-    profile: str = ""
     model: str = ""
     status: str = ""
     cwd: str = ""
@@ -268,7 +267,6 @@ class SessionObservability:
     def to_dict(self) -> dict[str, Any]:
         return {
             "session_id": self.session_id,
-            "profile": self.profile,
             "model": self.model,
             "status": self.status,
             "cwd": self.cwd,
@@ -318,7 +316,6 @@ def build_session_observability(metadata: dict[str, Any], events: list[dict[str,
     events = events or []
     snapshot = SessionObservability(
         session_id=str(metadata.get("id", "")),
-        profile=str(metadata.get("profile", "")),
         model=str(metadata.get("model", "")),
         status=str(metadata.get("status", "")),
         cwd=str(metadata.get("cwd", "")),
@@ -452,7 +449,6 @@ def render_session_observability(snapshot: SessionObservability) -> str:
     lines = [
         "Observability dashboard",
         f"session: {snapshot.session_id}",
-        f"profile: {snapshot.profile}",
         f"model: {snapshot.model}",
         f"status: {snapshot.status}",
         f"created_at: {snapshot.created_at}",
@@ -605,7 +601,7 @@ def _session_rank_lines(sessions: list[SessionObservability], *, key: str) -> li
             value = f"failures={session.audit.failures}"
         else:
             value = f"cache_hit={_percent(session.tokens.cache_hit_ratio)}"
-        lines.append(f"- {session.session_id}: {value}, profile={session.profile}")
+        lines.append(f"- {session.session_id}: {value}")
     return lines
 
 

@@ -22,12 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         from harness_code_agent.headless import print_run_result, run_task
 
-        result = run_task(
-            cwd=workspace,
-            task=prompt,
-            profile="coding-agent",
-            profile_explicit=True,
-        )
+        result = run_task(cwd=workspace, task=prompt)
         print_run_result(result)
         if result.error:
             print(result.error.rstrip(), file=sys.stderr)

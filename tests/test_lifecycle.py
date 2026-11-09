@@ -49,8 +49,15 @@ class LifecycleScopeTests(unittest.TestCase):
 class ExecutionBoundaryTests(unittest.TestCase):
     def test_cancelled_resource_wait_never_enters_handler(self):
         import threading
-        from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
-        from harness_code_agent.runtime.execution_planner import ResourceCoordinator, ResourceClaim
+
+        from harness_code_agent.agent.cancellation import (
+            CancellationToken,
+            CancelledError,
+        )
+        from harness_code_agent.runtime.execution_planner import (
+            ResourceClaim,
+            ResourceCoordinator,
+        )
         coordinator = ResourceCoordinator()
         claim = ResourceClaim("workspace", "file", access="write")
         token = CancellationToken()
@@ -73,12 +80,17 @@ class ExecutionBoundaryTests(unittest.TestCase):
         self.assertFalse(entered)
 
     def test_unknown_effect_conflicts_with_workspace_write(self):
-        from harness_code_agent.runtime.execution_planner import CallEffect, ResourceClaim, effects_conflict
+        from harness_code_agent.runtime.execution_planner import (
+            CallEffect,
+            ResourceClaim,
+            effects_conflict,
+        )
         self.assertTrue(effects_conflict(CallEffect.global_exclusive(),
                         CallEffect((ResourceClaim("workspace", "file", access="write"),))))
 
     def test_supervisor_keeps_running_future_until_real_completion(self):
         from concurrent.futures import Future
+
         from harness_code_agent.agent.cancellation import CancellationToken
         from harness_code_agent.runtime.task_supervisor import ToolTaskSupervisor
         supervisor, future, token = ToolTaskSupervisor(), Future(), CancellationToken()
@@ -93,10 +105,15 @@ class ExecutionBoundaryTests(unittest.TestCase):
         self.assertEqual(supervisor.pending_count, 0)
 
     def test_approval_wait_cancels_only_own_execution(self):
-        import threading
         import tempfile
+        import threading
         from pathlib import Path
-        from harness_code_agent.agent.cancellation import CancellationToken, CancelledError, cancellation_scope
+
+        from harness_code_agent.agent.cancellation import (
+            CancellationToken,
+            CancelledError,
+            cancellation_scope,
+        )
         from harness_code_agent.tui_bridge import BridgeInteractionProvider
         opened, exited = threading.Event(), threading.Event()
         token = CancellationToken()
@@ -128,7 +145,12 @@ class ExecutionBoundaryTests(unittest.TestCase):
 
     def test_cancelled_startup_wait_retains_session_future(self):
         from concurrent.futures import Future
-        from harness_code_agent.agent.cancellation import CancellationToken, CancelledError, cancellation_scope
+
+        from harness_code_agent.agent.cancellation import (
+            CancellationToken,
+            CancelledError,
+            cancellation_scope,
+        )
         from harness_code_agent.core.interactive import InteractiveSession
         future, token = Future(), CancellationToken()
         future.set_running_or_notify_cancel()
@@ -144,6 +166,7 @@ class ExecutionBoundaryTests(unittest.TestCase):
         import threading
         from types import SimpleNamespace
         from unittest.mock import Mock
+
         from harness_code_agent.core.interactive import InteractiveSession
         session = InteractiveSession.__new__(InteractiveSession)
         session._execution_condition = threading.Condition(threading.RLock())
@@ -163,6 +186,7 @@ class ExecutionBoundaryTests(unittest.TestCase):
     def test_runtime_mutation_is_rejected_for_lingering_foreground_work(self):
         import threading
         from types import SimpleNamespace
+
         from harness_code_agent.core.interactive import InteractiveSession
         session = InteractiveSession.__new__(InteractiveSession)
         session._execution_condition = threading.Condition(threading.RLock())

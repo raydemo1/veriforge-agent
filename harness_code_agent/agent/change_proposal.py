@@ -515,7 +515,7 @@ def _entry_stats(entry: ChangeEntry) -> dict[str, int]:
         entry.result_content.splitlines(),
         lineterm="",
     ):
-        if line.startswith("+++ ") or line.startswith("--- "):
+        if line.startswith(("+++ ", "--- ")):
             continue
         if line.startswith("+"):
             additions += 1

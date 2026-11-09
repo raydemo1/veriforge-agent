@@ -9,7 +9,6 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
-
 EXCLUDED_NAMES = frozenset({
     ".git", ".harness", ".harbor", "node_modules", ".venv", "venv", "__pycache__",
     ".pytest_cache", ".ruff_cache", ".mypy_cache", ".cache", "build", "dist",

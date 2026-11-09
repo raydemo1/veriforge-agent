@@ -53,7 +53,6 @@ FORWARDED_ENV_PREFIXES = (
     "HARNESS_",
     "OPENAI_",
     "DEEPSEEK_",
-    "PROFILE_CODING_AGENT_",
     "MAX_AGENT_",
     "COMPRESS_THRESHOLD",
 )
@@ -108,9 +107,9 @@ class HarnessCodeAgentAdapter(BaseClawAdapter):
             f"HARNESS_MODEL_INTENSITY={os.environ.get('HARNESS_MODEL_INTENSITY', 'normal')}",
         ])
         # max_turns stays accepted for upstream CLI compatibility but is
-        # intentionally not applied: runs are bounded by the profile task
-        # budget (PROFILE_CODING_AGENT_TASK_BUDGET) plus the hard process
-        # timeout, not by a step guess.
+        # intentionally not applied: runs are bounded by the task time budget
+        # (HARNESS_TASK_BUDGET) plus the hard process timeout, not by a step
+        # guess.
         return args
 
     def post_container_start(self, workspace) -> None:
@@ -227,7 +226,7 @@ def _agent_command(*, timeout: int) -> str:
         "HARNESS_MEMORY_DISABLED": "1",
         "HARNESS_MENTION_MODE": "off",
         "MAX_AGENT_TOTAL_TOKENS": "900000",
-        "PROFILE_CODING_AGENT_TASK_BUDGET": str(timeout),
+        "HARNESS_TASK_BUDGET": str(timeout),
     }
     prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
     return f"cd /testbed && {prefix} python3 {shlex.quote(RUNNER)} {shlex.quote(CONTAINER_PROMPT)}"

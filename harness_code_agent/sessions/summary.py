@@ -51,7 +51,6 @@ def format_session_summary(
     tool_counts = _tool_counts(events)
     changed_files = _changed_files(events)
     approvals = _approval_counts(events)
-    switches = _profile_switches(events)
     failures = _count_events(events, "failure")
     failure_categories = _failure_categories(events)
     fallbacks = _count_events(events, "agent_fallback")
@@ -63,7 +62,6 @@ def format_session_summary(
     lines = [
         "Session summary",
         f"id: {resolved_id}",
-        f"profile: {metadata.get('profile', '')}",
         f"model: {metadata.get('model', '')}",
         f"permission_mode: {metadata.get('permission_mode', '')}",
         f"status: {status}",
@@ -89,7 +87,6 @@ def format_session_summary(
             f"{approvals['approved']} approved, "
             f"{approvals['denied']} denied"
         ),
-        f"profile_switches: {_format_list(switches)}",
         f"plans_ready: {plans_ready}",
     ])
     if final_report:
@@ -138,22 +135,6 @@ def _failure_categories(events: list[dict[str, Any]]) -> Counter[str]:
         return Counter({str(key): int(value) for key, value in report_categories.items()})
 
     return _event_failure_categories(events)
-
-
-def _profile_switches(events: list[dict[str, Any]]) -> list[str]:
-    switches: list[str] = []
-    for event in events:
-        if _event_type(event) != "profile_switched":
-            continue
-        payload = _payload(event)
-        previous = payload.get("previous_profile", "")
-        current = payload.get("profile", "")
-        reason = payload.get("reason", "")
-        text = f"{previous} -> {current}".strip()
-        if reason:
-            text = f"{text} ({reason})"
-        switches.append(text)
-    return switches
 
 
 def _latest_task_outcome(events: list[dict[str, Any]]) -> str:

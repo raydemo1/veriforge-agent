@@ -66,8 +66,8 @@ class ProjectResourceBudget:
     def acquire(self, kind, *, session_id=None, turn_id=None, label="", cancellation_token=None):
         release_owner = self.hold()
         key = uuid.uuid4().hex
-        entry = dict(resource=kind, sessionId=session_id, turnId=turn_id, label=label,
-                     since=time.time())
+        entry = {"resource": kind, "sessionId": session_id, "turnId": turn_id, "label": label,
+                     "since": time.time()}
         limit = self.limits.get(kind, 2)
         try:
             with self._condition:
@@ -93,8 +93,8 @@ class ProjectResourceBudget:
         """Report a wait for a resource this budget does not itself grant."""
         key = uuid.uuid4().hex
         with self._condition:
-            self._waiting[key] = dict(resource=kind, sessionId=session_id, turnId=turn_id,
-                                      label=label, since=time.time())
+            self._waiting[key] = {"resource": kind, "sessionId": session_id, "turnId": turn_id,
+                                      "label": label, "since": time.time()}
         try:
             yield
         finally:
@@ -104,7 +104,7 @@ class ProjectResourceBudget:
     def submit(self, kind, function, *args, session_id=None, turn_id=None, label=""):
         release_owner = self.hold()
         key = uuid.uuid4().hex
-        entry = dict(resource=kind, sessionId=session_id, turnId=turn_id, label=label, since=time.time())
+        entry = {"resource": kind, "sessionId": session_id, "turnId": turn_id, "label": label, "since": time.time()}
         with self._condition:
             self._waiting[key] = entry
 
@@ -137,7 +137,7 @@ class ProjectResourceBudget:
     async def acquire_async(self, kind, *, session_id=None, label=""):
         release_owner = self.hold()
         key = uuid.uuid4().hex
-        entry = dict(resource=kind, sessionId=session_id, turnId=None, label=label, since=time.time())
+        entry = {"resource": kind, "sessionId": session_id, "turnId": None, "label": label, "since": time.time()}
         try:
             with self._condition:
                 self._waiting[key] = entry
@@ -158,5 +158,5 @@ class ProjectResourceBudget:
 
     def snapshot(self):
         with self._condition:
-            return dict(limits=dict(self.limits), active=[dict(row) for row in self._active.values()],
-                        waiting=[dict(row) for row in self._waiting.values()])
+            return {"limits": dict(self.limits), "active": [dict(row) for row in self._active.values()],
+                        "waiting": [dict(row) for row in self._waiting.values()]}

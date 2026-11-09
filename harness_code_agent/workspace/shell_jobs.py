@@ -4,9 +4,9 @@ import codecs
 import contextlib
 import os
 import subprocess
+import tempfile
 import threading
 import time
-import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,7 +19,6 @@ from ..agent.cancellation import CancellationToken, CancelledError
 from ..agent.context import count_text_tokens
 from ..runtime.tool_output import output_limit
 from .shell_environment import shell_executable
-
 
 ShellJobStatus = Literal["running", "stopping", "exited", "stopped", "failed"]
 
@@ -220,8 +219,12 @@ class ShellJobManager:
         lease, temporary = None, None
         try:
             if os.name == "nt":
-                from .native_shell import launch_arguments, write_claims, write_directories
                 from .access import WorkspaceAccessCoordinator
+                from .native_shell import (
+                    launch_arguments,
+                    write_claims,
+                    write_directories,
+                )
 
                 root = Path(self.workspace)
                 directories = write_directories(root, write_paths)
@@ -341,12 +344,12 @@ class ShellJobManager:
             if job.status in {"running", "stopping"}:
                 raise RuntimeError("cannot export running shell jobs")
             with job.output._lock:
-                exported.append(dict(
-                    job_id=job.job_id, command=job.command, pid=job.pid, status=job.status,
-                    background=job.background, exit_code=job.exit_code, started_at=job.started_at,
-                    ended_at=job.ended_at, error=job.error, output_error=job.output.error,
-                    output_path=str(job.output.path) if job.output.path is not None else None,
-                    output_text=job.output._text, output_chars=job.output.total_chars))
+                exported.append({
+                    "job_id": job.job_id, "command": job.command, "pid": job.pid, "status": job.status,
+                    "background": job.background, "exit_code": job.exit_code, "started_at": job.started_at,
+                    "ended_at": job.ended_at, "error": job.error, "output_error": job.output.error,
+                    "output_path": str(job.output.path) if job.output.path is not None else None,
+                    "output_text": job.output._text, "output_chars": job.output.total_chars})
         return exported
 
     def import_jobs(self, entries: list[dict]) -> None:
@@ -375,7 +378,9 @@ class ShellJobManager:
             stderr=subprocess.PIPE,
             text=False,
             start_new_session=True,
-            preexec_fn=_apply_posix_rlimits if _posix_rlimits_enabled() else None,
+            # rlimits must be set between fork and exec; this is the only
+            # stdlib hook for it and it stays None unless a limit is configured.
+            preexec_fn=_apply_posix_rlimits if _posix_rlimits_enabled() else None,  # noqa: PLW1509
         )
 
     def _start_reader(self, job: ShellJob, pipe, stream_name: str) -> None:

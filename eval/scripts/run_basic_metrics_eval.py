@@ -141,7 +141,6 @@ def run_memory_suite(args: argparse.Namespace) -> Path:
                 prompt=_metrics_eval_prompt(
                     str(task.get("learn_prompt") or task["prompt"]), suite="memory",
                 ),
-                profile=str(task.get("profile") or "general"),
                 env=env,
                 run_dir=run_dir,
                 timeout=args.task_timeout,
@@ -159,7 +158,6 @@ def run_memory_suite(args: argparse.Namespace) -> Path:
                 case_id=str(task["id"]),
                 variant=variant,
                 prompt=_metrics_eval_prompt(str(task["prompt"]), suite="memory"),
-                profile=str(task.get("profile") or "general"),
                 env=env,
                 run_dir=run_dir,
                 timeout=args.task_timeout,
@@ -188,7 +186,6 @@ def run_latency_suite(args: argparse.Namespace) -> Path:
             case_id=str(task["id"]),
             variant="streaming",
             prompt=_metrics_eval_prompt(str(task["prompt"]), suite="latency"),
-            profile=str(task.get("profile") or "general"),
             env=env,
             run_dir=run_dir,
             timeout=args.task_timeout,
@@ -208,7 +205,6 @@ def _run_hca_case(
     case_id: str,
     variant: str,
     prompt: str,
-    profile: str,
     env: dict[str, str],
     run_dir: Path,
     timeout: int,
@@ -216,7 +212,7 @@ def _run_hca_case(
 ) -> CaseResult:
     case_dir = run_dir / "cases" / _safe_name(case_id) / _safe_name(variant)
     case_dir.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, "-m", "harness_code_agent.cli", "--profile", profile, "-p", prompt]
+    command = [sys.executable, "-m", "harness_code_agent.cli", "-p", prompt]
     started = time.perf_counter()
     timed_out = False
     try:

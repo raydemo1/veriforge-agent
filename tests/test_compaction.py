@@ -2,9 +2,10 @@
 import os
 import tempfile
 import unittest
-import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 # ---------------------------------------------------------------------------
 # CompactionGate — controls when compaction is allowed
@@ -306,7 +307,6 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
             root = Path(tmpdir)
             store = SessionStore(root / ".harness")
             session = store.create(
-                profile="coding-agent",
                 cwd=root,
                 model="test-model",
                 permission_mode="workspace-write",
@@ -520,7 +520,6 @@ class CompactedStorageTests(unittest.TestCase):
             from harness_code_agent.sessions.store import SessionStore
             store = SessionStore(Path(tmpdir))
             session = store.create(
-                profile="coding-agent",
                 cwd=tmpdir,
                 model="test",
                 permission_mode="workspace-write",
@@ -584,7 +583,6 @@ class TuiStateCompactionTests(unittest.TestCase):
     def _make_state(self):
         from harness_code_agent.tui.state import SessionStatusSnapshot, TuiState
         snapshot = SessionStatusSnapshot(
-            profile="coding-agent",
             model="test",
             provider="test",
             permission_mode="workspace-write",

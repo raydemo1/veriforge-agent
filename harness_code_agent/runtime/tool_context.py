@@ -3,18 +3,18 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from ..sessions.events import EventBus
 from ..config import ModelSelection
+from ..sessions.events import EventBus
 from ..workspace.service import WorkspaceService
 from .approvals import ApprovalProvider, NoApprovalProvider
 from .execution_planner import ResourceCoordinator
 from .permissions import PermissionPolicy
+from .project_resources import ProjectResourceBudget
 from .questions import NoQuestionProvider, QuestionProvider
 from .task_supervisor import ToolTaskSupervisor
-from .project_resources import ProjectResourceBudget
 
 if TYPE_CHECKING:
     from ..agent.coordinator import AgentCoordinator

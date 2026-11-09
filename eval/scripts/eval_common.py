@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 RESULTS_ROOT = PROJECT_ROOT / "eval" / "results"
 TASKS_ROOT = PROJECT_ROOT / "eval" / "tasks"
-TBENCH_METADATA_PATH = PROJECT_ROOT / "harness_code_agent" / "profiles" / "tb2_tasks.json"
+TBENCH_METADATA_PATH = PROJECT_ROOT / "eval" / "benchmarks" / "data" / "tb2_tasks.json"
 TBENCH_TASK_FILES = {
     "8task": "terminal_bench_8task.json",
     "24task": "terminal_bench_24task.json",

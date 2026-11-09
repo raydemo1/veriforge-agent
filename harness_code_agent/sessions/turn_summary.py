@@ -17,7 +17,7 @@ log = logging.getLogger("harness")
 
 LONG_TURN_TOOL_RESULT_THRESHOLD = 3
 LONG_TURN_SECONDS_THRESHOLD = 45.0
-LONG_TURN_TOOLS = {"run_bash", "browser_test"}
+LONG_TURN_TOOLS = {"run_bash"}
 
 
 @dataclass(frozen=True)
@@ -31,13 +31,9 @@ class TurnSummaryResult:
 def should_summarize_turn(
     events: list[dict[str, Any]],
     *,
-    profile_name: str,
     duration_seconds: float,
 ) -> bool:
     """Return whether a turn is long enough to summarize for TUI display."""
-    if profile_name == "plan":
-        return False
-
     counts = _tool_counts(events)
     if sum(counts.values()) >= LONG_TURN_TOOL_RESULT_THRESHOLD:
         return True

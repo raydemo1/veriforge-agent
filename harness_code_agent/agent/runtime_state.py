@@ -152,7 +152,6 @@ class AgentFallbackState:
 @dataclass
 class AgentRuntimeState:
     shell_job_manager: ShellJobManager | None = None
-    browser_job_id: str | None = None
     todo: TodoList | None = None
     task_metadata: dict[str, Any] = field(default_factory=dict)
     fallback: AgentFallbackState = field(default_factory=AgentFallbackState)

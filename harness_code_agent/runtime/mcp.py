@@ -25,9 +25,9 @@ from .permissions import (
     TOOL_PERMISSION_READ,
     VALID_TOOL_PERMISSIONS,
 )
+from .project_resources import ProjectResourceBudget
 from .recovery import atomic_bytes
 from .tool_result import ToolResult
-from .project_resources import ProjectResourceBudget
 
 _static_lock = threading.RLock()
 _config_cache = {}
@@ -301,7 +301,7 @@ class McpClientManager:
             )
 
     def _schema_key(self, server):
-        data = dict(workspace=str(self.workspace), server=_server_entry(server))
+        data = {"workspace": str(self.workspace), "server": _server_entry(server)}
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
     def prime_catalog(self):
@@ -1023,7 +1023,7 @@ class McpClientManager:
         try:
             try:
                 self._run(self._close_async())
-            except Exception as exc:  # noqa: BLE001 - teardown must finish
+            except Exception as exc:
                 log.warning("MCP shutdown reported an error: %s", exc)
         finally:
             self._loop_thread.close()

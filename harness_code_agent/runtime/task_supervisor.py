@@ -19,8 +19,8 @@ class ToolTaskSupervisor:
             if self._closed:
                 future.cancel()
                 raise RuntimeError("tool task supervisor is closed")
-            self._futures[future] = dict(turn_id=turn_id, tool_call_id=tool_call_id,
-                                         resources=tuple(resources), cancellation_token=cancellation_token, foreground=foreground)
+            self._futures[future] = {"turn_id": turn_id, "tool_call_id": tool_call_id,
+                                         "resources": tuple(resources), "cancellation_token": cancellation_token, "foreground": foreground}
         future.add_done_callback(self._forget)
 
     @property

@@ -294,7 +294,7 @@ class AgentConversation:
     def _request_contract(self) -> dict:
         profile = config.resolve_model_profile(self.agent.model_intensity or config.MODEL_INTENSITY, self.agent.model_selection)
         return {
-            "profile": self.agent.name, "provider": profile.provider, "model": profile.model,
+            "agent": self.agent.name, "provider": profile.provider, "model": profile.model,
             "thinking": profile.thinking, "reasoning_effort": profile.reasoning_effort,
             "input_mode": profile.input_mode,
             "system": self._system_message()["content"],
@@ -356,9 +356,9 @@ class AgentConversation:
         return outbound
 
     def rebind_agent(self, agent: Agent) -> None:
-        """Keep this conversation while changing the active profile runtime.
+        """Keep this conversation while swapping the agent runtime it runs on.
 
-        Profile switching is a session-level policy change, not a new chat.
+        Rebuilding the agent is a session-level runtime change, not a new chat.
         The message history and runtime state stay intact; only the system
         contract, tool policy and middleware set come from the new agent.
         """
@@ -372,7 +372,7 @@ class AgentConversation:
             if messages and messages[0].get("role") == "system":
                 messages[0] = self._system_message(agent)
             self.agent = agent
-            self.start_epoch("profile_changed", messages)
+            self.start_epoch("agent_rebound", messages)
         except BaseException:
             self.agent = previous
             self._memory_snapshot_key, self._memory_snapshot, self._memory_index = memory

@@ -3,7 +3,7 @@ import { DEFAULT_COMMANDS, initialWorkState } from "./protocol.ts";
 import { formatUserError } from "./errors.ts";
 
 export const initialSnapshot: Snapshot = {
-  profile: "general", permissionMode: "workspace-write", model: "starting", reasoningEffort: "high", provider: "auto",
+  permissionMode: "workspace-write", model: "starting", reasoningEffort: "high", provider: "auto",
   contextPercent: 100, status: "starting", cwd: "工作区", inputMode: "text",
 };
 export type SessionViewState = {

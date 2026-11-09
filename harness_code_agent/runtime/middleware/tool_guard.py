@@ -238,9 +238,7 @@ def _is_bounded_recursive_path(target: str) -> bool:
     # are unbounded; anything naming a concrete path below them is bounded.
     if lowered in {".", "..", "~", "$home", "$env:userprofile", "userprofile"}:
         return False
-    if re.fullmatch(r"[a-z]:", lowered):
-        return False
-    return True
+    return not re.fullmatch(r"[a-z]:", lowered)
 
 
 def _is_broad_recursive_grep(command: str) -> bool:

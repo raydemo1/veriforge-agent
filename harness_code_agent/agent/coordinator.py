@@ -396,7 +396,8 @@ class AgentCoordinator:
             for spec in self._role_registry(record.role).specs():
                 registry.register_spec(spec)
 
-        policy = PermissionPolicy.for_role(
+        policy = PermissionPolicy.delegated_from(
+            self.context.permission_policy,
             record.role,
             allowed_paths=record.allowed_paths,
         )

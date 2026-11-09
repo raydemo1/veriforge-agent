@@ -19,8 +19,8 @@ import threading
 import time
 import traceback
 import uuid
-from dataclasses import replace
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,14 +59,6 @@ from .tui.protocol import UI_PROTOCOL_VERSION, validate_ui_event
 from .tui.state import SessionStatusSnapshot, TranscriptBlock, TuiState, _localize_error
 
 log = logging.getLogger("harness.opentui")
-
-_PROFILE_COPY = {
-    "general": ("通用", "问答、分析与轻量只读任务"),
-    "coding-agent": ("编码", "修改代码、运行测试并完成验证"),
-    "plan": ("规划", "调查现状并形成决策完整的实施方案"),
-    "app-builder": ("应用构建", "端到端构建并验证应用界面"),
-    "review": ("审查", "只读检查代码并优先报告问题"),
-}
 
 _PERMISSION_COPY = {
     PermissionPolicy.WORKSPACE_WRITE: ("请求批准", "工作区内写入允许，风险操作询问，工作区外写入拒绝"),
@@ -111,7 +103,6 @@ def _localize_observability(text: str) -> str:
         "Observability dashboard": "可观测性面板",
         "Project observability": "项目可观测性",
         "session:": "会话：",
-        "profile:": "配置：",
         "model:": "模型：",
         "status:": "状态：",
         "created_at:": "创建时间：",
@@ -288,7 +279,7 @@ class BridgeInteractionProvider:
 class SessionBridge:
     """Own one Python session and serve request/event messages over stdio."""
 
-    def __init__(self, *, cwd: Path, profile_name: str, profile_explicit: bool,
+    def __init__(self, *, cwd: Path,
                  session_id: str, state_root: Path, environment: str, emit, session_action,
                  project_resources=None) -> None:
         self.runtime_id = session_id
@@ -307,8 +298,6 @@ class SessionBridge:
         self._suspend_retry_at = 0
         self._last_activity = time.monotonic()
         self.cwd = cwd.resolve()
-        self.profile_name = profile_name
-        self.profile_explicit = profile_explicit
         self._write_lock = threading.Lock()
         self._tasks: queue.Queue[PreparedTurn | Any | None] = queue.Queue()
         self.work = WorkStateProjection(self.cwd)
@@ -331,7 +320,6 @@ class SessionBridge:
         self._assistant_counter = 0
         self.state = TuiState(
             snapshot=SessionStatusSnapshot(
-                profile=profile_name,
                 model=config.MODEL,
                 provider=config.PROVIDER,
                 permission_mode=os.environ.get("HARNESS_PERMISSION_MODE", "workspace-write"),
@@ -345,16 +333,14 @@ class SessionBridge:
         from .sessions.store import SessionStore
         store = SessionStore(self.state_root)
         if not (store.sessions_dir / self.runtime_id / "session.json").exists():
-            store.create(profile=profile_name, cwd=self.cwd, model=config.MODEL,
-                                 permission_mode=self.state.snapshot.permission_mode,
-                                 profile_source="explicit" if profile_explicit else "default",
-                                 session_id=self.runtime_id, routing_mode="pinned" if profile_explicit else "auto",
-                                 environment=environment)
+            store.create(cwd=self.cwd, model=config.MODEL,
+                         permission_mode=self.state.snapshot.permission_mode,
+                         session_id=self.runtime_id,
+                         environment=environment)
         metadata = store.read_metadata(self.runtime_id)
         self._model_selection = config.ModelSelection(**metadata.get("model_selection", {}))
         self.state.snapshot.session_id = self.runtime_id
-        self.state.snapshot.profile = metadata["profile"]
-        self.state.snapshot.permission_mode = metadata["permission_mode"]
+        self.state.snapshot.permission_mode = metadata.get("permission_mode", self.state.snapshot.permission_mode)
         self.state.snapshot.status = "idle"
         items = self._history_items(self.runtime_id)
         self._emit_commands()
@@ -388,8 +374,6 @@ class SessionBridge:
                 state_root=self.state_root,
                 environment=self.environment,
                 project_resources=self.project_resources,
-                profile_name=self.profile_name,
-                profile_explicit=self.profile_explicit,
                 stream_sink=lambda text: (
                     self._stream_delta(text) if self._is_current_generation(generation) else None
                 ),
@@ -601,7 +585,6 @@ class SessionBridge:
             "user": "user",
             "file": "file",
             "thought": "thought",
-            "profile": "profile",
             "agent": "agent",
         }
         kind = kind_map.get(block.kind, "status")
@@ -660,7 +643,6 @@ class SessionBridge:
         profile = config.resolve_model_profile(config.MODEL_INTENSITY,
                                                self._session.model_selection if self._session else self._model_selection)
         return {
-            "profile": snapshot.profile,
             "permissionMode": snapshot.permission_mode,
             "model": profile.model,
             "reasoningEffort": profile.reasoning_effort,
@@ -671,7 +653,6 @@ class SessionBridge:
             "status": snapshot.status,
             "cwd": str(snapshot.cwd),
             "sessionId": snapshot.session_id,
-            "routingMode": getattr(self._session, "display_routing_mode", "auto"),
             "dirtyCount": snapshot.dirty_count,
             "inputMode": model_input_mode(),
         }
@@ -797,7 +778,7 @@ class SessionBridge:
                 if getattr(result, "text", ""):
                     self._notice("info", str(result.text))
                 action = getattr(result, "action", None)
-                if action in {"profile", "mcp", "observe"}:
+                if action in {"mcp", "observe"}:
                     self._send_event({"type": "panel", "panel": self._panel(str(action))})
                 elif action == "compact":
                     self._notice("info", session.compact_current_context())
@@ -818,29 +799,6 @@ class SessionBridge:
 
     def _panel(self, kind: str) -> dict[str, Any]:
         session = self._require_session()
-        if kind == "profile":
-            from .profiles import list_profiles
-
-            current = "auto" if session.display_routing_mode == "auto" else session.display_profile
-            auto_option: dict[str, Any] = {
-                "id": "auto",
-                "label": "自动路由",
-                "description": "根据当前任务选择工作模式",
-                "tone": "success" if current == "auto" else "default",
-                "selected": current == "auto",
-            }
-            if session.display_routing_mode == "auto":
-                active_label = _PROFILE_COPY.get(session.display_profile, (session.display_profile, ""))[0]
-                auto_option["badge"] = f"当前：{active_label}"
-            options = [auto_option]
-            options.extend({
-                "id": item["name"],
-                "label": _PROFILE_COPY.get(item["name"], (item["name"], item["description"]))[0],
-                "description": _PROFILE_COPY.get(item["name"], (item["name"], item["description"]))[1],
-                "tone": "success" if current == item["name"] else "default",
-                "selected": current == item["name"],
-            } for item in list_profiles())
-            return {"kind": "profile", "title": "工作模式", "options": options}
         if kind == "permission":
             current = session.permission_mode
             options = []
@@ -955,8 +913,6 @@ class SessionBridge:
                 return self._session_action("fork_session", {})
             else:
                 raise ValueError(f"unknown command action: {action}")
-        elif panel == "profile":
-            message = session.enable_auto_profile_routing() if action == "auto" else session.switch_profile(action)
         elif panel == "permission":
             message = session.set_permission_mode(action)
         elif panel == "model":
@@ -997,7 +953,7 @@ class SessionBridge:
         else:
             raise ValueError(f"unknown panel action: {panel}")
         self._send_snapshot()
-        if panel in {"profile", "permission", "model", "effort"}:
+        if panel in {"permission", "model", "effort"}:
             return {"ok": True}
         return {"ok": True, "message": str(message or "")}
 
@@ -1026,8 +982,9 @@ class SessionBridge:
         store = SessionStore(self.state_root)
         metadata = store.read_metadata(session_id)
         replay = TuiState(snapshot=SessionStatusSnapshot(
-            profile=metadata["profile"], model=self.state.snapshot.model,
-            provider=self.state.snapshot.provider, permission_mode=metadata["permission_mode"],
+            model=self.state.snapshot.model,
+            provider=self.state.snapshot.provider,
+            permission_mode=metadata.get("permission_mode", "workspace-write"),
             session_id=session_id, cwd=self.cwd,
         ))
         items = []
@@ -1079,8 +1036,7 @@ class SessionBridge:
                     item["recoveryPointId"] = point_id
         self.state = replay
         self.state.snapshot.session_id = session_id
-        self.state.snapshot.profile = metadata["profile"]
-        self.state.snapshot.permission_mode = metadata["permission_mode"]
+        self.state.snapshot.permission_mode = metadata.get("permission_mode", "workspace-write")
         self.state.snapshot.status = "idle"
         self._assistant_group_id = None
         self._assistant_id = None
@@ -1142,11 +1098,11 @@ class SessionBridge:
         occupied = any(entry["sessionId"] == self.runtime_id for entry in [*executing["active"], *executing["waiting"]])
         active = bool(turn or pending or interactions or tools or jobs or agents or constructing or occupied
                       or pending_changes or self._runtime_users)
-        return dict(state="active" if active else "warm" if session is not None else "dormant",
-                    turn=turn, queue=max(0, pending - int(turn)), approvals=int(interactions),
-                    tools=tools, agents=len(agents),
-                    jobs=[dict(id=job.job_id, pid=job.pid, status=job.status, command=job.command,
-                               background=job.background) for job in jobs])
+        return {"state": "active" if active else "warm" if session is not None else "dormant",
+                    "turn": turn, "queue": max(0, pending - int(turn)), "approvals": int(interactions),
+                    "tools": tools, "agents": len(agents),
+                    "jobs": [{"id": job.job_id, "pid": job.pid, "status": job.status, "command": job.command,
+                               "background": job.background} for job in jobs]}
 
     @contextmanager
     def turns_paused(self):
@@ -1170,8 +1126,6 @@ class SessionBridge:
                 return False
             session = self._session
             self._model_selection = session.model_selection
-            self.profile_name = session.profile.name()
-            self.profile_explicit = session.routing_mode == "pinned"
             self._not_suspending.clear()
         try:
             try:
@@ -1504,10 +1458,9 @@ class SessionBridge:
 
 
 class BridgeServer:
-    def __init__(self, *, cwd: Path, profile_name: str, profile_explicit: bool):
+    def __init__(self, *, cwd: Path):
         from .core.session_runtime_registry import SessionRuntimeRegistry
         self.cwd = cwd.resolve()
-        self.profile_name, self.profile_explicit = profile_name, profile_explicit
         self._write_lock = threading.Lock()
         self._output_broken = threading.Event()
         self._closed = False
@@ -1530,9 +1483,10 @@ class BridgeServer:
                 self._output_broken.set()
 
     def _event(self, event):
-        if event["type"] not in {"sessions", "shutdown", "session_view", "resources"}:
-            if not event.get("sessionId") or not isinstance(event.get("sequence"), int):
-                raise ValueError("会话事件缺少寻址或序列")
+        if event["type"] not in {"sessions", "shutdown", "session_view", "resources"} and (
+            not event.get("sessionId") or not isinstance(event.get("sequence"), int)
+        ):
+            raise ValueError("会话事件缺少寻址或序列")
         self._write({"type": "event", "event": event})
 
     def _response(self, request_id, result=None, error=None):
@@ -1546,8 +1500,7 @@ class BridgeServer:
                 self.registry.publish(record.id, message["event"])
             else:
                 self._write(message)
-        return SessionBridge(cwd=record.cwd, profile_name=self.profile_name,
-                             profile_explicit=self.profile_explicit, session_id=record.id,
+        return SessionBridge(cwd=record.cwd, session_id=record.id,
                              state_root=self.registry.store.root, environment=record.environment, emit=send,
                              session_action=lambda name, params: self._action(record.id, name, params),
                              project_resources=self.registry.resources)
@@ -1605,8 +1558,12 @@ class BridgeServer:
             return host._action(name, params)
 
     def _apply_worktree(self, record):
-        from .workspace.worktrees import WorktreeService, WorktreeMergeConflict, prepare_merge_review
         from .agent.cancellation import current_token
+        from .workspace.worktrees import (
+            WorktreeMergeConflict,
+            WorktreeService,
+            prepare_merge_review,
+        )
         service = WorktreeService(self.cwd)
         session = record.host._require_session()
         if session.tool_context.agent_coordinator.has_active_agents():
@@ -1741,18 +1698,12 @@ class BridgeServer:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="VeriForge OpenTUI NDJSON bridge")
     parser.add_argument("--cwd", default=".")
-    parser.add_argument("--profile", default="general")
-    parser.add_argument("--profile-explicit", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    server = BridgeServer(
-        cwd=Path(args.cwd),
-        profile_name=args.profile,
-        profile_explicit=args.profile_explicit,
-    )
+    server = BridgeServer(cwd=Path(args.cwd))
     return server.run()
 
 

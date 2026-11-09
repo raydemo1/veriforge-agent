@@ -81,3 +81,6 @@ vendor_wheels/
 
 # TRAE local planning documents
 .trae/
+
+# WorkBuddy local session/memory state
+.workbuddy/

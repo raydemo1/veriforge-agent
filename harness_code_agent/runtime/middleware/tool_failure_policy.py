@@ -112,7 +112,7 @@ class ToolFailurePolicyMiddleware(AgentMiddleware):
 
     def on_tool_failure(
         self,
-        failure: "ToolFailure",
+        failure: ToolFailure,
         messages: list[dict],
         runtime_state=None,
         agent_name: str | None = None,
@@ -215,7 +215,7 @@ class ToolFailurePolicyMiddleware(AgentMiddleware):
     # Correction text
     # ------------------------------------------------------------------
 
-    def _schema_correction(self, failure: "ToolFailure") -> str:
+    def _schema_correction(self, failure: ToolFailure) -> str:
         lines = [
             f"Previous {failure.attempt} calls to `{failure.tool_name}` failed validation.",
         ]

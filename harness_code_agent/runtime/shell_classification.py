@@ -326,9 +326,7 @@ def _analyze_segment(
             traits.add(ShellTrait.UNKNOWN_EFFECT)
         else:
             effects.add(ShellEffect.READ)
-    elif is_verify_shell_command(segment):
-        effects.add(ShellEffect.READ)
-    elif exe in _READ_COMMANDS:
+    elif is_verify_shell_command(segment) or exe in _READ_COMMANDS:
         effects.add(ShellEffect.READ)
     else:
         # Unrecognized executable: we cannot prove what it does.
@@ -438,7 +436,7 @@ def _interpreter_facts(exe, args, root):
     # Test runners and builds are treated as reads (derived artifacts only).
     if is_verify_shell_command(" ".join((exe, *args))):
         return {ShellEffect.READ}, set(), []
-    if args and _bare(args[0]).lower() in {"--version", "-v", "-v", "-V"}:
+    if args and _bare(args[0]).lower() in {"--version", "-v", "-V"}:
         return {ShellEffect.READ}, set(), []
 
     traits = {ShellTrait.DYNAMIC, ShellTrait.UNKNOWN_EFFECT}

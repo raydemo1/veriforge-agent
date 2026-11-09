@@ -157,8 +157,8 @@ def test_stop_after_tool_persists_diagnostics_with_memory_disabled(runtime_facto
     monkeypatch.setattr(
         "harness_code_agent.runtime.verification.python._check_ruff", lambda *_: ([], False)
     )
-    session = create(profile_name="coding-agent")
-    session.ensure_profile_bound_for_first_task("edit a source file")
+    session = create()
+    session._ensure_bound()
     requests = []
 
     def reply(*_, **__):

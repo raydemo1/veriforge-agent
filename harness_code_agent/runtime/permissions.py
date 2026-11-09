@@ -184,6 +184,24 @@ class PermissionPolicy:
             )
         raise ValueError(f"Unknown agent role: {role}")
 
+    @classmethod
+    def delegated_from(
+        cls,
+        parent: PermissionPolicy | None,
+        role: str,
+        *,
+        allowed_paths: tuple[str, ...] | list[str] | None = None,
+    ) -> PermissionPolicy:
+        """Policy for a delegated agent, never broader than its parent's.
+
+        A read-only parent (an active planning flow) cannot grant write access
+        by delegation, so worker roles inherit the read-only ceiling instead of
+        their usual sandbox-write policy.
+        """
+        if parent is not None and parent.mode == cls.READ_ONLY:
+            return cls(cls.READ_ONLY, role=role, allowed_paths=allowed_paths)
+        return cls.for_role(role, allowed_paths=allowed_paths)
+
     def restricted_by(
         self, preset: PermissionPreset | None
     ) -> PermissionPolicy:

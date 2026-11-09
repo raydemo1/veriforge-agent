@@ -235,14 +235,14 @@ def test_fork_resume_restores_structured_reference_and_detects_damage(tmp_path):
     from harness_code_agent.sessions.store import SessionStore
 
     sessions = SessionStore(tmp_path / '.harness')
-    source = sessions.create(profile='coding', cwd=str(tmp_path), model='test', permission_mode='danger-full-access')
+    source = sessions.create(cwd=str(tmp_path), model='test', permission_mode='danger-full-access')
     original = make_conversation(make_context(tmp_path, source.id))
     recovered = None
     try:
         observation = record_large_result(original)
         from harness_code_agent.runtime.recovery import atomic_json
         metadata = sessions.read_metadata(source.id)
-        metadata["fork_boundary"] = dict(turn=1, journal_sequence=original.journal.sequence, event_count=0, change_cursor=0)
+        metadata["fork_boundary"] = {'turn': 1, 'journal_sequence': original.journal.sequence, 'event_count': 0, 'change_cursor': 0}
         atomic_json(source.metadata_path, metadata)
         branch = sessions.fork(source.id)
         context = make_context(tmp_path, branch.id)
@@ -366,9 +366,8 @@ def test_cancellation_after_tool_completion_preserves_completed_result(tmp_path)
         token.cancel()
         return ExecutedToolCall(prepared, ToolResult(tool='read_file', status='success', output='COMPLETED_BEFORE_CANCEL'))
     try:
-        with patch.object(executor, '_execute_one', side_effect=finish):
-            with pytest.raises(CancelledError):
-                executor.execute([call])
+        with patch.object(executor, '_execute_one', side_effect=finish), pytest.raises(CancelledError):
+            executor.execute([call])
         assert 'COMPLETED_BEFORE_CANCEL' in conversation.messages[-1]['content']
     finally:
         conversation.close()

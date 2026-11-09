@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -628,7 +628,7 @@ def classify_tool_failure(tool_result: Any) -> str:
         return "user_cancelled"
     if source in {"runtime", "exception", "shell"}:
         return "runtime_error"
-    if source in {"native", "registry", "permission", "browser"}:
+    if source in {"native", "registry", "permission"}:
         return "tool_error"
     if "traceback" in combined or "exception" in combined or "command exited with code" in combined:
         return "runtime_error"

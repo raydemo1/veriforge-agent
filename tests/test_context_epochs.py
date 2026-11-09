@@ -55,7 +55,7 @@ def test_epoch_recovery_keeps_runtime_system_and_original_log(tmp_path):
     event = {"role": "system", "content": "[HARNESS_RUNTIME_EVENT v1]\nwarning"}
     history.append(event, journal=journal, metadata={"kind": "runtime_event"})
     history.start_epoch(
-        "profile_changed",
+        "agent_rebound",
         [{"role": "system", "content": "new"}, event],
         {},
         journal=journal,

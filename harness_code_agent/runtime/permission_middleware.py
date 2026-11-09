@@ -17,9 +17,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from .shell_classification import ShellEffect, TargetScope
 from .approvals import ApprovalRequest
 from .middleware import AgentMiddleware
+from .shell_classification import ShellEffect, TargetScope
 from .tool_result import ToolResult
 
 if TYPE_CHECKING:

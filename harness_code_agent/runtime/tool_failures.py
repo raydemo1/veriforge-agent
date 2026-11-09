@@ -25,7 +25,6 @@ from typing import Any
 
 from .tool_result import ToolResult
 
-
 # ---------------------------------------------------------------------------
 # Taxonomy constants
 # ---------------------------------------------------------------------------
@@ -70,7 +69,9 @@ class FailureKind:
     PERMISSION_DENIED = "permission_denied"
     APPROVAL_DENIED = "approval_denied"
     POLICY_VIOLATION = "policy_violation"
-    PROFILE_BLOCKED = "profile_blocked"
+    #: The tool is not exposed to this agent by the product tool surface
+    #: (blocked names or allowed permissions), not by a permission decision.
+    TOOL_SURFACE_BLOCKED = "tool_surface_blocked"
     USER_ATTENTION_REQUIRED = "user_attention_required"
     # resource
     BUDGET_EXCEEDED = "budget_exceeded"
@@ -171,7 +172,7 @@ _KIND_SPECS: dict[str, tuple[str, str | None, bool, bool]] = {
         False,
         False,
     ),
-    FailureKind.PROFILE_BLOCKED: (
+    FailureKind.TOOL_SURFACE_BLOCKED: (
         FailureCategory.POLICY,
         FailurePhase.POLICY,
         False,
@@ -250,7 +251,7 @@ BLOCKING_POLICY_KINDS = frozenset(
         FailureKind.BLOCKED_COMMAND,
         FailureKind.PERMISSION_DENIED,
         FailureKind.POLICY_VIOLATION,
-        FailureKind.PROFILE_BLOCKED,
+        FailureKind.TOOL_SURFACE_BLOCKED,
     }
 )
 
@@ -280,8 +281,8 @@ _SOURCE_DEFAULT_KIND = {
     "permission": FailureKind.PERMISSION_DENIED,
     "approval": FailureKind.APPROVAL_DENIED,
     "tool_policy": FailureKind.POLICY_VIOLATION,
-    "delegate_policy": FailureKind.PROFILE_BLOCKED,
-    "agent_policy": FailureKind.PROFILE_BLOCKED,
+    "delegate_policy": FailureKind.TOOL_SURFACE_BLOCKED,
+    "agent_policy": FailureKind.TOOL_SURFACE_BLOCKED,
     "user_question": FailureKind.USER_ATTENTION_REQUIRED,
     "budget": FailureKind.BUDGET_EXCEEDED,
     "fallback": FailureKind.BUDGET_EXCEEDED,
@@ -295,7 +296,6 @@ _SOURCE_DEFAULT_KIND = {
     "shell": FailureKind.PROCESS_FAILED,
     "shell_job": FailureKind.EXECUTION_FAILED,
     "mcp": FailureKind.EXECUTION_FAILED,
-    "browser": FailureKind.EXECUTION_FAILED,
     "unstructured": FailureKind.EXECUTION_FAILED,
     "": FailureKind.EXECUTION_FAILED,
 }
@@ -317,7 +317,6 @@ _TEXT_REFINABLE_SOURCES = frozenset(
         "shell",
         "shell_job",
         "mcp",
-        "browser",
         "unstructured",
     }
 )

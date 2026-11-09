@@ -27,7 +27,6 @@ SECTION_EVENTS = {
 
 _TERMINAL_AGENT_STATES = {"completed", "failed", "blocked", "interrupted"}
 _PLAN_STEP_LIMIT = 12
-_CHECK_TOOLS = {"browser_test"}
 
 
 class WorkStateProjection:
@@ -67,8 +66,8 @@ class WorkStateProjection:
         elif event_type == "plan_ready":
             self._apply_plan_ready(payload)
             changed.add("plan")
-        elif event_type == "profile_switched":
-            if self._plan is not None and str(payload.get("reason") or "") == "execute approved plan":
+        elif event_type == "plan_executed":
+            if self._plan is not None:
                 self._plan["status"] = "executing"
                 changed.add("plan")
         elif event_type == "turn_finished":
@@ -83,12 +82,6 @@ class WorkStateProjection:
                 else:
                     self._plan["status"] = "incomplete"
                 changed.add("plan")
-        elif event_type == "tool_call" and str(payload.get("tool") or "") in _CHECK_TOOLS:
-            changed |= self._upsert_check({
-                "name": "Browser verification",
-                "status": "running",
-                "detail": str((payload.get("args") or {}).get("url") or ""),
-            })
         elif event_type == "tool_result":
             changed |= self._apply_tool_result(payload)
         elif event_type == "file_change" and (agent is None or agent == "main_agent"):
@@ -291,15 +284,6 @@ class WorkStateProjection:
         for artifact in metadata.get("artifacts") or []:
             if isinstance(artifact, dict) and artifact.get("path"):
                 changed |= self._upsert_artifact(artifact)
-        running = self._checks.get("browser-verification")
-        if tool in _CHECK_TOOLS and (running is None or running["status"] == "running"):
-            # Runs without structured evidence still resolve the running row
-            # to the tool's objective pass/fail.
-            changed |= self._upsert_check({
-                "name": "Browser verification",
-                "status": "passed" if payload.get("status") == "success" else "failed",
-                "detail": str(metadata.get("url") or ""),
-            })
         return changed
 
     def _upsert_check(self, raw: dict[str, Any]) -> set[str]:

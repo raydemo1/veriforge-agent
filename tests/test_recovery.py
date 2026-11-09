@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-import pytest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from harness_code_agent.runtime.questions import QuestionResult
 from harness_code_agent.runtime.recovery import (
@@ -38,9 +39,11 @@ class RecoveryStoreTests(unittest.TestCase):
                 store.blob(digest)
 
 
-import pytest
-from harness_code_agent.workspace.access import WorkspaceAccessCoordinator, WorkspaceConflict
 from harness_code_agent.runtime.recovery import atomic_bytes
+from harness_code_agent.workspace.access import (
+    WorkspaceAccessCoordinator,
+    WorkspaceConflict,
+)
 
 
 @pytest.mark.session
@@ -99,9 +102,12 @@ def test_transaction_failure_rolls_back_all_files_and_journal(tmp_path):
         if path == tmp_path / "b" and data == b"new-b":
             raise OSError("disk unavailable")
         real(path, data)
-    with patch("harness_code_agent.runtime.recovery.atomic_bytes", side_effect=write), pytest.raises(OSError):
-        with access.transaction({"a": b"new-a", "b": b"new-b"}, participants=[journal]):
-            journal.write_bytes(b"new-journal")
+    with (
+        patch("harness_code_agent.runtime.recovery.atomic_bytes", side_effect=write),
+        pytest.raises(OSError),
+        access.transaction({"a": b"new-a", "b": b"new-b"}, participants=[journal]),
+    ):
+        journal.write_bytes(b"new-journal")
     assert (tmp_path / "a").read_bytes() == b"old-a"
     assert (tmp_path / "b").read_bytes() == b"old-b"
     assert journal.read_bytes() == b"old-journal"
@@ -124,7 +130,7 @@ with a.acquire([a.write_claim()]):
   (root/'.harness/sessions/A/journal.jsonl').write_bytes(b'new-journal')
   os._exit(17)
 """
-    result = subprocess.run([sys.executable, "-c", script, str(tmp_path)], timeout=10)
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path)], timeout=10, check=False)
     assert result.returncode == 17
     WorkspaceAccessCoordinator(tmp_path)
     assert (tmp_path / "a").read_bytes() == b"before"

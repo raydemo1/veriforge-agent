@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -51,6 +54,23 @@ def model(monkeypatch, tmp_path):
     return client
 
 
+def test_terminal_runner_starts_when_executed_by_path(tmp_path):
+    """Harbor runs the runner as a file path, so it has no package context."""
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    result = subprocess.run(
+        [sys.executable, str(Path(hca_terminal_runner.__file__).resolve()), "--help"],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--workspace" in result.stdout
+
+
 def test_run_task_records_session_before_execution_and_keeps_recovery(tmp_path, model):
     started = []
 
@@ -59,7 +79,7 @@ def test_run_task_records_session_before_execution_and_keeps_recovery(tmp_path, 
         assert (info.harness_root / "sessions" / info.session_id / "session.json").is_file()
         started.append(info)
 
-    result = run_task(cwd=tmp_path, task="Inspect the code", profile="coding-agent", on_session_started=on_started)
+    result = run_task(cwd=tmp_path, task="Inspect the code", on_session_started=on_started)
 
     assert result.status == "completed"
     assert result.exit_code == 0
@@ -92,7 +112,7 @@ def test_entrypoints_execute_real_session_and_report_failures(tmp_path, model, m
         model.chat.completions.create.side_effect = RuntimeError("model request failed")
 
     if entry == "cli":
-        exit_code = cli.main(["-p", "--profile", "coding-agent", "Inspect the code"])
+        exit_code = cli.main(["-p", "Inspect the code"])
     elif entry == "terminal":
         exit_code = hca_terminal_runner.main(["--workspace", str(tmp_path), "Inspect the code"])
     else:
@@ -159,7 +179,7 @@ def test_periodic_export_reads_public_session_paths(tmp_path, model, monkeypatch
     started = []
     exported = threading.Event()
 
-    result = run_task(cwd=tmp_path, task="Inspect the code", profile="coding-agent", on_session_started=started.append)
+    result = run_task(cwd=tmp_path, task="Inspect the code", on_session_started=started.append)
     original_export = hca_terminal_runner.export_session_artifacts
     monkeypatch.setenv("HCA_ARTIFACTS_ROOT", str(tmp_path / "artifacts"))
 
@@ -185,10 +205,10 @@ def test_interrupts_close_real_session(tmp_path, model, interrupt):
     model.chat.completions.create.side_effect = interrupt
     if isinstance(interrupt, SystemExit):
         with pytest.raises(SystemExit) as exc:
-            run_task(cwd=tmp_path, task="Inspect the code", profile="coding-agent")
+            run_task(cwd=tmp_path, task="Inspect the code")
         assert exc.value.code == 143
     else:
-        result = run_task(cwd=tmp_path, task="Inspect the code", profile="coding-agent")
+        result = run_task(cwd=tmp_path, task="Inspect the code")
         assert result.status == "interrupted"
         assert result.exit_code == 130
         assert result.session_id
@@ -207,7 +227,7 @@ def test_close_failure_preserves_result_and_primary_error(tmp_path, model, monke
     if submit_fails:
         model.chat.completions.create.side_effect = RuntimeError("primary submit error")
 
-    result = run_task(cwd=tmp_path, task="Inspect the code", profile="coding-agent")
+    result = run_task(cwd=tmp_path, task="Inspect the code")
 
     assert result.status == "failed"
     assert result.exit_code == 1
@@ -223,7 +243,7 @@ def test_start_callback_failure_closes_session_without_submitting(tmp_path, mode
     def started(info):
         raise RuntimeError("startup callback failed")
 
-    result = run_task(cwd=tmp_path, task="Inspect the code", profile="coding-agent", on_session_started=started)
+    result = run_task(cwd=tmp_path, task="Inspect the code", on_session_started=started)
 
     assert result.status == "failed"
     assert result.session_id
@@ -241,7 +261,7 @@ def test_initialization_failure_releases_already_registered_resources(tmp_path, 
             raise RuntimeError("initialization failed")
 
     monkeypatch.setattr(InteractiveSession, "_report_startup", report)
-    result = run_task(cwd=tmp_path, task="Inspect the code", profile="coding-agent")
+    result = run_task(cwd=tmp_path, task="Inspect the code")
 
     assert result.status == "failed"
     assert result.session_id is None
@@ -267,13 +287,13 @@ def test_headless_does_not_read_input_for_approval_or_questions(tmp_path, model,
         return original_submit(session, task)
 
     monkeypatch.setattr(InteractiveSession, "submit", submit)
-    result = run_task(cwd=tmp_path, task="Inspect the code", profile="coding-agent")
+    result = run_task(cwd=tmp_path, task="Inspect the code")
     assert result.status == "completed"
 
 
 def test_cli_print_still_handles_local_slash_commands(tmp_path, model, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
-    assert cli.main(["-p", "--profile", "coding-agent", "/context"]) == 0
+    assert cli.main(["-p", "/context"]) == 0
     assert "上下文估算" in capsys.readouterr().out
     model.chat.completions.create.assert_not_called()
     model.close.assert_called_once()

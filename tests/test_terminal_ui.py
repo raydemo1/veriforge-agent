@@ -62,39 +62,6 @@ class TerminalUiTests(unittest.TestCase):
         self.assertIn("reviewer", block.title)
         self.assertEqual(block.body, "evidence contradicts the plan")
 
-    def test_transcript_hides_internal_route_fallbacks_and_only_shows_real_switches(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
-        stayed = state.apply_event(SessionEvent(
-            1,
-            0,
-            "profile_route_decision",
-            "main",
-            {
-                "profile": "general",
-                "action": "stay",
-                "switched": False,
-                "fallback_used": True,
-                "fallback_reason": "low local route confidence",
-            },
-        ))
-        switched = state.apply_event(SessionEvent(
-            2,
-            0,
-            "profile_route_decision",
-            "main",
-            {
-                "profile": "coding-agent",
-                "action": "switch_profile",
-                "switched": True,
-                "fallback_used": False,
-            },
-        ))
-
-        self.assertIsNone(stayed)
-        self.assertEqual(switched.title, "工作模式")
-        self.assertEqual(switched.body, "已切换到 coding-agent")
-        self.assertNotIn("兜底", switched.body)
-
     def test_project_allowlist_reuses_persisted_command_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
             allowlist = ApprovalAllowlist(tmp)

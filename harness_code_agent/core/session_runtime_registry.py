@@ -8,9 +8,9 @@ import weakref
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..runtime.project_resources import ProjectResourceBudget
 from ..sessions.store import SessionStore
 from ..workspace.worktrees import WorktreeService
-from ..runtime.project_resources import ProjectResourceBudget
 
 
 @dataclass
@@ -110,7 +110,7 @@ class SessionRuntimeRegistry:
                 job.update(processes=count, rssMiB=round(rss / 1048576, 1), cpuSeconds=round(cpu, 1))
             sessions.append(dict(id=record.id, title=record.title, environment=record.environment,
                                  lastError=record.last_error, waitingReason=record.waiting_reason, **state))
-        return dict(sessions=sessions, budget=self.resources.snapshot())
+        return {"sessions": sessions, "budget": self.resources.snapshot()}
 
     def create(self, *, session_id=None, cwd=None, environment="local"):
         with self._lock:
@@ -201,14 +201,14 @@ class SessionRuntimeRegistry:
         from ..runtime.recovery import atomic_json
         metadata = self.store.read_metadata(fork.id)
         metadata.update(cwd=str(root), environment="worktree" if worktree else source.environment)
+        import uuid
+
         from ..runtime.recovery import RecoveryStore
         from ..workspace.access import WorkspaceAccessCoordinator
-        import uuid
         boundary = metadata["history_boundary"]
         base = dict(boundary, id="rp_" + uuid.uuid4().hex, session_id=fork.id,
-                    change_cursor=WorkspaceAccessCoordinator(root).cursor(), profile=metadata["profile"],
+                    change_cursor=WorkspaceAccessCoordinator(root).cursor(),
                     permission_mode=metadata["permission_mode"], model_selection=metadata.get("model_selection", {"model": None, "reasoning_effort": None}))
-        base["routing_mode"] = metadata["routing_mode"]
         metadata.update(checkpoint=base, branch_origin=base)
         atomic_json(RecoveryStore(root).root / "points" / f"{base['id']}.json", base)
         atomic_json(fork.metadata_path, metadata)
@@ -216,10 +216,10 @@ class SessionRuntimeRegistry:
 
     def announce(self):
         with self._lock:
-            sessions = [dict(id=r.id, title=r.title, environment=r.environment,
-                             cwd=str(r.cwd), visible=r.visible, status=r.status,
-                             lifecycle=r.lifecycle,
-                             pendingApproval=self._views[r.id]["interaction"] is not None)
+            sessions = [{"id": r.id, "title": r.title, "environment": r.environment,
+                             "cwd": str(r.cwd), "visible": r.visible, "status": r.status,
+                             "lifecycle": r.lifecycle,
+                             "pendingApproval": self._views[r.id]["interaction"] is not None}
                         for r in self._records.values()]
             self.emit({"type": "sessions", "sessions": sessions, "activeSessionId": self.active_id})
 
@@ -270,8 +270,8 @@ class SessionRuntimeRegistry:
                 failed = event.get("level") == "error"
                 if failed:
                     record.last_error = event["text"]
-                view["items"].append(dict(id=f"notice-{view['sequence'] + 1}", kind="error" if failed else "status",
-                                          title="错误" if failed else "提示", body=event["text"], state="failed" if failed else "success"))
+                view["items"].append({"id": f"notice-{view['sequence'] + 1}", "kind": "error" if failed else "status",
+                                          "title": "错误" if failed else "提示", "body": event["text"], "state": "failed" if failed else "success"})
             elif kind == "interaction_closed":
                 if view["interaction"] and view["interaction"]["id"] == event["id"]:
                     view["interaction"] = None
@@ -312,7 +312,7 @@ class SessionRuntimeRegistry:
             try:
                 record.host.close()
                 self.access.release_runtime(record.id)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - one failed host must not block the rest
                 with lock:
                     errors.append(f"{record.id}: {exc}")
         threads = [threading.Thread(target=close_one, args=(r,), daemon=True) for r in records]

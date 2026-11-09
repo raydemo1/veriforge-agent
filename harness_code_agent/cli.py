@@ -14,9 +14,6 @@ from . import config
 if TYPE_CHECKING:
     from .sessions.store import SessionStore
 
-PRODUCT_DEFAULT_PROFILE = "general"
-
-
 def TuiApp(**kwargs):
     """Lazy OpenTUI constructor so batch commands stay lightweight."""
     from .opentui_launcher import OpenTuiApp as App
@@ -53,11 +50,9 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(prog="veriforge", description="VeriForge interactive local coding agent")
     parser.add_argument("task", nargs="*", help="Optional first task to submit after startup")
-    parser.add_argument("--profile", default=PRODUCT_DEFAULT_PROFILE, help="Profile name to use before the session starts")
     parser.add_argument("-p", "--print", dest="print_mode", action="store_true",
         help="Execute a single task and print results (no REPL)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
-    parser.add_argument("--list-profiles", action="store_true", help="List profiles and exit")
     parser.add_argument("--no-alt-screen", action="store_true",
         help="Keep the OpenTUI frontend in the main terminal screen")
     parser.add_argument("--theme", choices=("auto", "dark", "light"),
@@ -65,19 +60,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--icons", choices=("auto", "nerd", "unicode"),
         default=os.environ.get("VERIFORGE_ICONS", "auto"), help="OpenTUI icon set")
     args = parser.parse_args(argv)
-    profile_explicit = any(arg == "--profile" or arg.startswith("--profile=") for arg in argv)
     is_tty = _is_interactive_tty()
 
     from .core.logging_config import setup_logging
     setup_logging(
         verbose=args.verbose,
-        console=args.list_profiles or args.print_mode or not is_tty,
+        console=args.print_mode or not is_tty,
     )
-
-    if args.list_profiles:
-        from .core.formatters import print_profiles
-        print_profiles()
-        return 0
 
     first_task = " ".join(args.task).strip()
 
@@ -99,19 +88,11 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as e:
             _print_error(f"Error: {e}")
             return 2
-        return run_batch(
-            cwd=cwd,
-            profile_name=args.profile,
-            profile_explicit=profile_explicit,
-            first_task=first_task,
-            stream_sink=stream_sink,
-        )
+        return run_batch(cwd=cwd, first_task=first_task, stream_sink=stream_sink)
 
     try:
         app = TuiApp(
             cwd=cwd,
-            profile_name=args.profile,
-            profile_explicit=profile_explicit,
             first_task=first_task,
             no_alt_screen=args.no_alt_screen,
             theme=args.theme,
@@ -126,20 +107,12 @@ def main(argv: list[str] | None = None) -> int:
 def run_batch(
     *,
     cwd: Path,
-    profile_name: str,
     first_task: str,
     stream_sink=None,
-    profile_explicit: bool = False,
 ) -> int:
     from .headless import print_run_result, run_task
 
-    result = run_task(
-        cwd=cwd,
-        task=first_task,
-        profile=profile_name,
-        profile_explicit=profile_explicit,
-        stream_sink=stream_sink,
-    )
+    result = run_task(cwd=cwd, task=first_task, stream_sink=stream_sink)
     print_run_result(result)
     if result.error:
         _print_error(result.error.rstrip())
