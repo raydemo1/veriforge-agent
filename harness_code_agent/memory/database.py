@@ -23,25 +23,39 @@ from .vector_schema import VECTOR_SCHEMA, load_vector_extension
 
 _INITIALIZATION_LOCK = threading.Lock()
 _BUSY_TIMEOUT_SECONDS = 5.0
-#: SQLITE_BUSY, SQLITE_LOCKED and SQLITE_READONLY all describe a writer that
-#: lost a lock race rather than a database it may never write to.
-_RETRYABLE_LOCK_CODES = frozenset(
-    {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_READONLY}
-)
-_RETRYABLE_LOCK_MESSAGES = (
-    "database is locked",
-    "database is busy",
-    "readonly database",
-    "read-only database",
-)
+#: Losing a lock race is transient: another writer holds the database.
+_RETRYABLE_LOCK_CODES = frozenset({sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED})
 
 
-def _is_retryable_lock_error(exc: sqlite3.OperationalError) -> bool:
+def _is_retryable_lock_error(exc: sqlite3.OperationalError, path: Path) -> bool:
+    """Whether a failed write is worth another connection.
+
+    ``SQLITE_READONLY`` covers two very different situations: a connection
+    that lost the WAL shared-memory race is read-only for its lifetime and
+    recovers on reconnect, while a read-only file or directory never does.
+    Only the first is retried; everything else is reported as it happened.
+    """
     code = getattr(exc, "sqlite_errorcode", None)
-    if code is not None and (code & 0xFF) in _RETRYABLE_LOCK_CODES:
+    base = code & 0xFF if code is not None else None
+    if base in _RETRYABLE_LOCK_CODES:
         return True
+    if base == sqlite3.SQLITE_READONLY:
+        return _database_is_writable(path)
     message = str(exc).lower()
-    return any(marker in message for marker in _RETRYABLE_LOCK_MESSAGES)
+    if "locked" in message or "busy" in message:
+        return True
+    if "readonly" in message or "read-only" in message:
+        return _database_is_writable(path)
+    return False
+
+
+def _database_is_writable(path: Path) -> bool:
+    if not path.exists():
+        return True
+    try:
+        return os.access(path, os.W_OK)
+    except OSError:
+        return False
 
 MemoryKind = Literal["preference", "project_fact", "convention", "decision", "lesson", "workflow"]
 KINDS = frozenset({"preference", "project_fact", "convention", "decision", "lesson", "workflow"})
@@ -116,7 +130,7 @@ class MemoryDatabase:
                     self._bootstrap(db)
                     return
                 except sqlite3.OperationalError as exc:
-                    if not _is_retryable_lock_error(exc) or time.monotonic() >= deadline:
+                    if not _is_retryable_lock_error(exc, self.path) or time.monotonic() >= deadline:
                         raise
                     time.sleep(delay)
                     delay = min(delay * 2, 0.2)
@@ -200,7 +214,7 @@ class MemoryDatabase:
                 return db
             except sqlite3.OperationalError as exc:
                 db.close()
-                if not _is_retryable_lock_error(exc) or time.monotonic() >= deadline:
+                if not _is_retryable_lock_error(exc, self.path) or time.monotonic() >= deadline:
                     raise
                 time.sleep(delay)
                 delay = min(delay * 2, 0.2)

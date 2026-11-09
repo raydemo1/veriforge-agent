@@ -1,9 +1,12 @@
 import hashlib
 import json
+import os
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
@@ -275,3 +278,17 @@ def test_initialize_retries_with_a_new_connection_after_a_wal_race(tmp_path, mon
     with database.connect() as db:
         assert db.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
     assert opened["count"] >= 2
+
+
+def test_read_only_file_is_reported_without_retrying(database):
+    """Only a lost WAL race recovers on reconnect; a read-only file never does."""
+    save(database)
+    os.chmod(database.path, stat.S_IREAD)
+    started = time.monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            save(database, body="BUILD_V2")
+    finally:
+        os.chmod(database.path, stat.S_IWRITE)
+
+    assert time.monotonic() - started < 3, "a read-only file must not burn the retry budget"
