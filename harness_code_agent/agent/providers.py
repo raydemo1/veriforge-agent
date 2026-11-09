@@ -1,11 +1,15 @@
 """Provider adapters for OpenAI-compatible chat completions."""
 from __future__ import annotations
 
+import functools
+import os
 import re
+import ssl
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 
+import httpx
 from openai import OpenAI
 
 from .. import config
@@ -60,13 +64,45 @@ def build_system_cache_breakpoint_content(
     ]
 
 
+# CA bundle overrides httpx honours when trust_env is on; the shared TLS
+# context is keyed on them so a process that re-points its bundle gets a
+# context built from the new one.
+_TLS_ENV_KEYS = ("SSL_CERT_FILE", "SSL_CERT_DIR")
+
+
+@functools.lru_cache(maxsize=4)
+def _shared_tls_context(env_bundle: tuple[str | None, str | None]) -> ssl.SSLContext:
+    """Build the verified TLS context once and share it process-wide.
+
+    A client normally builds three contexts (the main transport plus the
+    per-scheme proxy transports), and OpenSSL's file-based CA loader re-opens
+    the bundle once per certificate: certifi's 119 roots cost ~0.8s on hosts
+    with a filesystem filter driver, so every client construction is ~2.4s.
+    A constructed context carries no per-connection state, so one instance can
+    serve all transports and still verify against the same roots.
+    """
+    return httpx.create_ssl_context(verify=env_bundle[0] or True, trust_env=True)
+
+
+def _tls_context() -> ssl.SSLContext:
+    return _shared_tls_context(tuple(os.environ.get(key) for key in _TLS_ENV_KEYS))
+
+
 def get_client() -> OpenAI:
-    client_config = _current_client_config()
+    api_key, base_url, timeout, max_retries = _current_client_config()
+    # The client owns its transport (and closes it), so per-session lifecycle
+    # and refresh semantics are unchanged; only the TLS context is shared.
+    http_client = httpx.Client(
+        verify=_tls_context(),
+        timeout=timeout,
+        follow_redirects=True,
+    )
     return OpenAI(
-        api_key=client_config[0],
-        base_url=client_config[1],
-        timeout=client_config[2],
-        max_retries=client_config[3],
+        api_key=api_key,
+        base_url=base_url,
+        timeout=timeout,
+        max_retries=max_retries,
+        http_client=http_client,
     )
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 import subprocess
@@ -14,6 +15,15 @@ def find_bun() -> str | None:
     configured = os.environ.get("VERIFORGE_BUN")
     if configured and Path(configured).is_file():
         return configured
+    return _installed_bun()
+
+
+# ``shutil.which`` costs one stat per PATH directory per PATHEXT suffix, and it
+# runs on every session startup. The installed runtime does not move while the
+# process lives, so probe the filesystem once; VERIFORGE_BUN is still read on
+# every call.
+@functools.lru_cache(maxsize=1)
+def _installed_bun() -> str | None:
     on_path = shutil.which("bun")
     if on_path:
         return on_path
@@ -33,16 +43,12 @@ class OpenTuiApp:
         self,
         *,
         cwd: str | Path,
-        profile_name: str = "general",
-        profile_explicit: bool = False,
         first_task: str = "",
         no_alt_screen: bool = False,
         theme: str = "auto",
         icons: str = "auto",
     ) -> None:
         self.cwd = Path(cwd).resolve()
-        self.profile_name = profile_name
-        self.profile_explicit = profile_explicit
         self.first_task = first_task
         self.no_alt_screen = no_alt_screen
         self.theme = theme
@@ -68,15 +74,11 @@ class OpenTuiApp:
             sys.executable,
             "--cwd",
             str(self.cwd),
-            "--profile",
-            self.profile_name,
             "--theme",
             self.theme,
             "--icons",
             self.icons,
         ]
-        if self.profile_explicit:
-            command.append("--profile-explicit")
         if self.first_task:
             command.extend(["--first-task", self.first_task])
         if self.no_alt_screen:
