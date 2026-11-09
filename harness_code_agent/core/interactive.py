@@ -72,7 +72,7 @@ from ..runtime.questions import (
 )
 from ..runtime.recovery import RecoveryService, atomic_json
 from ..runtime.tool_context import ToolContext
-from ..runtime.tool_registry import tool_schemas_for_profile
+from ..runtime.tool_registry import tool_schemas_for_agent
 from ..sessions.events import (
     AssistantMessageEvent,
     FinalReportEvent,
@@ -162,7 +162,6 @@ class InteractiveSession:
         environment: str = "local",
         project_resources=None,
         time_budget: float | None = None,
-        task_metadata: dict | None = None,
     ):
         self.cwd = Path(cwd).resolve()
         self._requested_session_id = session_id
@@ -226,10 +225,7 @@ class InteractiveSession:
             self.plan_mode = False
             self.last_user_task: str = ""
             self.last_assistant_text: str = ""
-            self.runtime_options = RuntimeOptions(
-                time_budget=time_budget,
-                task_metadata=dict(task_metadata) if task_metadata else None,
-            )
+            self.runtime_options = RuntimeOptions(time_budget=time_budget)
             self._closed = False
             self._close_lock = threading.Lock()
             # User middlewares are loaded exactly once per session.
@@ -296,8 +292,6 @@ class InteractiveSession:
             stream_callback=self.stream_sink,
             prompt_cache_identity=prefix.cache_identity,
         )
-        if self.runtime_options.task_metadata:
-            agent.current_task_metadata = dict(self.runtime_options.task_metadata)
         return agent
 
     def _load_mcp_tools(self) -> None:
@@ -331,7 +325,7 @@ class InteractiveSession:
 
     def _tool_schemas(self, *, update_context: bool = True, tool_context=None) -> list[dict]:
         context = tool_context or self.tool_context
-        core_schemas = tool_schemas_for_profile(
+        core_schemas = tool_schemas_for_agent(
             allowed_permissions=PRODUCT_TOOL_PERMISSIONS,
             registry=self.tool_registry,
         )
@@ -346,7 +340,7 @@ class InteractiveSession:
                 # from; recompute it even when nothing is discovered.
                 context.revealed_tool_names = set()
             return core_schemas
-        revealed_schemas = tool_schemas_for_profile(
+        revealed_schemas = tool_schemas_for_agent(
             allowed_permissions=PRODUCT_TOOL_PERMISSIONS,
             include_names=discovered,
             registry=self.tool_registry,

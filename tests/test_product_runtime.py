@@ -21,7 +21,7 @@ from harness_code_agent.runtime.builtins.shell import (
 )
 from harness_code_agent.runtime.tool_registry import (
     ToolRegistry,
-    tool_schemas_for_profile,
+    tool_schemas_for_agent,
 )
 from harness_code_agent.runtime.tool_result import ToolResult
 from harness_code_agent.runtime.tool_runner import execute_tool
@@ -2680,7 +2680,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 tool_context=context,
                 tool_registry=BUILTIN_TOOL_REGISTRY,
             )
-            shell_schemas = tool_schemas_for_profile(allowed_permissions={"shell"})
+            shell_schemas = tool_schemas_for_agent(allowed_permissions={"shell"})
 
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
@@ -2755,7 +2755,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 permission_policy=PermissionPolicy(mode="workspace-write"),
                 event_bus=EventBus(),
             )
-            read_only_schemas = tool_schemas_for_profile(allowed_permissions={"read"})
+            read_only_schemas = tool_schemas_for_agent(allowed_permissions={"read"})
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
                     Agent(
@@ -2812,7 +2812,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 permission_policy=PermissionPolicy(mode="danger-full-access"),
                 event_bus=EventBus(),
             )
-            write_schemas = tool_schemas_for_profile(allowed_permissions={"edit"})
+            write_schemas = tool_schemas_for_agent(allowed_permissions={"edit"})
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
                     Agent(
@@ -2929,7 +2929,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 permission_policy=PermissionPolicy(mode="danger-full-access"),
                 event_bus=EventBus(),
             )
-            write_schemas = tool_schemas_for_profile(allowed_permissions={"edit"})
+            write_schemas = tool_schemas_for_agent(allowed_permissions={"edit"})
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
                     Agent(
@@ -3052,7 +3052,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 permission_policy=PermissionPolicy(mode="workspace-write"),
                 event_bus=EventBus(),
             )
-            read_schemas = tool_schemas_for_profile(allowed_permissions={"read"})
+            read_schemas = tool_schemas_for_agent(allowed_permissions={"read"})
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
                     Agent(
@@ -3118,7 +3118,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 permission_policy=PermissionPolicy(mode="workspace-write"),
                 event_bus=EventBus(),
             )
-            read_schemas = tool_schemas_for_profile(allowed_permissions={"read"})
+            read_schemas = tool_schemas_for_agent(allowed_permissions={"read"})
             with patch("harness_code_agent.agent.conversation.get_client", return_value=FakeClient()):
                 conversation = AgentConversation(
                     Agent(

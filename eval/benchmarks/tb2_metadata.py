@@ -50,15 +50,15 @@ def resolve_task_metadata(user_prompt: str = "", *, workspace: str = "") -> dict
     return None
 
 
-def resolve_task_budget(user_prompt: str = "", *, workspace: str = "") -> tuple[float, dict | None]:
-    """Return the wall-clock budget and the metadata that produced it."""
+def resolve_task_budget(user_prompt: str = "", *, workspace: str = "") -> float:
+    """Return the wall-clock budget for this task, falling back to the default."""
     metadata = resolve_task_metadata(user_prompt, workspace=workspace)
     if metadata and metadata.get("agent_timeout_sec"):
         try:
-            return float(metadata["agent_timeout_sec"]), metadata
+            return float(metadata["agent_timeout_sec"])
         except (TypeError, ValueError):
             pass
-    return _default_budget(), metadata
+    return _default_budget()
 
 
 def _default_budget() -> float:

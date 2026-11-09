@@ -13,5 +13,3 @@ from dataclasses import dataclass
 class RuntimeOptions:
     # Hard wall-clock limit for one task, in seconds. None means no limit.
     time_budget: float | None = None
-    # Benchmark metadata attached to the agent's runtime state for reporting.
-    task_metadata: dict | None = None

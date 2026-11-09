@@ -20,7 +20,7 @@ from ..runtime.tool_failures import (
     ToolFailure,
     failure_batch_key,
 )
-from ..runtime.tool_registry import tool_schemas_for_profile
+from ..runtime.tool_registry import tool_schemas_for_agent
 from ..runtime.tool_result import ToolResult
 from ..runtime.tool_runner import (
     _registry_for_context,
@@ -787,7 +787,7 @@ class ToolExecutor:
             return
 
         allowed_permissions = context.allowed_tool_permissions
-        revealed_schemas = tool_schemas_for_profile(
+        revealed_schemas = tool_schemas_for_agent(
             allowed_permissions=allowed_permissions,
             include_names=new_names,
             exclude_names=context.blocked_tool_names,

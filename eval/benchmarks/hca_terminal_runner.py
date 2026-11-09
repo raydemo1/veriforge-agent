@@ -278,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("Failed to write early VeriForge artifact manifest:", file=sys.stderr)
                 traceback.print_exc()
 
-        budget, _metadata = resolve_task_budget(args.prompt, workspace=str(workspace))
+        budget = resolve_task_budget(args.prompt, workspace=str(workspace))
         result = run_task(
             cwd=workspace,
             task=args.prompt,

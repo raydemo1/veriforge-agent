@@ -156,7 +156,7 @@ class ToolRegistry:
         return clone
 
 
-def tool_schemas_for_profile(
+def tool_schemas_for_agent(
     *,
     allowed_permissions: set[str] | None = None,
     include_names: set[str] | None = None,

@@ -153,7 +153,6 @@ class AgentFallbackState:
 class AgentRuntimeState:
     shell_job_manager: ShellJobManager | None = None
     todo: TodoList | None = None
-    task_metadata: dict[str, Any] = field(default_factory=dict)
     fallback: AgentFallbackState = field(default_factory=AgentFallbackState)
     failures: FailureTracker = field(default_factory=FailureTracker)
     workspace_conflict_attempts: dict[str, int] = field(default_factory=dict)

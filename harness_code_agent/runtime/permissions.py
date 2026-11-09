@@ -18,7 +18,6 @@ from .shell_classification import (
     ShellTrait,
     TargetScope,
     analyze_shell_command,
-    is_workspace_write_shell_command,
 )
 
 TOOL_PERMISSION_READ = "read"
@@ -202,18 +201,6 @@ class PermissionPolicy:
             return cls(cls.READ_ONLY, role=role, allowed_paths=allowed_paths)
         return cls.for_role(role, allowed_paths=allowed_paths)
 
-    def restricted_by(
-        self, preset: PermissionPreset | None
-    ) -> PermissionPolicy:
-        """Return this policy constrained by a profile preset.
-
-        ``None`` returns the same object untouched; otherwise decisions can
-        only stay equal or become more restrictive.
-        """
-        if preset is None:
-            return self
-        return _ProfilePresetPolicy(self, preset)
-
     # ------------------------------------------------------------------
     # Decision
     # ------------------------------------------------------------------
@@ -377,66 +364,6 @@ class PermissionPolicy:
             if not path or not _path_allowed(path, self.allowed_paths):
                 return f"write path is outside allowed_paths: {path or '<empty>'}"
         return None
-
-
-def is_workspace_write_command(command: str, workspace_root: str | None = None) -> bool:
-    """Check only the workspace-write boundary, without a read command allowlist."""
-    return is_workspace_write_shell_command(command, workspace_root)
-
-
-class PermissionPreset(Enum):
-    """Profile-scoped restriction layered on top of the session permission mode.
-
-    A preset can only tighten a session decision; it never loosens one.
-    Presets are not a ranking of permission modes -- each member encodes one
-    concrete profile constraint.
-    """
-
-    NO_WORKSPACE_WRITES = "no-workspace-writes"
-
-
-class _ProfilePresetPolicy(PermissionPolicy):
-    """Apply a profile preset on top of the session policy.
-
-    Only ``decide_tool_call`` is constrained: the session decision is returned
-    unchanged unless the preset denies. ``mode`` stays the user-facing session
-    mode (runtime state/UI read it).
-    """
-
-    def __init__(self, session: PermissionPolicy, preset: PermissionPreset):
-        self._session = session
-        self._preset = preset
-
-    @property
-    def mode(self) -> str:  # type: ignore[override]
-        return self._session.mode
-
-    def decide_tool_call(
-        self,
-        tool_name: str,
-        args: dict | None = None,
-        tool_permission: str | None = None,
-        workspace_root: str | None = None,
-    ) -> PermissionDecision:
-        decision = self._session.decide_tool_call(
-            tool_name, args, tool_permission, workspace_root
-        )
-        if decision.action == PermissionAction.DENY.value:
-            return decision
-        args = args or {}
-        if (
-            self._preset is PermissionPreset.NO_WORKSPACE_WRITES
-            and tool_name == "run_bash"
-            # Deliberately called without workspace_root: this must stay the
-            # exact boundary the review profile enforced before the migration.
-            and is_workspace_write_command(str(args.get("command", "")))
-        ):
-            return PermissionDecision(
-                PermissionAction.DENY.value,
-                "shell_profile_restricted",
-                "profile does not allow shell commands that write workspace files",
-            )
-        return decision
 
 
 def _normalize_rel_path(value: str) -> str:

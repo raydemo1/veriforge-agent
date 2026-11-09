@@ -103,7 +103,6 @@ class Agent:
         self.stream_callback = stream_callback
         self.prompt_cache_identity = prompt_cache_identity
         self.model_intensity = model_intensity
-        self.current_task_metadata: dict = {}
         self._conversations: weakref.WeakSet[AgentConversation] = weakref.WeakSet()
 
     @property
@@ -138,7 +137,6 @@ class Agent:
         from .observations import observation_dir_for
 
         return AgentRuntimeState(
-            task_metadata=dict(self.current_task_metadata or {}),
             shell_job_manager=ShellJobManager(workspace, artifact_dir=observation_dir_for(
                 workspace, getattr(self.tool_context, "session_id", None), getattr(self.tool_context, "agent_id", None)),
                 environment=getattr(self.tool_context, "environment", "local"),
@@ -442,7 +440,6 @@ class AgentConversation:
         self.runtime_state.pending_budget_warnings.clear()
         self.runtime_state.current_turn_start_index = len(previous_messages)
         self.runtime_state.todo = None
-        self.runtime_state.task_metadata = dict(self.agent.current_task_metadata or {})
         self.runtime_state.fallback = AgentFallbackState()
         self.runtime_state.auto_compaction_turn_start_index = -1
         self.runtime_state.auto_compaction_suspended = False

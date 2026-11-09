@@ -21,7 +21,7 @@ from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.runtime.tool_registry import (
     ToolRegistry,
-    tool_schemas_for_profile,
+    tool_schemas_for_agent,
 )
 from harness_code_agent.runtime.tool_result import ToolResult
 from harness_code_agent.sessions.events import EventBus
@@ -457,7 +457,7 @@ class ToolExecutorTests(unittest.TestCase):
                 blocked_tool_names=set(),
                 revealed_tool_names=set(),
             )
-            initial_schemas = tool_schemas_for_profile(
+            initial_schemas = tool_schemas_for_agent(
                 allowed_permissions=context.allowed_tool_permissions,
                 exclude_names=context.blocked_tool_names,
                 registry=registry,
@@ -519,10 +519,10 @@ class ToolExecutorTests(unittest.TestCase):
                 "main_agent",
                 "system",
                 use_tools=True,
-                tool_schemas=tool_schemas_for_profile(
+                tool_schemas=tool_schemas_for_agent(
                     allowed_permissions={"read"},
                     registry=registry,
-                ) + tool_schemas_for_profile(
+                ) + tool_schemas_for_agent(
                     allowed_permissions={"read"},
                     registry=registry,
                     disclosure={"deferred"},
