@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -223,3 +224,54 @@ def test_invalid_records_cannot_be_committed(database, overrides):
     with pytest.raises(ValueError):
         save(database, **overrides)
     assert database.revision == 0
+
+
+class _DowngradedConnection(sqlite3.Connection):
+    """A connection that lost the WAL shared-memory race and went read-only."""
+
+    armed = False
+
+    def execute(self, sql, *args, **kwargs):
+        if self.armed and sql.startswith("BEGIN IMMEDIATE"):
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+        return super().execute(sql, *args, **kwargs)
+
+    def executescript(self, sql):
+        if self.armed:
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+        return super().executescript(sql)
+
+
+def _arm_first_connection(monkeypatch):
+    """Make the first new connection read-only; count how many get opened."""
+    real_connect = sqlite3.connect
+    opened = {"count": 0}
+
+    def connect(*args, **kwargs):
+        opened["count"] += 1
+        kwargs["factory"] = _DowngradedConnection
+        connection = real_connect(*args, **kwargs)
+        connection.armed = opened["count"] == 1
+        return connection
+
+    monkeypatch.setattr("harness_code_agent.memory.database.sqlite3.connect", connect)
+    return opened
+
+
+def test_write_retries_with_a_new_connection_after_a_wal_race(database, monkeypatch):
+    opened = _arm_first_connection(monkeypatch)
+
+    result = save(database)
+
+    assert result.record.body == "BUILD_V1"
+    assert opened["count"] >= 2, "the read-only connection must be replaced, not reused"
+
+
+def test_initialize_retries_with_a_new_connection_after_a_wal_race(tmp_path, monkeypatch):
+    opened = _arm_first_connection(monkeypatch)
+
+    database = MemoryDatabase(tmp_path / "fresh", "project:sample")
+
+    with database.connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+    assert opened["count"] >= 2

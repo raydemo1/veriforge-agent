@@ -22,6 +22,26 @@ from .search_index import search_terms
 from .vector_schema import VECTOR_SCHEMA, load_vector_extension
 
 _INITIALIZATION_LOCK = threading.Lock()
+_BUSY_TIMEOUT_SECONDS = 5.0
+#: SQLITE_BUSY, SQLITE_LOCKED and SQLITE_READONLY all describe a writer that
+#: lost a lock race rather than a database it may never write to.
+_RETRYABLE_LOCK_CODES = frozenset(
+    {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_READONLY}
+)
+_RETRYABLE_LOCK_MESSAGES = (
+    "database is locked",
+    "database is busy",
+    "readonly database",
+    "read-only database",
+)
+
+
+def _is_retryable_lock_error(exc: sqlite3.OperationalError) -> bool:
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None and (code & 0xFF) in _RETRYABLE_LOCK_CODES:
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in _RETRYABLE_LOCK_MESSAGES)
 
 MemoryKind = Literal["preference", "project_fact", "convention", "decision", "lesson", "workflow"]
 KINDS = frozenset({"preference", "project_fact", "convention", "decision", "lesson", "workflow"})
@@ -78,20 +98,36 @@ class MemoryDatabase:
         self.initialize()
 
     def initialize(self) -> None:
+        """Create the schema, starting over on a fresh handle after a WAL race.
+
+        Same failure mode as :meth:`_begin`: a connection that loses the race
+        to initialize the WAL shared-memory index is read-only for its whole
+        lifetime, so the DDL below fails with "attempt to write a readonly
+        database". ``executescript`` is idempotent here, so retrying on a new
+        connection is safe.
+        """
         self.root.mkdir(parents=True, exist_ok=True)
-        with _INITIALIZATION_LOCK, contextlib.closing(sqlite3.connect(self.path, timeout=5)) as db:
-            load_vector_extension(db)
-            if db.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
-                deadline = time.monotonic() + 5
-                while True:
-                    try:
-                        db.execute("PRAGMA journal_mode=WAL")
-                        break
-                    except sqlite3.OperationalError as exc:
-                        if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
-                            raise
-                        time.sleep(0.05)
-            db.executescript("""
+        with _INITIALIZATION_LOCK:
+            deadline = time.monotonic() + _BUSY_TIMEOUT_SECONDS
+            delay = 0.01
+            while True:
+                db = sqlite3.connect(self.path, timeout=_BUSY_TIMEOUT_SECONDS)
+                try:
+                    self._bootstrap(db)
+                    return
+                except sqlite3.OperationalError as exc:
+                    if not _is_retryable_lock_error(exc) or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(delay)
+                    delay = min(delay * 2, 0.2)
+                finally:
+                    db.close()
+
+    def _bootstrap(self, db: sqlite3.Connection) -> None:
+        load_vector_extension(db)
+        if db.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+            db.execute("PRAGMA journal_mode=WAL")
+        db.executescript("""
                 CREATE TABLE IF NOT EXISTS state (
                     id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
                 INSERT OR IGNORE INTO state VALUES(1,0);
@@ -125,18 +161,13 @@ class MemoryDatabase:
                 CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(memory_id UNINDEXED, terms);
                 CREATE INDEX IF NOT EXISTS memories_namespace ON memories(namespace,status);
             """)
-            db.executescript(EXTRACTION_SCHEMA)
-            db.executescript(VECTOR_SCHEMA)
+        db.executescript(EXTRACTION_SCHEMA)
+        db.executescript(VECTOR_SCHEMA)
 
     @contextlib.contextmanager
     def connect(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.path, timeout=5, isolation_level=None)
-        load_vector_extension(db)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys=ON")
-        db.execute("PRAGMA synchronous=FULL")
+        db = self._begin("BEGIN IMMEDIATE" if write else "BEGIN")
         try:
-            db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield db
             db.commit()
         except BaseException:
@@ -144,6 +175,35 @@ class MemoryDatabase:
             raise
         finally:
             db.close()
+
+    def _begin(self, statement: str) -> sqlite3.Connection:
+        """Open a connection and start a transaction, surviving WAL races.
+
+        Two writers that open the database in the same instant race to
+        initialize the WAL shared-memory index. The loser is downgraded to a
+        read-only connection for its whole lifetime, so ``BEGIN IMMEDIATE``
+        fails with "attempt to write a readonly database" and retrying on the
+        same handle cannot recover -- only a new connection can. Start over
+        with a fresh handle inside the busy-timeout budget instead of
+        surfacing that as a failed write.
+        """
+        deadline = time.monotonic() + _BUSY_TIMEOUT_SECONDS
+        delay = 0.01
+        while True:
+            db = sqlite3.connect(self.path, timeout=_BUSY_TIMEOUT_SECONDS, isolation_level=None)
+            try:
+                load_vector_extension(db)
+                db.row_factory = sqlite3.Row
+                db.execute("PRAGMA foreign_keys=ON")
+                db.execute("PRAGMA synchronous=FULL")
+                db.execute(statement)
+                return db
+            except sqlite3.OperationalError as exc:
+                db.close()
+                if not _is_retryable_lock_error(exc) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 0.2)
 
     @property
     def revision(self) -> int:
