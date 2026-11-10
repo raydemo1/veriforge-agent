@@ -86,7 +86,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "search_tools",
-            "description": "Search the deferred tool catalog for a capability that is not in your mounted tools, including on-demand built-in tools and MCP servers. Pass short English keywords; the optional server id narrows the search to one MCP server. Matching tools are mounted as native functions and stay available. A zero-score search mounts nothing and returns that scope's tool names and descriptions only.",
+            "description": "Find deferred built-in or MCP tools using short English keywords. Use a discovery scope to narrow the search. Without one, search registered tools only. Matching usable tools are mounted as native functions; unavailable MCP tools may appear as history.",
             "parameters": {
                 "type": "object",
                 "required": ["query"],
@@ -97,14 +97,18 @@ CORE_TOOL_SCHEMAS = [
                     },
                     "server": {
                         "type": "string",
-                        "description": "MCP server id from the system prompt; limits the search to that server.",
+                        "description": "Discovery scope from the system prompt, such as builtin:agents or mcp:github. Only an MCP scope connects to a server. A bare id also selects MCP.",
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 20,
                         "default": 5,
-                        "description": "Maximum number of matching tools to mount.",
+                        "description": (
+                            "Maximum number of ranked search matches. A matched "
+                            "workflow group mounts all of its tools, so the number "
+                            "mounted can exceed this limit."
+                        ),
                     },
                 },
             },

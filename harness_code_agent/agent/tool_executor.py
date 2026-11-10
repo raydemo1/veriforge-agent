@@ -164,11 +164,11 @@ class ToolExecutor:
             ))
 
     def _prepare_calls(self, tool_calls: list) -> list[PreparedToolCall]:
+        registry = self._call_registry = _registry_for_context(self.agent.tool_context).copy()
         prepared: list[PreparedToolCall] = []
         for index, tc in enumerate(tool_calls):
             call = ToolCall.from_raw(tc, index)
             fn_name = call.name or "<unknown>"
-            registry = _registry_for_context(self.agent.tool_context)
             validation = validate_tool_call(call, registry, self.agent.tool_context)
             if validation.error is not None:
                 rejected = validation.error.to_result(fn_name)
@@ -198,7 +198,7 @@ class ToolExecutor:
                 continue
 
             fn_args = validation.arguments
-            effect = self._classify_call(fn_name, fn_args)
+            effect = registry.effect_for(fn_name, fn_args, self.agent.tool_context)
             blocked = None
             blocked_reason = self._tool_surface_block_reason(fn_name, registry)
             if blocked_reason is not None:
@@ -225,10 +225,6 @@ class ToolExecutor:
                 )
             )
         return prepared
-
-    def _classify_call(self, name: str, args: dict) -> CallEffect:
-        registry = _registry_for_context(self.agent.tool_context)
-        return registry.effect_for(name, args, self.agent.tool_context)
 
     def _permission_decision(self, name: str, args: dict, registry):
         context = self.agent.tool_context
@@ -535,6 +531,7 @@ class ToolExecutor:
                 emit_events=False,
                 validate_arguments=False,
                 cancellation_token=cancellation_token,
+                registry=self._call_registry,
             )
             return ExecutedToolCall(prepared, tool_result)
 
@@ -792,6 +789,7 @@ class ToolExecutor:
             exclude_names=context.blocked_tool_names,
             registry=registry,
             disclosure={"deferred"},
+            capabilities={context.tool_capability},
         )
         if not revealed_schemas:
             return

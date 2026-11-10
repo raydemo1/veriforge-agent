@@ -22,6 +22,7 @@ from ..shell_classification import (
 )
 from ..tool_call_validation import strict_tool_schema
 from ..tool_registry import (
+    BUILTIN_AGENTS_SCOPE,
     TOOL_CAPABILITY_MAIN,
     TOOL_CAPABILITY_READONLY_AGENT,
     TOOL_CAPABILITY_WORKER_AGENT,
@@ -73,7 +74,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
     # absent from its registry. This is the fixed Main <-> Child topology.
     child_agents = {TOOL_CAPABILITY_READONLY_AGENT, TOOL_CAPABILITY_WORKER_AGENT}
 
-    def add(name, handler, permission, effect=None, *, capabilities=main, disclosure="core"):
+    def add(name, handler, permission, effect=None, *, capabilities=main, disclosure="core", discovery_scope=None):
         registry.register(
             schemas[name],
             handler,
@@ -81,6 +82,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
             effect=effect,
             capabilities=capabilities,
             disclosure=disclosure,
+            discovery_scope=discovery_scope,
         )
 
     add("code_intelligence", code_intelligence, TOOL_PERMISSION_READ,
@@ -173,6 +175,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
     add(
         "spawn_agent", spawn_agent, TOOL_PERMISSION_READ, CallEffect(kind="agent_spawn"),
         disclosure="deferred",
+        discovery_scope=BUILTIN_AGENTS_SCOPE,
     )
     add(
         "send_agent_message",
@@ -180,6 +183,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         TOOL_PERMISSION_READ,
         _agent_effect("agent_id", access="write"),
         disclosure="deferred",
+        discovery_scope=BUILTIN_AGENTS_SCOPE,
     )
     add(
         "send_parent_message",
@@ -187,6 +191,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         TOOL_PERMISSION_READ,
         CallEffect((ResourceClaim("agent", "main_agent", "exact", "write"),)),
         capabilities=child_agents,
+        discovery_scope=BUILTIN_AGENTS_SCOPE,
     )
     add(
         "followup_agent",
@@ -194,6 +199,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         TOOL_PERMISSION_READ,
         _agent_effect("agent_id", access="write"),
         disclosure="deferred",
+        discovery_scope=BUILTIN_AGENTS_SCOPE,
     )
     add(
         "wait_agents",
@@ -203,6 +209,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
             (ResourceClaim("agent-session", "*", "global", "read"),), kind="agent_wait"
         ),
         disclosure="deferred",
+        discovery_scope=BUILTIN_AGENTS_SCOPE,
     )
     add(
         "interrupt_agent",
@@ -210,6 +217,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         TOOL_PERMISSION_CONTROL,
         _agent_effect("agent_id", access="write"),
         disclosure="deferred",
+        discovery_scope=BUILTIN_AGENTS_SCOPE,
     )
     add(
         "read_agent_changes",
@@ -217,6 +225,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         TOOL_PERMISSION_READ,
         _agent_effect("proposal_id", access="read", domain="agent-proposal"),
         disclosure="deferred",
+        discovery_scope=BUILTIN_AGENTS_SCOPE,
     )
     add(
         "apply_agent_changes",
@@ -224,6 +233,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         TOOL_PERMISSION_EDIT,
         _apply_effect,
         disclosure="deferred",
+        discovery_scope=BUILTIN_AGENTS_SCOPE,
     )
     add(
         "close_agent",
@@ -231,6 +241,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         TOOL_PERMISSION_CONTROL,
         _agent_effect("agent_id", access="write"),
         disclosure="deferred",
+        discovery_scope=BUILTIN_AGENTS_SCOPE,
     )
     add(
         "ask_user",

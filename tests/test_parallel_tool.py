@@ -72,11 +72,12 @@ class ParallelToolTests(unittest.TestCase):
 
     def test_mcp_read_only_hint_and_server_write_effects(self):
         manager = McpClientManager(workspace=self.root)
+        schema = {"type": "object"}
         manager.tool_bindings = [
-            McpToolBinding("mcp_read_a", "docs", "a", "", {}, "network_read", {"readOnlyHint": True}),
-            McpToolBinding("mcp_read_b", "docs", "b", "", {}, "network_read", {"readOnlyHint": True}),
-            McpToolBinding("mcp_write_a", "state", "a", "", {}, "dangerous", {}),
-            McpToolBinding("mcp_write_b", "state", "b", "", {}, "dangerous", {}),
+            McpToolBinding("mcp_read_a", "docs", "a", "", schema, "network_read", {"readOnlyHint": True}),
+            McpToolBinding("mcp_read_b", "docs", "b", "", schema, "network_read", {"readOnlyHint": True}),
+            McpToolBinding("mcp_write_a", "state", "a", "", schema, "dangerous", {}),
+            McpToolBinding("mcp_write_b", "state", "b", "", schema, "dangerous", {}),
         ]
         registry = ToolRegistry()
         manager.register_tools(registry)

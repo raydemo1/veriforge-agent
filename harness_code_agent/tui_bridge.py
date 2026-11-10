@@ -850,9 +850,15 @@ class SessionBridge:
         if kind == "mcp":
             session.mcp_status()
             manager = session.mcp_manager
-            statuses = getattr(manager, "statuses", {})
-            names = set(manager.configured_server_names())
-            names.update(name for name in statuses if name != "config")
+            statuses = manager.discovery_statuses()
+            state_labels = {
+                "connected": "已连接",
+                "unconnected": "待连接",
+                "cached": "已有目录缓存",
+                "failed": "连接失败",
+                "invalid": "配置无效",
+                "disabled": "已停用",
+            }
             options = [
                 {
                     "id": "add",
@@ -861,9 +867,10 @@ class SessionBridge:
                 },
                 {"id": "reload", "label": "重新加载全部 MCP 服务"},
             ]
-            for name in sorted(names):
-                status = statuses.get(name)
-                state = "已停用" if status is None else ("已连接" if status.state == "connected" else "连接失败")
+            for name, status in sorted(statuses.items()):
+                state = state_labels[status.state]
+                if status.error:
+                    state = f"{state} · {status.error}"
                 server = manager.config.servers.get(name)
                 description = (server.description if server is not None else "") or state
                 options.append({"id": f"reconnect:{name}", "label": f"重新连接 {name}", "description": state})
@@ -871,11 +878,12 @@ class SessionBridge:
                 options.append({"id": f"remove:{name}", "label": f"移除 {name}"})
                 options.append({"id": f"toggle:{name}", "label": f"切换启用 {name}"})
             options.append({"id": "open_config", "label": "显示 MCP 配置路径"})
-            connected = sum(getattr(status, "state", "") == "connected" for status in statuses.values())
+            connected = [status for status in statuses.values() if status.state == "connected"]
+            body = f"已连接 {len(connected)} 个服务 · 在线工具 {sum(status.tool_count for status in connected)} 个"
             return {
                 "kind": "mcp",
                 "title": "MCP 管理",
-                "body": f"已连接 {connected} 个服务 · 已注册 {len(getattr(manager, 'tool_bindings', []))} 个工具",
+                "body": manager.config_error or body,
                 "options": options,
             }
         if kind == "observe":

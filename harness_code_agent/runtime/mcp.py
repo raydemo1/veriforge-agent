@@ -12,11 +12,16 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+
+from anyio import BrokenResourceError, ClosedResourceError, EndOfStream
+from anyio.abc import ObjectReceiveStream
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 
 from ..support.cancellation import CancelledError
 from .permissions import (
@@ -27,6 +32,7 @@ from .permissions import (
 )
 from .project_resources import ProjectResourceBudget
 from .recovery import atomic_bytes
+from .tool_registry import ToolSpec
 from .tool_result import ToolResult
 
 _static_lock = threading.RLock()
@@ -65,6 +71,8 @@ class McpServerConfig:
 class McpConfig:
     path: Path
     servers: dict[str, McpServerConfig] = field(default_factory=dict)
+    server_errors: dict[str, str] = field(default_factory=dict)
+    disabled_servers: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -78,40 +86,42 @@ class McpToolBinding:
     annotations: dict[str, Any] = field(default_factory=dict)
 
     def schema(self) -> dict[str, Any]:
-        parameters = self.input_schema or {"type": "object", "properties": {}}
-        if parameters.get("type") != "object":
-            parameters = {"type": "object", "properties": {}, "additionalProperties": True}
         description = self.description or f"MCP tool {self.server_name}/{self.tool_name}"
         return {
             "type": "function",
             "function": {
                 "name": self.exposed_name,
                 "description": description,
-                "parameters": parameters,
+                "parameters": self.input_schema,
             },
         }
 
 
 @dataclass(frozen=True)
 class McpCatalogSnapshot:
-    """Immutable catalog view published by the connection event loop.
-
-    ``revision`` and ``bindings`` come from the same event loop tick, so a
-    consumer can build a Registry from the bindings and record the revision
-    without racing a concurrent connect or disconnect.
-    """
+    """The catalog and its revision captured together for Registry publication."""
 
     revision: int
     bindings: tuple[McpToolBinding, ...]
+    statuses: dict[str, McpServerStatus]
 
 
-@dataclass
+@dataclass(frozen=True)
 class McpServerStatus:
     name: str
     transport: str
     state: str
     tool_count: int = 0
     error: str | None = None
+    catalog_source: str = "none"
+
+
+@dataclass(frozen=True)
+class PublishedMcpCatalog:
+    manager: McpClientManager
+    revision: int
+    specs: tuple[ToolSpec, ...]
+    statuses: dict[str, McpServerStatus]
 
 
 @dataclass(frozen=True)
@@ -130,6 +140,12 @@ class _McpConnection:
     task: asyncio.Task | None
 
 
+@dataclass
+class _ConnectFlight:
+    task: asyncio.Task
+    waiters: int = 0
+
+
 def load_mcp_config(workspace: str | Path) -> McpConfig:
     root = Path(workspace).resolve()
     path = root / MCP_CONFIG_RELATIVE_PATH
@@ -137,7 +153,7 @@ def load_mcp_config(workspace: str | Path) -> McpConfig:
         return McpConfig(path=path)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeError) as exc:
         raise McpConfigError(f"Invalid MCP config JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise McpConfigError("MCP config must be a JSON object")
@@ -145,63 +161,67 @@ def load_mcp_config(workspace: str | Path) -> McpConfig:
     if not isinstance(raw_servers, dict):
         raise McpConfigError("MCP config field 'servers' must be an object")
 
-    servers: dict[str, McpServerConfig] = {}
+    config = McpConfig(path=path)
     for name, raw in raw_servers.items():
-        _validate_server_name(name)
-        if not isinstance(raw, dict):
-            raise McpConfigError(f"MCP server {name!r} must be an object")
-        if raw.get("enabled", True) is False:
+        if isinstance(raw, dict) and raw.get("enabled") is False:
+            config.disabled_servers.add(name)
             continue
+        try:
+            config.servers[name] = _parse_server_entry(name, raw)
+        except McpConfigError as exc:
+            config.server_errors[name] = str(exc)
+    return config
 
-        expanded = _expand_env(raw)
-        transport = str(expanded.get("transport") or "").strip()
-        if transport == "streamable-http":
-            transport = "streamable_http"
-        if transport not in MCP_TRANSPORTS:
-            raise McpConfigError(f"MCP server {name!r} has unsupported transport: {transport!r}")
 
-        permission = str(expanded.get("permission") or TOOL_PERMISSION_DANGEROUS)
-        _validate_permission(permission, f"server {name!r}")
-        tool_permissions = _string_dict(expanded.get("tool_permissions") or {}, f"server {name!r} tool_permissions")
-        for tool_name, tool_permission in tool_permissions.items():
-            _validate_permission(tool_permission, f"server {name!r} tool {tool_name!r}")
+def _parse_server_entry(name: str, raw: Any) -> McpServerConfig:
+    _validate_server_name(name)
+    if not isinstance(raw, dict):
+        raise McpConfigError(f"MCP server {name!r} must be an object")
+    expanded = _expand_env(raw)
+    transport = str(expanded.get("transport") or "").strip()
+    if transport == "streamable-http":
+        transport = "streamable_http"
+    if transport not in MCP_TRANSPORTS:
+        raise McpConfigError(f"MCP server {name!r} has unsupported transport: {transport!r}")
 
-        args = expanded.get("args") or []
-        if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
-            raise McpConfigError(f"MCP server {name!r} args must be a list of strings")
+    permission = str(expanded.get("permission") or TOOL_PERMISSION_DANGEROUS)
+    _validate_permission(permission, f"server {name!r}")
+    tool_permissions = _string_dict(expanded.get("tool_permissions", {}), f"server {name!r} tool_permissions")
+    for tool_name, tool_permission in tool_permissions.items():
+        _validate_permission(tool_permission, f"server {name!r} tool {tool_name!r}")
 
-        if transport == "stdio":
-            command = str(expanded.get("command") or "").strip()
-            if not command:
-                raise McpConfigError(f"MCP stdio server {name!r} requires command")
-            servers[name] = McpServerConfig(
-                name=name,
-                transport=transport,
-                permission=permission,
-                command=command,
-                args=args,
-                env=_string_dict(expanded.get("env") or {}, f"server {name!r} env"),
-                cwd=str(expanded.get("cwd")) if expanded.get("cwd") else None,
-                tool_permissions=tool_permissions,
-                title=str(expanded.get("title") or "").strip(),
-                description=str(expanded.get("description") or "").strip(),
-            )
-        else:
-            url = str(expanded.get("url") or "").strip()
-            if not url:
-                raise McpConfigError(f"MCP streamable_http server {name!r} requires url")
-            servers[name] = McpServerConfig(
-                name=name,
-                transport=transport,
-                permission=permission,
-                url=url,
-                headers=_string_dict(expanded.get("headers") or {}, f"server {name!r} headers"),
-                tool_permissions=tool_permissions,
-                title=str(expanded.get("title") or "").strip(),
-                description=str(expanded.get("description") or "").strip(),
-            )
+    args = expanded.get("args", [])
+    if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
+        raise McpConfigError(f"MCP server {name!r} args must be a list of strings")
 
-    return McpConfig(path=path, servers=servers)
+    common = {
+        "name": name,
+        "transport": transport,
+        "permission": permission,
+        "tool_permissions": tool_permissions,
+        "title": str(expanded.get("title") or "").strip(),
+        "description": str(expanded.get("description") or "").strip(),
+    }
+    if transport == "stdio":
+        command = expanded.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise McpConfigError(f"MCP stdio server {name!r} requires command")
+        return McpServerConfig(
+            **common,
+            command=command.strip(),
+            args=args,
+            env=_string_dict(expanded.get("env", {}), f"server {name!r} env"),
+            cwd=str(expanded.get("cwd")) if expanded.get("cwd") else None,
+        )
+
+    url = expanded.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise McpConfigError(f"MCP streamable_http server {name!r} requires url")
+    return McpServerConfig(
+        **common,
+        url=url.strip(),
+        headers=_string_dict(expanded.get("headers", {}), f"server {name!r} headers"),
+    )
 
 
 def build_server_config(
@@ -264,7 +284,7 @@ class McpClientManager:
         self.project_resources = project_resources or ProjectResourceBudget.for_project(self.workspace)
         self._resource_owner = weakref.finalize(self, self.project_resources.hold())
         self.session_id = session_id
-        self._connect_lock = threading.RLock()
+        self._state_lock = threading.RLock()
         self._catalog_only = set()
         self._closed = False
         self.config = config or McpConfig(path=self.workspace / MCP_CONFIG_RELATIVE_PATH)
@@ -274,7 +294,11 @@ class McpClientManager:
         self.statuses: dict[str, McpServerStatus] = {}
         self.tool_bindings: list[McpToolBinding] = []
         self._bindings_by_exposed_name: dict[str, McpToolBinding] = {}
+        self._validated_specs: dict[str, tuple[tuple[McpToolBinding, ...], tuple[ToolSpec, ...]]] = {}
         self._connections: dict[str, _McpConnection] = {}
+        self._connecting: dict[str, _ConnectFlight] = {}
+        self._disconnecting: set[str] = set()
+        self._workers: set[asyncio.Task] = set()
         self.connection_revision = 0
         self._loop_thread: _AsyncLoopThread | None = None
 
@@ -301,103 +325,175 @@ class McpClientManager:
             )
 
     def _schema_key(self, server):
-        data = {"workspace": str(self.workspace), "server": _server_entry(server)}
+        entry = _server_entry(server)
+        entry.pop("title", None)
+        entry.pop("description", None)
+        data = {"workspace": str(self.workspace), "server": entry}
         return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
-    def prime_catalog(self):
-        with self._connect_lock, _static_lock:
+    def prime_catalog(self, server_name: str | None = None) -> None:
+        with self._state_lock:
+            known = {binding.server_name for binding in self.tool_bindings}
             for server in self.config.servers.values():
-                if any(binding.server_name == server.name for binding in self.tool_bindings):
+                if server_name is not None and server.name != server_name:
                     continue
-                cached = _schema_cache.get(self._schema_key(server), ())
-                for binding in copy.deepcopy(cached):
-                    self.tool_bindings.append(binding)
-                    self._bindings_by_exposed_name[binding.exposed_name] = binding
-                    self._catalog_only.add(binding.exposed_name)
+                if server.name in known or server.name in self._connections:
+                    continue
+                with _static_lock:
+                    cached = copy.deepcopy(_schema_cache.get(self._schema_key(server), ()))
+                if cached and not any(item.exposed_name in self._bindings_by_exposed_name for item in cached):
+                    self._replace_bindings(server.name, cached, cached=True)
 
-    def discover(self, server_name=None, *, cancellation_token=None):
-        self.prime_catalog()
-        for server in self.config.servers.values():
-            if server_name is not None and server.name != server_name:
-                continue
-            if not any(binding.server_name == server.name for binding in self.tool_bindings):
-                self.ensure_connected(server.name, cancellation_token=cancellation_token)
+    def discover(self, server_name=None, *, cancellation_token=None) -> dict[str, str]:
+        """Connect the requested server, preserving cached catalogs on failure."""
+        if self.config_error:
+            return {server_name or "config": self.config_error}
+        self.prime_catalog(server_name)
+        with self._state_lock:
+            failures = dict(self.config.server_errors)
+            names = list(self.config.servers)
+        if server_name is not None:
+            failures = {server_name: failures[server_name]} if server_name in failures else {}
+            names = [server_name] if server_name in names else []
+        if names:
+            failures.update(self._ensure_loop().run(
+                self._discover_connected(names), timeout=None, cancellation_token=cancellation_token,
+            ))
+        return failures
 
     def ensure_connected(self, server_name, *, cancellation_token=None):
-        while not self._connect_lock.acquire(timeout=.05):
-            if cancellation_token is not None:
-                cancellation_token.check()
+        if cancellation_token is not None:
+            cancellation_token.check()
+        loop = self._ensure_loop()
+        loop.run(self._ensure_connected(server_name), timeout=None, cancellation_token=cancellation_token)
+
+    async def _ensure_connected(self, server_name: str) -> None:
+        if self._closed:
+            raise RuntimeError("MCP manager is closed")
+        if server_name in self._disconnecting:
+            raise RuntimeError(f"MCP server is being reconfigured: {server_name}")
+        connection = self._connections.get(server_name)
+        if connection is not None and connection.task is not None and not connection.task.done():
+            return
+        if connection is not None:
+            self._on_worker_done(connection)
+        if error := self.config.server_errors.get(server_name):
+            raise McpConfigError(error)
+        server = self.config.servers[server_name]
+        flight = self._connecting.get(server_name)
+        if flight is None:
+            flight = _ConnectFlight(asyncio.create_task(self._connect_one_and_store(server)))
+            self._connecting[server_name] = flight
+
+            def finished(done: asyncio.Task) -> None:
+                if self._connecting.get(server_name) is flight:
+                    self._connecting.pop(server_name)
+                if not done.cancelled():
+                    done.exception()
+
+            flight.task.add_done_callback(finished)
+        flight.waiters += 1
         try:
-            connection = self._connections.get(server_name)
-            if connection is not None and connection.task is not None and not connection.task.done():
-                return
-            if self._closed:
-                raise RuntimeError("MCP manager is closed")
-            server = self.config.servers[server_name]
-            self._ensure_loop()
-            self._loop_thread.run(self._connect_one_and_store(server), timeout=None,
-                                  cancellation_token=cancellation_token)
+            await asyncio.shield(flight.task)
         finally:
-            self._connect_lock.release()
+            flight.waiters -= 1
+            if not flight.waiters and not flight.task.done():
+                if self._connecting.get(server_name) is flight:
+                    self._connecting.pop(server_name)
+                flight.task.cancel()
 
     def connect_all(self) -> None:
-        if self.config_error:
-            self.statuses["config"] = McpServerStatus(
-                name="config",
-                transport="config",
-                state="failed",
-                error=self.config_error,
-            )
-            return
-        if not self.config.servers:
-            return
-        for server in self.config.servers.values():
-            try:
-                self.ensure_connected(server.name)
-            except Exception as exc:
-                self.statuses[server.name] = McpServerStatus(
-                    name=server.name, transport=server.transport, state="failed",
-                    error=f"{type(exc).__name__}: {exc}",
-                )
+        self.discover()
+
+    async def _discover_connected(self, names: list[str]) -> dict[str, str]:
+        results = await asyncio.gather(*(self._ensure_connected(name) for name in names), return_exceptions=True)
+        return {
+            name: f"{type(result).__name__}: {result}"
+            for name, result in zip(names, results)
+            if isinstance(result, BaseException)
+        }
 
     async def _connect_one(
         self,
         server: McpServerConfig,
-    ) -> tuple[_McpConnection, list[McpToolBinding]]:
+    ) -> tuple[_McpConnection, list[McpToolBinding], float]:
         """Connect to a single server with a per-server timeout."""
         async with self.project_resources.acquire_async("mcp_connect", session_id=self.session_id, label=server.name):
+            deadline = time.monotonic() + self.timeout_seconds
             request_queue: asyncio.Queue = asyncio.Queue()
             ready: asyncio.Future = asyncio.get_running_loop().create_future()
             connection = _McpConnection(config=server, request_queue=request_queue, task=None)
             task = asyncio.create_task(self._connection_worker(server, request_queue, ready))
             connection.task = task
-            task.add_done_callback(lambda _task, item=connection: self._on_worker_done(item))
+            self._workers.add(task)
+            task.add_done_callback(lambda _task: self._on_worker_done(connection))
             try:
-                bindings = await asyncio.wait_for(
-                    asyncio.shield(ready), timeout=self.timeout_seconds
-                )
-            except asyncio.CancelledError:
+                bindings = await asyncio.wait_for(asyncio.shield(ready), timeout=self.timeout_seconds)
+            except (asyncio.CancelledError, Exception) as exc:
+                ready.cancel()
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+                if isinstance(exc, asyncio.TimeoutError):
+                    raise TimeoutError(f"MCP handshake exceeded {self.timeout_seconds:g} seconds") from exc
                 raise
-            except Exception:
-                task.cancel()
-                with contextlib.suppress(Exception):
-                    await task
-                raise
-            return connection, bindings
+            return connection, bindings, deadline
 
-    def register_tools(self, registry, snapshot: McpCatalogSnapshot | None = None) -> None:
+    def register_tools(self, registry, snapshot: McpCatalogSnapshot | None = None) -> dict[str, str]:
+        view = snapshot if snapshot is not None else self.catalog_snapshot()
+        groups: dict[str, list[McpToolBinding]] = {}
+        for binding in view.bindings:
+            groups.setdefault(binding.server_name, []).append(binding)
+
+        failures: dict[str, str] = {}
+        published = []
+        names = {spec.name for spec in registry.specs() if spec.origin_server is None}
+        for server_name, bindings in groups.items():
+            try:
+                specs = self._validated_server_specs(bindings)
+                if collision := names.intersection(spec.name for spec in specs):
+                    raise ValueError(f"Duplicate tool name: {min(collision)!r}")
+            except (ValueError, TypeError) as exc:
+                failures[server_name] = str(exc)
+                continue
+            published.extend(specs)
+            names.update(spec.name for spec in specs)
+        registry.replace_mcp_specs(published)
+        return failures
+
+    def _validated_server_specs(self, bindings: list[McpToolBinding]) -> tuple[ToolSpec, ...]:
+        if not bindings:
+            return ()
+        server_name = bindings[0].server_name
+        with self._state_lock:
+            previous, specs = self._validated_specs.get(server_name, ((), ()))
+        if len(previous) == len(bindings) and all(old is new for old, new in zip(previous, bindings)):
+            return specs
+
+        specs = tuple(self._server_specs(bindings))
+        with self._state_lock:
+            if all(self._bindings_by_exposed_name.get(item.exposed_name) is item for item in bindings):
+                self._validated_specs[server_name] = (tuple(bindings), specs)
+        return specs
+
+    def _server_specs(self, bindings):
         from .execution_planner import CallEffect, ResourceClaim
         from .tool_registry import (
             TOOL_CAPABILITY_MAIN,
             TOOL_CAPABILITY_READONLY_AGENT,
             TOOL_CAPABILITY_WORKER_AGENT,
+            ToolRegistry,
         )
 
-        view = snapshot if snapshot is not None else self.catalog_snapshot()
-        for binding in view.bindings:
+        registry = ToolRegistry()
+        for binding in bindings:
+            if registry.spec_for(binding.exposed_name) is not None:
+                raise ValueError(f"Duplicate tool name: {binding.tool_name!r}")
+            parameters = binding.input_schema
+            if not isinstance(parameters, dict) or parameters.get("type") != "object":
+                raise ValueError(f"MCP tool {binding.tool_name!r} requires an object input schema")
+            try:
+                Draft202012Validator.check_schema(parameters)
+            except SchemaError as exc:
+                raise ValueError(f"MCP tool {binding.tool_name!r} has invalid input schema: {exc.message}") from exc
             if binding.annotations.get("readOnlyHint") is True:
                 effect = CallEffect(
                     (ResourceClaim("mcp", binding.server_name, "exact", "read"),),
@@ -428,20 +524,44 @@ class McpClientManager:
                 origin_tool=binding.tool_name,
             )
 
+        return registry.specs()
+
     def catalog_snapshot(self) -> McpCatalogSnapshot:
-        """Return a versioned, immutable view of the current tool catalog."""
-        if self._loop_thread is None:
+        """Return a versioned view of the current tool catalog."""
+        with self._state_lock:
             return McpCatalogSnapshot(
                 revision=self.connection_revision,
                 bindings=tuple(self.tool_bindings),
+                statuses=self.discovery_statuses(),
             )
-        return self._run(self._catalog_snapshot())
 
-    async def _catalog_snapshot(self) -> McpCatalogSnapshot:
-        return McpCatalogSnapshot(
-            revision=self.connection_revision,
-            bindings=tuple(self.tool_bindings),
-        )
+    def discovery_statuses(self) -> dict[str, McpServerStatus]:
+        with self._state_lock:
+            counts: dict[str, int] = {}
+            for binding in self.tool_bindings:
+                counts[binding.server_name] = counts.get(binding.server_name, 0) + 1
+            statuses = {}
+            for name, server in self.config.servers.items():
+                count = counts.get(name, 0)
+                current = self.statuses.get(name)
+                if current is not None and current.state == "connected":
+                    statuses[name] = current
+                    continue
+                source = "cache" if count else "none"
+                statuses[name] = McpServerStatus(
+                    name, server.transport,
+                    current.state if current else ("cached" if count else "unconnected"),
+                    count, current.error if current else None, source,
+                )
+            statuses.update(
+                (name, McpServerStatus(name, "config", "invalid", error=error))
+                for name, error in self.config.server_errors.items()
+            )
+            statuses.update(
+                (name, McpServerStatus(name, "config", "disabled"))
+                for name in self.config.disabled_servers
+            )
+            return statuses
 
     def call_tool(
         self,
@@ -459,12 +579,8 @@ class McpClientManager:
         and then be routed to a newer binding from another connection.
         """
         try:
-            binding = self._bindings_by_exposed_name.get(exposed_name)
-            if binding is not None:
-                self.ensure_connected(binding.server_name, cancellation_token=cancellation_token)
-            self._ensure_loop()
-            return self._loop_thread.run(
-                self._dispatch_tool(exposed_name, dict(arguments or {}), expected_binding),
+            return self._ensure_loop().run(
+                self._call_with_connection(exposed_name, dict(arguments or {}), expected_binding),
                 cancellation_token=cancellation_token,
                 timeout=None,
             )
@@ -480,6 +596,24 @@ class McpClientManager:
                 metadata={"status_source": "mcp"},
             )
 
+    async def _call_with_connection(
+        self,
+        exposed_name: str,
+        arguments: dict[str, Any],
+        expected_binding: McpToolBinding | None,
+    ) -> ToolResult:
+        with self._state_lock:
+            binding = self._bindings_by_exposed_name.get(exposed_name)
+            status = self.statuses.get(binding.server_name) if binding is not None else None
+            cached = exposed_name in self._catalog_only
+        if binding is not None and (expected_binding is None or binding is expected_binding):
+            if status is not None and status.state == "failed":
+                raise RuntimeError(f"MCP server {binding.server_name!r} is unavailable: {status.error}")
+            if cached:
+                await self._ensure_connected(binding.server_name)
+                expected_binding = binding
+        return await self._dispatch_tool(exposed_name, arguments, expected_binding)
+
     async def _dispatch_tool(
         self,
         exposed_name: str,
@@ -487,15 +621,6 @@ class McpClientManager:
         expected_binding: McpToolBinding | None,
     ) -> ToolResult:
         binding = self._bindings_by_exposed_name.get(exposed_name)
-        if binding is None:
-            error = f"Unknown MCP tool: {exposed_name}"
-            return ToolResult(
-                tool=exposed_name,
-                status="failed",
-                output=f"[error] {error}",
-                error=error,
-                metadata={"status_source": "mcp"},
-            )
         if expected_binding is not None and binding is not expected_binding:
             error = (
                 f"MCP tool '{exposed_name}' has been updated or removed. "
@@ -512,6 +637,15 @@ class McpClientManager:
                     "server": expected_binding.server_name,
                     "tool": expected_binding.tool_name,
                 },
+            )
+        if binding is None:
+            error = f"Unknown MCP tool: {exposed_name}"
+            return ToolResult(
+                tool=exposed_name,
+                status="failed",
+                output=f"[error] {error}",
+                error=error,
+                metadata={"status_source": "mcp"},
             )
         connection = self._connections.get(binding.server_name)
         if connection is None or connection.task is None or connection.task.done():
@@ -530,24 +664,17 @@ class McpClientManager:
         return await self._call_tool(connection, binding, arguments)
 
     def status_report(self) -> str:
-        lines = ["MCP status"]
+        lines = ["MCP status", f"config: {self.config.path}"]
         if self.config_error:
             lines.append(f"config: failed - {self.config_error}")
             return "\n".join(lines)
-        if not self.config.servers:
-            lines.append(f"config: {self.config.path}")
+        statuses = self.discovery_statuses()
+        if not statuses:
             lines.append("no MCP servers configured")
-            return "\n".join(lines)
-        lines.append(f"config: {self.config.path}")
-        for status in self.statuses.values():
-            if status.state == "connected":
-                lines.append(f"server {status.name}: connected ({status.tool_count} tool(s), {status.transport})")
-            else:
-                lines.append(f"server {status.name}: failed - {status.error}")
-        missing = set(self.config.servers) - set(self.statuses)
-        for name in sorted(missing):
-            server = self.config.servers[name]
-            lines.append(f"server {name}: not connected ({server.transport})")
+        for status in statuses.values():
+            details = f" ({status.tool_count} tool(s), {status.transport})" if status.catalog_source != "none" else ""
+            error = f" - {status.error}" if status.error else ""
+            lines.append(f"server {status.name}: {status.state}{details}{error}")
         return "\n".join(lines)
 
     def tools_report(self) -> str:
@@ -562,40 +689,13 @@ class McpClientManager:
             )
         return "\n".join(lines)
 
-    def catalog_prompt(self) -> str:
-        """Describe connected MCP servers without listing their tools.
-
-        The model picks a server id from this catalog and calls ``search_tools``
-        to mount the tools it needs; tool schemas stay out of the prompt.
-        """
-        if self.config_error or not self.config.servers:
-            return ""
-        lines = [
-            "## MCP Servers",
-            "",
-            (
-                "Configured MCP servers, connected on demand. Use the server id when "
-                "calling search_tools:"
-            ),
-        ]
-        for name in sorted(self.config.servers):
-            server = self.config.servers[name]
-            description = server.description or _MISSING_DESCRIPTION_TEXT
-            label = f"{name} ({server.title})" if server.title else name
-            lines.append(f"- {label}: {description}")
-        lines.extend(
-            [
-                "",
-                (
-                    "When a needed capability is not in your mounted tools, call search_tools with the "
-                    "MCP server id and short English keywords. Matching tools are mounted for later turns "
-                    "and stay available. Never repeat the same server and query; if nothing is mounted, "
-                    "try different English keywords or another server, and if no server can do it, tell "
-                    "the user instead of substituting a similar tool."
-                ),
-            ]
-        )
-        return "\n".join(lines)
+    def discovery_scopes(self) -> dict[str, str]:
+        with self._state_lock:
+            return {
+                f"mcp:{name}": f"{server.title} — {server.description}" if server.title and server.description
+                else server.description or server.title or _MISSING_DESCRIPTION_TEXT
+                for name, server in sorted(self.config.servers.items())
+            }
 
     def configured_server_names(self) -> list[str]:
         """Return server names from the raw config, including disabled ones."""
@@ -605,18 +705,21 @@ class McpClientManager:
             data = json.loads(self.config.path.read_text(encoding="utf-8"))
             servers = data.get("servers") if isinstance(data, dict) else None
             return sorted(str(name) for name in servers if isinstance(name, str))
-        except (OSError, json.JSONDecodeError, AttributeError):
+        except (OSError, ValueError, AttributeError):
             return sorted(self.config.servers)
 
     def registered_report(self) -> str:
         """List registered servers from the config file without connecting."""
         lines = [f"MCP config: {self.config.path}"]
+        if self.config_error:
+            lines.append(f"config: failed - {self.config_error}")
+            return "\n".join(lines)
         if not self.config.path.exists():
             lines.append("no MCP servers registered")
             return "\n".join(lines)
         try:
             data = json.loads(self.config.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError) as exc:
             lines.append(f"config: failed - {exc}")
             return "\n".join(lines)
         servers = data.get("servers") if isinstance(data, dict) else None
@@ -624,6 +727,9 @@ class McpClientManager:
             lines.append("no MCP servers registered")
             return "\n".join(lines)
         for name in sorted(str(item) for item in servers):
+            if error := self.config.server_errors.get(name):
+                lines.append(f"- {name}: invalid - {error}")
+                continue
             entry = servers[name]
             if not isinstance(entry, dict):
                 lines.append(f"- {name}: invalid entry")
@@ -663,88 +769,59 @@ class McpClientManager:
             permissions = {
                 str(name): value
                 for name, value in previous["tool_permissions"].items()
-                if isinstance(name, str) and value in VALID_TOOL_PERMISSIONS
+                if isinstance(name, str) and isinstance(value, str) and value in VALID_TOOL_PERMISSIONS
             }
             if permissions:
                 updates["tool_permissions"] = permissions
         return replace(server, **updates) if updates else server
 
     def register_server(self, server: McpServerConfig) -> McpRegistration:
-        """Add or replace one server: probe connection, persist config, bind tools.
-
-        The config entry is written even when the connection probe fails, so the
-        user keeps a registration to retry later.  A write failure raises
-        ``McpConfigError`` and leaves no in-memory state behind.
-        """
+        """Persist one server and probe it, keeping the entry if the probe fails."""
         if self.config_error:
             raise McpConfigError(f"现有 MCP 配置无法解析，无法注册服务：{self.config_error}")
-        existed = server.name in set(self.configured_server_names()) or server.name in self.config.servers
+        existed = server.name in self.configured_server_names()
         if existed:
             server = self._merge_previous_metadata(server)
-        connection: _McpConnection | None = None
-        bindings: list[McpToolBinding] = []
-        error: str | None = None
+        self._update_config_document(lambda servers: servers.__setitem__(server.name, _server_entry(server)))
+        self._reconfigure_server(server.name, server)
+        self.prime_catalog(server.name)
         try:
-            self._ensure_loop()
-            connection, bindings = self._run(self._connect_one(server))
+            self.ensure_connected(server.name)
         except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-        try:
-            self._update_config_document(lambda servers: servers.__setitem__(server.name, _server_entry(server)))
-        except McpConfigError:
-            if connection is not None:
-                with contextlib.suppress(Exception):
-                    self._run(self._close_connections([connection]))
-            raise
-        self.config.servers[server.name] = server
-        if connection is not None:
-            try:
-                self._run(
-                    self._register_connection(server, connection, bindings),
-                    timeout=self.timeout_seconds + 5.0,
-                )
-            except Exception as exc:
-                if self._connections.get(server.name) is not connection:
-                    error = f"{type(exc).__name__}: {exc}"
-                    with contextlib.suppress(Exception):
-                        self._run(self._close_connections([connection]))
-                    connection = None
-                else:
-                    log.warning(
-                        "MCP server %s was registered but replacement reported: %s",
-                        server.name,
-                        exc,
-                    )
-        else:
-            self._drop_server(server.name)
-        if connection is not None:
-            state = "connected"
-        else:
-            self.statuses[server.name] = McpServerStatus(
-                name=server.name,
-                transport=server.transport,
-                state="failed",
-                error=error,
-            )
-            state = "failed"
-        return McpRegistration(
-            server=server,
-            state=state,
-            tool_count=len(bindings) if connection is not None else 0,
-            error=error,
-            replaced=existed,
-        )
+            return McpRegistration(server, "failed", error=f"{type(exc).__name__}: {exc}", replaced=existed)
+        status = self.discovery_statuses()[server.name]
+        return McpRegistration(server, status.state, status.tool_count, status.error, replaced=existed)
 
     def remove_server(self, server_name: str) -> str:
         """Remove one registered server from the config and drop its runtime state."""
         if self.config_error:
             raise McpConfigError(f"现有 MCP 配置无法解析，无法移除服务：{self.config_error}")
-        if server_name not in set(self.configured_server_names()):
+        if server_name not in self.configured_server_names():
             raise McpConfigError(f"MCP 服务不存在：{server_name}")
         self._update_config_document(lambda servers: servers.pop(server_name, None))
-        self._drop_server(server_name)
-        self.config.servers.pop(server_name, None)
+        self._reconfigure_server(server_name, None)
         return f"MCP 服务已移除：{server_name}"
+
+    def _reconfigure_server(self, name: str, server: McpServerConfig | None) -> None:
+        def update_config() -> None:
+            if server is None:
+                self.config.servers.pop(name, None)
+            else:
+                self.config.servers[name] = server
+            self.config.server_errors.pop(name, None)
+            self.config.disabled_servers.discard(name)
+
+        async def apply() -> None:
+            with self._state_lock:
+                update_config()
+            await self._drop_server_async(name)
+
+        with self._state_lock:
+            if self._loop_thread is None:
+                update_config()
+                self._drop_server_state(name)
+                return
+        self._run(apply(), timeout=self.timeout_seconds + 5.0)
 
     def generate_server_description(
         self,
@@ -777,10 +854,13 @@ class McpClientManager:
 
     def reload_server(self, server_name: str) -> str:
         """Reconnect exactly one server, leaving other servers untouched."""
+        if error := self.config_error or self.config.server_errors.get(server_name):
+            return f"MCP 服务配置无效：{server_name}（{error}）"
         server = self.config.servers.get(server_name)
         if server is None:
             return f"MCP 服务不存在或未启用：{server_name}"
         self._drop_server(server_name)
+        self.prime_catalog(server_name)
         try:
             self.ensure_connected(server_name)
         except Exception as exc:
@@ -817,127 +897,114 @@ class McpClientManager:
         server: McpServerConfig,
         connection: _McpConnection,
         bindings: list[McpToolBinding],
+        deadline: float,
     ) -> None:
-        """Publish a connection; must run on the MCP event loop thread."""
-        task = connection.task
-        error = "connection worker exited before registration"
-        if task is not None and task.done():
-            if not task.cancelled():
-                with contextlib.suppress(Exception):
-                    exc = task.exception()
-                    if exc is not None:
-                        error = f"{type(exc).__name__}: {exc}"
-            raise RuntimeError(error)
-        for item in bindings:
-            existing = self._bindings_by_exposed_name.get(item.exposed_name)
-            if existing is not None and existing.server_name != server.name:
-                raise RuntimeError(
-                    f"duplicate exposed MCP tool name {item.exposed_name!r} "
-                    f"for servers {existing.server_name!r} and {server.name!r}"
-                )
-        self._connections[server.name] = connection
-        self.statuses[server.name] = McpServerStatus(
-            name=server.name,
-            transport=server.transport,
-            state="connected",
-            tool_count=len(bindings),
-        )
-        bindings = [self._bindings_by_exposed_name[item.exposed_name]
-                    if item.exposed_name in self._catalog_only and self._bindings_by_exposed_name.get(item.exposed_name) == item
-                    else item for item in bindings]
-        self.tool_bindings = [item for item in self.tool_bindings if item.server_name != server.name] + bindings
-        self._bindings_by_exposed_name.update({item.exposed_name: item for item in bindings})
-        self._catalog_only.difference_update(item.exposed_name for item in bindings)
-        with _static_lock:
-            _schema_cache[self._schema_key(server)] = copy.deepcopy(tuple(bindings))
-        self.connection_revision += 1
-
-    async def _register_connection(
-        self,
-        server: McpServerConfig,
-        connection: _McpConnection,
-        bindings: list[McpToolBinding],
-    ) -> None:
-        """Replace one server, keeping the new worker owned if the old close hangs."""
-        old = self._connections.pop(server.name, None)
-        if old is not None and old is not connection:
-            try:
-                await asyncio.wait_for(
-                    self._close_connections([old]), timeout=self.timeout_seconds
-                )
-            except Exception as exc:
-                log.warning("Failed to close previous MCP server %s: %s", server.name, exc)
-                if old.task is not None and not old.task.done():
-                    old.task.cancel()
-        self._drop_server_state(server.name)
-        self._store_connection(server, connection, bindings)
+        """Validate a full catalog before replacing the previous server snapshot."""
+        if connection.task is not None and connection.task.done():
+            raise RuntimeError("MCP connection worker exited before registration")
+        with self._state_lock:
+            bindings = [
+                self._bindings_by_exposed_name[item.exposed_name]
+                if item.exposed_name in self._catalog_only
+                and self._bindings_by_exposed_name[item.exposed_name] == item
+                and server.name not in self.statuses
+                else item
+                for item in bindings
+            ]
+        specs = self._validated_server_specs(bindings)
+        cache_key = self._schema_key(server)
+        cached = copy.deepcopy(tuple(bindings))
+        with self._state_lock, _static_lock:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"MCP handshake exceeded {self.timeout_seconds:g} seconds")
+            for item in bindings:
+                existing = self._bindings_by_exposed_name.get(item.exposed_name)
+                if existing is not None and existing.server_name != server.name:
+                    raise ValueError(f"Duplicate exposed MCP tool name {item.exposed_name!r}")
+            self._validated_specs[server.name] = (tuple(bindings), specs)
+            self._connections[server.name] = connection
+            self.statuses[server.name] = McpServerStatus(
+                server.name, server.transport, "connected", len(bindings), catalog_source="live",
+            )
+            self._replace_bindings(server.name, bindings)
+            _schema_cache[cache_key] = cached
 
     def _on_worker_done(self, connection: _McpConnection) -> None:
-        """Reclaim a server whose connection worker exited outside a close."""
         server_name = connection.config.name
-        if self._connections.get(server_name) is not connection:
-            return
-        self._connections.pop(server_name, None)
         task = connection.task
         error = "connection worker exited"
-        if task is not None and not task.cancelled():
-            with contextlib.suppress(Exception):
-                exc = task.exception()
-                if exc is not None:
-                    error = f"{type(exc).__name__}: {exc}"
-        self.statuses[server_name] = McpServerStatus(
-            name=server_name,
-            transport=connection.config.transport,
-            state="failed",
-            error=error,
-        )
-        self.tool_bindings = [
-            binding for binding in self.tool_bindings if binding.server_name != server_name
-        ]
-        self._bindings_by_exposed_name = {
-            binding.exposed_name: binding for binding in self.tool_bindings
-        }
-        self.connection_revision += 1
+        if task is not None:
+            self._workers.discard(task)
+            if not task.cancelled() and (exc := task.exception()) is not None:
+                error = f"{type(exc).__name__}: {exc}"
+        with self._state_lock:
+            if self._connections.get(server_name) is not connection:
+                return
+            self._connections.pop(server_name)
+            history = [item for item in self.tool_bindings if item.server_name == server_name]
+            self._replace_bindings(server_name, history, cached=True)
+            self._mark_failed(connection.config, error)
         log.warning("MCP server %s disconnected unexpectedly: %s", server_name, error)
 
+    def _replace_bindings(self, server_name: str, bindings, *, cached: bool = False) -> None:
+        for item in self.tool_bindings:
+            if item.server_name == server_name:
+                self._bindings_by_exposed_name.pop(item.exposed_name, None)
+                self._catalog_only.discard(item.exposed_name)
+        self.tool_bindings = [item for item in self.tool_bindings if item.server_name != server_name] + list(bindings)
+        self._bindings_by_exposed_name.update((item.exposed_name, item) for item in bindings)
+        if cached:
+            self._catalog_only.update(item.exposed_name for item in bindings)
+        self.connection_revision += 1
+
     def _drop_server(self, server_name: str) -> None:
-        """Drop one server's runtime state on the connection event loop."""
-        if self._loop_thread is None:
-            self._drop_server_state(server_name)
-            return
-        self._run(self._drop_server_async(server_name))
+        with self._state_lock:
+            if self._loop_thread is None:
+                self._drop_server_state(server_name)
+                return
+        self._run(self._drop_server_async(server_name), timeout=self.timeout_seconds + 5.0)
 
     async def _drop_server_async(self, server_name: str) -> None:
-        connection = self._connections.pop(server_name, None)
+        self._disconnecting.add(server_name)
         try:
+            pending = self._connecting.get(server_name)
+            if pending is not None:
+                pending.task.cancel()
+                await asyncio.gather(pending.task, return_exceptions=True)
+            with self._state_lock:
+                connection = self._connections.pop(server_name, None)
+                self._drop_server_state(server_name)
             if connection is not None:
-                await self._close_connections([connection])
-        except Exception as exc:
-            log.warning("Failed to close MCP server %s: %s", server_name, exc)
+                try:
+                    await asyncio.wait_for(self._close_connections([connection]), timeout=self.timeout_seconds)
+                except Exception as exc:
+                    log.warning("Failed to close MCP server %s: %s", server_name, exc)
+                    if connection.task is not None and not connection.task.done():
+                        connection.task.cancel()
         finally:
-            self._drop_server_state(server_name)
+            self._disconnecting.discard(server_name)
 
     def _drop_server_state(self, server_name: str) -> None:
         self.statuses.pop(server_name, None)
-        self.tool_bindings = [
-            binding for binding in self.tool_bindings if binding.server_name != server_name
-        ]
-        self._bindings_by_exposed_name = {
-            binding.exposed_name: binding for binding in self.tool_bindings
-        }
-        self.connection_revision += 1
+        self._validated_specs.pop(server_name, None)
+        self._replace_bindings(server_name, ())
+
+    def _mark_failed(self, server: McpServerConfig, error: str) -> None:
+        with self._state_lock:
+            self.statuses[server.name] = McpServerStatus(
+                server.name, server.transport, "failed", error=error,
+            )
+            self.connection_revision += 1
 
     async def _connect_one_and_store(self, server: McpServerConfig) -> None:
+        connection = None
         try:
-            connection, bindings = await self._connect_one(server)
-            self._store_connection(server, connection, bindings)
+            connection, bindings, deadline = await self._connect_one(server)
+            self._store_connection(server, connection, bindings, deadline)
         except Exception as exc:
-            self.statuses[server.name] = McpServerStatus(
-                name=server.name,
-                transport=server.transport,
-                state="failed",
-                error=f"{type(exc).__name__}: {exc}",
-            )
+            if connection is not None and connection.task is not None:
+                connection.task.cancel()
+            self._mark_failed(server, f"{type(exc).__name__}: {exc}")
             raise
 
     def set_server_enabled(self, server_name: str, enabled: bool) -> str:
@@ -975,9 +1042,11 @@ class McpClientManager:
 
         self._update_config_document(mutate)
         for name, description in written.items():
-            server = self.config.servers.get(name)
-            if server is not None:
-                self.config.servers[name] = replace(server, description=description)
+            with self._state_lock:
+                server = self.config.servers.get(name)
+                if server is not None and server.description != description:
+                    self.config.servers[name] = replace(server, description=description)
+                    self.connection_revision += 1
 
     def _update_config_document(self, mutate: Callable[[dict[str, Any]], None]) -> None:
         """Apply a mutation to the raw config document with an atomic write."""
@@ -1007,27 +1076,29 @@ class McpClientManager:
             return False, self.config_error
         if not self.config.path.exists():
             return True, "not configured"
-        failed = [status for status in self.statuses.values() if status.state != "connected"]
+        failed = [status for status in self.discovery_statuses().values() if status.state in {"failed", "invalid"}]
         if failed:
             details = "; ".join(f"{item.name}: {item.error}" for item in failed)
             return False, details
         return True, f"{len(self.config.servers)} server(s), {len(self.tool_bindings)} tool(s)"
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self._loop_thread is None:
-            self._resource_owner()
-            return
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            loop = self._loop_thread
         try:
-            try:
-                self._run(self._close_async())
-            except Exception as exc:
-                log.warning("MCP shutdown reported an error: %s", exc)
+            if loop is not None:
+                try:
+                    loop.run(self._close_async(), timeout=self.timeout_seconds + 5.0)
+                except Exception as exc:
+                    log.warning("MCP shutdown reported an error: %s", exc)
+                finally:
+                    loop.close()
         finally:
-            self._loop_thread.close()
-            self._loop_thread = None
+            with self._state_lock:
+                self._loop_thread = None
             self._resource_owner()
 
     async def _connection_worker(
@@ -1082,10 +1153,22 @@ class McpClientManager:
                     streamable_http_client(server.url or "", http_client=http_client)
                 )
 
-            session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+            def disconnected() -> None:
+                request_queue.put_nowait(("disconnect", None, None))
+
+            session = await stack.enter_async_context(
+                ClientSession(_ObservedReadStream(read_stream, disconnected), write_stream)
+            )
             await session.initialize()
             list_result = await session.list_tools()
-            tools = list(getattr(list_result, "tools", []) or [])
+            tools = list(list_result.tools)
+            cursors = set()
+            while (cursor := getattr(list_result, "nextCursor", None)) is not None:
+                if cursor in cursors:
+                    raise ValueError("MCP tools/list repeated a pagination cursor")
+                cursors.add(cursor)
+                list_result = await session.list_tools(cursor=cursor)
+                tools.extend(list_result.tools)
             bindings = _bindings_for_server(server, tools)
             if not ready.done():
                 ready.set_result(bindings)
@@ -1107,6 +1190,8 @@ class McpClientManager:
 
             while True:
                 kind, payload, response = await request_queue.get()
+                if kind == "disconnect":
+                    raise RuntimeError("MCP transport closed")
                 if kind == "close":
                     # Do not wait for remote calls to finish naturally; the
                     # finally block cancels and reaps them.
@@ -1165,9 +1250,26 @@ class McpClientManager:
             raise
 
     async def _close_async(self) -> None:
-        connections = list(self._connections.values())
-        self._connections.clear()
-        await self._close_connections(connections)
+        pending = [flight.task for flight in self._connecting.values()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        with self._state_lock:
+            connections = list(self._connections.values())
+            self._connections.clear()
+        try:
+            results = await asyncio.gather(
+                *(self._close_connections([connection]) for connection in connections),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    raise result
+        finally:
+            workers = list(self._workers)
+            if workers:
+                await asyncio.gather(*workers, return_exceptions=True)
 
     async def _close_connections(self, connections: list[_McpConnection]) -> None:
         errors: list[tuple[str, Exception]] = []
@@ -1228,18 +1330,41 @@ class McpClientManager:
 
         return handler
 
-    def _ensure_loop(self) -> None:
-        if self._loop_thread is None:
-            self._loop_thread = _AsyncLoopThread()
+    def _ensure_loop(self) -> _AsyncLoopThread:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("MCP manager is closed")
+            if self._loop_thread is None:
+                self._loop_thread = _AsyncLoopThread()
+            return self._loop_thread
 
     def _run(self, coro, *, cancellation_token=None, timeout: float | None = None):
-        self._ensure_loop()
-        assert self._loop_thread is not None
-        return self._loop_thread.run(
+        try:
+            loop = self._ensure_loop()
+        except Exception:
+            coro.close()
+            raise
+        return loop.run(
             coro,
             timeout=self.timeout_seconds if timeout is None else timeout,
             cancellation_token=cancellation_token,
         )
+
+
+class _ObservedReadStream(ObjectReceiveStream):
+    def __init__(self, stream, disconnected):
+        self._stream = stream
+        self._disconnected = disconnected
+
+    async def receive(self):
+        try:
+            return await self._stream.receive()
+        except (EndOfStream, ClosedResourceError, BrokenResourceError):
+            self._disconnected()
+            raise
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
 
 
 def mcp_result_to_tool_result(
@@ -1281,9 +1406,9 @@ def _bindings_for_server(
 ) -> list[McpToolBinding]:
     bindings: list[McpToolBinding] = []
     for tool in mcp_tools:
-        tool_name = str(getattr(tool, "name", "") or "").strip()
-        if not tool_name:
-            continue
+        tool_name = getattr(tool, "name", "")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise ValueError("MCP tool name is missing")
         exposed_name = _exposed_tool_name(server.name, tool_name)
         permission = server.tool_permissions.get(tool_name, server.permission)
         description = str(getattr(tool, "description", "") or getattr(tool, "title", "") or "")
@@ -1294,7 +1419,7 @@ def _bindings_for_server(
                 server_name=server.name,
                 tool_name=tool_name,
                 description=description,
-                input_schema=dict(getattr(tool, "inputSchema", None) or {"type": "object", "properties": {}}),
+                input_schema=getattr(tool, "inputSchema", None),
                 permission=permission,
                 annotations=annotations,
             )
@@ -1303,7 +1428,7 @@ def _bindings_for_server(
 
 
 _MISSING_DESCRIPTION_TEXT = (
-    "description unavailable; call search_tools with this server id to inspect its tools"
+    "Use search_tools to inspect its tools."
 )
 
 
@@ -1519,6 +1644,8 @@ class _AsyncLoopThread:
     def __init__(self):
         self.loop = asyncio.new_event_loop()
         self._ready = threading.Event()
+        self._submit_lock = threading.Lock()
+        self._stopping = False
         self._queue = None
         self._actor_task: asyncio.Task | None = None
         self._thread = threading.Thread(target=self._run_loop, name="hca-mcp-loop", daemon=True)
@@ -1533,7 +1660,11 @@ class _AsyncLoopThread:
             assert self._queue is not None
             self._queue.put_nowait((coro, future, actor_holder))
 
-        self.loop.call_soon_threadsafe(submit)
+        with self._submit_lock:
+            if self._stopping:
+                coro.close()
+                raise RuntimeError("MCP event loop is closed")
+            self.loop.call_soon_threadsafe(submit)
         deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
             if cancellation_token is not None and cancellation_token.is_cancelled:
@@ -1546,13 +1677,15 @@ class _AsyncLoopThread:
             try:
                 return future.result(timeout=min(0.05, remaining))
             except FutureTimeoutError:
-                continue
+                if future.done():
+                    return future.result()
 
     def _cancel(self, future: Future, actor_holder: list[asyncio.Task | None]) -> None:
         future.cancel()
         actor_task = actor_holder[0]
         if actor_task is not None and not actor_task.done():
-            self.loop.call_soon_threadsafe(actor_task.cancel)
+            with contextlib.suppress(RuntimeError):
+                self.loop.call_soon_threadsafe(actor_task.cancel)
 
     def close(self) -> None:
         if self._queue is not None:
@@ -1562,7 +1695,9 @@ class _AsyncLoopThread:
                 assert self._queue is not None
                 self._queue.put_nowait((None, future))
 
-            self.loop.call_soon_threadsafe(submit_stop)
+            with self._submit_lock:
+                self._stopping = True
+                self.loop.call_soon_threadsafe(submit_stop)
             with contextlib.suppress(Exception):
                 future.result(timeout=5)
         self.loop.call_soon_threadsafe(self.loop.stop)
@@ -1612,15 +1747,12 @@ class _AsyncLoopThread:
 
             def _finish(done: asyncio.Task, *, target: Future = future) -> None:
                 tasks.discard(done)
-                if target.done():
-                    return
-                if done.cancelled():
-                    target.set_exception(TimeoutError("MCP operation timed out and was cancelled"))
-                    return
-                error = done.exception()
-                if error is not None:
-                    target.set_exception(error)
-                else:
-                    target.set_result(done.result())
+                with contextlib.suppress(InvalidStateError):
+                    if done.cancelled():
+                        target.set_exception(TimeoutError("MCP operation was cancelled"))
+                    elif (error := done.exception()) is not None:
+                        target.set_exception(error)
+                    else:
+                        target.set_result(done.result())
 
             task.add_done_callback(_finish)

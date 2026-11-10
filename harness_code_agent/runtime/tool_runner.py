@@ -49,6 +49,7 @@ def execute_tool_result(
     emit_events: bool = True,
     validate_arguments: bool = True,
     cancellation_token=None,
+    registry: ToolRegistry | None = None,
 ) -> ToolResult:
     """Execute a registered tool only after the runtime validation boundary.
 
@@ -56,7 +57,8 @@ def execute_tool_result(
     preparation (the ToolExecutor) pass ``validate_arguments=False``; direct
     and public execution keeps the default and validates here.
     """
-    registry = _registry_for_context(tool_context)
+    if registry is None:
+        registry = _registry_for_context(tool_context)
     fn = registry.get(name)
     has_schema = fn is not None and registry.schema_for(name) is not None
     validation = (

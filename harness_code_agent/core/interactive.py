@@ -45,9 +45,15 @@ from ..runtime.approvals import (
     ConsoleApprovalProvider,
     LlmAutoApprovalProvider,
 )
+from ..runtime.builtins.discovery import discovery_catalog_prompt
 from ..runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
 from ..runtime.lifecycle import LifecycleScope
-from ..runtime.mcp import McpClientManager, McpConfigError, build_server_config
+from ..runtime.mcp import (
+    McpClientManager,
+    McpConfigError,
+    PublishedMcpCatalog,
+    build_server_config,
+)
 from ..runtime.middleware.loader import load_user_middlewares
 from ..runtime.middleware.stack import build_main_agent_middlewares
 from ..runtime.permissions import (
@@ -215,8 +221,8 @@ class InteractiveSession:
             self.tool_registry = None
             self.mcp_manager = None
             self._mcp_tools_loaded = False
-            self._mcp_load_lock = threading.Lock()
-            self._mcp_connection_revision = 0
+            self._mcp_load_lock = threading.RLock()
+            self._published_mcp_catalog: PublishedMcpCatalog | None = None
             self.agent = None
             self.conversation: AgentConversation | None = None
             self.turn_count = 0
@@ -292,15 +298,16 @@ class InteractiveSession:
             stream_callback=self.stream_sink,
             prompt_cache_identity=prefix.cache_identity,
         )
+        agent.set_tool_discovery_catalog(
+            discovery_catalog_prompt(self.tool_registry, self.mcp_manager.discovery_scopes())
+        )
         return agent
 
     def _load_mcp_tools(self) -> None:
         if self.tool_registry is None or self.mcp_manager is None:
             self._prepare_tool_registry()
         self.mcp_manager.prime_catalog()
-        snapshot = self.mcp_manager.catalog_snapshot()
-        self.mcp_manager.register_tools(self.tool_registry, snapshot=snapshot)
-        self._mcp_connection_revision = snapshot.revision
+        self._rebuild_mcp_state()
         self._mcp_tools_loaded = True
 
     def _prepare_tool_registry(self) -> None:
@@ -314,14 +321,16 @@ class InteractiveSession:
         with self._mcp_load_lock:
             if not self._mcp_tools_loaded:
                 self._load_mcp_tools()
-                self._refresh_agent_tool_schemas()
-                self._refresh_mcp_catalog()
 
-    def _discover_mcp_tools(self, server_name=None):
-        self.mcp_manager.discover(server_name, cancellation_token=current_token.get())
-        self.mcp_manager.register_tools(self.tool_registry)
-        self._mcp_connection_revision = self.mcp_manager.connection_revision
-        self._refresh_mcp_catalog()
+    def _discover_mcp_tools(self, server_name):
+        manager = self.mcp_manager
+        failures = manager.discover(server_name, cancellation_token=current_token.get())
+        with self._mcp_load_lock:
+            if manager is self.mcp_manager:
+                publication_errors = self._rebuild_mcp_state()
+                if server_name in publication_errors:
+                    failures[server_name] = publication_errors[server_name]
+        return failures
 
     def _tool_schemas(self, *, update_context: bool = True, tool_context=None) -> list[dict]:
         context = tool_context or self.tool_context
@@ -369,9 +378,11 @@ class InteractiveSession:
         if self.agent is not None:
             self.agent.update_tool_schemas(self._tool_schemas())
 
-    def _refresh_mcp_catalog(self) -> None:
+    def _refresh_discovery_catalog(self) -> None:
         if self.mcp_manager is not None and self.agent is not None:
-            self.agent.set_mcp_catalog(self.mcp_manager.catalog_prompt())
+            self.agent.set_tool_discovery_catalog(
+                discovery_catalog_prompt(self.tool_registry, self.mcp_manager.discovery_scopes())
+            )
 
     def format_task(self, user_prompt: str) -> str:
         return f"Task:\n{user_prompt}"
@@ -608,6 +619,9 @@ class InteractiveSession:
             environment=self.environment,
             project_resources=self.project_resources,
             discover_mcp_tools=self._discover_mcp_tools,
+            sync_mcp_catalog=self._sync_mcp_connections,
+            mcp_discovery_statuses=lambda: self.mcp_manager.discovery_statuses(),
+            mcp_discovery_scopes=lambda: self.mcp_manager.discovery_scopes(),
             model_selection=self.model_selection,
             memory_use_enabled=self.memory_use_enabled,
             memory_auto_extract_enabled=self.memory_auto_extract_enabled,
@@ -680,7 +694,6 @@ class InteractiveSession:
         else:
             self.conversation.rebind_agent(agent)
         self.agent = agent
-        self._refresh_mcp_catalog()
         self._apply_permission_policy()
         return created
 
@@ -1243,13 +1256,10 @@ class InteractiveSession:
     @runtime_change
     def reload_mcp(self) -> str:
         self._ensure_mcp_tools_loaded()
-        self.mcp_manager.close()
-        self._prepare_tool_registry()
-        self._ensure_mcp_tools_loaded()
-        if self.tool_context is not None:
-            self.tool_context.tool_registry = self.tool_registry
-        self._refresh_agent_tool_schemas()
-        self._refresh_mcp_catalog()
+        with self._mcp_load_lock:
+            self.mcp_manager.close()
+            self._prepare_tool_registry()
+            self._ensure_mcp_tools_loaded()
         if self.event_bus is not None:
             self.event_bus.emit(
                 "mcp_reloaded",
@@ -1306,7 +1316,7 @@ class InteractiveSession:
                 except McpConfigError as exc:
                     lines.append(str(exc))
                 else:
-                    self._refresh_mcp_catalog()
+                    self._refresh_discovery_catalog()
             return "\n".join(lines)
         lines = [
             f"MCP 服务{verb}但连接失败：{name}",
@@ -1328,45 +1338,40 @@ class InteractiveSession:
         """Regenerate one server description from its current tool catalog."""
         self._ensure_mcp_tools_loaded()
         result = self.mcp_manager.generate_server_description(server_name, refresh=refresh)
-        self._refresh_mcp_catalog()
+        self._refresh_discovery_catalog()
         return result
 
-    def _rebuild_mcp_state(self) -> None:
-        if self.tool_registry is not None and self.mcp_manager is not None:
-            snapshot = self.mcp_manager.catalog_snapshot()
-            self._mcp_connection_revision = snapshot.revision
-            self.tool_registry = BUILTIN_TOOL_REGISTRY.copy()
-            self.mcp_manager.register_tools(self.tool_registry, snapshot=snapshot)
-        if self.tool_context is not None:
-            self.tool_context.tool_registry = self.tool_registry
-            # Discovery history survives an agent rebuild, but a tool that no
-            # longer exists in the rebuilt catalog is dropped: it is gone, not
-            # merely disallowed by the current tool surface.
-            existing = {spec.name for spec in self.tool_registry.specs()}
-            removed = self.tool_context.discovered_tool_names - existing
-            self.tool_context.discovered_tool_names &= existing
-            self.tool_context.revealed_tool_names &= self.tool_context.discovered_tool_names
-            if removed:
-                # Results from the old catalog can no longer justify skipping
-                # a repeat query; a reconnect with the same names must allow
-                # rediscovery.
-                self.tool_context.search_tools_queries.clear()
-                self.tool_context.search_tools_no_progress = 0
-        self._refresh_agent_tool_schemas()
-        self._refresh_mcp_catalog()
+    def _rebuild_mcp_state(self) -> dict[str, str]:
+        with self._mcp_load_lock:
+            manager = self.mcp_manager
+            published = self._published_mcp_catalog
+            if published is not None and published.manager is manager and published.revision == manager.connection_revision:
+                return {}
+            snapshot = manager.catalog_snapshot()
+            context = self.tool_context
+            previous = context.tool_registry.specs() if context is not None else []
+            failures = manager.register_tools(self.tool_registry, snapshot=snapshot)
+            if context is not None:
+                context.tool_registry = self.tool_registry
+                context.invalidate_mcp_tools(previous, statuses=snapshot.statuses)
+            self._refresh_agent_tool_schemas()
+            self._refresh_discovery_catalog()
+            self._published_mcp_catalog = PublishedMcpCatalog(
+                manager, snapshot.revision,
+                tuple(spec for spec in self.tool_registry.specs() if spec.origin_server is not None),
+                snapshot.statuses,
+            )
+            return failures
 
-    def _sync_mcp_connections(self) -> None:
-        """Refresh registry and schemas when a worker connection changed.
-
-        Workers exit outside the user-visible commands; this runs only at the
-        safe boundary before a turn, never from the worker thread.
-        """
+    def _sync_mcp_connections(self) -> PublishedMcpCatalog | None:
         manager = self.mcp_manager
-        if manager is None:
-            return
-        if manager.connection_revision == self._mcp_connection_revision:
-            return
-        self._rebuild_mcp_state()
+        published = self._published_mcp_catalog
+        if manager is not None and (
+            published is None or published.manager is not manager or published.revision != manager.connection_revision
+        ):
+            self._rebuild_mcp_state()
+            return self._published_mcp_catalog
+        return published
 
     @runtime_change
     def toggle_mcp_server(self, server_name: str) -> str:
@@ -1375,7 +1380,7 @@ class InteractiveSession:
         names = set(self.mcp_manager.configured_server_names())
         if server_name not in names:
             return f"MCP 服务不存在：{server_name}"
-        enabled = server_name not in self.mcp_manager.config.servers
+        enabled = server_name in self.mcp_manager.config.disabled_servers
         result = self.mcp_manager.set_server_enabled(server_name, enabled)
         refreshed = self.reload_mcp()
         return f"{result}\n{refreshed}"

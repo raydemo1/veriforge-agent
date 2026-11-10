@@ -249,10 +249,13 @@ def mcp_command(cwd: Path, args: list[str]) -> int:
             if manager.config_error:
                 _print_error(f"Error: {manager.config_error}")
                 return 1
+            if error := manager.config.server_errors.get(parsed.name):
+                _print_error(f"Error: {error}")
+                return 1
             if parsed.name not in manager.config.servers:
                 _print_error(f"Error: MCP server is not registered or is disabled: {parsed.name}")
                 return 1
-            manager.connect_all()
+            manager.discover(parsed.name)
             try:
                 print(manager.generate_server_description(parsed.name, refresh=parsed.refresh))
             except McpConfigError as exc:

@@ -174,6 +174,116 @@ class ChangeProposalTests(unittest.TestCase):
         self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "value = 4\n")
 
 
+class ToolDiscoveryTests(unittest.TestCase):
+    def test_workflow_group_expands_independently_of_ranking(self):
+        from harness_code_agent.runtime.builtins.discovery import (
+            TOOL_GROUPS,
+            _expand_groups,
+        )
+        from harness_code_agent.runtime.tool_registry import ToolSpec
+
+        group = next(iter(TOOL_GROUPS))
+        catalog = {
+            name: ToolSpec(
+                name=name,
+                schema={
+                    "type": "function",
+                    "function": {"name": name, "parameters": {"type": "object"}},
+                },
+                handler=lambda **_: None,
+                permission="read",
+                effect_resolver=lambda _args, _context: None,
+            )
+            for name in group
+        }
+
+        mounted = _expand_groups(["spawn_agent"], catalog)
+
+        self.assertEqual(mounted[0], "spawn_agent")
+        self.assertEqual(set(mounted), set(group))
+
+        partial = {name: catalog[name] for name in ("spawn_agent", "wait_agents")}
+        self.assertEqual(_expand_groups(["spawn_agent"], partial), ["spawn_agent", "wait_agents"])
+
+    def test_search_without_server_does_not_connect_mcp_servers(self):
+        from harness_code_agent.runtime.builtins.discovery import search_tools
+
+        calls = []
+
+        def discover(server_name=None):
+            calls.append(server_name)
+            return {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self._context(Path(tmp), discover=discover)
+            result = search_tools("spawn agent", limit=1, tool_context=context)
+
+        self.assertEqual(result.status, "success")
+        self.assertIn("spawn_agent", result.metadata["revealed_tool_names"])
+        self.assertEqual(calls, [])
+
+    def test_requested_server_failure_is_reported_with_cached_tools(self):
+        from harness_code_agent.runtime.builtins.discovery import search_tools
+
+        registry = BUILTIN_TOOL_REGISTRY.copy()
+        registry.register(
+            {
+                "type": "function",
+                "function": {
+                    "name": "mcp__docs__search",
+                    "description": "Search product documentation",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                    },
+                },
+            },
+            lambda **_: None,
+            permission="read",
+            disclosure="deferred",
+            origin_server="docs",
+            origin_tool="search",
+        )
+        failure = "TimeoutError: did not answer"
+
+        def discover(server_name=None):
+            return {"docs": failure}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self._context(Path(tmp), discover=discover, registry=registry)
+            result = search_tools("product documentation", server="docs", tool_context=context)
+
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.metadata["failed_mcp_servers"], {"docs": failure})
+        self.assertIn("Unavailable MCP server(s)", result.output)
+
+    def test_requested_server_without_cached_tools_fails_clearly(self):
+        from harness_code_agent.runtime.builtins.discovery import search_tools
+
+        def discover(server_name=None):
+            raise TimeoutError("did not answer")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            context = self._context(Path(tmp), discover=discover)
+            result = search_tools("documents", server="docs", tool_context=context)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error, "mcp_unavailable")
+        self.assertEqual(
+            result.metadata["failed_mcp_servers"],
+            {"docs": "TimeoutError: did not answer"},
+        )
+
+    def _context(self, root, *, discover, registry=None):
+        return ToolContext(
+            workspace=WorkspaceService(root=root),
+            permission_policy=PermissionPolicy(mode=PermissionPolicy.DANGER_FULL_ACCESS),
+            event_bus=EventBus(),
+            tool_registry=registry or BUILTIN_TOOL_REGISTRY,
+            discover_mcp_tools=discover,
+        )
+
+
 class _ControlledConversation:
     instances: ClassVar[dict] = {}
 

@@ -441,6 +441,8 @@ class ToolExecutorTests(unittest.TestCase):
             lambda **_: ToolResult(tool="mcp__docs__search", status="success", output="searched"),
             permission="read",
             disclosure="deferred",
+            origin_server="docs",
+            origin_tool="search",
         )
         tool_calls = [
             _tool_call("tc_search", "search_tools", {"query": "product documentation", "server": "docs"}),

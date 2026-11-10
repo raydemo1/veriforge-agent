@@ -1,13 +1,14 @@
-"""Server-scoped tool discovery with confidence tiers."""
+"""Tool discovery by namespace, with confidence tiers."""
 from __future__ import annotations
 
 import hashlib
 import json
 
-from ..mcp import MCP_TOOL_PREFIX
+from ...support.cancellation import CancelledError
+from ..mcp import McpServerStatus
 from ..permissions import VALID_TOOL_PERMISSIONS
 from ..tool_context import ToolContext
-from ..tool_registry import ToolSpec
+from ..tool_registry import BUILTIN_AGENTS_SCOPE, ToolSpec
 from ..tool_result import ToolResult
 from ..tool_search import SearchDocument, search_bm25
 
@@ -41,6 +42,26 @@ TOOL_GROUPS = (
 )
 
 
+def discovery_catalog_prompt(registry, mcp_scopes: dict[str, str]) -> str:
+    scopes = dict(mcp_scopes)
+    if any(spec.discovery_scope == BUILTIN_AGENTS_SCOPE and spec.disclosure == "deferred" for spec in registry.specs()):
+        scopes = {BUILTIN_AGENTS_SCOPE: "Delegate tasks, coordinate agents, inspect and apply proposals.", **scopes}
+    if not scopes:
+        return ""
+    lines = ["## Tool discovery scopes", ""]
+    lines.extend(f"- {scope} — {description}" for scope, description in scopes.items())
+    lines.extend([
+        "",
+        (
+            "Use search_tools with short English keywords and the scope in the server argument. "
+            "An explicit MCP scope connects only that server. Built-in scopes and searches without a scope "
+            "use the registered catalog. Mounted tools are native functions. Vary the keywords or scope "
+            "if a search finds nothing."
+        ),
+    ])
+    return "\n".join(lines)
+
+
 def search_tools(
     query: str,
     server: str | None = None,
@@ -49,12 +70,16 @@ def search_tools(
 ) -> ToolResult:
     """Search the deferred tool catalog and mount matching tool schemas.
 
-    ``server`` narrows the search to one MCP server.  Zero-score results never
-    mount a schema: they return that server's tool names and descriptions so
-    the model can retry with better keywords or switch servers.
+    An explicit MCP scope connects that server on demand. Built-in scopes
+    and unscoped searches use only the current Registry. Zero-score results
+    never mount a schema: they return that scope's tool names and descriptions
+    so the model can retry with better keywords or switch servers.
     """
     query = str(query or "").strip()
-    server_name = str(server or "").strip() or None
+    scope = str(server or "").strip() or None
+    if scope is not None and ":" not in scope:
+        scope = f"mcp:{scope}"
+    server_name = scope.removeprefix("mcp:") if scope and scope.startswith("mcp:") else None
     try:
         limit = max(1, min(int(limit or DEFAULT_LIMIT), MAX_LIMIT))
     except (TypeError, ValueError):
@@ -65,58 +90,114 @@ def search_tools(
     if not query:
         return _failure("missing_query", "search_tools requires a non-empty query.")
 
-    if tool_context.discover_mcp_tools is not None:
-        tool_context.discover_mcp_tools(server_name)
-
+    failures: dict[str, str] = {}
+    read_statuses = tool_context.mcp_discovery_statuses if scope is None or server_name else None
+    statuses = read_statuses() if read_statuses else {}
+    previous_status = statuses.get(server_name)
+    if (
+        server_name and tool_context.discover_mcp_tools is not None
+        and (previous_status is None or previous_status.state not in {"failed", "invalid", "disabled"})
+    ):
+        try:
+            failures = _failure_map(tool_context.discover_mcp_tools(server_name))
+        except CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - MCP is a separate availability domain
+            failures = {server_name: f"{type(exc).__name__}: {exc}"}
+        if read_statuses is not None:
+            statuses = read_statuses()
     registry = tool_context.tool_registry
     allowed_permissions = (
         set(tool_context.allowed_tool_permissions)
         if tool_context.allowed_tool_permissions is not None
-        else set(VALID_TOOL_PERMISSIONS)
+        else VALID_TOOL_PERMISSIONS
     )
-    blocked_names = set(tool_context.blocked_tool_names or set())
-    revealed = set(tool_context.revealed_tool_names or set())
-
-    deferred = [spec for spec in registry.specs() if spec.disclosure == "deferred"]
-    servers = sorted({_server_of(spec) for spec in deferred if _server_of(spec)})
-    if server_name is not None and server_name not in servers:
-        valid = ", ".join(servers) if servers else "none"
-        return _failure(
-            "unknown_server",
-            f"Unknown MCP server: {server_name}. Valid server ids: {valid}.",
-            metadata={"query": query, "server": server_name},
-        )
-
-    catalog = [
-        spec for spec in deferred if spec.name not in blocked_names and spec.permission in allowed_permissions
+    blocked_names = tool_context.blocked_tool_names
+    revealed = set(tool_context.revealed_tool_names)
+    deferred = [
+        spec for spec in registry.specs()
+        if spec.disclosure == "deferred"
+        and tool_context.tool_capability in spec.capabilities
+        and spec.name not in blocked_names
+        and spec.permission in allowed_permissions
     ]
-    spec_by_name = {spec.name: spec for spec in catalog}
-    documents = [
-        _document(spec)
-        for spec in catalog
-        if spec.name not in revealed and (server_name is None or _server_of(spec) == server_name)
-    ]
+    catalog = [spec for spec in deferred if scope is None or spec.discovery_scope == scope]
+    selected_servers = {spec.origin_server for spec in catalog if spec.origin_server}
+    if server_name:
+        selected_servers.add(server_name)
 
-    signature = _catalog_signature(catalog)
+    mcp_servers = {}
+    for name in sorted(selected_servers):
+        status = statuses.get(name)
+        if name in failures and (status is None or status.state not in {"failed", "invalid"}):
+            status = McpServerStatus(
+                name, "", "failed", error=failures[name],
+                catalog_source="cache" if any(spec.origin_server == name for spec in catalog) else "none",
+            )
+        if status is not None:
+            mcp_servers[name] = {"status": status.state, "catalog_source": status.catalog_source}
+            if status.error:
+                mcp_servers[name]["error"] = status.error
+                failures[name] = status.error
+    metadata = {"query": query, "server": server_name or scope, "scope": scope}
+    if mcp_servers:
+        metadata["mcp_servers"] = mcp_servers
+    if server_name in mcp_servers:
+        metadata.update(mcp_servers[server_name])
+    if scope == BUILTIN_AGENTS_SCOPE and catalog:
+        metadata.update(status="available", catalog_source="builtin")
+    if failures:
+        metadata["failed_mcp_servers"] = failures
+
+    state = metadata.get("status")
+    if scope is not None and not catalog:
+        if server_name in failures:
+            return _failure(
+                "mcp_invalid" if state == "invalid" else "mcp_unavailable",
+                f"MCP server '{server_name}' could not be discovered: {failures[server_name]}",
+                metadata=metadata,
+            )
+        if state == "disabled":
+            return _failure("mcp_disabled", f"MCP server '{server_name}' is disabled.", metadata=metadata)
+        if state is None:
+            valid = {spec.discovery_scope for spec in deferred if spec.discovery_scope}
+            valid.update(f"mcp:{name}" for name, status in statuses.items() if status.state not in {"disabled", "invalid"})
+            return _failure(
+                "unknown_scope",
+                f"Unknown tool scope: {scope}. Available scopes: {', '.join(sorted(valid)) or 'none'}.",
+                metadata=metadata,
+            )
+
+    historical = [
+        spec for spec in catalog if mcp_servers.get(spec.origin_server, {}).get("status") == "failed"
+    ]
+    unavailable = {
+        name for name, value in mcp_servers.items() if value["status"] in {"failed", "invalid", "disabled"}
+    }
+    spec_by_name = {spec.name: spec for spec in catalog if spec.origin_server not in unavailable}
+    documents = [_document(spec) for spec in spec_by_name.values() if spec.name not in revealed]
+    failure_note = _failure_note(failures)
+    if historical:
+        failure_note += "\n\nHistorical tools (unavailable):\n" + _directory(historical, scope)
+
+    signature = _catalog_signature(deferred)
     if signature != tool_context.search_tools_signature:
-        # A changed visible catalog (including a permission or profile change)
-        # invalidates the previous query history; the old repeat guard must not
-        # outlive the view it was recorded against.
         tool_context.search_tools_queries.clear()
         tool_context.search_tools_signature = signature
         tool_context.search_tools_no_progress = 0
 
-    query_key = (server_name or "", " ".join(query.lower().split()), limit)
+    availability = tuple((name, value["status"]) for name, value in mcp_servers.items())
+    query_key = (scope or "", " ".join(query.lower().split()), limit, availability)
     if query_key in tool_context.search_tools_queries:
         tool_context.search_tools_no_progress += 1
         return _result(
-            f"You already searched '{query}' in {_scope_label(server_name)}. Do not repeat it: "
-            "use different English keywords, or search another server.\n"
-            + _directory(catalog, server_name)
+            f"You already searched '{query}' in {_scope_label(scope)}. Do not repeat it: "
+            "use different English keywords, or search another scope.\n"
+            + _directory(list(spec_by_name.values()), scope)
+            + failure_note
             + _no_progress_block(tool_context),
             metadata={
-                "query": query,
-                "server": server_name,
+                **metadata,
                 "level": "repeated",
                 "revealed_tool_names": [],
                 "no_progress": tool_context.search_tools_no_progress,
@@ -126,14 +207,17 @@ def search_tools(
 
     if not documents:
         tool_context.search_tools_no_progress += 1
+        message = (
+            f"No unmounted tools remain in {_scope_label(scope)}." if spec_by_name
+            else f"No usable tools are available in {_scope_label(scope)}."
+        )
         return _result(
-            f"No unmounted tools remain in {_scope_label(server_name)}. Proceed with the mounted tools, "
-            "or search another server.\n"
-            + _directory(catalog, server_name)
+            message + "\n"
+            + _directory(list(spec_by_name.values()), scope)
+            + failure_note
             + _no_progress_block(tool_context),
             metadata={
-                "query": query,
-                "server": server_name,
+                **metadata,
                 "level": "none",
                 "revealed_tool_names": [],
                 "no_progress": tool_context.search_tools_no_progress,
@@ -144,15 +228,15 @@ def search_tools(
     if not hits:
         tool_context.search_tools_no_progress += 1
         return _result(
-            f"No match for '{query}' in {_scope_label(server_name)} (coverage 0.00). "
+            f"No match for '{query}' in {_scope_label(scope)} (coverage 0.00). "
             "No tool schema was mounted, so calling an unmounted tool will fail.\n"
-            + _directory(catalog, server_name)
-            + "\nRetry with different English keywords, or search another server if the capability "
-            "lives elsewhere. If no server has it, tell the user you cannot do it."
+            + _directory(list(spec_by_name.values()), scope)
+            + "\nRetry with different English keywords, or search another scope if the capability "
+            "lives elsewhere. If no scope has it, tell the user you cannot do it."
+            + failure_note
             + _no_progress_block(tool_context),
             metadata={
-                "query": query,
-                "server": server_name,
+                **metadata,
                 "coverage": 0.0,
                 "level": "none",
                 "revealed_tool_names": [],
@@ -181,19 +265,27 @@ def search_tools(
         group_note = " (including its workflow group)" if len(mounted) > len(hits) else ""
         heading = (
             f"Mounted {len(new_names)} new tool(s){group_note} "
-            f"from {_scope_label(server_name)}{note}:"
+            f"from {_scope_label(scope)}{note}:"
         )
     else:
         heading = (
-            f"No new tools: all {len(mounted)} match(es) from {_scope_label(server_name)} were "
+            f"No new tools: all {len(mounted)} match(es) from {_scope_label(scope)} were "
             "already mounted. Change the query, or proceed with the mounted tools."
         )
 
+    cached = sorted({
+        spec.origin_server for name in mounted
+        if (spec := spec_by_name[name]).origin_server
+        and mcp_servers.get(spec.origin_server, {}).get("status") == "cached"
+    })
+    cache_note = (
+        "\n\nCached catalog; the first call connects: " + ", ".join(f"mcp:{name}" for name in cached) + "."
+        if cached else ""
+    )
     return _result(
-        f"{heading}\n{listing}" + _no_progress_block(tool_context),
+        f"{heading}\n{listing}" + cache_note + failure_note + _no_progress_block(tool_context),
         metadata={
-            "query": query,
-            "server": server_name,
+            **metadata,
             "coverage": coverage,
             "level": level,
             "revealed_tool_names": mounted,
@@ -229,6 +321,7 @@ def _catalog_signature(deferred: list[ToolSpec]) -> tuple[str, ...]:
                 {
                     "name": spec.name,
                     "permission": spec.permission,
+                    "scope": spec.discovery_scope,
                     "origin_server": spec.origin_server,
                     "origin_tool": spec.origin_tool,
                     "schema": spec.schema,
@@ -260,22 +353,19 @@ def _no_progress_block(context: ToolContext) -> str:
     )
 
 
-def _scope_label(server_name: str | None) -> str:
-    return f"server '{server_name}'" if server_name else "the catalog"
+def _scope_label(scope: str | None) -> str:
+    return f"scope '{scope}'" if scope else "the catalog"
 
 
-def _directory(catalog: list[ToolSpec], server_name: str | None) -> str:
-    selected = [
-        spec for spec in catalog if server_name is None or _server_of(spec) == server_name
-    ]
-    if not selected:
+def _directory(catalog: list[ToolSpec], scope: str | None) -> str:
+    if not catalog:
         return "No tools are available in this catalog."
-    lines = ["Available tools (names and descriptions only):"]
+    lines = ["Tool names and descriptions:"]
     grouped: dict[str, list[ToolSpec]] = {}
-    for spec in selected:
-        grouped.setdefault(_server_of(spec) or "", []).append(spec)
+    for spec in catalog:
+        grouped.setdefault(spec.discovery_scope or "", []).append(spec)
     for name in sorted(grouped):
-        if name and server_name is None:
+        if name and scope is None:
             lines.append(f"[{name}]")
         for spec in grouped[name]:
             description = _one_line(_description_of(spec))
@@ -300,7 +390,7 @@ def _document(spec: ToolSpec) -> SearchDocument:
         text=text,
         metadata={
             "description": description,
-            "server": _server_of(spec),
+            "server": spec.origin_server,
             "tool": _tool_of(spec),
             "permission": spec.permission,
         },
@@ -328,26 +418,8 @@ def _schema_parameter_text(schema: dict) -> str:
     return " ".join(part for part in parts if part)
 
 
-def _server_of(spec: ToolSpec) -> str | None:
-    if spec.origin_server:
-        return spec.origin_server
-    name = spec.name
-    if not name.startswith(MCP_TOOL_PREFIX):
-        return None
-    remainder = name[len(MCP_TOOL_PREFIX):]
-    if "__" not in remainder:
-        return None
-    return remainder.split("__", 1)[0] or None
-
-
 def _tool_of(spec: ToolSpec) -> str:
-    if spec.origin_tool:
-        return spec.origin_tool
-    name = spec.name
-    if not name.startswith(MCP_TOOL_PREFIX):
-        return name
-    remainder = name[len(MCP_TOOL_PREFIX):]
-    return remainder.split("__", 1)[1] if "__" in remainder else remainder
+    return spec.origin_tool or spec.name
 
 
 def _one_line(value: object) -> str:
@@ -355,6 +427,22 @@ def _one_line(value: object) -> str:
     if len(text) > _DESCRIPTION_LIMIT:
         text = text[: _DESCRIPTION_LIMIT - 3] + "..."
     return text
+
+
+def _failure_map(value: object) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    return {str(name): str(error) for name, error in value.items()}
+
+
+def _failure_note(failures: dict[str, str]) -> str:
+    if not failures:
+        return ""
+    details = "; ".join(f"{name}: {error}" for name, error in sorted(failures.items()))
+    return (
+        f"\n\nUnavailable MCP server(s): {details}. "
+        "Use the MCP management controls to reconnect if needed."
+    )
 
 
 def _failure(reason: str, message: str, *, metadata: dict | None = None) -> ToolResult:

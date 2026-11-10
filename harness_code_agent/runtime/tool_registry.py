@@ -17,6 +17,7 @@ EffectResolver = Callable[[dict, "ToolContext | None"], CallEffect]
 TOOL_CAPABILITY_MAIN = "main"
 TOOL_CAPABILITY_READONLY_AGENT = "readonly_agent"
 TOOL_CAPABILITY_WORKER_AGENT = "worker_agent"
+BUILTIN_AGENTS_SCOPE = "builtin:agents"
 VALID_TOOL_CAPABILITIES = {
     TOOL_CAPABILITY_MAIN,
     TOOL_CAPABILITY_READONLY_AGENT,
@@ -36,6 +37,7 @@ class ToolSpec:
     #: Canonical owner identity for tools proxied from an external catalog.
     origin_server: str | None = None
     origin_tool: str | None = None
+    discovery_scope: str | None = None
 
 
 VALID_TOOL_DISCLOSURES = {"core", "deferred"}
@@ -58,6 +60,7 @@ class ToolRegistry:
         capabilities: set[str] | frozenset[str] | None = None,
         origin_server: str | None = None,
         origin_tool: str | None = None,
+        discovery_scope: str | None = None,
     ) -> None:
         name = schema.get("function", {}).get("name")
         if not name:
@@ -93,6 +96,7 @@ class ToolRegistry:
             capabilities=resolved_capabilities,
             origin_server=origin_server,
             origin_tool=origin_tool,
+            discovery_scope=discovery_scope or (f"mcp:{origin_server}" if origin_server else None),
         )
 
     def register_spec(self, spec: ToolSpec) -> None:
@@ -105,7 +109,12 @@ class ToolRegistry:
             capabilities=spec.capabilities,
             origin_server=spec.origin_server,
             origin_tool=spec.origin_tool,
+            discovery_scope=spec.discovery_scope,
         )
+
+    def replace_mcp_specs(self, specs: list[ToolSpec]) -> None:
+        native = {name: spec for name, spec in self._specs.items() if spec.origin_server is None}
+        self._specs = {**{spec.name: spec for spec in specs}, **native}
 
     def get(self, name: str) -> Callable | None:
         spec = self._specs.get(name)
@@ -142,10 +151,10 @@ class ToolRegistry:
         return spec.disclosure if spec is not None else None
 
     def specs(self) -> list[ToolSpec]:
-        return [self._specs[name] for name in sorted(self._specs)]
+        return sorted(self._specs.values(), key=lambda spec: spec.name)
 
     def schemas(self) -> list[dict]:
-        return [self._specs[name].schema for name in sorted(self._specs)]
+        return [spec.schema for spec in self.specs()]
 
     def dispatch(self) -> dict[str, Callable]:
         return {name: spec.handler for name, spec in self._specs.items()}

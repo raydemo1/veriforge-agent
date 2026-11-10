@@ -13,8 +13,10 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
+from ..runtime.builtins.discovery import discovery_catalog_prompt
 from ..runtime.errors import SubagentCapacityError
 from ..runtime.execution_planner import workspace_claim
+from ..runtime.mcp import PublishedMcpCatalog
 from ..runtime.middleware.stack import build_subagent_middlewares
 from ..runtime.output_artifacts import copy_artifact, file_digest
 from ..runtime.permissions import PermissionPolicy
@@ -387,12 +389,25 @@ class AgentCoordinator:
             workspace = WorkspaceService(root=sandbox.workspace)
         else:
             workspace = self.context.workspace
+        parent_sync = self.context.sync_mcp_catalog
+        published = parent_sync() if parent_sync is not None else None
         registry = self._role_registry(record.role)
 
-        def discover_mcp(server_name=None):
-            self.context.discover_mcp_tools(server_name)
-            for spec in self._role_registry(record.role).specs():
-                registry.register_spec(spec)
+        def sync_mcp_catalog():
+            nonlocal published
+            latest = parent_sync()
+            if latest is not published:
+                self._refresh_child_mcp(agent, sub_context, latest)
+                published = latest
+            return published
+
+        def discover_mcp(server_name):
+            failures = self.context.discover_mcp_tools(server_name)
+            if parent_sync is None:
+                self._refresh_child_mcp(agent, sub_context)
+            else:
+                sync_mcp_catalog()
+            return failures
 
         policy = PermissionPolicy.delegated_from(
             self.context.permission_policy,
@@ -404,6 +419,9 @@ class AgentCoordinator:
             project_resources=self.context.project_resources,
             ui_request_id=self.context.ui_request_id,
             discover_mcp_tools=discover_mcp if self.context.discover_mcp_tools is not None else None,
+            sync_mcp_catalog=sync_mcp_catalog if parent_sync is not None else None,
+            mcp_discovery_statuses=self.context.mcp_discovery_statuses,
+            mcp_discovery_scopes=self.context.mcp_discovery_scopes,
             permission_policy=policy,
             event_bus=self.context.event_bus,
             session_id=self.context.session_id,
@@ -413,6 +431,7 @@ class AgentCoordinator:
             memory_auto_extract_enabled=self.context.memory_auto_extract_enabled,
             memory_service=self.context.memory_service,
             tool_registry=registry,
+            tool_capability=self._role_capability(record.role),
             allowed_tool_permissions={"read", "network_read", "edit", "shell"},
             agent_id=record.id,
             agent_coordinator=self,
@@ -441,6 +460,8 @@ class AgentCoordinator:
             tool_context=sub_context,
             model_intensity=record.model_intensity,
         )
+        if sub_context.mcp_discovery_scopes is not None:
+            agent.set_tool_discovery_catalog(discovery_catalog_prompt(registry, sub_context.mcp_discovery_scopes()))
         record.conversation = agent.start_conversation(_task_prompt(record))
         saved, record.saved_messages = record.saved_messages, None
         if saved:
@@ -470,6 +491,27 @@ class AgentCoordinator:
                 copy_artifact(self.context.workspace.root, sandbox.workspace, reference)
                 record.conversation.agent.tool_context.tool_output_artifacts[reference["path"]] = dict(reference)
 
+    def _refresh_child_mcp(self, agent, context: ToolContext, catalog: PublishedMcpCatalog | None = None) -> None:
+        registry = context.tool_registry
+        previous = registry.specs()
+        specs = catalog.specs if catalog is not None else self.context.tool_registry.specs()
+        registry.replace_mcp_specs([
+            spec for spec in specs
+            if spec.origin_server is not None and context.tool_capability in spec.capabilities
+        ])
+        invalidated = context.invalidate_mcp_tools(previous, statuses=catalog.statuses if catalog is not None else None)
+        if invalidated:
+            agent.update_tool_schemas([
+                schema for schema in agent.tool_schemas
+                if schema["function"]["name"] not in invalidated
+            ])
+        if context.mcp_discovery_scopes is not None:
+            agent.set_tool_discovery_catalog(discovery_catalog_prompt(registry, context.mcp_discovery_scopes()))
+
+    @staticmethod
+    def _role_capability(role: str) -> str:
+        return TOOL_CAPABILITY_WORKER_AGENT if role == "worker" else TOOL_CAPABILITY_READONLY_AGENT
+
     def _role_registry(self, role: str) -> ToolRegistry:
         # Depth limit: subagent registries are capability-filtered views of
         # the parent registry. spawn_agent carries no *_AGENT capability, so
@@ -478,7 +520,7 @@ class AgentCoordinator:
         source = self.context.tool_registry
         if source is None:
             raise RuntimeError("parent tool registry is unavailable")
-        capability = TOOL_CAPABILITY_WORKER_AGENT if role == "worker" else TOOL_CAPABILITY_READONLY_AGENT
+        capability = self._role_capability(role)
         registry = ToolRegistry()
         for spec in source.specs():
             if capability not in spec.capabilities:

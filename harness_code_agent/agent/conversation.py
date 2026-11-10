@@ -91,7 +91,7 @@ class Agent:
         # index is dynamic reference material and stays a separate suffix so
         # it never pollutes the stable prompt-cache boundary.
         self.system_prompt = system_prompt
-        self.mcp_catalog = None
+        self.tool_discovery_catalog = None
         self.memory_index = (
             memory_index.strip() if isinstance(memory_index, str) and memory_index.strip() else None
         )
@@ -112,9 +112,9 @@ class Agent:
 
     @property
     def stable_system_prompt(self) -> str:
-        """Stable prefix plus the MCP server catalog (no tool schemas)."""
-        if self.mcp_catalog:
-            return f"{self.system_prompt}\n\n{self.mcp_catalog}"
+        """Stable prefix plus the tool discovery directory."""
+        if self.tool_discovery_catalog:
+            return f"{self.system_prompt}\n\n{self.tool_discovery_catalog}"
         return self.system_prompt
 
     @property
@@ -124,12 +124,12 @@ class Agent:
             return f"{self.stable_system_prompt}\n\n{self.memory_index}"
         return self.stable_system_prompt
 
-    def set_mcp_catalog(self, catalog: str | None) -> None:
-        """Set the MCP server directory shown to the model."""
+    def set_tool_discovery_catalog(self, catalog: str | None) -> None:
+        """Set the tool discovery directory shown to the model."""
         catalog = catalog.strip() if isinstance(catalog, str) and catalog.strip() else None
-        if catalog == self.mcp_catalog:
+        if catalog == self.tool_discovery_catalog:
             return
-        self.mcp_catalog = catalog
+        self.tool_discovery_catalog = catalog
         for conversation in list(self._conversations):
             conversation._cached_prompt_cache_key = None
 
@@ -976,6 +976,8 @@ class AgentConversation:
                     self.trace.middleware_inject(type(mw).__name__, "per_iteration", inject)
 
             # --- Context lifecycle check ---
+            if agent.use_tools and (sync_mcp_catalog := getattr(agent.tool_context, "sync_mcp_catalog", None)):
+                sync_mcp_catalog()
             self._ensure_request_contract()
             self._flush_runtime_events()
             tool_schemas = _tool_schemas_for_agent(agent)
