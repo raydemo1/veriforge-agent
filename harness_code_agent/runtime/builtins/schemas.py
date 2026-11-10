@@ -473,24 +473,15 @@ CORE_TOOL_SCHEMAS = [
             "name": "run_bash",
             "description": (
                 "Execute a shell command in the workspace directory. "
-                + ("On Windows use PowerShell 7 syntax; processes run under the native directory write sandbox. "
+                + ("On Windows use PowerShell 7 syntax; processes run under the native directory write sandbox: "
+                   "the project is read-only unless write_paths declares writable directories "
+                   "(private TEMP is always writable), and a background job cannot claim the whole shared workspace. "
                    if os.name == "nt" else "Use Bash syntax; commands run directly in the current execution environment. ")
-                + "Use for installing deps, running builds, starting servers, running tests, etc. "
-                + (
-                    "The Windows sandbox makes the project read-only unless write_paths declares writable directories. "
-                    "Declare only required output/cache/source directories; private TEMP is writable. "
-                    "Background jobs retain those directory write permits until their process trees exit. "
-                    "A background job cannot request the whole shared Local workspace. Never create a Worktree automatically; only the user creates one. "
-                    if os.name == "nt" else ""
-                )
-                + "Keep each call to one logical verification whenever practical. "
-                "A command that runs to completion is reported as success even when it exits non-zero (a failing test run or compiler error is a normal result for you to read and act on); the exit code is appended as [exit_code: N]. Only timeouts or tool/runtime errors are reported as failed. "
-                "Do not use shell for repository search or file listing; use repo_search/list_files/read_file. "
-                "Repository-browsing shell commands such as bare rg without a path, recursive grep/findstr, Get-ChildItem -Recurse, or dir /s may be blocked. "
-                "For long-running verification commands (compilation, training), increase the timeout parameter. "
-                "For dev servers, watch mode, and runserver commands, this returns a background shell job id; use read_shell_output, list_shell_jobs, and stop_shell_job to manage it. "
-                "Prefer bounded inspection commands such as rg, head/tail, sed -n, Select-Object -First/-Last, or line counts instead of dumping whole files or logs. "
-                "Stderr is labelled in output for easier debugging."
+                + "A command that runs to completion is reported as success even when it exits non-zero - the code is appended as [exit_code: N]; only timeouts and runtime errors are failures. "
+                "Long builds need a larger timeout. Dev servers and watch mode return a background job id for the shell-job tools. "
+                "Keep inspection commands bounded and prefer the dedicated file and search tools; "
+                "unbounded repository-wide listing or searching may be blocked. "
+                "Never create a git worktree on your own."
             ),
             "parameters": {
                 "type": "object",
