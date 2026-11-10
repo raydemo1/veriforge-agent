@@ -9,9 +9,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from harness_code_agent.support.cancellation import CancellationToken, CancelledError
+
 from harness_code_agent import config
 from harness_code_agent.agent import llm_channel
-from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
 from harness_code_agent.agent.coordinator import AgentCoordinator
 from harness_code_agent.runtime.builtins.filesystem import write_file
 from harness_code_agent.runtime.builtins.registry import BUILTIN_TOOL_REGISTRY

@@ -15,9 +15,9 @@ from typing import Literal
 import psutil
 
 from .. import config
-from ..agent.cancellation import CancellationToken, CancelledError
-from ..agent.context import count_text_tokens
 from ..runtime.tool_output import output_limit
+from ..support.cancellation import CancellationToken, CancelledError
+from ..support.tokens import count_text_tokens
 from .shell_environment import shell_executable
 
 ShellJobStatus = Literal["running", "stopping", "exited", "stopped", "failed"]

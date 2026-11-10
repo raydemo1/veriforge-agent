@@ -9,8 +9,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..agent.cancellation import current_token
 from ..runtime.recovery import RecoveryStore, atomic_json
+from ..support.cancellation import current_token
 from .access import WorkspaceAccessCoordinator, WorkspaceConflict, fingerprint
 
 
@@ -124,7 +124,7 @@ class WorktreeService:
         return destination
 
     def apply(self, session_id, *, turn_id="worktree-apply", approved=None):
-        from ..agent.change_proposal import _git_merge_text
+        from .merge import git_merge_text
         descriptor = json.loads((self.project / ".harness" / "worktree-environments" / f"{session_id}.json").read_text(encoding="utf-8"))
         root = Path(descriptor["root"])
         work_access = WorkspaceAccessCoordinator(root)
@@ -151,7 +151,7 @@ class WorktreeService:
                         conflicts[name] = {"base": before, "local": current, "task": desired}
                         continue
                     try:
-                        merged, conflict = _git_merge_text(current.decode("utf-8"), before.decode("utf-8"), desired.decode("utf-8"))
+                        merged, conflict = git_merge_text(current.decode("utf-8"), before.decode("utf-8"), desired.decode("utf-8"))
                     except UnicodeDecodeError:
                         conflicts[name] = {"base": before, "local": current, "task": desired}
                         continue

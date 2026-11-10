@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import Any
 
 from . import config
-from .agent.cancellation import CancellationToken, CancelledError
 from .attachments import (
     AttachmentError,
     ExternalPathConfirmationRequired,
@@ -51,6 +50,7 @@ from .sessions.observability import (
     format_project_observability,
     format_session_observability,
 )
+from .support.cancellation import CancellationToken, CancelledError
 from .tui.approval import ApprovalAllowlist, _persistent_prefix_for_request
 from .tui.commands import default_command_registry
 from .tui.completion import MentionIndex
@@ -217,7 +217,7 @@ class BridgeInteractionProvider:
         )
 
     def _open(self, kind: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        from .agent.cancellation import current_token
+        from .support.cancellation import current_token
         token = current_token.get()
         while not self._presentation_lock.acquire(timeout=0.05):
             if token is not None:
@@ -241,7 +241,7 @@ class BridgeInteractionProvider:
             result: dict[str, Any] = {}
             self._pending[interaction_id] = (event, result)
         self._emit({"type": "interaction", "id": interaction_id, "kind": kind, "payload": payload})
-        from .agent.cancellation import current_token
+        from .support.cancellation import current_token
         token = current_token.get()
         try:
             while not event.wait(timeout=0.05):
@@ -708,7 +708,7 @@ class SessionBridge:
                 self._close_assistant_group("success")
             self._send_event({"type": "turn_state", "state": "running"})
             try:
-                from .agent.cancellation import cancellation_scope
+                from .support.cancellation import cancellation_scope
                 with cancellation_scope(token):
                     if self._session is not None:
                         while self._session.tool_context.tool_tasks.pending_foreground_count:
@@ -1174,7 +1174,7 @@ class SessionBridge:
                 self._last_activity = time.monotonic()
 
     def _require_session(self) -> InteractiveSession:
-        from .agent.cancellation import current_token
+        from .support.cancellation import current_token
         token = current_token.get()
         while True:
             while not self._not_suspending.wait(.05):
@@ -1558,7 +1558,7 @@ class BridgeServer:
             return host._action(name, params)
 
     def _apply_worktree(self, record):
-        from .agent.cancellation import current_token
+        from .support.cancellation import current_token
         from .workspace.worktrees import (
             WorktreeMergeConflict,
             WorktreeService,
@@ -1647,7 +1647,7 @@ class BridgeServer:
         return True
 
     def _start_control(self, request_id, session_id, name, params):
-        from .agent.cancellation import cancellation_scope
+        from .support.cancellation import cancellation_scope
         token = CancellationToken()
         def run():
             try:

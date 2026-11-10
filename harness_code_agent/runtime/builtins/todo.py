@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 from ... import config
-from ...agent.runtime_state import TodoList, normalize_todo_items
+from ..todo_state import TodoList, normalize_todo_items
 from ..tool_context import ToolContext
 from ..tool_result import ToolResult
 

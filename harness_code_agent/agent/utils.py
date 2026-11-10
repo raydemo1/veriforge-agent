@@ -10,37 +10,6 @@ if TYPE_CHECKING:
     from .conversation import Agent
 
 
-def _get(value, key: str, default=None):
-    """Get an attribute/key from either an object or a dict."""
-    if isinstance(value, dict):
-        return value.get(key, default)
-    return getattr(value, key, default)
-
-
-def _usage_to_dict(usage) -> dict | None:
-    """Convert an OpenAI Usage object (or dict) to a plain dict."""
-    if usage is None:
-        return None
-    prompt_tokens = _get(usage, "prompt_tokens")
-    completion_tokens = _get(usage, "completion_tokens")
-    total_tokens = _get(usage, "total_tokens")
-    details = _get(usage, "prompt_tokens_details") or {}
-    cache_hit_tokens = _usage_optional_int(usage, "prompt_cache_hit_tokens")
-    if cache_hit_tokens is None:
-        cache_hit_tokens = _usage_optional_int(details, "cached_tokens")
-    cache_miss_tokens = _usage_optional_int(usage, "prompt_cache_miss_tokens")
-    if cache_miss_tokens is None and cache_hit_tokens is not None and prompt_tokens is not None:
-        cache_miss_tokens = max(0, int(prompt_tokens) - cache_hit_tokens)
-    return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-        "cached_tokens": cache_hit_tokens,
-        "cache_hit_tokens": cache_hit_tokens,
-        "cache_miss_tokens": cache_miss_tokens,
-    }
-
-
 @dataclass(frozen=True)
 class PromptCacheShape:
     system_hash: str
@@ -163,31 +132,6 @@ def _canonical_schema_value(value, *, parent_key: str = ""):
             return sorted(items)
         return items
     return value
-
-
-def _usage_optional_int(usage, key: str) -> int | None:
-    value = _get(usage, key, None)
-    if value is None:
-        value = _get(_get(usage, "model_extra") or {}, key, None)
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _usage_int(usage, key: str) -> int:
-    value = _get(usage, key, None)
-    if value is None:
-        extra = _get(usage, "model_extra") or {}
-        value = _get(extra, key, 0)
-    return _int_or_zero(value)
-
-
-def _int_or_zero(value) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def _short_hash(text: str) -> str:

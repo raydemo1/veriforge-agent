@@ -27,7 +27,7 @@ class TuiProtocolTests(unittest.TestCase):
     def test_stop_preserves_queued_messages_and_resets_idle_flag(self):
         import queue
 
-        from harness_code_agent.agent.cancellation import CancellationToken
+        from harness_code_agent.support.cancellation import CancellationToken
         for active in (False, True):
             server = self._server()
             server._active_lock = threading.Lock()

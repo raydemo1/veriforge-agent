@@ -7,6 +7,7 @@ from typing import Any
 
 from ..sessions.store import SessionStore
 from ..sessions.summary import load_session_summary
+from ..workspace.paths import is_relative_to
 
 
 @dataclass(frozen=True)
@@ -147,7 +148,7 @@ def _resolve_file_mention(mention: Mention, root: Path) -> ResolvedMention:
         candidate = raw_path.resolve()
     else:
         candidate = (root / raw_path).resolve()
-    if not _is_relative_to(candidate, root):
+    if not is_relative_to(candidate, root):
         raise MentionResolutionError(f"File mention escapes workspace: {mention.raw}")
     if not candidate.exists() or not (candidate.is_file() or candidate.is_dir()):
         raise MentionResolutionError(f"File mention not found: {mention.raw}")
@@ -192,11 +193,3 @@ def _resolve_session_mention(
         resolved=mention.target,
         content=content,
     )
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False

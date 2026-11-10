@@ -5,12 +5,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from unittest.mock import patch
 
 import pytest
-
-from harness_code_agent.agent.cancellation import (
+from harness_code_agent.support.cancellation import (
     CancellationToken,
     CancelledError,
     cancellation_scope,
 )
+
 from harness_code_agent.agent.trace import TraceWriter
 from harness_code_agent.tui_bridge import BridgeServer
 

@@ -14,7 +14,6 @@ from openai import OpenAI
 
 from .. import config
 from ..provider_resolution import resolve_provider_name
-from .utils import _get, _usage_to_dict
 
 TextDeltaCallback = Callable[[str], None]
 ChunkCallback = Callable[[], None]
@@ -22,6 +21,47 @@ ChunkCallback = Callable[[], None]
 # Explicit prompt-cache breakpoints ship on the OpenAI GPT-5.6 family and
 # later model families only.
 _OPENAI_BREAKPOINT_MODEL_RE = re.compile(r"^gpt-(\d+)(?:[.-](\d+))?(?:[.-].*)?$")
+
+
+def get(value, key: str, default=None):
+    """Get an attribute/key from either an object or a dict."""
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _usage_optional_int(usage, key: str) -> int | None:
+    value = get(usage, key, None)
+    if value is None:
+        value = get(get(usage, "model_extra") or {}, key, None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def usage_to_dict(usage) -> dict | None:
+    """Convert an OpenAI Usage object (or dict) to a plain dict."""
+    if usage is None:
+        return None
+    prompt_tokens = get(usage, "prompt_tokens")
+    completion_tokens = get(usage, "completion_tokens")
+    total_tokens = get(usage, "total_tokens")
+    details = get(usage, "prompt_tokens_details") or {}
+    cache_hit_tokens = _usage_optional_int(usage, "prompt_cache_hit_tokens")
+    if cache_hit_tokens is None:
+        cache_hit_tokens = _usage_optional_int(details, "cached_tokens")
+    cache_miss_tokens = _usage_optional_int(usage, "prompt_cache_miss_tokens")
+    if cache_miss_tokens is None and cache_hit_tokens is not None and prompt_tokens is not None:
+        cache_miss_tokens = max(0, int(prompt_tokens) - cache_hit_tokens)
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "cached_tokens": cache_hit_tokens,
+        "cache_hit_tokens": cache_hit_tokens,
+        "cache_miss_tokens": cache_miss_tokens,
+    }
 
 
 def openai_model_supports_cache_breakpoint(model: str | None) -> bool:
@@ -190,12 +230,12 @@ class ProviderAdapter:
         return kwargs
 
     def assistant_message_from_response(self, msg) -> dict:
-        assistant_msg = {"role": "assistant", "content": _get(msg, "content")}
+        assistant_msg = {"role": "assistant", "content": get(msg, "content")}
         reasoning_content = _reasoning_content_from(msg)
         if self.requires_reasoning_content_roundtrip and reasoning_content is not None:
             assistant_msg["reasoning_content"] = reasoning_content
 
-        tool_calls = [_normalize_tool_call(tc) for tc in (_get(msg, "tool_calls") or [])]
+        tool_calls = [_normalize_tool_call(tc) for tc in (get(msg, "tool_calls") or [])]
         if tool_calls:
             for index, call in enumerate(tool_calls):
                 if not call.get("id"):
@@ -224,19 +264,19 @@ class ProviderAdapter:
             if on_chunk is not None:
                 on_chunk()
             _check_cancelled(cancellation_token)
-            chunk_usage = _usage_to_dict(_get(chunk, "usage"))
+            chunk_usage = usage_to_dict(get(chunk, "usage"))
             if chunk_usage is not None:
                 usage = chunk_usage
-            choices = _get(chunk, "choices") or []
+            choices = get(chunk, "choices") or []
             if not choices:
                 continue
             choice = choices[0]
-            finish = _get(choice, "finish_reason")
+            finish = get(choice, "finish_reason")
             if finish is not None:
                 finish_reason = finish
-            delta = _get(choice, "delta") or {}
+            delta = get(choice, "delta") or {}
 
-            text_delta = _get(delta, "content")
+            text_delta = get(delta, "content")
             if text_delta:
                 content_parts.append(text_delta)
                 if on_text_delta is not None:
@@ -250,25 +290,25 @@ class ProviderAdapter:
                 if on_reasoning_delta is not None:
                     on_reasoning_delta(reasoning_delta)
 
-            for tc_delta in _get(delta, "tool_calls") or []:
-                index = _get(tc_delta, "index")
+            for tc_delta in get(delta, "tool_calls") or []:
+                index = get(tc_delta, "index")
                 if index is None:
                     index = len(tool_calls_by_index)
                 entry = tool_calls_by_index.setdefault(
                     int(index),
                     {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
                 )
-                call_id = _get(tc_delta, "id")
+                call_id = get(tc_delta, "id")
                 if call_id:
                     entry["id"] = call_id
-                call_type = _get(tc_delta, "type")
+                call_type = get(tc_delta, "type")
                 if call_type:
                     entry["type"] = call_type
-                fn_delta = _get(tc_delta, "function") or {}
-                name_delta = _get(fn_delta, "name")
+                fn_delta = get(tc_delta, "function") or {}
+                name_delta = get(fn_delta, "name")
                 if name_delta:
                     entry["function"]["name"] += name_delta
-                args_delta = _get(fn_delta, "arguments")
+                args_delta = get(fn_delta, "arguments")
                 if args_delta:
                     entry["function"]["arguments"] += args_delta
 
@@ -310,21 +350,21 @@ def _check_cancelled(cancellation_token) -> None:
 
 
 def _normalize_tool_call(tc) -> dict:
-    fn = _get(tc, "function") or {}
+    fn = get(tc, "function") or {}
     return {
-        "id": _get(tc, "id"),
-        "type": _get(tc, "type") or "function",
+        "id": get(tc, "id"),
+        "type": get(tc, "type") or "function",
         "function": {
-            "name": _get(fn, "name"),
-            "arguments": _get(fn, "arguments") or "",
+            "name": get(fn, "name"),
+            "arguments": get(fn, "arguments") or "",
         },
     }
 
 
 def _reasoning_content_from(value) -> str | None:
-    reasoning_content = _get(value, "reasoning_content")
+    reasoning_content = get(value, "reasoning_content")
     if reasoning_content is None:
-        reasoning_content = _get(_get(value, "model_extra") or {}, "reasoning_content")
+        reasoning_content = get(get(value, "model_extra") or {}, "reasoning_content")
     return reasoning_content
 
 

@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 
 from ... import config
-from ...agent.context import count_text_tokens
+from ...support.tokens import count_text_tokens
 from ...workspace.service import WorkspaceQuotaError
 from ..tool_context import ToolContext
 from ..tool_output import fitting_prefix, output_limit
@@ -231,7 +231,7 @@ def repo_search(
             selected.seek(0)
             output = selected.read(65537)
             if len(output) > 65536:
-                from ...agent.observations import observation_dir_for
+                from ...workspace.paths import observation_dir_for
                 directory = observation_dir_for(workspace, getattr(tool_context, "session_id", None),
                                                 getattr(tool_context, "agent_id", None))
                 directory.mkdir(parents=True, exist_ok=True)

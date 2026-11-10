@@ -10,8 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from harness_code_agent.support.cancellation import CancellationToken, CancelledError
 
-from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
 from harness_code_agent.runtime.builtins.shell import run_bash
 from harness_code_agent.workspace.access import WorkspaceAccessCoordinator
 from harness_code_agent.workspace.native_shell import (

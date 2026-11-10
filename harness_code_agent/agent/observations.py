@@ -22,19 +22,9 @@ from ..runtime.tool_output import (
     result_text,
 )
 from ..runtime.tool_result import ToolResult
-from .context import count_text_tokens
+from ..support.tokens import count_text_tokens
 
 log = logging.getLogger("harness")
-
-def observation_dir_for(root: str | Path, session_id: str | None, agent_id: str | None = None) -> Path:
-    """Directory for observation files and streamed tool-output artifacts."""
-    safe_session_id = "".join(
-        ch if ch.isalnum() or ch in {"-", "_"} else "_"
-        for ch in str(session_id or "default")
-    )
-    safe_agent_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(agent_id or "main"))
-    return Path(root) / ".harness" / "observations" / safe_session_id / safe_agent_id
-
 
 @dataclass
 class ToolObservation:

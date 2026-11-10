@@ -14,10 +14,9 @@ from contextlib import nullcontext
 from email.utils import parsedate_to_datetime
 
 from .. import config
-from . import context
-from .cancellation import CancelledError, current_token
-from .providers import ProviderAdapter, client_scope
-from .utils import _usage_to_dict
+from ..support import tokens
+from ..support.cancellation import CancelledError, current_token
+from ..support.llm import ProviderAdapter, client_scope, usage_to_dict
 
 log = logging.getLogger("harness")
 
@@ -199,7 +198,7 @@ def llm_call_simple(messages: list[dict], *, diagnostics=None, trace=None, epoch
 
     def _invoke() -> str:
         kwargs = adapter.chat_kwargs(profile=profile, messages=messages, max_tokens=10000)
-        if context.count_request_tokens(kwargs["messages"]) + kwargs["max_tokens"] > config.CONTEXT_WINDOW_TOKENS:
+        if tokens.count_request_tokens(kwargs["messages"]) + kwargs["max_tokens"] > config.CONTEXT_WINDOW_TOKENS:
             log.warning("Skipping compaction: summary request exceeds context budget")
             return ""
         record = diagnostics.begin(kwargs, provider=profile.provider, epoch=epoch,
@@ -215,7 +214,7 @@ def llm_call_simple(messages: list[dict], *, diagnostics=None, trace=None, epoch
             raise
         if record is not None and trace is not None:
             trace._write("request_diagnostics", {"purpose": "summary", **diagnostics.finish(
-                record, usage=_usage_to_dict(getattr(resp, "usage", None)))})
+                record, usage=usage_to_dict(getattr(resp, "usage", None)))})
         return resp.choices[0].message.content or ""
 
     try:
@@ -253,7 +252,7 @@ class LlmChannel:
             finish(error=exc)
             raise
         if not kwargs.get("stream"):
-            finish(_usage_to_dict(getattr(response, "usage", None)))
+            finish(usage_to_dict(getattr(response, "usage", None)))
             return response
 
         def chunks():
@@ -261,7 +260,7 @@ class LlmChannel:
             error = None
             try:
                 for chunk in response:
-                    usage = _usage_to_dict(getattr(chunk, "usage", None)) or usage
+                    usage = usage_to_dict(getattr(chunk, "usage", None)) or usage
                     yield chunk
             except BaseException as exc:
                 error = exc
@@ -432,7 +431,7 @@ class LlmChannel:
             first_token_ms=None,
             model=str(kwargs.get("model") or config.MODEL),
         )
-        conv.record_llm_usage(_usage_to_dict(getattr(response, "usage", None)), kwargs.get("prompt_cache_key"))
+        conv.record_llm_usage(usage_to_dict(getattr(response, "usage", None)), kwargs.get("prompt_cache_key"))
 
         return conv.provider.assistant_message_from_response(choice.message), choice.finish_reason
     def _interrupt_client_on_cancel(self, cancellation_token):

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ..support import tokens
 from . import context
 from .history import tool_pairs_closed
 
@@ -44,9 +45,9 @@ class ContextManager:
         system = [messages[0]] if messages[0].get("role") == "system" else []
         system_len = len(system)
         split = max(system_len, min(current_turn_start_index, len(messages)))
-        if context.count_tokens(messages[split:]) > context.DEFAULT_RECENT_TAIL_TOKENS:
+        if tokens.count_tokens(messages[split:]) > context.DEFAULT_RECENT_TAIL_TOKENS:
             tail = max(system_len, len(messages) - context.DEFAULT_MIN_RECENT_MESSAGES)
-            while tail > system_len and context.count_tokens(messages[tail - 1:]) <= context.DEFAULT_RECENT_TAIL_TOKENS:
+            while tail > system_len and tokens.count_tokens(messages[tail - 1:]) <= context.DEFAULT_RECENT_TAIL_TOKENS:
                 tail -= 1
             split = max(split, tail)
         while split > system_len and not tool_pairs_closed(messages[split:]):
@@ -90,7 +91,7 @@ class ContextManager:
                 candidate = refresh(candidate)
             except Exception:  # noqa: BLE001 - a failed hook cannot partially commit a new context
                 return None
-        if not tool_pairs_closed(candidate) or context.count_tokens(candidate) >= context.count_tokens(messages):
+        if not tool_pairs_closed(candidate) or tokens.count_tokens(candidate) >= tokens.count_tokens(messages):
             return None
         return CompactionResult(
             messages=candidate,
@@ -102,23 +103,23 @@ class ContextManager:
     def breakdown(messages: list[dict], tool_schemas: list[dict] | None = None) -> dict[str, int]:
         result = {"system": 0, "summary": 0, "recent": 0, "memory": 0, "tools": 0}
         for index, message in enumerate(messages):
-            tokens = context.count_tokens([message])
+            message_tokens = tokens.count_tokens([message])
             content = str(message.get("content") or "")
             if index == 0 and message.get("role") == "system":
                 if "[HARNESS_MEMORY_INDEX]" in content:
                     stable, memory = content.split("[HARNESS_MEMORY_INDEX]", 1)
-                    result["system"] += context.count_text_tokens(stable)
-                    result["memory"] += context.count_text_tokens("[HARNESS_MEMORY_INDEX]" + memory)
+                    result["system"] += tokens.count_text_tokens(stable)
+                    result["memory"] += tokens.count_text_tokens("[HARNESS_MEMORY_INDEX]" + memory)
                 else:
-                    result["system"] += tokens
+                    result["system"] += message_tokens
             elif SUMMARY_MARKER in content:
-                result["summary"] += tokens
+                result["summary"] += message_tokens
             elif "Relevant long-term memory" in content:
-                result["memory"] += tokens
+                result["memory"] += message_tokens
             else:
-                result["recent"] += tokens
+                result["recent"] += message_tokens
         if tool_schemas:
-            result["tools"] = context.count_request_tokens([], tool_schemas=tool_schemas)
+            result["tools"] = tokens.count_request_tokens([], tool_schemas=tool_schemas)
         return result
 
 

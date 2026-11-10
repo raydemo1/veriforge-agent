@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from harness_code_agent.agent.context import count_text_tokens
 from harness_code_agent.memory import (
     EvidenceReference,
     MemoryService,
@@ -18,6 +17,7 @@ from harness_code_agent.runtime.builtins.memory_tools import (
     memory_write,
 )
 from harness_code_agent.sessions.journal import SessionJournal
+from harness_code_agent.support.tokens import count_text_tokens
 
 
 def test_file_evidence_expires_and_confirmation_replaces_old_fingerprint(tmp_path):

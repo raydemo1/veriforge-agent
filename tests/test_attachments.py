@@ -4,9 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness_code_agent.agent.context import _messages_to_text, count_tokens
+from harness_code_agent.agent.context import _messages_to_text
 from harness_code_agent.agent.llm_channel import _is_multimodal_rejection
-from harness_code_agent.agent.providers import _strip_response_only_message_fields
 from harness_code_agent.attachments import (
     AttachmentError,
     AttachmentManager,
@@ -16,6 +15,8 @@ from harness_code_agent.attachments import (
     detect_explicit_file_paths,
 )
 from harness_code_agent.sessions.events import UserInputEvent
+from harness_code_agent.support.llm import _strip_response_only_message_fields
+from harness_code_agent.support.tokens import count_tokens
 
 
 class AttachmentManagerTests(unittest.TestCase):

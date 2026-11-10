@@ -8,11 +8,7 @@ from typing import ClassVar
 from unittest.mock import patch
 
 from harness_code_agent.agent.change_proposal import ChangeProposalStore
-from harness_code_agent.agent.coordinator import (
-    AgentCoordinator,
-    AgentRecord,
-    _path_allowed,
-)
+from harness_code_agent.agent.coordinator import AgentCoordinator, AgentRecord
 from harness_code_agent.runtime.builtins.registry import (
     BUILTIN_TOOL_REGISTRY,
     TOOL_SCHEMAS,
@@ -20,14 +16,15 @@ from harness_code_agent.runtime.builtins.registry import (
 from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.sessions.events import EventBus
+from harness_code_agent.workspace.paths import path_within
 from harness_code_agent.workspace.service import WorkspaceService
 
 
 class AgentPathOwnershipTests(unittest.TestCase):
     def test_only_workspace_relative_owned_paths_are_allowed(self):
-        self.assertTrue(_path_allowed("src/app.py", ["src"]))
-        self.assertTrue(_path_allowed("docs", ["docs"]))
-        self.assertFalse(_path_allowed("docs2/x.md", ["docs"]))
+        self.assertTrue(path_within("src/app.py", ["src"]))
+        self.assertTrue(path_within("docs", ["docs"]))
+        self.assertFalse(path_within("docs2/x.md", ["docs"]))
         with self.assertRaises(ValueError):
             from harness_code_agent.agent.coordinator import _normalize_rel
 
@@ -215,7 +212,7 @@ class AgentCoordinatorTests(unittest.TestCase):
         shutil.rmtree(self.temp, ignore_errors=True)
 
     def test_registered_agent_survives_requesting_turn_cancellation(self):
-        from harness_code_agent.agent.cancellation import CancellationToken
+        from harness_code_agent.support.cancellation import CancellationToken
         token = CancellationToken()
         with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
             spawned = self.coordinator.spawn(name="independent", role="explorer", task="inspect",

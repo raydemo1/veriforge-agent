@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
-from ..agent.context import count_text_tokens
+from ..support.tokens import count_text_tokens
 from .database import (
     EvidenceReference,
     MemoryDatabase,

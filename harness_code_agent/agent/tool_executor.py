@@ -29,7 +29,7 @@ from ..runtime.tool_runner import (
     finalize_executed_tool_result,
     finalize_intercepted_tool_result,
 )
-from .cancellation import CancellationToken, CancelledError, cancellation_scope
+from ..support.cancellation import CancellationToken, CancelledError, cancellation_scope
 
 log = logging.getLogger("harness")
 

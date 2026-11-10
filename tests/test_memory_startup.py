@@ -4,7 +4,6 @@ from unittest.mock import patch
 
 import pytest
 
-from harness_code_agent.agent.context import count_text_tokens
 from harness_code_agent.agent.conversation import Agent
 from harness_code_agent.memory import MemoryService
 from harness_code_agent.memory.database import EvidenceReference
@@ -12,6 +11,7 @@ from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.sessions.events import EventBus
 from harness_code_agent.sessions.journal import SessionJournal
+from harness_code_agent.support.tokens import count_text_tokens
 from harness_code_agent.workspace.service import WorkspaceService
 
 

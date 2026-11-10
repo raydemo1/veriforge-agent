@@ -19,9 +19,17 @@ from ..runtime.tool_context import ToolContext
 from ..runtime.tool_result import ToolResult
 from ..runtime.tool_runner import finalize_intercepted_tool_result
 from ..sessions.journal import SessionJournal
+from ..support import tokens
+from ..support.cancellation import CancelledError
+from ..support.llm import (
+    ProviderAdapter,
+    build_system_cache_breakpoint_content,
+    current_adapter,
+    get_client,
+    supports_system_cache_breakpoint,
+)
 from ..workspace.shell_jobs import ShellJobManager
 from . import context
-from .cancellation import CancelledError
 from .compaction import CompactionGate, compaction_action, get_thresholds
 from .context_manager import ContextManager
 from .history import ContextHistory, fingerprint, tool_pairs_closed
@@ -32,13 +40,6 @@ from .llm_channel import (
     llm_call_simple,
 )
 from .observations import FactTracker, ObservationStore
-from .providers import (
-    ProviderAdapter,
-    build_system_cache_breakpoint_content,
-    current_adapter,
-    get_client,
-    supports_system_cache_breakpoint,
-)
 from .request_diagnostics import RequestDiagnostics
 from .runtime_state import (
     AgentFallbackState,
@@ -134,7 +135,7 @@ class Agent:
 
     def _create_runtime_state(self, task: str) -> AgentRuntimeState:
         workspace = self.tool_context.workspace.root if self.tool_context is not None else Path.cwd()
-        from .observations import observation_dir_for
+        from ..workspace.paths import observation_dir_for
 
         return AgentRuntimeState(
             shell_job_manager=ShellJobManager(workspace, artifact_dir=observation_dir_for(
@@ -247,7 +248,7 @@ class AgentConversation:
             self.add_user_turn(initial_task)
 
     def _observation_dir(self) -> Path:
-        from .observations import observation_dir_for
+        from ..workspace.paths import observation_dir_for
 
         return observation_dir_for(
             self._workspace_root(),
@@ -391,7 +392,7 @@ class AgentConversation:
         if len(self.messages) <= 2:
             return "当前对话内容还不足以压缩"
         messages_before = len(self.messages)
-        token_count_before = context.count_request_tokens(
+        token_count_before = tokens.count_request_tokens(
             self.messages,
             tool_schemas=_tool_schemas_for_agent(self.agent),
         )
@@ -604,7 +605,7 @@ class AgentConversation:
             self._persist_compacted_summary(summary_text, phase=phase)
         if self.emitter.event_bus is None:
             return
-        tokens_after = context.count_request_tokens(
+        tokens_after = tokens.count_request_tokens(
             self.messages,
             tool_schemas=_tool_schemas_for_agent(self.agent),
         )
@@ -656,7 +657,7 @@ class AgentConversation:
                 phase="summarizing_history",
             )
 
-        tokens_after_summary = context.count_request_tokens(
+        tokens_after_summary = tokens.count_request_tokens(
             self.messages,
             tool_schemas=_tool_schemas_for_agent(agent),
         )
@@ -983,7 +984,7 @@ class AgentConversation:
             if profile.provider != "deepseek":
                 for message in accounting_messages:
                     message.pop("reasoning_content", None)
-            token_count = context.count_request_tokens(accounting_messages, tool_schemas=tool_schemas)
+            token_count = tokens.count_request_tokens(accounting_messages, tool_schemas=tool_schemas)
             log.info(f"[{agent.name}] iteration={iteration}  tokens~{token_count}")
             self.trace.iteration(iteration, token_count)
 
@@ -1033,7 +1034,7 @@ class AgentConversation:
                     )
                 chat_args["prompt_cache_key"] = self._cached_prompt_cache_key
             kwargs = self.provider.chat_kwargs(**chat_args)
-            input_tokens = context.count_request_tokens(kwargs["messages"], tool_schemas=tool_schemas)
+            input_tokens = tokens.count_request_tokens(kwargs["messages"], tool_schemas=tool_schemas)
             if input_tokens + chat_args["max_tokens"] > config.CONTEXT_WINDOW_TOKENS:
                 self.runtime_state.fallback.request_stop(reason="context_budget_exceeded")
                 self.emitter.emit_agent_fallback(self.runtime_state.fallback)

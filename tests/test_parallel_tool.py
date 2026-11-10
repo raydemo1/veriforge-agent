@@ -7,7 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from harness_code_agent.agent.cancellation import CancellationToken
+from harness_code_agent.support.cancellation import CancellationToken
+
 from harness_code_agent.runtime.builtins.registry import (
     BUILTIN_TOOL_REGISTRY,
     TOOL_SCHEMAS,
@@ -123,7 +124,8 @@ class ParallelToolTests(unittest.TestCase):
         self.assertIs(captured["expected_binding"], binding)
 
     def test_mcp_loop_cancels_one_call_and_remains_usable(self):
-        from harness_code_agent.agent.cancellation import CancelledError
+        from harness_code_agent.support.cancellation import CancelledError
+
         from harness_code_agent.runtime.mcp import _AsyncLoopThread
 
         loop_thread = _AsyncLoopThread()

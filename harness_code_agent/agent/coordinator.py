@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
+from ..runtime.errors import SubagentCapacityError
 from ..runtime.execution_planner import workspace_claim
 from ..runtime.middleware.stack import build_subagent_middlewares
 from ..runtime.output_artifacts import copy_artifact, file_digest
@@ -23,8 +24,9 @@ from ..runtime.tool_registry import (
     TOOL_CAPABILITY_WORKER_AGENT,
     ToolRegistry,
 )
+from ..support.cancellation import CancellationToken, CancelledError
+from ..workspace.paths import path_within
 from ..workspace.service import WorkspaceService
-from .cancellation import CancellationToken, CancelledError
 from .change_proposal import ChangeProposalStore
 
 AGENT_ROLES = {"explorer", "test_designer", "reviewer", "verifier", "worker"}
@@ -32,9 +34,6 @@ ACTIVE_STATES = {"queued", "running"}
 TERMINAL_STATES = {"completed", "blocked", "failed", "interrupted", "closed"}
 MAX_OPEN_AGENTS = max(1, int(config.MAX_OPEN_AGENTS))
 
-
-class SubagentCapacityError(ValueError):
-    """The maximum number of open agents has been reached."""
 
 @dataclass
 class AgentRecord:
@@ -513,7 +512,7 @@ class AgentCoordinator:
         if record.conversation is None:
             return
         sandbox = self.changes.sandbox_for(record.id)
-        from .observations import observation_dir_for
+        from ..workspace.paths import observation_dir_for
 
         source_root = sandbox.workspace if sandbox is not None else self.context.workspace.root
         directory = observation_dir_for(source_root, self.context.session_id, record.id)
@@ -658,19 +657,5 @@ def _normalize_rel(value: str) -> str:
     return raw.as_posix().removeprefix("./")
 
 
-def _path_allowed(path: str, allowed: list[str]) -> bool:
-    candidate = Path(path)
-    for root in allowed:
-        base = Path(root)
-        if candidate == base:
-            return True
-        try:
-            candidate.relative_to(base)
-            return True
-        except ValueError:
-            continue
-    return False
-
-
 def _paths_overlap(left: str, right: str) -> bool:
-    return _path_allowed(left, [right]) or _path_allowed(right, [left])
+    return path_within(left, [right]) or path_within(right, [left])

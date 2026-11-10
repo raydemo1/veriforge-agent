@@ -9,7 +9,6 @@ from harness_code_agent import config
 from harness_code_agent.agent.context_manager import SUMMARY_MARKER, ContextManager
 from harness_code_agent.agent.conversation import Agent
 from harness_code_agent.agent.history import ContextHistory, tool_pairs_closed
-from harness_code_agent.agent.providers import ProviderAdapter
 from harness_code_agent.agent.request_diagnostics import RequestDiagnostics
 from harness_code_agent.agent.runtime_state import AgentRuntimeState
 from harness_code_agent.agent.tool_executor import ToolExecutor
@@ -19,6 +18,7 @@ from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.sessions.events import EventBus
 from harness_code_agent.sessions.journal import SessionJournal
+from harness_code_agent.support.llm import ProviderAdapter
 from harness_code_agent.workspace.service import WorkspaceService
 
 
@@ -212,7 +212,7 @@ def test_oversize_summary_request_does_not_call_provider():
 
     with (
         patch.object(config, "CONTEXT_WINDOW_TOKENS", 200000),
-        patch("harness_code_agent.agent.llm_channel.context.count_request_tokens", return_value=190001),
+        patch("harness_code_agent.support.tokens.count_request_tokens", return_value=190001),
         patch("harness_code_agent.agent.llm_channel.client_scope") as client,
     ):
         assert llm_call_simple([{"role": "user", "content": "history"}]) == ""
@@ -322,7 +322,7 @@ def test_status_query_counts_against_tool_budget_and_todo_is_not_reinjected(
     runtime_conversation,
 ):
     conversation = runtime_conversation
-    from harness_code_agent.agent.runtime_state import TodoItem, TodoList
+    from harness_code_agent.runtime.todo_state import TodoItem, TodoList
 
     conversation.runtime_state.todo = TodoList(items=[TodoItem("one", "task")])
     assert conversation._build_prompt() == conversation.messages

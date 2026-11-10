@@ -53,7 +53,7 @@ class LlmAutoApprovalProvider:
 
     def request(self, request: ApprovalRequest) -> ApprovalResult:
         from .. import config
-        from ..agent.providers import ProviderAdapter, client_scope
+        from ..support.llm import ProviderAdapter, client_scope
 
         profile = config.resolve_model_profile("fast")
         metadata = {

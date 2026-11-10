@@ -17,12 +17,6 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
-from ..agent.cancellation import (
-    CancellationToken,
-    CancelledError,
-    cancellation_scope,
-    current_token,
-)
 from ..agent.conversation import AgentConversation
 from ..agent.coordinator import AgentCoordinator
 from ..agent.prompts import GlobalRulesDoc, PromptPrefixBuilder
@@ -85,6 +79,12 @@ from ..sessions.report import build_final_report
 from ..sessions.store import Session, SessionStore
 from ..sessions.turn_summary import generate_turn_summary, should_summarize_turn
 from ..skills import SkillRegistry
+from ..support.cancellation import (
+    CancellationToken,
+    CancelledError,
+    cancellation_scope,
+    current_token,
+)
 from ..workspace.service import WorkspaceService
 from ..workspace.shell_environment import (
     validate_shell_configuration,
@@ -1411,7 +1411,7 @@ class InteractiveSession:
 
     @staticmethod
     def _restore_todo(runtime_state, events):
-        from ..agent.runtime_state import TodoItem, TodoList
+        from ..runtime.todo_state import TodoItem, TodoList
         payload = next(((event.get("payload", {}).get("metadata") or {})["todo_state"]
                         for event in reversed(events) if event["type"] == "tool_result"
                         and event.get("agent") == "main_agent"

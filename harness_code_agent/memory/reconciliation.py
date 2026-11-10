@@ -10,9 +10,8 @@ from pathlib import Path
 from jsonschema import Draft202012Validator
 
 from .. import config
-from ..agent.context import count_request_tokens, count_text_tokens
-from ..agent.providers import ProviderAdapter, client_scope
-from ..agent.utils import _usage_to_dict
+from ..support.llm import ProviderAdapter, client_scope, usage_to_dict
+from ..support.tokens import count_request_tokens, count_text_tokens
 from .database import EvidenceReference, MemoryDatabase, _find_topic, _hash, _now
 from .search_index import search_terms
 from .security import contains_secret, redact_secrets
@@ -310,7 +309,7 @@ class ConsolidationQueue:
                 with self.database.connect(write=True) as db:
                     db.execute("UPDATE consolidation_model_calls SET output_hash=?,usage=?,elapsed_ms=?,error_type=? WHERE id=?",
                                (_hash(content) if isinstance(content, str) else None,
-                                json.dumps(_usage_to_dict(getattr(response, "usage", None))),
+                                json.dumps(usage_to_dict(getattr(response, "usage", None))),
                                 round((time.monotonic() - started) * 1000), error, call_id))
             if should_continue is not None and not should_continue():
                 self._release(task, failed=False)

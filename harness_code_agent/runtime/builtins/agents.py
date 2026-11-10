@@ -5,7 +5,7 @@ import json
 import time
 from typing import Any
 
-from ...agent.coordinator import SubagentCapacityError
+from ..errors import SubagentCapacityError
 from ..tool_context import ToolContext
 from ..tool_result import ToolResult
 

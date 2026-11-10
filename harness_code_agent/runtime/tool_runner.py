@@ -5,7 +5,6 @@ import inspect
 from collections.abc import Callable
 from typing import Any
 
-from ..agent.cancellation import CancelledError
 from ..sessions.events import (
     FailureEvent,
     FileChangeEvent,
@@ -13,6 +12,7 @@ from ..sessions.events import (
     ToolResultEvent,
     classify_tool_failure,
 )
+from ..support.cancellation import CancelledError
 from ..workspace.access import WorkspaceConflict
 from .tool_call_validation import validate_tool_arguments
 from .tool_context import ToolContext

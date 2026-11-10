@@ -173,7 +173,7 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertNotIn("reasoning_content", assistant_msg)
 
     def test_provider_auto_detection_distinguishes_openai_deepseek_and_compatible(self):
-        from harness_code_agent.agent.providers import resolve_provider_name
+        from harness_code_agent.support.llm import resolve_provider_name
 
         self.assertEqual(
             resolve_provider_name(provider="auto", base_url="https://api.openai.com/v1", model="gpt-4o"),
@@ -193,7 +193,7 @@ class ProductRuntimeTests(unittest.TestCase):
         )
 
     def test_provider_clients_are_independent_per_owner(self):
-        from harness_code_agent.agent import providers
+        from harness_code_agent.support import llm as providers
 
         created = []
 
@@ -208,7 +208,7 @@ class ProductRuntimeTests(unittest.TestCase):
             return client
 
         with (
-            patch("harness_code_agent.agent.providers.OpenAI", side_effect=fake_openai),
+            patch("harness_code_agent.support.llm.OpenAI", side_effect=fake_openai),
             patch.object(providers.config, "API_KEY", "key-a"),
             patch.object(providers.config, "BASE_URL", "https://one.example/v1"),
         ):
@@ -221,7 +221,7 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertEqual(created[1].kwargs["base_url"], "https://one.example/v1")
 
     def test_provider_streaming_normalizes_content_reasoning_and_tool_calls(self):
-        from harness_code_agent.agent.providers import ProviderAdapter
+        from harness_code_agent.support.llm import ProviderAdapter
 
         def chunk(delta, finish_reason=None):
             return SimpleNamespace(
@@ -273,7 +273,7 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertEqual(result.assistant_message["tool_calls"][0]["function"]["arguments"], '{"path":"README.md"}')
 
     def test_deepseek_chat_kwargs_preserve_reasoning_content(self):
-        from harness_code_agent.agent.providers import ProviderAdapter
+        from harness_code_agent.support.llm import ProviderAdapter
 
         messages = [
             {
@@ -300,11 +300,11 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertEqual(messages[0]["reasoning_content"], "provider-only thinking")
 
     def test_provider_streaming_checks_cancellation_between_chunks(self):
-        from harness_code_agent.agent.cancellation import (
+        from harness_code_agent.support.cancellation import (
             CancellationToken,
             CancelledError,
         )
-        from harness_code_agent.agent.providers import ProviderAdapter
+        from harness_code_agent.support.llm import ProviderAdapter
 
         def chunk(text):
             return SimpleNamespace(
@@ -334,11 +334,11 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertEqual(deltas, ["hel"])
 
     def test_cancelling_while_waiting_for_stream_closes_the_active_client(self):
-        from harness_code_agent.agent.cancellation import (
+        from harness_code_agent.agent.conversation import Agent, AgentConversation
+        from harness_code_agent.support.cancellation import (
             CancellationToken,
             CancelledError,
         )
-        from harness_code_agent.agent.conversation import Agent, AgentConversation
 
         started = threading.Event()
         released = threading.Event()
@@ -468,7 +468,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_tool_enabled_agent_builds_chat_kwargs_once(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.agent.providers import ProviderAdapter
+        from harness_code_agent.support.llm import ProviderAdapter
 
         class FakeCompletions:
             def create(self, **kwargs):
@@ -509,7 +509,7 @@ class ProductRuntimeTests(unittest.TestCase):
         conversation.provider = provider
 
         with (
-            patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+            patch("harness_code_agent.support.tokens.count_tokens", return_value=1),
         ):
             result = conversation.run_until_idle()
 
@@ -520,7 +520,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_agent_loop_uses_configured_model_intensity_profile(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.agent.providers import ProviderAdapter
+        from harness_code_agent.support.llm import ProviderAdapter
 
         class FakeCompletions:
             def create(self, **kwargs):
@@ -563,7 +563,7 @@ class ProductRuntimeTests(unittest.TestCase):
             patch("harness_code_agent.agent.conversation.config.BASE_URL", "https://api.deepseek.com"),
             patch("harness_code_agent.agent.conversation.config.MODEL_INTENSITY", "hard"),
             patch.dict("harness_code_agent.agent.conversation.config.MODEL_OVERRIDES", {"hard": None}),
-            patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+            patch("harness_code_agent.support.tokens.count_tokens", return_value=1),
         ):
             conversation.run_until_idle()
 
@@ -588,7 +588,7 @@ class ProductRuntimeTests(unittest.TestCase):
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
 
         with (
-            patch("harness_code_agent.agent.providers.get_client", return_value=fake_client),
+            patch("harness_code_agent.support.llm.get_client", return_value=fake_client),
             patch.object(loop.config, "BASE_URL", "https://api.deepseek.com"),
             patch.dict(loop.config.MODEL_OVERRIDES, {"fast": None}),
         ):
@@ -704,7 +704,7 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertEqual(result.tool_counts, {"write_file": 1})
 
     def test_openai_provider_accepts_prompt_cache_key_and_stream_usage_options(self):
-        from harness_code_agent.agent.providers import ProviderAdapter
+        from harness_code_agent.support.llm import ProviderAdapter
 
         kwargs = ProviderAdapter("openai").chat_kwargs(
             model="m",
@@ -719,7 +719,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_provider_adapter_maps_model_profile_kwargs(self):
         from harness_code_agent import config
-        from harness_code_agent.agent.providers import ProviderAdapter
+        from harness_code_agent.support.llm import ProviderAdapter
 
         deepseek = ProviderAdapter("deepseek").chat_kwargs(
             profile=config.ModelProfile(
@@ -750,7 +750,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_agent_loop_uses_prompt_cache_key_only_for_openai_provider(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.agent.providers import ProviderAdapter
+        from harness_code_agent.support.llm import ProviderAdapter
 
         class FakeCompletions:
             def __init__(self):
@@ -796,7 +796,7 @@ class ProductRuntimeTests(unittest.TestCase):
         compatible_conv.provider = CapturingProvider("openai-compatible")
 
         with (
-            patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+            patch("harness_code_agent.support.tokens.count_tokens", return_value=1),
         ):
             openai_conv.run_until_idle()
             compatible_conv.run_until_idle()
@@ -910,7 +910,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
 
     def test_openai_cache_breakpoint_model_gate(self):
-        from harness_code_agent.agent.providers import (
+        from harness_code_agent.support.llm import (
             ProviderAdapter,
             openai_model_supports_cache_breakpoint,
             supports_system_cache_breakpoint,
@@ -934,7 +934,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_outbound_messages_split_memory_at_cache_breakpoint_only_for_supported_path(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.agent.providers import ProviderAdapter
+        from harness_code_agent.support.llm import ProviderAdapter
 
         memory_block = "[HARNESS_MEMORY_INDEX]\n- [project:doc1 v1 active] topic"
         agent = Agent("test", "stable-prefix", use_tools=False, memory_index=memory_block)
@@ -969,7 +969,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_outbound_messages_without_memory_index_are_not_rendered(self):
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.agent.providers import ProviderAdapter
+        from harness_code_agent.support.llm import ProviderAdapter
 
         agent = Agent("test", "stable", use_tools=False)
         with patch("harness_code_agent.agent.conversation.get_client"):
@@ -983,7 +983,7 @@ class ProductRuntimeTests(unittest.TestCase):
     def test_agent_loop_sends_memory_breakpoint_parts_on_supported_openai_model(self):
         from harness_code_agent import config
         from harness_code_agent.agent.conversation import Agent, AgentConversation
-        from harness_code_agent.agent.providers import ProviderAdapter
+        from harness_code_agent.support.llm import ProviderAdapter
 
         memory_block = "[HARNESS_MEMORY_INDEX]\n- [project:doc1 v1 active] topic"
 
@@ -1035,7 +1035,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 "harness_code_agent.agent.conversation.config.resolve_model_profile",
                 return_value=profile,
             ),
-            patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+            patch("harness_code_agent.support.tokens.count_tokens", return_value=1),
         ):
             conversation.run_until_idle()
 
@@ -1080,8 +1080,8 @@ class ProductRuntimeTests(unittest.TestCase):
             ["system"],
         )
 
-    def test_usage_to_dict_normalizes_deepseek_cache_hit_and_miss_tokens(self):
-        from harness_code_agent.agent.utils import _usage_to_dict
+    def testusage_to_dict_normalizes_deepseek_cache_hit_and_miss_tokens(self):
+        from harness_code_agent.support.llm import usage_to_dict
 
         usage = SimpleNamespace(
             prompt_tokens=100,
@@ -1091,7 +1091,7 @@ class ProductRuntimeTests(unittest.TestCase):
             prompt_cache_miss_tokens=30,
         )
 
-        result = _usage_to_dict(usage)
+        result = usage_to_dict(usage)
 
         self.assertEqual(result["cached_tokens"], 70)
         self.assertEqual(result["cache_hit_tokens"], 70)
@@ -1129,7 +1129,7 @@ class ProductRuntimeTests(unittest.TestCase):
         conversation.emitter.event_bus = conversation.event_bus
 
         with (
-            patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+            patch("harness_code_agent.support.tokens.count_tokens", return_value=1),
         ):
             conversation.run_until_idle()
 
@@ -1183,7 +1183,7 @@ class ProductRuntimeTests(unittest.TestCase):
         conversation.emitter.event_bus = conversation.event_bus
 
         with (
-            patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+            patch("harness_code_agent.support.tokens.count_tokens", return_value=1),
         ):
             conversation.run_until_idle()
             agent.update_tool_schemas([write_schema])
@@ -1270,7 +1270,7 @@ class ProductRuntimeTests(unittest.TestCase):
                         conversation = AgentConversation(Agent("test", "system", use_tools=True))
 
                     with (
-                        patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+                        patch("harness_code_agent.support.tokens.count_tokens", return_value=1),
                         patch("harness_code_agent.config.WORKSPACE", str(root)),
                     ):
                         conversation.run_until_idle()
@@ -2500,13 +2500,13 @@ class ProductRuntimeTests(unittest.TestCase):
             reason="llm-auto mode requires automatic LLM approval",
         )
 
-        with patch("harness_code_agent.agent.providers.get_client", return_value=FakeClient('{"approved": true, "confidence": 0.9, "reason": "bounded install"}')):
+        with patch("harness_code_agent.support.llm.get_client", return_value=FakeClient('{"approved": true, "confidence": 0.9, "reason": "bounded install"}')):
             approved = LlmAutoApprovalProvider().request(request)
-        with patch("harness_code_agent.agent.providers.get_client", return_value=FakeClient('{"approved": true, "confidence": 0.5, "reason": "not sure"}')):
+        with patch("harness_code_agent.support.llm.get_client", return_value=FakeClient('{"approved": true, "confidence": 0.5, "reason": "not sure"}')):
             low_confidence = LlmAutoApprovalProvider().request(request)
-        with patch("harness_code_agent.agent.providers.get_client", return_value=FakeClient('{"approved": false, "confidence": 0.95, "reason": "too broad"}')):
+        with patch("harness_code_agent.support.llm.get_client", return_value=FakeClient('{"approved": false, "confidence": 0.95, "reason": "too broad"}')):
             denied = LlmAutoApprovalProvider().request(request)
-        with patch("harness_code_agent.agent.providers.get_client", return_value=FakeClient("not json")):
+        with patch("harness_code_agent.support.llm.get_client", return_value=FakeClient("not json")):
             invalid = LlmAutoApprovalProvider().request(request)
 
         self.assertTrue(approved.approved)
@@ -2531,7 +2531,7 @@ class ProductRuntimeTests(unittest.TestCase):
             reason="llm-auto mode requires automatic LLM approval",
         )
 
-        with patch("harness_code_agent.agent.providers.get_client", side_effect=RuntimeError("network down")):
+        with patch("harness_code_agent.support.llm.get_client", side_effect=RuntimeError("network down")):
             result = LlmAutoApprovalProvider().request(request)
 
         self.assertFalse(result.approved)
@@ -2826,7 +2826,7 @@ class ProductRuntimeTests(unittest.TestCase):
             with (
                 patch("harness_code_agent.agent.conversation.config.MAX_AGENT_TOTAL_TOKENS", 10),
                 patch("harness_code_agent.agent.conversation.config.MAX_AGENT_TOOL_CALLS", 100),
-                patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+                patch("harness_code_agent.support.tokens.count_tokens", return_value=1),
             ):
                 text = conversation.run_until_idle()
 
@@ -2874,7 +2874,7 @@ class ProductRuntimeTests(unittest.TestCase):
         conversation.agent.middlewares = [AlwaysInject()]
         with (
             patch("harness_code_agent.agent.conversation.config.MAX_AGENT_TOTAL_TOKENS", 15),
-            patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+            patch("harness_code_agent.support.tokens.count_tokens", return_value=1),
         ):
             text = conversation.run_until_idle()
 
@@ -2943,7 +2943,7 @@ class ProductRuntimeTests(unittest.TestCase):
             with (
                 patch("harness_code_agent.agent.conversation.config.MAX_AGENT_TOTAL_TOKENS", 100),
                 patch("harness_code_agent.agent.conversation.config.MAX_AGENT_TOOL_CALLS", 1),
-                patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+                patch("harness_code_agent.support.tokens.count_tokens", return_value=1),
             ):
                 text = conversation.run_until_idle()
 
@@ -3001,7 +3001,7 @@ class ProductRuntimeTests(unittest.TestCase):
             conversation = AgentConversation(Agent("main_agent", "system", use_tools=True))
         conversation.agent.middlewares = [QueueOnceMiddleware(conversation)]
 
-        with patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1):
+        with patch("harness_code_agent.support.tokens.count_tokens", return_value=1):
             text = conversation.run_until_idle()
 
         self.assertEqual(text, "incorporating the report")
@@ -3064,7 +3064,7 @@ class ProductRuntimeTests(unittest.TestCase):
                         time_budget=0.0,
                     )
                 )
-            with patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1):
+            with patch("harness_code_agent.support.tokens.count_tokens", return_value=1):
                 text = conversation.run_until_idle()
 
             self.assertIn("Agent fallback triggered", text)
@@ -3133,7 +3133,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 patch("harness_code_agent.agent.conversation.config.MAX_AGENT_TOTAL_TOKENS", 200),
                 patch("harness_code_agent.agent.conversation.config.MAX_AGENT_TOOL_CALLS", 100),
                 patch("harness_code_agent.agent.conversation.config.AGENT_BUDGET_WARN_FRACTION", 0.25),
-                patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
+                patch("harness_code_agent.support.tokens.count_tokens", return_value=1),
             ):
                 conversation.run_until_idle()
 

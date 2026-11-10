@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from ..agent.cancellation import CancelledError
+from ..support.cancellation import CancelledError
 from .permissions import (
     TOOL_PERMISSION_DANGEROUS,
     TOOL_PERMISSION_NETWORK_READ,
@@ -1343,7 +1343,7 @@ def describe_mcp_servers(
             response = llm_create(messages)
         else:
             from .. import config
-            from ..agent.providers import ProviderAdapter, client_scope
+            from ..support.llm import ProviderAdapter, client_scope
 
             profile = config.resolve_model_profile("fast")
             adapter = ProviderAdapter(profile.provider)

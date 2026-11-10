@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from .. import config
-from ..agent.context import count_text_tokens
+from ..support.tokens import count_text_tokens
 from .tool_result import ToolResult
 
 

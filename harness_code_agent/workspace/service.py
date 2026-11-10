@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import ClassVar
 
 from .. import config
-from ..agent.cancellation import current_token
+from ..support.cancellation import current_token
 from .access import WorkspaceAccessCoordinator, WorkspaceConflict, fingerprint
 from .change_journal import WorkspaceChangeJournal
+from .paths import is_relative_to
 
 _UNOBSERVED = object()
 
@@ -336,10 +337,4 @@ class WorkspaceService:
                 return True
         return False
 
-    @staticmethod
-    def _is_relative_to(path: Path, root: Path) -> bool:
-        try:
-            path.relative_to(root)
-            return True
-        except ValueError:
-            return False
+    _is_relative_to = staticmethod(is_relative_to)

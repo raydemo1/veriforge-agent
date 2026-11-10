@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .. import config
-from ..agent.providers import ProviderAdapter, client_scope
+from ..support.llm import ProviderAdapter, client_scope
 from ._event_helpers import changed_files as _changed_files
 from ._event_helpers import event_type as _event_type
 from ._event_helpers import payload as _payload

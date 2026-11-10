@@ -8,8 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness_code_agent import config
-from harness_code_agent.agent.providers import client_scope
-from harness_code_agent.agent.utils import _usage_to_dict
+from harness_code_agent.agent.utils import usage_to_dict
+from harness_code_agent.support.llm import client_scope
 
 
 class RequestRecorder:
@@ -38,7 +38,7 @@ class RequestRecorder:
                 started = time.monotonic()
                 try:
                     result = original(**kwargs)
-                    record["usage"] = _usage_to_dict(result.usage)
+                    record["usage"] = usage_to_dict(result.usage)
                     record["response"] = result.choices[0].message.content or ""
                     record["finish_reason"] = result.choices[0].finish_reason
                     return result

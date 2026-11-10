@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import difflib
 import hashlib
-import os
 import shutil
-import subprocess
 import tempfile
 import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..workspace.merge import git_merge_text
+from ..workspace.paths import path_within
 from ..workspace.service import WorkspaceService
 
 _EXCLUDED_NAMES = {
@@ -363,7 +363,7 @@ def _collect_changes(baseline: Path, workspace: Path, allowed_paths: list[str]) 
         after_bytes = after_path.read_bytes()
         if before_bytes == after_bytes:
             continue
-        if not _path_allowed(rel, allowed_paths):
+        if not path_within(rel, allowed_paths):
             invalid.append(f"changed path is outside allowed_paths: {rel}")
             continue
         try:
@@ -400,19 +400,6 @@ def _excluded(rel: Path) -> bool:
     return any(lowered[:len(blocked)] == blocked for blocked in _EXCLUDED_PATHS)
 
 
-def _path_allowed(path: str, allowed_paths: list[str]) -> bool:
-    candidate = Path(path.replace("\\", "/"))
-    for raw in allowed_paths:
-        allowed = Path(str(raw).replace("\\", "/"))
-        try:
-            candidate.relative_to(allowed)
-            return True
-        except ValueError:
-            if candidate == allowed:
-                return True
-    return False
-
-
 def _merge_entry(entry: ChangeEntry, current_content: str | None) -> tuple[str, ConflictFile | None]:
     if entry.operation == "create":
         if current_content is None or current_content == entry.result_content:
@@ -430,7 +417,7 @@ def _merge_entry(entry: ChangeEntry, current_content: str | None) -> tuple[str, 
     disjoint = _merge_disjoint_text(base, current_content, entry.result_content)
     if disjoint is not None:
         return disjoint, None
-    merged, conflicted = _git_merge_text(current_content, base, entry.result_content)
+    merged, conflicted = git_merge_text(current_content, base, entry.result_content)
     if not conflicted:
         return merged, None
     return "", ConflictFile(entry.path, base, current_content, entry.result_content, merged)
@@ -473,33 +460,6 @@ def _edits_conflict(left: tuple[int, int, list[str]], right: tuple[int, int, lis
     if right_start == right_end:
         return left_start < right_start < left_end
     return max(left_start, right_start) < min(left_end, right_end)
-
-
-def _git_merge_text(current: str, base: str, worker: str) -> tuple[str, bool]:
-    with tempfile.TemporaryDirectory(prefix="hca-merge-") as temp_dir:
-        root = Path(temp_dir)
-        current_path = root / "current"
-        base_path = root / "base"
-        worker_path = root / "worker"
-        current_path.write_text(current, encoding="utf-8")
-        base_path.write_text(base, encoding="utf-8")
-        worker_path.write_text(worker, encoding="utf-8")
-        env = dict(os.environ)
-        env.update({"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never"})
-        completed = subprocess.run(
-            ["git", "merge-file", "-p", "--diff3", str(current_path), str(base_path), str(worker_path)],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=env,
-            timeout=30,
-            check=False,
-        )
-    if completed.returncode not in {0, 1}:
-        raise RuntimeError(f"git merge-file failed: {completed.stderr.strip()}")
-    return completed.stdout, completed.returncode == 1
 
 
 def _entry_diff(entry: ChangeEntry) -> str:

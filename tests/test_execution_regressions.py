@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from harness_code_agent.support.cancellation import CancellationToken
 
-from harness_code_agent.agent.cancellation import CancellationToken
 from harness_code_agent.agent.coordinator import AgentCoordinator
 from harness_code_agent.runtime.task_supervisor import ToolTaskSupervisor
 

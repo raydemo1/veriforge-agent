@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 
 from ... import config
-from ...agent.cancellation import CancelledError
+from ...support.cancellation import CancelledError
 from ...workspace.shell_jobs import ShellJobNotFound
 from ..shell_classification import is_long_running_shell_command
 from ..tool_output import fitting_prefix, output_limit

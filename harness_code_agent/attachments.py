@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from . import config
+from .workspace.paths import is_relative_to
 
 ModelInputMode = Literal["text", "multimodal"]
 AttachmentKind = Literal["text", "docx", "image", "pdf"]
@@ -131,7 +132,7 @@ class AttachmentManager:
         if attachment.cached:
             path = Path(attachment.path)
             try:
-                if path.exists() and _is_relative_to(path.resolve(), self.attachments_dir.resolve()):
+                if path.exists() and is_relative_to(path.resolve(), self.attachments_dir.resolve()):
                     path.unlink()
                     parent = path.parent
                     if parent != self.attachments_dir and parent.exists() and not any(parent.iterdir()):
@@ -150,7 +151,7 @@ class AttachmentManager:
         resolved = _resolve_candidate(path, self.workspace_root)
         if not resolved.exists() or not resolved.is_file():
             raise AttachmentError(f"文件不存在：{path}")
-        external = not _is_relative_to(resolved, self.workspace_root)
+        external = not is_relative_to(resolved, self.workspace_root)
         should_copy = external if copy_to_session is None else copy_to_session
         size = resolved.stat().st_size
         self._validate_size(size)
@@ -227,7 +228,7 @@ class AttachmentManager:
         external_unapproved = [
             str(path)
             for path, _source in path_entries
-            if not _is_relative_to(path, self.workspace_root) and str(path) not in authorized
+            if not is_relative_to(path, self.workspace_root) and str(path) not in authorized
         ]
         if external_unapproved:
             raise ExternalPathConfirmationRequired(external_unapproved)
@@ -236,7 +237,7 @@ class AttachmentManager:
             attachment = self.stage_path(
                 path,
                 source=source,
-                copy_to_session=not _is_relative_to(path, self.workspace_root),
+                copy_to_session=not is_relative_to(path, self.workspace_root),
             )
             attachment_ids.append(attachment.id)
 
@@ -433,14 +434,6 @@ def _safe_filename(name: str) -> str:
     base = Path(name).name.strip().replace("\x00", "") or "attachment"
     safe = "".join(ch if ch.isalnum() or ch in {"-", "_", ".", " ", "（", "）"} else "_" for ch in base)
     return safe[:180] or "attachment"
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-        return True
-    except ValueError:
-        return False
 
 
 def _all_supported_suffixes() -> set[str]:

@@ -10,9 +10,8 @@ from pathlib import Path
 from jsonschema import Draft202012Validator
 
 from .. import config
-from ..agent.context import count_request_tokens, count_text_tokens
-from ..agent.providers import ProviderAdapter, client_scope
-from ..agent.utils import _usage_to_dict
+from ..support.llm import ProviderAdapter, client_scope, usage_to_dict
+from ..support.tokens import count_request_tokens, count_text_tokens
 from .database import KINDS, MemoryDatabase
 from .reconciliation import hold_matching_facts
 from .security import contains_secret, redact_secrets
@@ -385,7 +384,7 @@ class ExtractionQueue:
         choices = getattr(response, "choices", None) or []
         message = getattr(choices[0], "message", None) if choices else None
         content = getattr(message, "content", None)
-        usage = _usage_to_dict(getattr(response, "usage", None)) if response is not None else None
+        usage = usage_to_dict(getattr(response, "usage", None)) if response is not None else None
         with self.database.connect(write=True) as db:
             db.execute("UPDATE memory_model_calls SET output_hash=?,usage=?,elapsed_ms=?,error_type=? WHERE id=?",
                        (hashlib.sha256(content.encode()).hexdigest() if isinstance(content, str) else None,

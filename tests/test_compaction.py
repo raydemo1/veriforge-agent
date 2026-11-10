@@ -189,7 +189,7 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
             patch.object(config, "CONTEXT_WINDOW_TOKENS", 200000),
             patch.object(config, "COMPRESS_THRESHOLD", 190000),
             patch(
-                "harness_code_agent.agent.conversation.context.count_request_tokens",
+                "harness_code_agent.support.tokens.count_request_tokens",
                 side_effect=[168000, 1000, 1000],
             ),
             patch.object(conv.context_manager, "compact", return_value=CompactionResult(candidate, "summary", 1)) as compact,
@@ -216,7 +216,7 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
         with (
             patch.object(config, "CONTEXT_WINDOW_TOKENS", 200000),
             patch.object(config, "COMPRESS_THRESHOLD", 190000),
-            patch("harness_code_agent.agent.conversation.context.count_request_tokens", return_value=168000),
+            patch("harness_code_agent.support.tokens.count_request_tokens", return_value=168000),
             patch.object(conv.context_manager, "compact", return_value=None) as compact,
             patch.object(conv.llm, "request_assistant_message") as request,
         ):
@@ -271,7 +271,7 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
 
         with (
             patch(
-                "harness_code_agent.agent.conversation.context.count_tokens",
+                "harness_code_agent.support.tokens.count_tokens",
                 side_effect=[
                     thresholds.compact,
                     thresholds.compact - 1,
@@ -328,7 +328,7 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
 
             with (
                 patch(
-                    "harness_code_agent.agent.conversation.context.count_tokens",
+                    "harness_code_agent.support.tokens.count_tokens",
                     side_effect=[thresholds.compact] + [thresholds.compact - 1] * 10,
                 ),
                 patch("harness_code_agent.agent.conversation.context.detect_anxiety", return_value=False),
@@ -359,7 +359,7 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
 
         with (
             patch(
-                "harness_code_agent.agent.conversation.context.count_tokens",
+                "harness_code_agent.support.tokens.count_tokens",
                 side_effect=[
                     thresholds.compact,
                     thresholds.compact,
@@ -393,7 +393,7 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
 
         with (
             patch(
-                "harness_code_agent.agent.conversation.context.count_tokens",
+                "harness_code_agent.support.tokens.count_tokens",
                 side_effect=[
                     thresholds.compact,       # main loop → trigger
                     thresholds.compact,       # after summarize → still over → suspend this turn
@@ -436,7 +436,7 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
         )
 
         with (
-            patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=thresholds.compact - 1),
+            patch("harness_code_agent.support.tokens.count_tokens", return_value=thresholds.compact - 1),
             patch("harness_code_agent.agent.conversation.context.detect_anxiety", return_value=signal),
             patch.object(conv.context_manager, "compact") as summarize,
             patch.object(
@@ -476,7 +476,7 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
         )
 
         with (
-            patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=thresholds.compact - 1),
+            patch("harness_code_agent.support.tokens.count_tokens", return_value=thresholds.compact - 1),
             patch("harness_code_agent.agent.conversation.context.detect_anxiety", return_value=signal),
             patch.object(
                 conv.llm,

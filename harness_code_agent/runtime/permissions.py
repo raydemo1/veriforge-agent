@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import ClassVar
 
+from ..workspace.paths import normalize_rel_path, path_within
 from .shell_classification import (
     ShellEffect,
     ShellTrait,
@@ -360,26 +361,10 @@ class PermissionPolicy:
         if self.role in _READ_ONLY_ROLE_NAMES and tool_name in {"write_file", "apply_patch"}:
             return f"{self.role} role cannot modify the workspace"
         if self.role == "worker" and tool_name in {"write_file", "apply_patch"}:
-            path = _normalize_rel_path(str(args.get("path") or ""))
-            if not path or not _path_allowed(path, self.allowed_paths):
+            path = normalize_rel_path(str(args.get("path") or ""))
+            if not path_within(path, self.allowed_paths):
                 return f"write path is outside allowed_paths: {path or '<empty>'}"
         return None
-
-
-def _normalize_rel_path(value: str) -> str:
-    value = str(value or "").replace("\\", "/").removeprefix("./")
-    return value.rstrip("/") or "."
-
-
-def _path_allowed(path: str, allowed: tuple[str, ...]) -> bool:
-    if not allowed:
-        return False
-    needle = path.strip("/").split("/")
-    for root in allowed:
-        base = root.strip("/").split("/")
-        if needle[: len(base)] == base:
-            return True
-    return False
 
 
 def _builtin_permission(tool_name: str) -> str | None:

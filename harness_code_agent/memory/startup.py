@@ -2,7 +2,7 @@ import hashlib
 import json
 from itertools import zip_longest
 
-from ..agent.context import count_text_tokens
+from ..support.tokens import count_text_tokens
 
 PERSONAL_TOKENS = 300
 PROJECT_TOKENS = 500

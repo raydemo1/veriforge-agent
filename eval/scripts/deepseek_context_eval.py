@@ -26,18 +26,19 @@ from harness_code_agent import config
 from harness_code_agent.agent import context
 from harness_code_agent.agent.context_manager import ContextManager
 from harness_code_agent.agent.conversation import Agent
-from harness_code_agent.agent.providers import current_adapter, get_client
 from harness_code_agent.agent.utils import (
-    _usage_to_dict,
     capture_prompt_cache_shape,
     compare_prompt_cache_shapes,
+    usage_to_dict,
 )
+from harness_code_agent.support.llm import current_adapter, get_client
 
 DEFAULT_CONTEXT_FILES = [
     "README.md",
     "harness_code_agent/agent/context.py",
+    "harness_code_agent/support/llm.py",
+    "harness_code_agent/support/tokens.py",
     "harness_code_agent/agent/conversation.py",
-    "harness_code_agent/agent/providers.py",
     "harness_code_agent/agent/utils.py",
     "harness_code_agent/sessions/events.py",
     "harness_code_agent/sessions/observability.py",
@@ -413,7 +414,7 @@ class DeepSeekContextEvaluator:
         if not response.choices:
             raise RuntimeError("API returned no choices")
         choice = response.choices[0]
-        usage = _usage_to_dict(getattr(response, "usage", None)) or {}
+        usage = usage_to_dict(getattr(response, "usage", None)) or {}
         assistant = self.adapter.assistant_message_from_response(choice.message)
         return assistant, usage, getattr(choice, "finish_reason", None), latency_ms
 

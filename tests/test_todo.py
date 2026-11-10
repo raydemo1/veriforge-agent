@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from harness_code_agent import config
 from harness_code_agent.agent.conversation import AgentRuntimeState
-from harness_code_agent.agent.runtime_state import TodoList, normalize_todo_items
+from harness_code_agent.runtime.todo_state import TodoList, normalize_todo_items
 from harness_code_agent.runtime.tool_runner import execute_tool, execute_tool_result
 
 

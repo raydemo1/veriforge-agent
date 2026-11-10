@@ -4,10 +4,10 @@ from unittest.mock import patch
 
 import pytest
 
-from harness_code_agent.agent.context import count_text_tokens, count_tokens
 from harness_code_agent.agent.observations import FactTracker, ObservationStore
 from harness_code_agent.runtime.builtins.filesystem import read_file
 from harness_code_agent.runtime.tool_result import ToolResult
+from harness_code_agent.support.tokens import count_text_tokens, count_tokens
 from harness_code_agent.workspace.service import WorkspaceService
 
 
@@ -329,8 +329,8 @@ def test_intercepted_results_use_the_same_budget(tmp_path):
 
 
 def test_shell_log_pages_advance_unicode_offsets_without_duplicate_artifacts(tmp_path):
-    from harness_code_agent.agent.observations import observation_dir_for
     from harness_code_agent.runtime.builtins.shell import read_shell_output
+    from harness_code_agent.workspace.paths import observation_dir_for
     from harness_code_agent.workspace.shell_jobs import ShellJob, ShellOutputBuffer
 
     context = make_context(tmp_path, 'session')
@@ -354,8 +354,11 @@ def test_shell_log_pages_advance_unicode_offsets_without_duplicate_artifacts(tmp
 
 
 def test_cancellation_after_tool_completion_preserves_completed_result(tmp_path):
-    from harness_code_agent.agent.cancellation import CancellationToken, CancelledError
     from harness_code_agent.agent.tool_executor import ExecutedToolCall, ToolExecutor
+    from harness_code_agent.support.cancellation import (
+        CancellationToken,
+        CancelledError,
+    )
 
     conversation = make_conversation(make_context(tmp_path, 'session'))
     token = CancellationToken()
