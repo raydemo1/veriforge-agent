@@ -545,16 +545,34 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_agent_changes",
-            "description": 'Read an isolated change proposal with pagination. With conflict_id, read base, main, worker and marked merge content for that conflict instead.',
-            "parameters": {"type": "object", "required": ["proposal_id"], "properties": {"proposal_id": {"type": "string"}, "conflict_id": {"type": "string", "default": ""}, "path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50000, "default": 12000}}},
+            "description": 'Read an isolated change proposal with pagination. Pass conflict_id instead to read base, main, worker and marked merge content for that conflict.',
+            "parameters": {
+                "type": "object",
+                "anyOf": [{"required": ["proposal_id"]}, {"required": ["conflict_id"]}],
+                "properties": {
+                    "proposal_id": {"type": "string", "description": "Proposal to read. Optional when conflict_id is given."},
+                    "conflict_id": {"type": "string", "default": "", "description": "Conflict id returned by apply_agent_changes; reads the conflicted files."},
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50000, "default": 12000},
+                },
+            },
         },
     },
     {
         "type": "function",
         "function": {
             "name": "apply_agent_changes",
-            "description": 'Three-way merge and atomically apply a worker proposal. Overlapping edits return a conflict id without changing the workspace. With conflict_id and resolutions, commit that final content and complete the merge after revalidation.',
-            "parameters": {"type": "object", "required": ["proposal_id"], "properties": {"proposal_id": {"type": "string"}, "conflict_id": {"type": "string", "default": ""}, "resolutions": {"type": "object", "additionalProperties": {"type": "string"}}}},
+            "description": 'Three-way merge and atomically apply a worker proposal. Overlapping edits return a conflict id without changing the workspace. Pass conflict_id with resolutions to commit the final content and complete the merge after revalidation.',
+            "parameters": {
+                "type": "object",
+                "anyOf": [{"required": ["proposal_id"]}, {"required": ["conflict_id"]}],
+                "properties": {
+                    "proposal_id": {"type": "string", "description": "Proposal to apply. Optional when resolving with conflict_id; when both are given they must name the same proposal."},
+                    "conflict_id": {"type": "string", "default": "", "description": "Conflict id returned by a previous apply. Requires resolutions."},
+                    "resolutions": {"type": "object", "additionalProperties": {"type": "string"}},
+                },
+            },
         },
     },
     {

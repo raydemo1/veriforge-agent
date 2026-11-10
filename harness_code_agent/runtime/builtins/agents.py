@@ -105,23 +105,27 @@ def interrupt_agent(agent_id: str, tool_context: ToolContext | None = None) -> T
 
 
 def read_agent_changes(
-    proposal_id: str,
+    proposal_id: str = "",
     conflict_id: str = "",
     path: str = "",
     offset: int = 0,
     limit: int = 12_000,
     tool_context: ToolContext | None = None,
 ) -> ToolResult:
+    if not proposal_id and not conflict_id:
+        raise ValueError("read_agent_changes requires proposal_id or conflict_id")
     changes = _coordinator(tool_context).changes
     if conflict_id:
-        payload = changes.read_conflicts(conflict_id, path=path, offset=offset, limit=limit)
+        payload = changes.read_conflicts(
+            conflict_id, proposal_id=proposal_id, path=path, offset=offset, limit=limit
+        )
     else:
         payload = changes.read_changes(proposal_id, path=path, offset=offset, limit=limit)
     return _result("read_agent_changes", payload)
 
 
 def apply_agent_changes(
-    proposal_id: str,
+    proposal_id: str = "",
     conflict_id: str = "",
     resolutions: dict[str, str] | None = None,
     tool_context: ToolContext | None = None,
@@ -130,9 +134,17 @@ def apply_agent_changes(
     if resolutions is not None:
         if not conflict_id:
             raise ValueError("resolutions requires the conflict_id returned by the previous apply")
-        payload = changes.resolve(conflict_id, resolutions, tool_context.workspace)
-    else:
+        payload = changes.resolve(
+            conflict_id, resolutions, tool_context.workspace, proposal_id=proposal_id
+        )
+    elif conflict_id:
+        raise ValueError(
+            "conflict_id requires resolutions with the final content for every conflicted path"
+        )
+    elif proposal_id:
         payload = changes.apply(proposal_id, tool_context.workspace)
+    else:
+        raise ValueError("apply_agent_changes requires proposal_id or conflict_id")
     return _result("apply_agent_changes", payload, metadata={"file_changes": payload.get("file_changes", [])})
 
 

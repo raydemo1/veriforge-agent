@@ -66,6 +66,14 @@ class ConflictSet:
     status: str = "open"
 
 
+def _require_conflict_owner(conflict: ConflictSet, proposal_id: str) -> None:
+    """Reject a request whose two ids name different proposals."""
+    if proposal_id and proposal_id != conflict.proposal_id:
+        raise ValueError(
+            f"conflict {conflict.id} belongs to proposal {conflict.proposal_id}, not {proposal_id}"
+        )
+
+
 class ChangeProposalStore:
     """Own isolated workspaces and expose validated proposal operations."""
 
@@ -232,11 +240,13 @@ class ChangeProposalStore:
         self,
         conflict_id: str,
         *,
+        proposal_id: str = "",
         path: str = "",
         offset: int = 0,
         limit: int = 12_000,
     ) -> dict:
         conflict_set = self._get_conflict(conflict_id)
+        _require_conflict_owner(conflict_set, proposal_id)
         selected = conflict_set.conflicts
         if path:
             if path not in selected:
@@ -265,8 +275,16 @@ class ChangeProposalStore:
             "content": text[start:start + size],
         }
 
-    def resolve(self, conflict_id: str, resolutions: dict[str, str], workspace: WorkspaceService) -> dict:
+    def resolve(
+        self,
+        conflict_id: str,
+        resolutions: dict[str, str],
+        workspace: WorkspaceService,
+        *,
+        proposal_id: str = "",
+    ) -> dict:
         conflict_set = self._get_conflict(conflict_id)
+        _require_conflict_owner(conflict_set, proposal_id)
         if conflict_set.status != "open":
             raise ValueError(f"conflict is not open: {conflict_set.status}")
         expected_paths = set(conflict_set.conflicts)

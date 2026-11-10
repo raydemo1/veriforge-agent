@@ -31,6 +31,19 @@ class AgentPathOwnershipTests(unittest.TestCase):
 
             _normalize_rel("src/../../secret")
 
+    def test_dot_root_owns_the_whole_workspace(self):
+        self.assertTrue(path_within("src/app.py", ["."]))
+        self.assertTrue(path_within(".", ["."]))
+        self.assertFalse(path_within(".", ["src"]))
+        self.assertFalse(path_within("src2/app.py", ["src"]))
+
+    def test_worker_scopes_overlap_when_one_owns_the_root(self):
+        from harness_code_agent.agent.coordinator import _paths_overlap
+
+        self.assertTrue(_paths_overlap(".", "src"))
+        self.assertTrue(_paths_overlap("src", "src/app.py"))
+        self.assertFalse(_paths_overlap("src", "docs"))
+
 
 class ChangeProposalTests(unittest.TestCase):
     def setUp(self):
@@ -100,6 +113,17 @@ class ChangeProposalTests(unittest.TestCase):
         self.assertIsNotNone(first["next_offset"])
         self.assertIsNone(second["next_offset"])
         self.assertTrue(self.store.sandbox_for("agent_worker").workspace.exists())
+
+    def test_workspace_root_owner_can_finalize_a_nested_change(self):
+        (self.root / "src").mkdir()
+        (self.root / "src" / "app.py").write_text("one\n", encoding="utf-8")
+        sandbox = self.store.create_sandbox("agent_worker", self.root)
+        (sandbox.workspace / "src" / "app.py").write_text("two\n", encoding="utf-8")
+
+        proposal = self.store.finalize("agent_worker", ["."])
+
+        self.assertEqual(proposal.status, "ready")
+        self.assertEqual([entry.path for entry in proposal.entries], ["src/app.py"])
 
     def test_registry_exposes_lifecycle_tools_and_removes_legacy_batch_tools(self):
         names = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
@@ -172,6 +196,35 @@ class ChangeProposalTests(unittest.TestCase):
         )
         self.assertEqual(resolved["status"], "applied")
         self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "value = 4\n")
+
+    def test_conflict_flow_rejects_an_unrelated_proposal_id(self):
+        from harness_code_agent.runtime.builtins.agents import (
+            apply_agent_changes,
+            read_agent_changes,
+        )
+
+        proposal = self._proposal("value = 1\n", "value = 2\n")
+        (self.root / "app.py").write_text("value = 3\n", encoding="utf-8")
+        applied = self.store.apply(proposal.id, self.workspace)
+        context = types.SimpleNamespace(
+            agent_coordinator=types.SimpleNamespace(changes=self.store),
+            workspace=self.workspace,
+        )
+
+        with self.assertRaisesRegex(ValueError, "belongs to proposal"):
+            read_agent_changes(
+                "proposal_unrelated",
+                conflict_id=applied["conflict_id"],
+                tool_context=context,
+            )
+        with self.assertRaisesRegex(ValueError, "belongs to proposal"):
+            apply_agent_changes(
+                "proposal_unrelated",
+                conflict_id=applied["conflict_id"],
+                resolutions={"app.py": "value = 4\n"},
+                tool_context=context,
+            )
+        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "value = 3\n")
 
 
 class ToolDiscoveryTests(unittest.TestCase):

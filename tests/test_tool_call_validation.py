@@ -104,6 +104,29 @@ class ToolCallValidationTests(unittest.TestCase):
         self.assertTrue(result.error.retryable)
         self.assertEqual(result.arguments, {})
 
+    def test_conflict_flow_accepts_conflict_id_without_proposal_id(self):
+        read = validate_tool_arguments(
+            "read_agent_changes",
+            {"conflict_id": "conflict_1"},
+            BUILTIN_TOOL_REGISTRY,
+        )
+        resolve = validate_tool_arguments(
+            "apply_agent_changes",
+            {"conflict_id": "conflict_1", "resolutions": {"app.py": "final\n"}},
+            BUILTIN_TOOL_REGISTRY,
+        )
+        apply = validate_tool_arguments(
+            "apply_agent_changes",
+            {"proposal_id": "proposal_1"},
+            BUILTIN_TOOL_REGISTRY,
+        )
+        missing_ids = validate_tool_arguments("read_agent_changes", {}, BUILTIN_TOOL_REGISTRY)
+
+        self.assertTrue(read.valid)
+        self.assertTrue(resolve.valid)
+        self.assertTrue(apply.valid)
+        self.assertEqual(missing_ids.error.kind, "invalid_arguments")
+
     def test_missing_and_blank_model_arguments_require_an_explicit_object(self):
         for raw in (None, "", "  "):
             with self.subTest(raw=raw):

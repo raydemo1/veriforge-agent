@@ -26,6 +26,9 @@ def normalize_rel_path(value: str) -> str:
 def path_within(path: str, roots: Iterable[str]) -> bool:
     """Whether ``path`` is one of ``roots`` or below it, segment by segment.
 
+    ``"."`` names the workspace root, so every relative path is within it: a
+    worker may declare ``allowed_paths=["."]`` to own the whole workspace.
+
     String-only on purpose: ``allowed_paths`` describes the shape of a path a
     worker declared, not a resolved location on disk, so the check must not
     depend on what happens to exist or be linked at the time.
@@ -33,12 +36,17 @@ def path_within(path: str, roots: Iterable[str]) -> bool:
     roots = list(roots)
     if not roots:
         return False
-    needle = normalize_rel_path(path).strip("/").split("/")
+    needle = _segments(path)
     for root in roots:
-        base = normalize_rel_path(root).strip("/").split("/")
-        if needle[: len(base)] == base:
+        base = _segments(root)
+        if not base or needle[: len(base)] == base:
             return True
     return False
+
+
+def _segments(value: str) -> list[str]:
+    normalized = normalize_rel_path(value).strip("/")
+    return [] if normalized in {"", "."} else normalized.split("/")
 
 
 def is_relative_to(path: Path, root: Path, *, resolve: bool = False) -> bool:
