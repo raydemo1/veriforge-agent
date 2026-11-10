@@ -709,7 +709,6 @@ class ToolExecutor:
                         "tool_call_id": failure.tool_call_id,
                         "kind": failure.kind,
                         "category": failure.category,
-                        "phase": failure.phase,
                         "visibility": failure.visibility,
                         "attempt": failure.attempt,
                         "mode": action.mode,

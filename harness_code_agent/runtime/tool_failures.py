@@ -38,16 +38,6 @@ class FailureCategory:
     VERIFICATION = "verification"
 
 
-class FailurePhase:
-    PARSE = "parse"
-    SCHEMA_VALIDATION = "schema_validation"
-    SEMANTIC_VALIDATION = "semantic_validation"
-    POLICY = "policy"
-    RESOURCE = "resource"
-    EXECUTION = "execution"
-    VERIFICATION = "verification"
-
-
 class FailureVisibility:
     #: Protocol-level failure: the tool never ran; the model can regenerate
     #: the call through a bounded correction loop without task-level cost.
@@ -120,140 +110,33 @@ _NO_ACCOUNTING_KINDS = frozenset(
     }
 )
 
-# kind -> (category, default phase or None, retryable, user_action)
-_KIND_SPECS: dict[str, tuple[str, str | None, bool, bool]] = {
-    FailureKind.INVALID_JSON: (FailureCategory.INVALID_CALL, FailurePhase.PARSE, True, False),
-    FailureKind.INVALID_ARGUMENTS: (FailureCategory.INVALID_CALL, None, True, False),
-    FailureKind.INVALID_TOOL_CALL: (
-        FailureCategory.INVALID_CALL,
-        FailurePhase.SCHEMA_VALIDATION,
-        True,
-        False,
-    ),
-    FailureKind.UNKNOWN_TOOL: (
-        FailureCategory.INVALID_CALL,
-        FailurePhase.SCHEMA_VALIDATION,
-        False,
-        False,
-    ),
-    FailureKind.TOOL_SCHEMA_ERROR: (
-        FailureCategory.INVALID_CALL,
-        FailurePhase.SCHEMA_VALIDATION,
-        False,
-        False,
-    ),
-    FailureKind.WORKSPACE_ESCAPE: (
-        FailureCategory.POLICY,
-        FailurePhase.SEMANTIC_VALIDATION,
-        True,
-        False,
-    ),
-    FailureKind.BLOCKED_COMMAND: (
-        FailureCategory.POLICY,
-        FailurePhase.SEMANTIC_VALIDATION,
-        False,
-        False,
-    ),
-    FailureKind.PERMISSION_DENIED: (
-        FailureCategory.POLICY,
-        FailurePhase.POLICY,
-        False,
-        False,
-    ),
-    FailureKind.APPROVAL_DENIED: (
-        FailureCategory.POLICY,
-        FailurePhase.POLICY,
-        False,
-        True,
-    ),
-    FailureKind.POLICY_VIOLATION: (
-        FailureCategory.POLICY,
-        FailurePhase.POLICY,
-        False,
-        False,
-    ),
-    FailureKind.TOOL_SURFACE_BLOCKED: (
-        FailureCategory.POLICY,
-        FailurePhase.POLICY,
-        False,
-        False,
-    ),
-    FailureKind.USER_ATTENTION_REQUIRED: (
-        FailureCategory.POLICY,
-        FailurePhase.POLICY,
-        False,
-        True,
-    ),
-    FailureKind.BUDGET_EXCEEDED: (
-        FailureCategory.RESOURCE,
-        FailurePhase.RESOURCE,
-        False,
-        False,
-    ),
-    FailureKind.QUOTA_EXCEEDED: (
-        FailureCategory.RESOURCE,
-        FailurePhase.RESOURCE,
-        False,
-        False,
-    ),
-    FailureKind.SUBAGENT_CAPACITY: (
-        FailureCategory.RESOURCE,
-        FailurePhase.RESOURCE,
-        True,
-        False,
-    ),
+# kind -> (category, retryable, user_action)
+_KIND_SPECS: dict[str, tuple[str, bool, bool]] = {
+    FailureKind.INVALID_JSON: (FailureCategory.INVALID_CALL, True, False),
+    FailureKind.INVALID_ARGUMENTS: (FailureCategory.INVALID_CALL, True, False),
+    FailureKind.INVALID_TOOL_CALL: (FailureCategory.INVALID_CALL, True, False),
+    FailureKind.UNKNOWN_TOOL: (FailureCategory.INVALID_CALL, False, False),
+    FailureKind.TOOL_SCHEMA_ERROR: (FailureCategory.INVALID_CALL, False, False),
+    FailureKind.WORKSPACE_ESCAPE: (FailureCategory.POLICY, True, False),
+    FailureKind.BLOCKED_COMMAND: (FailureCategory.POLICY, False, False),
+    FailureKind.PERMISSION_DENIED: (FailureCategory.POLICY, False, False),
+    FailureKind.APPROVAL_DENIED: (FailureCategory.POLICY, False, True),
+    FailureKind.POLICY_VIOLATION: (FailureCategory.POLICY, False, False),
+    FailureKind.TOOL_SURFACE_BLOCKED: (FailureCategory.POLICY, False, False),
+    FailureKind.USER_ATTENTION_REQUIRED: (FailureCategory.POLICY, False, True),
+    FailureKind.BUDGET_EXCEEDED: (FailureCategory.RESOURCE, False, False),
+    FailureKind.QUOTA_EXCEEDED: (FailureCategory.RESOURCE, False, False),
+    FailureKind.SUBAGENT_CAPACITY: (FailureCategory.RESOURCE, True, False),
     # Timeout is a backend execution outcome (the backend killed its own
     # work), not a resource-capacity classification.
-    FailureKind.TIMEOUT: (FailureCategory.EXECUTION, FailurePhase.EXECUTION, True, False),
-    FailureKind.COMMAND_NOT_FOUND: (
-        FailureCategory.EXECUTION,
-        FailurePhase.EXECUTION,
-        True,
-        False,
-    ),
-    FailureKind.FILE_NOT_FOUND: (
-        FailureCategory.EXECUTION,
-        FailurePhase.EXECUTION,
-        True,
-        False,
-    ),
-    FailureKind.PROCESS_FAILED: (
-        FailureCategory.EXECUTION,
-        FailurePhase.EXECUTION,
-        True,
-        False,
-    ),
-    FailureKind.TOOL_INTERNAL_ERROR: (
-        FailureCategory.EXECUTION,
-        FailurePhase.EXECUTION,
-        True,
-        False,
-    ),
-    FailureKind.EXECUTION_FAILED: (
-        FailureCategory.EXECUTION,
-        FailurePhase.EXECUTION,
-        True,
-        False,
-    ),
-    FailureKind.VERIFICATION_FAILED: (
-        FailureCategory.VERIFICATION,
-        FailurePhase.VERIFICATION,
-        True,
-        False,
-    ),
+    FailureKind.TIMEOUT: (FailureCategory.EXECUTION, True, False),
+    FailureKind.COMMAND_NOT_FOUND: (FailureCategory.EXECUTION, True, False),
+    FailureKind.FILE_NOT_FOUND: (FailureCategory.EXECUTION, True, False),
+    FailureKind.PROCESS_FAILED: (FailureCategory.EXECUTION, True, False),
+    FailureKind.TOOL_INTERNAL_ERROR: (FailureCategory.EXECUTION, True, False),
+    FailureKind.EXECUTION_FAILED: (FailureCategory.EXECUTION, True, False),
+    FailureKind.VERIFICATION_FAILED: (FailureCategory.VERIFICATION, True, False),
 }
-
-#: Policy kinds that block execution and should never trigger a regeneration
-#: request (approval/user-action kinds excluded).
-BLOCKING_POLICY_KINDS = frozenset(
-    {
-        FailureKind.WORKSPACE_ESCAPE,
-        FailureKind.BLOCKED_COMMAND,
-        FailureKind.PERMISSION_DENIED,
-        FailureKind.POLICY_VIOLATION,
-        FailureKind.TOOL_SURFACE_BLOCKED,
-    }
-)
 
 #: Categories where the streak must reflect *what exactly* keeps failing,
 #: not just the failure kind. A different error signature or different
@@ -267,15 +150,6 @@ FINGERPRINTED_CATEGORIES = frozenset(
         FailureCategory.VERIFICATION,
     }
 )
-
-_LEGACY_VALIDATION_PHASE = {
-    "syntactic": FailurePhase.PARSE,
-    "structural": FailurePhase.SCHEMA_VALIDATION,
-    "semantic": FailurePhase.SEMANTIC_VALIDATION,
-    "parse": FailurePhase.PARSE,
-    "schema_validation": FailurePhase.SCHEMA_VALIDATION,
-    "semantic_validation": FailurePhase.SEMANTIC_VALIDATION,
-}
 
 _SOURCE_DEFAULT_KIND = {
     "permission": FailureKind.PERMISSION_DENIED,
@@ -333,7 +207,6 @@ class ToolFailure:
 
     tool_call_id: str
     tool_name: str
-    phase: str
     kind: str
     category: str
     message: str
@@ -373,7 +246,6 @@ class ToolFailure:
             {
                 "failure_category": self.category,
                 "failure_kind": self.kind,
-                "failure_phase": self.phase,
                 "failure_visibility": self.visibility,
                 "failure_retryable": self.retryable,
                 "failure_user_action": self.user_action_required,
@@ -396,18 +268,12 @@ class ToolFailure:
     ) -> ToolFailure:
         """Build a failure from a validation ``ToolError`` (structural use)."""
         kind = str(getattr(error, "kind", "") or FailureKind.INVALID_ARGUMENTS)
-        category, phase, default_retryable, user_action = _spec_for_kind(kind)
-        legacy_phase = str(getattr(error, "phase", "") or "")
-        if phase is None:
-            phase = _LEGACY_VALIDATION_PHASE.get(
-                legacy_phase, FailurePhase.SCHEMA_VALIDATION
-            )
+        category, default_retryable, user_action = _spec_for_kind(kind)
         retryable = bool(getattr(error, "retryable", default_retryable))
         message = str(getattr(error, "message", "") or "")
         return cls(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
-            phase=phase,
             kind=kind,
             category=category,
             message=message,
@@ -434,16 +300,12 @@ class ToolFailure:
         # Already normalized (e.g. produced via ToolError.to_result).
         canonical_kind = metadata.get("failure_kind")
         if isinstance(canonical_kind, str) and canonical_kind:
-            category, _phase, default_retryable, user_action = _spec_for_kind(
-                canonical_kind
-            )
-            phase = str(metadata.get("failure_phase") or _phase or FailurePhase.EXECUTION)
+            category, default_retryable, user_action = _spec_for_kind(canonical_kind)
             retry_value = metadata.get("failure_retryable", default_retryable)
             message = _result_message(result)
             return cls(
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
-                phase=phase,
                 kind=canonical_kind,
                 category=str(metadata.get("failure_category") or category),
                 message=message,
@@ -465,17 +327,11 @@ class ToolFailure:
 
         if source == "validation":
             kind = str(metadata.get("error_kind", "") or FailureKind.INVALID_ARGUMENTS)
-            category, phase, default_retryable, user_action = _spec_for_kind(kind)
-            legacy_phase = str(metadata.get("validation_phase", "") or "")
-            if phase is None:
-                phase = _LEGACY_VALIDATION_PHASE.get(
-                    legacy_phase, FailurePhase.SEMANTIC_VALIDATION
-                )
+            category, default_retryable, user_action = _spec_for_kind(kind)
             retryable = _optional_bool(metadata.get("retryable"), default_retryable)
             return cls(
                 tool_call_id=tool_call_id,
                 tool_name=tool_name,
-                phase=phase,
                 kind=kind,
                 category=category,
                 message=text,
@@ -497,17 +353,16 @@ class ToolFailure:
         else:
             kind = _SOURCE_DEFAULT_KIND.get(source, FailureKind.EXECUTION_FAILED)
 
-        category, phase, retryable, user_action = _spec_for_kind(kind)
+        category, retryable, user_action = _spec_for_kind(kind)
 
         if kind in {FailureKind.EXECUTION_FAILED, FailureKind.PROCESS_FAILED} and (
             source in _TEXT_REFINABLE_SOURCES
         ):
-            kind, category, phase = _refine_by_text(lowered, kind, category, phase)
+            kind, category = _refine_by_text(lowered, kind, category)
 
         return cls(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
-            phase=phase,
             kind=kind,
             category=category,
             message=text,
@@ -687,17 +542,10 @@ def failure_batch_key(messages: list[dict] | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _spec_for_kind(
-    kind: str,
-) -> tuple[str, str | None, bool, bool]:
+def _spec_for_kind(kind: str) -> tuple[str, bool, bool]:
     spec = _KIND_SPECS.get(kind)
     if spec is None:
-        return (
-            FailureCategory.EXECUTION,
-            FailurePhase.EXECUTION,
-            True,
-            False,
-        )
+        return (FailureCategory.EXECUTION, True, False)
     return spec
 
 
@@ -764,18 +612,13 @@ def _optional_bool(value: Any, default: bool) -> bool:
     return default
 
 
-def _refine_by_text(
-    lowered: str,
-    kind: str,
-    category: str,
-    phase: str,
-) -> tuple[str, str, str]:
+def _refine_by_text(lowered: str, kind: str, category: str) -> tuple[str, str]:
     if "timed out" in lowered or "timeout" in lowered:
-        return FailureKind.TIMEOUT, FailureCategory.EXECUTION, FailurePhase.EXECUTION
+        return FailureKind.TIMEOUT, FailureCategory.EXECUTION
     if "command not found" in lowered:
-        return FailureKind.COMMAND_NOT_FOUND, category, phase
+        return FailureKind.COMMAND_NOT_FOUND, category
     if "no such file or directory" in lowered or "file not found" in lowered:
-        return FailureKind.FILE_NOT_FOUND, category, phase
+        return FailureKind.FILE_NOT_FOUND, category
     if "traceback" in lowered or "modulenotfounderror" in lowered:
-        return FailureKind.TOOL_INTERNAL_ERROR, category, phase
-    return kind, category, phase
+        return FailureKind.TOOL_INTERNAL_ERROR, category
+    return kind, category

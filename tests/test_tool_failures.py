@@ -187,7 +187,6 @@ class NormalizationTests(unittest.TestCase):
         # Canonical keys are added.
         self.assertEqual(result.metadata["failure_category"], FailureCategory.INVALID_CALL)
         self.assertEqual(result.metadata["failure_kind"], FailureKind.INVALID_ARGUMENTS)
-        self.assertEqual(result.metadata["failure_phase"], "schema_validation")
         self.assertEqual(result.metadata["failure_visibility"], "protocol")
         self.assertTrue(result.metadata["failure_retryable"])
         self.assertEqual(result.metadata["failure_attempt"], 1)
@@ -343,7 +342,6 @@ class NormalizationTests(unittest.TestCase):
         )
         self.assertEqual(failure.kind, FailureKind.TIMEOUT)
         self.assertEqual(failure.category, FailureCategory.EXECUTION)
-        self.assertEqual(failure.phase, "execution")
 
 
 class FailureTrackerTests(unittest.TestCase):
@@ -927,7 +925,6 @@ class FailureObservabilityTests(unittest.TestCase):
             self.assertTrue(item["tool_call_id"].startswith("tc_bad"))
             self.assertEqual(item["kind"], FailureKind.INVALID_ARGUMENTS)
             self.assertEqual(item["category"], FailureCategory.INVALID_CALL)
-            self.assertEqual(item["phase"], "schema_validation")
             self.assertEqual(item["visibility"], "protocol")
             self.assertTrue(item["intercepted"])
             self.assertEqual(item["source"], "ToolFailurePolicyMiddleware")

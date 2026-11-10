@@ -300,7 +300,6 @@ def _emit_structured_tool_result(
             for key in (
                 "failure_category",
                 "failure_kind",
-                "failure_phase",
                 "failure_visibility",
                 "failure_retryable",
                 "failure_user_action",
