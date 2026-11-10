@@ -59,7 +59,6 @@ def _database_is_writable(path: Path) -> bool:
 
 MemoryKind = Literal["preference", "project_fact", "convention", "decision", "lesson", "workflow"]
 KINDS = frozenset({"preference", "project_fact", "convention", "decision", "lesson", "workflow"})
-STATUSES = frozenset({"active", "review_required", "expired"})
 
 
 @dataclass(frozen=True)

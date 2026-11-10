@@ -28,7 +28,6 @@ from .cancellation import CancellationToken, CancelledError
 from .change_proposal import ChangeProposalStore
 
 AGENT_ROLES = {"explorer", "test_designer", "reviewer", "verifier", "worker"}
-READ_ONLY_ROLES = AGENT_ROLES - {"worker"}
 ACTIVE_STATES = {"queued", "running"}
 TERMINAL_STATES = {"completed", "blocked", "failed", "interrupted", "closed"}
 MAX_OPEN_AGENTS = max(1, int(config.MAX_OPEN_AGENTS))

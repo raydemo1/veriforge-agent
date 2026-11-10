@@ -44,10 +44,6 @@ _WORKSPACE_READ_ONLY_MESSAGE = (
     "[blocked] 工具未执行：当前为只读权限模式，不能通过 shell 修改工作区。"
     "请向用户明确说明未执行。"
 )
-_PROFILE_RESTRICTED_MESSAGE = (
-    "[blocked] 工具未执行：当前任务模式不允许通过 shell 直接写入工作区文件"
-    "（例如 review 审查模式）。请向用户明确说明未执行。"
-)
 _SHELL_DENY_FALLBACK = (
     "[blocked] 工具未执行：当前权限模式不允许此命令。请向用户明确说明未执行，"
     "并说明需要用户如何授权。"
@@ -165,8 +161,6 @@ class PermissionMiddleware(AgentMiddleware):
     def _deny_message(self, tool_name: str, decision) -> str | None:
         if tool_name != "run_bash":
             return None
-        if decision.risk == "shell_profile_restricted":
-            return _PROFILE_RESTRICTED_MESSAGE
         if decision.risk == "shell_blocked":
             return _BLOCKED_MESSAGE
         analysis = getattr(decision, "analysis", None)

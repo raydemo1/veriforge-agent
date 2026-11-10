@@ -7,7 +7,6 @@ from ..agent.context import count_text_tokens
 PERSONAL_TOKENS = 300
 PROJECT_TOKENS = 500
 NAVIGATION_TOKENS = 400
-STARTUP_TOKENS = PERSONAL_TOKENS + PROJECT_TOKENS + NAVIGATION_TOKENS
 
 
 def _json(value):
