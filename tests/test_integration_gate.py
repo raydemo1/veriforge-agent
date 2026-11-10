@@ -62,8 +62,8 @@ class ProposalIntegrationGateTests(unittest.TestCase):
         injection = self.middleware.pre_exit([])
         self.assertIsNotNone(injection)
         self.assertIn(result["conflict_id"], injection)
-        self.assertIn("read_agent_conflicts", injection)
-        self.assertIn("resolve_agent_conflicts", injection)
+        self.assertIn("read_agent_changes(conflict_id=...)", injection)
+        self.assertIn("apply_agent_changes(conflict_id=...", injection)
         self.assertIn("question interaction", injection)
 
     def test_applied_proposal_allows_exit(self):

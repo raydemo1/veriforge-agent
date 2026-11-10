@@ -105,10 +105,58 @@ class ChangeProposalTests(unittest.TestCase):
         self.assertIn("spawn_agent", names)
         self.assertIn("send_agent_message", names)
         self.assertIn("apply_agent_changes", names)
-        self.assertIn("resolve_agent_conflicts", names)
+        self.assertIn("read_agent_changes", names)
+        # Conflict flow folded into read/apply; status listing folded into
+        # get_runtime_status(section="agents").
+        self.assertNotIn("read_agent_conflicts", names)
+        self.assertNotIn("resolve_agent_conflicts", names)
+        self.assertNotIn("list_agents", names)
         self.assertNotIn("delegate_agent", names)
         self.assertNotIn("parallel_agents", names)
         self.assertNotIn("parallel_commands", names)
+
+    def test_coordination_tools_are_deferred_until_search_tools_mounts_them(self):
+        from harness_code_agent.runtime.tool_registry import tool_schemas_for_agent
+
+        def names_of(**kwargs):
+            return {
+                schema["function"]["name"]
+                for schema in tool_schemas_for_agent(registry=BUILTIN_TOOL_REGISTRY, **kwargs)
+            }
+
+        core = names_of()
+        deferred = names_of(disclosure={"deferred"})
+        for name in ("spawn_agent", "apply_agent_changes", "wait_agents", "close_agent"):
+            self.assertNotIn(name, core, msg=f"{name} must not be mounted by default")
+            self.assertIn(name, deferred, msg=f"{name} must stay discoverable")
+        # Children always need their one upward channel, so it stays core for them.
+        child_view = {
+            schema["function"]["name"]
+            for schema in tool_schemas_for_agent(
+                registry=BUILTIN_TOOL_REGISTRY, capabilities={"worker_agent"}
+            )
+        }
+        self.assertIn("send_parent_message", child_view)
+
+    def test_search_tools_mounts_deferred_builtin_tools(self):
+        from harness_code_agent.runtime.builtins.discovery import search_tools
+
+        context = types.SimpleNamespace(
+            tool_registry=BUILTIN_TOOL_REGISTRY,
+            discover_mcp_tools=None,
+            allowed_tool_permissions=None,
+            blocked_tool_names=set(),
+            revealed_tool_names=set(),
+            search_tools_signature=None,
+            search_tools_queries=set(),
+            search_tools_no_progress=0,
+        )
+
+        result = search_tools("spawn agent", tool_context=context)
+        mounted = result.metadata.get("revealed_tool_names") or []
+
+        self.assertIn("spawn_agent", mounted)
+        self.assertNotIn("memory_search", mounted)  # core tools are not in the catalog
 
 
 class _ControlledConversation:

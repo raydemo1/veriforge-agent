@@ -181,7 +181,8 @@ Python 通信与文件监听依赖 `pygls` 和 `watchfiles` 随 `pip install -e 
 
 职责分层同样适用于模型可见面：**System Prompt 只放少量全局原则，Tool Schema 只描述精确的接口契约
 （参数语义、返回值语义、分页规则、隔离与权限参数），运行时保障由 Runtime 实际执行，复杂知识按需加载**。
-Schema 里不再重复提示词已经写过的行为策略。
+Schema 里不再重复提示词已经写过的行为策略。子代理协作工具（`spawn_agent` 等 8 个）默认不挂载，
+由 `search_tools` 按需发现并长期挂载；memory 与常规编码工具常驻。
 
 ### 执行边界
 

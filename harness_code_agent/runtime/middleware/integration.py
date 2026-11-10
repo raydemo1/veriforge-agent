@@ -63,9 +63,11 @@ class ProposalIntegrationMiddleware(AgentMiddleware):
             )
         if conflicts:
             lines.append(
-                "Inspect each conflict with read_agent_conflicts (base/current/worker), "
-                "then resolve every conflicted path with resolve_agent_conflicts. "
-                "If the conflict is genuinely a user or product decision the "
-                "requirements do not settle, ask via the question interaction first."
+                "Inspect each conflict with read_agent_changes(conflict_id=...) "
+                "(base/current/worker), then apply again with "
+                "apply_agent_changes(conflict_id=..., resolutions={path: content}) "
+                "for every conflicted path. If the conflict is genuinely a user or "
+                "product decision the requirements do not settle, ask via the "
+                "question interaction first."
             )
         return "\n".join(lines)

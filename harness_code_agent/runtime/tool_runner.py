@@ -260,7 +260,7 @@ def _event_safe_tool_output(tool_result: ToolResult) -> tuple[str, dict]:
     metadata = dict(tool_result.metadata)
     output = tool_result.output or ""
     metadata["output_length"] = len(output)
-    if tool_result.tool in {"read_file", "read_agent_changes", "read_agent_conflicts"} and output:
+    if tool_result.tool in {"read_file", "read_agent_changes"} and output:
         metadata["output_redacted"] = True
         return f"[redacted {tool_result.tool} output: {len(output)} chars]", metadata
     if len(output) > TOOL_EVENT_OUTPUT_LIMIT:

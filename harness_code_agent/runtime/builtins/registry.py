@@ -32,10 +32,7 @@ from .agents import (
     close_agent,
     followup_agent,
     interrupt_agent,
-    list_agents,
     read_agent_changes,
-    read_agent_conflicts,
-    resolve_agent_conflicts,
     send_agent_message,
     send_parent_message,
     spawn_agent,
@@ -76,13 +73,14 @@ def _build_builtin_tool_registry() -> ToolRegistry:
     # absent from its registry. This is the fixed Main <-> Child topology.
     child_agents = {TOOL_CAPABILITY_READONLY_AGENT, TOOL_CAPABILITY_WORKER_AGENT}
 
-    def add(name, handler, permission, effect=None, *, capabilities=main):
+    def add(name, handler, permission, effect=None, *, capabilities=main, disclosure="core"):
         registry.register(
             schemas[name],
             handler,
             permission=permission,
             effect=effect,
             capabilities=capabilities,
+            disclosure=disclosure,
         )
 
     add("code_intelligence", code_intelligence, TOOL_PERMISSION_READ,
@@ -169,14 +167,19 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         CallEffect(barrier=True, kind="control"),
         capabilities=all_agents,
     )
+    # Agent coordination is a demand-loaded surface: the main agent pays for
+    # these schemas only after search_tools mounts them. send_parent_message is
+    # the exception -- children always need their one upward channel.
     add(
-        "spawn_agent", spawn_agent, TOOL_PERMISSION_READ, CallEffect(kind="agent_spawn")
+        "spawn_agent", spawn_agent, TOOL_PERMISSION_READ, CallEffect(kind="agent_spawn"),
+        disclosure="deferred",
     )
     add(
         "send_agent_message",
         send_agent_message,
         TOOL_PERMISSION_READ,
         _agent_effect("agent_id", access="write"),
+        disclosure="deferred",
     )
     add(
         "send_parent_message",
@@ -190,6 +193,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         followup_agent,
         TOOL_PERMISSION_READ,
         _agent_effect("agent_id", access="write"),
+        disclosure="deferred",
     )
     add(
         "wait_agents",
@@ -198,50 +202,35 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         CallEffect(
             (ResourceClaim("agent-session", "*", "global", "read"),), kind="agent_wait"
         ),
-    )
-    add(
-        "list_agents",
-        list_agents,
-        TOOL_PERMISSION_READ,
-        CallEffect(
-            (ResourceClaim("agent-session", "*", "global", "read"),), kind="agent_list"
-        ),
+        disclosure="deferred",
     )
     add(
         "interrupt_agent",
         interrupt_agent,
         TOOL_PERMISSION_CONTROL,
         _agent_effect("agent_id", access="write"),
+        disclosure="deferred",
     )
     add(
         "read_agent_changes",
         read_agent_changes,
         TOOL_PERMISSION_READ,
         _agent_effect("proposal_id", access="read", domain="agent-proposal"),
+        disclosure="deferred",
     )
     add(
         "apply_agent_changes",
         apply_agent_changes,
         TOOL_PERMISSION_EDIT,
-        _proposal_effect,
-    )
-    add(
-        "read_agent_conflicts",
-        read_agent_conflicts,
-        TOOL_PERMISSION_READ,
-        _agent_effect("conflict_id", access="read", domain="agent-conflict"),
-    )
-    add(
-        "resolve_agent_conflicts",
-        resolve_agent_conflicts,
-        TOOL_PERMISSION_EDIT,
-        _conflict_effect,
+        _apply_effect,
+        disclosure="deferred",
     )
     add(
         "close_agent",
         close_agent,
         TOOL_PERMISSION_CONTROL,
         _agent_effect("agent_id", access="write"),
+        disclosure="deferred",
     )
     add(
         "ask_user",
@@ -346,6 +335,13 @@ def _conflict_effect(args, context):
         ),
         kind="agent_conflict",
     )
+
+
+def _apply_effect(args, context):
+    """applying a proposal writes its paths; resolving a conflict writes theirs."""
+    if args.get("resolutions") is not None:
+        return _conflict_effect(args, context)
+    return _proposal_effect(args, context)
 
 
 def _shell_effect(args, context):

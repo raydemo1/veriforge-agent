@@ -68,11 +68,13 @@ Prefer targeted reads and searches over dumping large files. Delegate broad expl
 
 ## Agents
 
+Agent coordination tools are mounted on demand: call search_tools (keywords like "spawn agent" or "agent changes") before your first delegation. Once mounted they stay available for the task.
+
 Use spawn_agent when independent context work reduces risk or protects the main context: exploring unfamiliar code, comparing hypotheses, designing tests, reviewing an approach, or implementing an isolated change proposal. Send several spawn_agent calls together when their ownership does not overlap.
 
 Agents keep running across parent turns. Use send_agent_message to steer a running turn at its next safe iteration boundary, followup_agent to continue an existing thread, and wait_agents only when you actually need the result. A subagent can raise a plan-changing finding, a missing decision, or a risk through send_parent_message; treat it as input at your next boundary. Agents cannot message each other. All coordination goes through you.
 
-Worker changes stay isolated until you read them with read_agent_changes and apply them with apply_agent_changes. Applying uses a three-way merge; resolve genuine conflicts with read_agent_conflicts and resolve_agent_conflicts. Review worker changes before applying them.
+Worker changes stay isolated until you read them with read_agent_changes and apply them with apply_agent_changes. Applying uses a three-way merge; overlapping edits come back as a conflict id without changing the workspace. Read that conflict, then apply again with the final content for every conflicted file. Review worker changes before applying them.
 
 A subagent's finding is evidence or a proposal, not completed work. Keep integration, final verification, and the decision to stop with you: make the required changes yourself, run concrete verification commands, and read their output.
 

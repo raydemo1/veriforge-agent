@@ -100,59 +100,40 @@ def wait_agents(
     return _result("wait_agents", payload)
 
 
-def list_agents(status: str = "", tool_context: ToolContext | None = None) -> ToolResult:
-    return _result("list_agents", _coordinator(tool_context).list(status))
-
-
 def interrupt_agent(agent_id: str, tool_context: ToolContext | None = None) -> ToolResult:
     return _result("interrupt_agent", _coordinator(tool_context).interrupt(agent_id))
 
 
 def read_agent_changes(
     proposal_id: str,
+    conflict_id: str = "",
     path: str = "",
     offset: int = 0,
     limit: int = 12_000,
     tool_context: ToolContext | None = None,
 ) -> ToolResult:
-    payload = _coordinator(tool_context).changes.read_changes(
-        proposal_id,
-        path=path,
-        offset=offset,
-        limit=limit,
-    )
+    changes = _coordinator(tool_context).changes
+    if conflict_id:
+        payload = changes.read_conflicts(conflict_id, path=path, offset=offset, limit=limit)
+    else:
+        payload = changes.read_changes(proposal_id, path=path, offset=offset, limit=limit)
     return _result("read_agent_changes", payload)
 
 
-def apply_agent_changes(proposal_id: str, tool_context: ToolContext | None = None) -> ToolResult:
-    coordinator = _coordinator(tool_context)
-    payload = coordinator.changes.apply(proposal_id, tool_context.workspace)
+def apply_agent_changes(
+    proposal_id: str,
+    conflict_id: str = "",
+    resolutions: dict[str, str] | None = None,
+    tool_context: ToolContext | None = None,
+) -> ToolResult:
+    changes = _coordinator(tool_context).changes
+    if resolutions is not None:
+        if not conflict_id:
+            raise ValueError("resolutions requires the conflict_id returned by the previous apply")
+        payload = changes.resolve(conflict_id, resolutions, tool_context.workspace)
+    else:
+        payload = changes.apply(proposal_id, tool_context.workspace)
     return _result("apply_agent_changes", payload, metadata={"file_changes": payload.get("file_changes", [])})
-
-
-def read_agent_conflicts(
-    conflict_id: str,
-    path: str = "",
-    offset: int = 0,
-    limit: int = 12_000,
-    tool_context: ToolContext | None = None,
-) -> ToolResult:
-    payload = _coordinator(tool_context).changes.read_conflicts(
-        conflict_id,
-        path=path,
-        offset=offset,
-        limit=limit,
-    )
-    return _result("read_agent_conflicts", payload)
-
-
-def resolve_agent_conflicts(
-    conflict_id: str,
-    resolutions: dict[str, str],
-    tool_context: ToolContext | None = None,
-) -> ToolResult:
-    payload = _coordinator(tool_context).changes.resolve(conflict_id, resolutions, tool_context.workspace)
-    return _result("resolve_agent_conflicts", payload, metadata={"file_changes": payload.get("file_changes", [])})
 
 
 def close_agent(

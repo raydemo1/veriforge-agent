@@ -86,7 +86,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "search_tools",
-            "description": "Search the MCP tool catalog for a capability that is not in your mounted tools. Pass the MCP server id and short English keywords. Matching tools are mounted as native functions and stay available. A zero-score search mounts nothing and returns that server's tool names and descriptions only.",
+            "description": "Search the deferred tool catalog for a capability that is not in your mounted tools, including on-demand built-in tools and MCP servers. Pass short English keywords; the optional server id narrows the search to one MCP server. Matching tools are mounted as native functions and stay available. A zero-score search mounts nothing and returns that scope's tool names and descriptions only.",
             "parameters": {
                 "type": "object",
                 "required": ["query"],
@@ -362,10 +362,10 @@ CORE_TOOL_SCHEMAS = [
                                  'review.',
                   'parameters': {'type': 'object',
                                  'required': ['topic', 'fact_key', 'kind', 'body', 'source_quote'],
-                                 'properties': {'topic': {'type': 'string',
-                                                         'description': 'Knowledge domain shared across kinds; reuse an existing topic or alias.'},
+                                 'properties': {                                                'topic': {'type': 'string',
+                                                         'description': 'Topic name, or an existing topic\'s alias.'},
                                                 'fact_key': {'type': 'string',
-                                                             'description': 'Stable qualified property key, e.g. package.manager. Reuse the same key for the same setting across scopes.'},
+                                                             'description': 'Stable qualified property key, e.g. package.manager. Reuse it for the same setting across scopes.'},
                                                 'kind': {'type': 'string',
                                                          'description': 'Nature of one fact, independent of its topic.',
                                                          'enum': ['preference',
@@ -381,7 +381,7 @@ CORE_TOOL_SCHEMAS = [
                                                           'description': 'Use project for repository-specific facts or preferences; user only for explicit cross-project personal preferences.',
                                                           'default': 'project'},
                                                 'applicability': {'type': 'string', 'default': '',
-                                                                  'description': 'Empty for unconditional defaults, otherwise the applicable condition. path: conditions belong to project scope.'},
+                                                                  'description': 'Empty for unconditional defaults, otherwise the applicable condition. path: conditions are project scope.'},
                                                 'source_paths': {'type': 'array',
                                                                  'items': {'type': 'string'},
                                                                  'default': []},
@@ -532,14 +532,6 @@ CORE_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "list_agents",
-            "description": 'List open background agent threads and their status.',
-            "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["", "queued", "running", "completed", "blocked", "failed", "interrupted"]}}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "interrupt_agent",
             "description": "Interrupt the selected agent's current turn while preserving its thread and completed artifacts.",
             "parameters": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}},
@@ -549,32 +541,16 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_agent_changes",
-            "description": 'Read a complete isolated change proposal with pagination.',
-            "parameters": {"type": "object", "required": ["proposal_id"], "properties": {"proposal_id": {"type": "string"}, "path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50000, "default": 12000}}},
+            "description": 'Read an isolated change proposal with pagination. With conflict_id, read base, main, worker and marked merge content for that conflict instead.',
+            "parameters": {"type": "object", "required": ["proposal_id"], "properties": {"proposal_id": {"type": "string"}, "conflict_id": {"type": "string", "default": ""}, "path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50000, "default": 12000}}},
         },
     },
     {
         "type": "function",
         "function": {
             "name": "apply_agent_changes",
-            "description": 'Three-way merge and atomically apply a worker proposal. Real overlapping edits return a conflict id without changing the workspace.',
-            "parameters": {"type": "object", "required": ["proposal_id"], "properties": {"proposal_id": {"type": "string"}}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_agent_conflicts",
-            "description": 'Read base, main, worker and marked merge content for a proposal conflict.',
-            "parameters": {"type": "object", "required": ["conflict_id"], "properties": {"conflict_id": {"type": "string"}, "path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50000, "default": 12000}}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "resolve_agent_conflicts",
-            "description": 'Submit final content for every conflicted file and atomically commit the complete merge after revalidation.',
-            "parameters": {"type": "object", "required": ["conflict_id", "resolutions"], "properties": {"conflict_id": {"type": "string"}, "resolutions": {"type": "object", "additionalProperties": {"type": "string"}}}},
+            "description": 'Three-way merge and atomically apply a worker proposal. Overlapping edits return a conflict id without changing the workspace. With conflict_id and resolutions, commit that final content and complete the merge after revalidation.',
+            "parameters": {"type": "object", "required": ["proposal_id"], "properties": {"proposal_id": {"type": "string"}, "conflict_id": {"type": "string", "default": ""}, "resolutions": {"type": "object", "additionalProperties": {"type": "string"}}}},
         },
     },
     {
