@@ -152,10 +152,15 @@ class ChangeProposalTests(unittest.TestCase):
             search_tools_no_progress=0,
         )
 
-        result = search_tools("spawn agent", tool_context=context)
+        # A query aimed at one tool of the coordination workflow mounts the
+        # whole group: the names share "agent", so keyword ranking alone would
+        # leave siblings tied at the noise floor and cut them at the limit.
+        result = search_tools("spawn agent explore repository", tool_context=context)
         mounted = result.metadata.get("revealed_tool_names") or []
 
         self.assertIn("spawn_agent", mounted)
+        self.assertIn("wait_agents", mounted)
+        self.assertIn("apply_agent_changes", mounted)
         self.assertNotIn("memory_search", mounted)  # core tools are not in the catalog
 
 

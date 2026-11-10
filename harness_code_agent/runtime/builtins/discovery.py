@@ -20,6 +20,26 @@ MAX_LIMIT = 20
 
 _DESCRIPTION_LIMIT = 180
 
+#: Built-in tools that form one workflow. They share their vocabulary ("agent"
+#: appears in every name), so a keyword search ranks one of them clearly on top
+#: and leaves the rest tied at the noise floor, where a per-tool limit cuts
+#: random siblings. Mounting a group together matches how they are actually
+#: used: spawn -> steer -> wait -> read/apply -> close.
+TOOL_GROUPS = (
+    frozenset(
+        {
+            "spawn_agent",
+            "send_agent_message",
+            "followup_agent",
+            "wait_agents",
+            "interrupt_agent",
+            "read_agent_changes",
+            "apply_agent_changes",
+            "close_agent",
+        }
+    ),
+)
+
 
 def search_tools(
     query: str,
@@ -147,18 +167,22 @@ def search_tools(
         "medium": " (medium confidence: verify before using)",
         "low": " (LOW confidence: mounted anyway for inspection; verify it really fits this step before calling)",
     }[level]
-    mounted = [hit.key for hit in hits]
+    mounted = _expand_groups([hit.key for hit in hits], spec_by_name)
     new_names = {name for name in mounted if name not in revealed}
     if new_names:
         tool_context.search_tools_no_progress = 0
 
     listing = "\n".join(
-        f"- {_tool_of(spec_by_name[hit.key])}: {_one_line(hit.metadata.get('description'))}"
-        for hit in hits
-        if hit.key in spec_by_name
+        f"- {_tool_of(spec_by_name[name])}: {_one_line(_description_of(spec_by_name[name]))}"
+        for name in mounted
+        if name in spec_by_name
     )
     if new_names:
-        heading = f"Mounted {len(new_names)} new tool(s) from {_scope_label(server_name)}{note}:"
+        group_note = " (including its workflow group)" if len(mounted) > len(hits) else ""
+        heading = (
+            f"Mounted {len(new_names)} new tool(s){group_note} "
+            f"from {_scope_label(server_name)}{note}:"
+        )
     else:
         heading = (
             f"No new tools: all {len(mounted)} match(es) from {_scope_label(server_name)} were "
@@ -176,6 +200,19 @@ def search_tools(
             "no_progress": tool_context.search_tools_no_progress,
         },
     )
+
+
+def _expand_groups(names: list[str], spec_by_name: dict[str, ToolSpec]) -> list[str]:
+    """Add the siblings of any workflow-group member that matched."""
+    ordered = list(names)
+    known = set(ordered)
+    for group in TOOL_GROUPS:
+        if known & group:
+            for name in sorted(group - known):
+                if name in spec_by_name and name not in known:
+                    ordered.append(name)
+                    known.add(name)
+    return ordered
 
 
 def _catalog_signature(deferred: list[ToolSpec]) -> tuple[str, ...]:
