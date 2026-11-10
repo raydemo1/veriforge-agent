@@ -1,3 +1,4 @@
+import json
 import shutil
 import tempfile
 import threading
@@ -138,30 +139,39 @@ class ChangeProposalTests(unittest.TestCase):
         }
         self.assertIn("send_parent_message", child_view)
 
-    def test_search_tools_mounts_deferred_builtin_tools(self):
-        from harness_code_agent.runtime.builtins.discovery import search_tools
-
-        context = types.SimpleNamespace(
-            tool_registry=BUILTIN_TOOL_REGISTRY,
-            discover_mcp_tools=None,
-            allowed_tool_permissions=None,
-            blocked_tool_names=set(),
-            revealed_tool_names=set(),
-            search_tools_signature=None,
-            search_tools_queries=set(),
-            search_tools_no_progress=0,
+    def test_merged_change_tools_route_conflict_flow(self):
+        from harness_code_agent.runtime.builtins.agents import (
+            apply_agent_changes,
+            read_agent_changes,
         )
 
-        # A query aimed at one tool of the coordination workflow mounts the
-        # whole group: the names share "agent", so keyword ranking alone would
-        # leave siblings tied at the noise floor and cut them at the limit.
-        result = search_tools("spawn agent explore repository", tool_context=context)
-        mounted = result.metadata.get("revealed_tool_names") or []
+        proposal = self._proposal("value = 1\n", "value = 2\n")
+        (self.root / "app.py").write_text("value = 3\n", encoding="utf-8")
+        context = types.SimpleNamespace(
+            agent_coordinator=types.SimpleNamespace(changes=self.store),
+            workspace=self.workspace,
+        )
 
-        self.assertIn("spawn_agent", mounted)
-        self.assertIn("wait_agents", mounted)
-        self.assertIn("apply_agent_changes", mounted)
-        self.assertNotIn("memory_search", mounted)  # core tools are not in the catalog
+        applied = json.loads(apply_agent_changes(proposal.id, tool_context=context).output)
+        self.assertEqual(applied["status"], "conflict")
+
+        conflict = json.loads(
+            read_agent_changes(
+                proposal.id, conflict_id=applied["conflict_id"], tool_context=context
+            ).output
+        )
+        self.assertIn("value = 2", conflict["content"])
+
+        resolved = json.loads(
+            apply_agent_changes(
+                proposal.id,
+                conflict_id=applied["conflict_id"],
+                resolutions={"app.py": "value = 4\n"},
+                tool_context=context,
+            ).output
+        )
+        self.assertEqual(resolved["status"], "applied")
+        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "value = 4\n")
 
 
 class _ControlledConversation:
