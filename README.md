@@ -167,13 +167,21 @@ Python 通信与文件监听依赖 `pygls` 和 `watchfiles` 随 `pip install -e 
 
 | 模块 | 职责 |
 | --- | --- |
-| `agent/` | 对话循环、统一上下文生命周期、provider、取消和子代理 |
+| `support/` | 叶子层原语：取消令牌、token 计数、LLM 客户端适配，不依赖任何其他包 |
+| `agent/` | 对话循环、统一上下文生命周期和子代理 |
 | `runtime/` | 工具 registry、权限、调度、middleware 和 MCP |
-| `workspace/` | 文件保护、快照、Shell 和后台任务 |
+| `workspace/` | 文件保护、快照、Shell、后台任务和路径规则 |
 | `sessions/` | session metadata、事件、逻辑消息手账和报告 |
 | `memory/` | SQLite 事实与修订、主题视图、向量＋全文检索、分阶段后台整理 |
 | `frontend/opentui/` | Bun + React + TypeScript 终端界面 |
 | `eval/` | 基准任务、运行器和结果账本 |
+
+依赖方向是单向的：`support` ← `runtime`/`workspace`/`memory`/`sessions` ← `agent` ← `core`/`tui`/`cli`。
+`tests/test_layering.py` 用 AST 检查这条规则，防止"顺手 import"重新造出环。
+
+职责分层同样适用于模型可见面：**System Prompt 只放少量全局原则，Tool Schema 只描述精确的接口契约
+（参数语义、返回值语义、分页规则、隔离与权限参数），运行时保障由 Runtime 实际执行，复杂知识按需加载**。
+Schema 里不再重复提示词已经写过的行为策略。
 
 ### 执行边界
 

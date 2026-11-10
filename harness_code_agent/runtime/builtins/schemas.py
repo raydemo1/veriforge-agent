@@ -10,7 +10,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_runtime_status",
-            "description": "Read current task, budget, verification, environment or agent state when needed. Do not poll after each tool call.",
+            "description": 'Read current task, budget, verification, environment or agent state on demand.',
             "parameters": {
                 "type": "object", "required": ["section"],
                 "properties": {"section": {"type": "string", "enum": ["task", "budget", "verification", "environment", "agents"]}},
@@ -21,7 +21,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "code_intelligence",
-            "description": "Read semantic definitions, references, document symbols or diagnostics from a system-installed language server outside the workspace. Workspace-local servers are never automatically executed. Returns unavailable when the server or operation is unavailable; continue with repo_search/read_file. Diagnostics are code-understanding information, not completion verification.",
+            "description": 'Read semantic definitions, references, document symbols or diagnostics from a system-installed language server. Workspace-local servers are never executed. Returns unavailable when the server or operation is unavailable. Diagnostics describe code understanding, not task verification.',
             "parameters": {
                 "type": "object",
                 "required": ["operation", "path"],
@@ -38,12 +38,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": (
-                "Read a workspace file in consecutive token-bounded pages. Follow next_read exactly when present. "
-                f"For sequential scans of large files (>1000 lines), use a larger window up to {READ_FILE_MAX_LINES} lines "
-                "to reduce round trips. Use narrower windows when following search hits, inspecting local context, "
-                "or avoiding the per-call token cap on dense files."
-            ),
+            "description": 'Read a workspace file in token-bounded pages. Follow next_read exactly when present to continue from where the last page ended.',
             "parameters": {
                 "type": "object",
                 "required": ["path"],
@@ -62,10 +57,7 @@ CORE_TOOL_SCHEMAS = [
                         "type": "integer",
                         "minimum": 1,
                         "maximum": READ_FILE_MAX_LINES,
-                        "description": f"Maximum lines to return for a bounded read. Must be <= {READ_FILE_MAX_LINES}. "
-                        "For sequential scans of large files, prefer a larger window; use smaller windows for targeted reads "
-                        "or token-dense content. "
-                        "The per-call output is also capped by a token limit (whichever is smaller).",
+                        "description": 'Maximum lines to return for a bounded read. Must be <= 2000. The per-call output is also capped by a token limit (whichever is smaller).',
                     },
                     "include_line_numbers": {
                         "type": "boolean",
@@ -80,7 +72,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_skill_file",
-            "description": "Read a skill file from the packaged skills catalog. Use this to load a skill's SKILL.md or any sub-files referenced within it. Path should be like 'catalog/frontend-design/SKILL.md'.",
+            "description": "Read a file from the packaged skills catalog. Paths look like 'catalog/frontend-design/SKILL.md'.",
             "parameters": {
                 "type": "object",
                 "required": ["path"],
@@ -94,13 +86,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "search_tools",
-            "description": (
-                "Search the MCP tool catalog when a needed capability is not in your mounted tools. "
-                "Pass the MCP server id and short English keywords. Matching tools are mounted as "
-                "native functions for later turns; mounted tools stay available. A zero-score search "
-                "mounts nothing and returns that server's tool names and descriptions only, so retry "
-                "with different keywords or another server instead of repeating the same query."
-            ),
+            "description": "Search the MCP tool catalog for a capability that is not in your mounted tools. Pass the MCP server id and short English keywords. Matching tools are mounted as native functions and stay available. A zero-score search mounts nothing and returns that server's tool names and descriptions only.",
             "parameters": {
                 "type": "object",
                 "required": ["query"],
@@ -128,7 +114,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "spawn_agent",
-            "description": "Start one focused background agent and return its id immediately. Emit multiple independent spawn_agent calls in one response to run them concurrently.",
+            "description": 'Start a focused background agent and return its id immediately.',
             "parameters": {
                 "type": "object",
                 "required": ["name", "role", "task"],
@@ -148,7 +134,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Create or overwrite a file in the workspace.",
+            "description": 'Create or overwrite a file in the workspace.',
             "parameters": {
                 "type": "object",
                 "required": ["path", "content"],
@@ -163,7 +149,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "apply_patch",
-            "description": "Apply a safe text patch to one file. The search text must match exactly once, or the patch fails without modifying the file.",
+            "description": 'Apply a text patch to one file. The search text must match exactly once, or the patch fails without modifying the file.',
             "parameters": {
                 "type": "object",
                 "required": ["path", "search", "replace"],
@@ -179,13 +165,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "update_todo",
-            "description": (
-                "Create or update the current execution todo list. The call replaces the "
-                "whole list, so resend all items each time. Use this for concrete remaining "
-                "work on non-trivial multi-step tasks, not for reasoning notes or high-level "
-                "strategy. Skip this tool entirely for simple tasks. Update it at meaningful "
-                "milestones rather than after every tool call."
-            ),
+            "description": 'Replace the current execution todo list with the given items in execution order; every call resends the whole list. Use it for concrete remaining work in multi-step tasks.',
             "parameters": {
                 "type": "object",
                 "required": ["items"],
@@ -223,10 +203,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "repo_search",
-            "description": (
-                "Search workspace code/text using bounded ripgrep. Use this for repository exploration instead of run_bash rg/grep/find commands. "
-                "The harness always supplies an explicit path, short timeout, default generated-directory excludes, and max result limits."
-            ),
+            "description": 'Search workspace code and text with bounded ripgrep. The harness supplies an explicit path, a short timeout, generated-directory excludes and a result cap.',
             "parameters": {
                 "type": "object",
                 "required": ["pattern"],
@@ -270,10 +247,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": (
-                "List workspace files and directories with bounded depth. Defaults to depth=2. "
-                "Use higher depth only when you also provide bounded max_results and exclusions."
-            ),
+            "description": 'List workspace files and directories with bounded depth. depth=1 lists direct children; the default depth=2 adds one nested level.',
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -315,12 +289,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "ask_user",
-            "description": (
-                "Ask the user one focused multiple-choice question. "
-                "Use when the model needs a user decision before continuing. "
-                "The UI always includes an Other/其他 option with free-text input, "
-                "and returns the selected option as structured JSON."
-            ),
+            "description": 'Ask the user one multiple-choice question. The UI always adds an Other/free-text option, and the answer returns as structured JSON with the selected value.',
             "parameters": {
                 "type": "object",
                 "required": ["question", "options"],
@@ -331,11 +300,7 @@ CORE_TOOL_SCHEMAS = [
                     },
                     "options": {
                         "type": "array",
-                        "description": (
-                            "Choices to show before the automatic Other choice. "
-                            "Pass concise labels with optional values/descriptions. "
-                            "3-4 options is ideal; maximum 9 (only the first 9 get number-key shortcuts)."
-                        ),
+                        "description": "Choices to show before the automatic Other choice. Pass concise labels with optional values/descriptions. Maximum 9 (only the first 9 get number-key shortcuts).",
                         "items": {
                             "oneOf": [
                                 {"type": "string"},
@@ -362,8 +327,7 @@ CORE_TOOL_SCHEMAS = [
     },
     {'type': 'function',
      'function': {'name': 'memory_search',
-                  'description': 'Search current memory when relevant prior context is needed. Reuse facts already '
-                                 'in context. Use a focused query, page by scope, and filter paths or kind.',
+                  'description': 'Search current memory with a focused query; page by scope and filter by paths or kind.',
                   'parameters': {'type': 'object',
                                  'required': ['query'],
                                  'properties': {'query': {'type': 'string'},
@@ -393,9 +357,9 @@ CORE_TOOL_SCHEMAS = [
                                                          'default': None}}}}},
     {'type': 'function',
      'function': {'name': 'memory_write',
-                  'description': 'Save a source-backed current fact. Quote the current user verbatim. Use the '
-                                 'existing id and version for explicit corrections; conflicting creates are held '
-                                 'for review.',
+                  'description': 'Save a source-backed fact. Quote the current user verbatim. Use the existing '
+                                 'id and expected_version to correct a fact; a conflicting create is held for '
+                                 'review.',
                   'parameters': {'type': 'object',
                                  'required': ['topic', 'fact_key', 'kind', 'body', 'source_quote'],
                                  'properties': {'topic': {'type': 'string',
@@ -428,8 +392,8 @@ CORE_TOOL_SCHEMAS = [
                                                                      'minimum': 1}}}}},
     {'type': 'function',
      'function': {'name': 'memory_read',
-                  'description': 'Read a current fact, or set history=true for previous revisions. Supply '
-                                 'topic or topic_id to expand a topic, or omit all identifiers to list topics.',
+                  'description': 'Read a fact, or set history=true for previous revisions. Pass topic or '
+                                 'topic_id to expand a topic, or omit identifiers to list topics.',
                   'parameters': {'type': 'object',
                                  'required': ['scope'],
                                  'properties': {'scope': {'type': 'string',
@@ -471,30 +435,19 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "run_bash",
-            "description": (
-                "Execute a shell command in the workspace directory. "
-                + ("On Windows use PowerShell 7 syntax; processes run under the native directory write sandbox: "
-                   "the project is read-only unless write_paths declares writable directories "
-                   "(private TEMP is always writable), and a background job cannot claim the whole shared workspace. "
-                   if os.name == "nt" else "Use Bash syntax; commands run directly in the current execution environment. ")
-                + "A command that runs to completion is reported as success even when it exits non-zero - the code is appended as [exit_code: N]; only timeouts and runtime errors are failures. "
-                "Long builds need a larger timeout. Dev servers and watch mode return a background job id for the shell-job tools. "
-                "Keep inspection commands bounded and prefer the dedicated file and search tools; "
-                "unbounded repository-wide listing or searching may be blocked. "
-                "Never create a git worktree on your own."
-            ),
+            "description": 'Execute a shell command in the workspace directory. On Windows use PowerShell 7 syntax; processes run under the native directory write sandbox: the project is read-only unless write_paths declares writable directories (private TEMP is always writable), and a background job cannot claim the whole shared workspace. A command that runs to completion is reported as success even when it exits non-zero - the code is appended as [exit_code: N]; only timeouts and runtime errors are failures. Dev servers and watch mode return a background job id for the shell-job tools. Unbounded repository-wide listing or searching may be blocked. Never create a git worktree on your own.',
             "parameters": {
                 "type": "object",
                 "required": ["command"],
                 "properties": {
-                    "command": {"type": "string", "description": "Shell command to run; keep inspection commands bounded and avoid combining unrelated checks."},
+                    "command": {"type": "string", "description": "Shell command to run."},
                     **({"write_paths": {
                         "type": "array", "items": {"type": "string"}, "default": [],
-                        "description": "Workspace directories that this process may write, relative to the workspace. Omit for a read-only project. Directory permits last until the process tree exits."
+                        "description": "Workspace directories this process may write, relative to the workspace. Omit for a read-only project. Permits last until the process tree exits."
                     }} if os.name == "nt" else {}),
                     "timeout": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default 300). Increase for long builds/training.",
+                        "description": "Timeout in seconds (default 300). Increase for long builds and training.",
                         "default": 300,
                     },
                 },
@@ -505,7 +458,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_shell_jobs",
-            "description": "List background shell jobs started by long-running run_bash commands in the current session.",
+            "description": 'List background shell jobs started by long-running run_bash commands in the current session.',
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -513,7 +466,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_shell_output",
-            "description": "Read consecutive stdout/stderr output from a background shell job. Continue with next_offset; offset counts Unicode characters.",
+            "description": 'Read consecutive stdout/stderr output from a background shell job. Continue with next_offset; offset counts Unicode characters.',
             "parameters": {
                 "type": "object",
                 "required": ["job_id"],
@@ -534,7 +487,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "stop_shell_job",
-            "description": "Stop a background shell job and its child process tree.",
+            "description": 'Stop a background shell job and its child process tree.',
             "parameters": {
                 "type": "object",
                 "required": ["job_id"],
@@ -548,7 +501,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "send_agent_message",
-            "description": "Steer a running agent at its next safe model boundary without waiting for its whole turn to finish.",
+            "description": 'Steer a running agent at its next safe model boundary without waiting for its whole turn to finish.',
             "parameters": {"type": "object", "required": ["agent_id", "message"], "properties": {"agent_id": {"type": "string"}, "message": {"type": "string"}}},
         },
     },
@@ -556,12 +509,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "send_parent_message",
-            "description": (
-                "Report to the parent main agent one of: a finding that changes the parent plan, "
-                "a missing decision or constraint, or a conflict/high-value risk. The parent sees "
-                "it at the next safe boundary. Do not use for routine progress; the final task "
-                "result is returned through completion."
-            ),
+            "description": "Report to the parent agent one of: a finding that changes the parent's plan, a missing decision or constraint, or a high-value risk. The parent sees it at the next safe boundary. Routine progress is not a message; the task result returns through completion.",
             "parameters": {"type": "object", "required": ["message"], "properties": {"message": {"type": "string"}}},
         },
     },
@@ -569,7 +517,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "followup_agent",
-            "description": "Give an agent another task. Running agents receive it at the next safe boundary; idle agents start a new turn.",
+            "description": 'Give an agent another task. A running agent receives it at its next safe boundary; an idle agent starts a new turn.',
             "parameters": {"type": "object", "required": ["agent_id", "task"], "properties": {"agent_id": {"type": "string"}, "task": {"type": "string"}}},
         },
     },
@@ -577,7 +525,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "wait_agents",
-            "description": "Wait until all selected background agents finish, then return their summaries.",
+            "description": 'Wait until all selected background agents finish, then return their summaries.',
             "parameters": {"type": "object", "properties": {"agent_ids": {"type": "array", "items": {"type": "string"}}, "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 300, "default": 30}}},
         },
     },
@@ -585,7 +533,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_agents",
-            "description": "List open background agent threads and their status.",
+            "description": 'List open background agent threads and their status.',
             "parameters": {"type": "object", "properties": {"status": {"type": "string", "enum": ["", "queued", "running", "completed", "blocked", "failed", "interrupted"]}}},
         },
     },
@@ -593,7 +541,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "interrupt_agent",
-            "description": "Interrupt only the selected agent's current turn while preserving its thread and completed artifacts.",
+            "description": "Interrupt the selected agent's current turn while preserving its thread and completed artifacts.",
             "parameters": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}},
         },
     },
@@ -601,7 +549,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_agent_changes",
-            "description": "Read a complete isolated change proposal with pagination.",
+            "description": 'Read a complete isolated change proposal with pagination.',
             "parameters": {"type": "object", "required": ["proposal_id"], "properties": {"proposal_id": {"type": "string"}, "path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50000, "default": 12000}}},
         },
     },
@@ -609,7 +557,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "apply_agent_changes",
-            "description": "Three-way merge and atomically apply a worker proposal. Real overlapping edits return a conflict id without changing the workspace.",
+            "description": 'Three-way merge and atomically apply a worker proposal. Real overlapping edits return a conflict id without changing the workspace.',
             "parameters": {"type": "object", "required": ["proposal_id"], "properties": {"proposal_id": {"type": "string"}}},
         },
     },
@@ -617,7 +565,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_agent_conflicts",
-            "description": "Read base, main, worker, and marked merge content for a proposal conflict.",
+            "description": 'Read base, main, worker and marked merge content for a proposal conflict.',
             "parameters": {"type": "object", "required": ["conflict_id"], "properties": {"conflict_id": {"type": "string"}, "path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0, "default": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50000, "default": 12000}}},
         },
     },
@@ -625,7 +573,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "resolve_agent_conflicts",
-            "description": "Submit final content for every conflicted file and atomically commit the complete merge after revalidation.",
+            "description": 'Submit final content for every conflicted file and atomically commit the complete merge after revalidation.',
             "parameters": {"type": "object", "required": ["conflict_id", "resolutions"], "properties": {"conflict_id": {"type": "string"}, "resolutions": {"type": "object", "additionalProperties": {"type": "string"}}}},
         },
     },
@@ -633,7 +581,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "close_agent",
-            "description": "Close an idle agent thread and release its isolated workspace. Unapplied changes require explicit discard_changes.",
+            "description": 'Close an idle agent thread and release its isolated workspace. Unapplied changes require explicit discard_changes.',
             "parameters": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}, "discard_changes": {"type": "boolean", "default": False}}},
         },
     },
@@ -641,7 +589,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web with the standard web search provider. Use this as an independent web search tool when Exa search is not available or when this provider is specifically needed. Returns titles, URLs, and snippets.",
+            "description": 'Search the web. Returns titles, URLs, and snippets.',
             "parameters": {
                 "type": "object",
                 "required": ["query"],
@@ -660,7 +608,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "web_fetch",
-            "description": "Fetch and read the text content of a web page. Use after web_search to read a specific page in detail.",
+            "description": 'Fetch and read the text content of a web page.',
             "parameters": {
                 "type": "object",
                 "required": ["url"],
