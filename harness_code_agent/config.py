@@ -5,6 +5,7 @@ Uses OpenAI-compatible API so it works with any provider.
 Setup:
   cp .env.template .env   # then fill in your real values
 """
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_dotenv():
-    """Load .env file if it exists. No third-party dependency needed."""
+    """Load .env (and the A/B overlay) without overriding the real environment.
+
+    Priority, highest first: an explicitly exported process variable, the
+    ``.env.ab`` overlay, ``.env``, then the defaults in this module.  A file is
+    only a source of defaults — a permission mode or model exported by an eval
+    runner must not be silently replaced because the working copy has a .env.
+    """
     profile = os.environ.get("HARNESS_EVAL_PROFILE", "").strip().lower()
     if profile not in {"", "ab"}:
         raise ValueError("HARNESS_EVAL_PROFILE must be empty or 'ab'")
@@ -25,6 +32,7 @@ def _load_dotenv():
         if not overlay.is_file():
             raise FileNotFoundError("A/B profile requires .env.ab")
         paths.append(overlay)
+    merged = {}
     for env_path in paths:
         if not env_path.exists():
             continue
@@ -42,7 +50,10 @@ def _load_dotenv():
             required.update(f"HARNESS_MODEL_{intensity}" for intensity in ("FAST", "NORMAL", "HARD", "MAX"))
             if any(not entries.get(key) for key in required):
                 raise ValueError("A/B profile must provide a key, base URL, provider, model, and all intensity models")
-        os.environ.update(entries)
+        # Later files win over earlier ones; the process environment wins over both.
+        merged.update(entries)
+    for key, value in merged.items():
+        os.environ.setdefault(key, value)
 
 
 _load_dotenv()
@@ -148,11 +159,7 @@ def _default_model_profile(provider: str, intensity: str) -> ModelProfile:
 def resolve_model_profile(intensity: str, selection: ModelSelection | None = None) -> ModelProfile:
     normalized = _normalize_model_intensity(intensity)
     override_model = _model_override_for_intensity(normalized)
-    provider = _resolve_provider_name(
-        provider=PROVIDER,
-        base_url=BASE_URL,
-        model=override_model or BASE_MODEL,
-    )
+    provider = _resolve_provider_name(provider=PROVIDER, base_url=BASE_URL)
     profile = _default_model_profile(provider, normalized)
     if override_model:
         profile = ModelProfile(
@@ -174,7 +181,7 @@ def resolve_model_profile(intensity: str, selection: ModelSelection | None = Non
     runtime_override = {"model": selection.model, "reasoning_effort": selection.reasoning_effort}
     if normalized != "fast" and (runtime_override["model"] or runtime_override["reasoning_effort"]):
         model = runtime_override["model"] or profile.model
-        provider = _resolve_provider_name(provider=PROVIDER, base_url=BASE_URL, model=model)
+        provider = _resolve_provider_name(provider=PROVIDER, base_url=BASE_URL)
         profile = ModelProfile(
             provider=provider,
             model=model,
@@ -186,8 +193,7 @@ def resolve_model_profile(intensity: str, selection: ModelSelection | None = Non
 
 
 MODEL_INTENSITY = _normalize_model_intensity(os.environ.get("HARNESS_MODEL_INTENSITY", "hard"))
-MODEL_PROFILES = {intensity: resolve_model_profile(intensity) for intensity in MODEL_INTENSITIES}
-MODEL_PROFILE = MODEL_PROFILES[MODEL_INTENSITY]
+MODEL_PROFILE = resolve_model_profile(MODEL_INTENSITY)
 MODEL = MODEL_PROFILE.model
 
 # --- Token budgets ---
@@ -224,6 +230,31 @@ TOOL_MAX_TIMEOUT_SECONDS = float(
 SHELL_OUTPUT_PREVIEW_CHARS = int(
     os.environ.get("HARNESS_SHELL_OUTPUT_PREVIEW_CHARS", "8192")
 )
+# Shell job lifecycle.  A foreground command's direct process exiting does not
+# mean the job is over: descendants that outlive it are given this long to
+# drain and are then terminated, so one tool call cannot hang until its own
+# timeout.  Background jobs instead follow their descendants for as long as
+# they live, and reader threads are never joined without a bound.
+def _finite_seconds(name: str, default: float, *, maximum: float = 3600.0) -> float:
+    """A duration that a deadline comparison can actually use.
+
+    ``float("nan")`` would make every deadline comparison false and turn a
+    bounded drain back into an unbounded one, so non-finite values are rejected
+    at import instead of at the first job.
+    """
+    raw = os.environ.get(name)
+    try:
+        value = float(default if raw is None else raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number of seconds") from None
+    if not math.isfinite(value) or not 0 <= value <= maximum:
+        raise ValueError(f"{name} must be a finite number between 0 and {maximum:g}")
+    return value
+
+
+SHELL_JOB_EXIT_DRAIN_SECONDS = _finite_seconds("HARNESS_SHELL_JOB_EXIT_DRAIN_SECONDS", 2.0)
+SHELL_JOB_TERMINATION_CONFIRM_SECONDS = _finite_seconds("HARNESS_SHELL_JOB_TERMINATION_CONFIRM_SECONDS", 3.0)
+SHELL_JOB_READER_JOIN_SECONDS = _finite_seconds("HARNESS_SHELL_JOB_READER_JOIN_SECONDS", 5.0)
 
 # --- Workspace write quota ---
 # Cumulative structured writes (write_file/apply_patch) allowed per session;
@@ -246,4 +277,3 @@ TRACE_STDERR = os.environ.get("HARNESS_TRACE_STDERR", "").lower() in {"1", "true
 
 # --- Paths ---
 WORKSPACE = os.path.abspath(os.environ.get("HARNESS_WORKSPACE", "./workspace"))
-PROGRESS_FILE = "progress.md"

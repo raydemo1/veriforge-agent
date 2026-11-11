@@ -1660,8 +1660,11 @@ class InteractiveSession:
         with coordinator._condition:
             managers += [record.conversation.runtime_state.shell_job_manager
                          for record in coordinator._records.values() if record.conversation is not None]
-        if any(manager is not None and manager.running_jobs() for manager in managers):
-            return "后台进程仍在运行"
+        if any(
+            manager is not None and (manager.running_jobs() or manager.retained_jobs())
+            for manager in managers
+        ):
+            return "后台进程仍占用资源，等待退出或释放"
         return None
 
     @property

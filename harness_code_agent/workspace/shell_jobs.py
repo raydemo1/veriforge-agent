@@ -22,6 +22,9 @@ from .shell_environment import shell_executable
 
 ShellJobStatus = Literal["running", "stopping", "exited", "stopped", "failed"]
 
+#: Sentinel for "caller did not supply this fact", distinct from an explicit None.
+_UNSET = object()
+
 
 def _posix_rlimits_enabled() -> bool:
     return os.name != "nt" and any(
@@ -125,6 +128,18 @@ class ShellJob:
     ended_at: float | None = None
     output: ShellOutputBuffer = field(default_factory=ShellOutputBuffer)
     error: str | None = None
+    # The lifecycle facts stay separate: the launched command exited, the
+    # managed processes drained, the output readers drained, and the write
+    # lease plus private temp directory are gone.  Only the last one is safe to
+    # assert to other agents.
+    launcher_exited: bool = False
+    processes_drained: bool = False
+    readers_drained: bool = False
+    resources_released: bool = False
+    #: Set when a tracking pass could not read a process state.  A later
+    #: successful pass clears it; until then the tree cannot be confirmed empty.
+    tracking_failed: bool = False
+    warnings: list[str] = field(default_factory=list)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _reader_threads: list[threading.Thread] = field(default_factory=list, repr=False)
     _finished: threading.Event = field(default_factory=threading.Event, repr=False)
@@ -133,12 +148,46 @@ class ShellJob:
     _temporary_directory: object = field(default=None, repr=False)
 
     @property
+    def drained(self) -> bool:
+        """Both halves of the drain, never only the process tree."""
+        return self.processes_drained and self.readers_drained
+
+    @property
     def output_tail(self) -> str:
         return self.output.read_tail(12_000)
 
     def uptime_seconds(self) -> float:
         end = self.ended_at if self.ended_at is not None else time.time()
         return max(0.0, end - self.started_at)
+
+    def launcher_alive(self) -> bool:
+        """Whether the launched process may still be running.
+
+        An unreadable state counts as alive: releasing the write lease on a
+        guess is worse than keeping it.
+        """
+        process = self.process
+        if process is None:
+            return False
+        try:
+            return process.poll() is None
+        except Exception:
+            return True
+
+    def has_retained_resources(self) -> bool:
+        """Whether the job still holds the write lease or the private temp dir.
+
+        A terminal status is not enough: a job can report `exited` while a
+        descendant keeps the lease, and such a job must stay stoppable.
+        """
+        with self._lock:
+            if self.resources_released:
+                return False
+            if self._write_lease is not None or self._temporary_directory is not None:
+                return True
+            if self.launcher_alive():
+                return True
+            return any(_process_running(process) for process in self._processes.values())
 
     def track_process(self, process):
         try:
@@ -150,24 +199,72 @@ class ShellJob:
                 return
             self._processes[key] = process
 
-    def mark(self, status: ShellJobStatus, *, exit_code: int | None = None, error: str | None = None) -> None:
+    def mark(self, status: ShellJobStatus, *, exit_code: int | None | object = _UNSET,
+             error: str | None = None, warning: str | None = None) -> None:
+        """Publish a terminal state, then try to release resources.
+
+        The state change and the resource release are deliberately separate:
+        a job whose processes survived termination still becomes terminal for
+        its caller, but keeps its write lease instead of pretending it is gone.
+        """
         with self._lock:
             self.status = status
-            self.exit_code = exit_code
+            if exit_code is not _UNSET:
+                self.exit_code = exit_code
             self.error = error or self.error
+            if warning and warning not in self.warnings:
+                self.warnings.append(warning)
             if status in {"exited", "stopped", "failed"}:
-                try:
-                    if self._temporary_directory is not None:
-                        self._temporary_directory.cleanup()
-                        self._temporary_directory = None
-                except OSError as exc:
-                    self.error = f"Private shell temp cleanup failed: {exc}"
-                finally:
-                    if self._write_lease is not None:
-                        self._write_lease.release()
-                        self._write_lease = None
                 self.ended_at = self.ended_at or time.time()
                 self._finished.set()
+        if status in {"exited", "stopped", "failed"}:
+            self.release_resources()
+
+    def release_resources(self) -> bool:
+        """Release the write lease and private temp dir, or keep them retryable.
+
+        The lease *is* the shared-workspace write permission: releasing it
+        while a managed process still runs would let another session write the
+        same directories.  A handle is only dropped after its release actually
+        succeeded, so a failed attempt leaves the job in a state that can be
+        retried and reported.
+        """
+        with self._lock:
+            if self.resources_released:
+                return True
+            if self.launcher_alive():
+                self._retain("write lease retained: the launched process is still running")
+                return False
+            alive = [process for process in self._processes.values() if _process_running(process)]
+            if alive:
+                self._retain(f"write lease retained: {len(alive)} managed process(es) still running")
+                return False
+            if self.tracking_failed:
+                self._retain(
+                    "write lease retained: the process tree could not be confirmed after a tracking failure"
+                )
+                return False
+            if self._temporary_directory is not None:
+                try:
+                    self._temporary_directory.cleanup()
+                except OSError as exc:
+                    self.error = f"Private shell temp cleanup failed: {exc}"
+                    self._retain(f"private temp directory retained: {exc}")
+                    return False
+                self._temporary_directory = None
+            if self._write_lease is not None:
+                try:
+                    self._write_lease.release()
+                except Exception as exc:
+                    self._retain(f"write lease release failed: {exc}")
+                    return False
+                self._write_lease = None
+            self.resources_released = True
+            return True
+
+    def _retain(self, note: str) -> None:
+        if note not in self.warnings:
+            self.warnings.append(note)
 
 
 class ShellJobManager:
@@ -276,10 +373,16 @@ class ShellJobManager:
             background=background,
         )
         self._store(job)
-        self._track_process_tree(job)
-        self._start_reader(job, process.stdout, "stdout")
-        self._start_reader(job, process.stderr, "stderr")
-        threading.Thread(target=self._monitor, args=(job,), daemon=True).start()
+        try:
+            self._track_process_tree(job)
+            self._start_reader(job, process.stdout, "stdout")
+            self._start_reader(job, process.stderr, "stderr")
+            threading.Thread(target=self._monitor, args=(job,), daemon=True).start()
+        except BaseException as exc:
+            # The process exists and is not being monitored: terminate it and
+            # keep the lease rather than leaving an untracked child behind.
+            self._fail_unconfirmed_exit(job, exc)
+            return job
 
         if early_exit_seconds > 0:
             deadline = time.time() + early_exit_seconds
@@ -304,19 +407,46 @@ class ShellJobManager:
     def running_jobs(self) -> list[ShellJob]:
         return [job for job in self.list_jobs() if job.status in {"running", "stopping"}]
 
+    def retained_jobs(self) -> list[ShellJob]:
+        """Jobs that still hold a write lease or private temp dir.
+
+        These block suspension and closing just like running jobs, even when
+        their status is already terminal.
+        """
+        return [job for job in self.list_jobs() if job.has_retained_resources()]
+
     def read_output(self, job_id: str, max_chars: int = 12_000, *, offset: int | None = None) -> str:
         max_chars = _clamp_int(max_chars, minimum=1, maximum=100_000)
         output = self.get(job_id).output
         return output.read_tail(max_chars) if offset is None else output.read(max(0, offset), max_chars)
 
     def stop(self, job_id: str, *, grace_seconds: float = 5.0) -> ShellJob:
+        """Stop a job, including one that already reported a terminal status.
+
+        A job can be `exited` while a descendant still holds the write lease.
+        Such a job has no monitor left to clean it up, so stopping it has to
+        terminate the survivors and release the lease here.
+        """
         job = self.get(job_id)
         with job._lock:
-            if job.status not in {"running", "stopping"}:
+            was_running = job.status in {"running", "stopping"}
+            if was_running:
+                job.status = "stopping"
+            elif not job.has_retained_resources():
                 return job
-            job.status = "stopping"
         deadline = time.monotonic() + max(0.0, grace_seconds) + 2.0
         self._terminate_process_tree(job, grace_seconds=grace_seconds)
+        if not was_running:
+            # A clean tracking pass clears a transient tracking failure so the
+            # lease can actually be released instead of staying retained.
+            self._track_process_tree(job)
+            self._prune_dead(job)
+            with job._lock:
+                job.processes_drained = not any(
+                    _process_running(process) for process in job._processes.values()
+                )
+            job.release_resources()
+            return job
         job._finished.wait(timeout=max(0.0, deadline - time.monotonic()))
         return job
 
@@ -330,10 +460,13 @@ class ShellJobManager:
             raise RuntimeError("Shell startup has not exited; job resources retained")
         with self._lock:
             jobs = list(self._jobs.values())
+        retained = []
         for job in jobs:
-            if job.status in {"running", "stopping"}:
+            if job.status in {"running", "stopping"} or job.has_retained_resources():
                 self.stop(job.job_id)
-        if self.running_jobs():
+            if not job.release_resources():
+                retained.append(job.job_id)
+        if self.running_jobs() or retained:
             raise RuntimeError("Shell processes have not exited; job resources retained")
         self._closed = True
 
@@ -343,13 +476,21 @@ class ShellJobManager:
         for job in self.list_jobs():
             if job.status in {"running", "stopping"}:
                 raise RuntimeError("cannot export running shell jobs")
+            if job.has_retained_resources():
+                raise RuntimeError("cannot export shell jobs whose resources are retained")
             with job.output._lock:
                 exported.append({
                     "job_id": job.job_id, "command": job.command, "pid": job.pid, "status": job.status,
                     "background": job.background, "exit_code": job.exit_code, "started_at": job.started_at,
                     "ended_at": job.ended_at, "error": job.error, "output_error": job.output.error,
                     "output_path": str(job.output.path) if job.output.path is not None else None,
-                    "output_text": job.output._text, "output_chars": job.output.total_chars})
+                    "output_text": job.output._text, "output_chars": job.output.total_chars,
+                    # Lifecycle facts survive a suspension: a restored background
+                    # job must still say whether its launcher had exited.
+                    "launcher_exited": job.launcher_exited,
+                    "processes_drained": job.processes_drained,
+                    "readers_drained": job.readers_drained,
+                    "warnings": list(job.warnings)})
         return exported
 
     def import_jobs(self, entries: list[dict]) -> None:
@@ -362,8 +503,14 @@ class ShellJobManager:
             job = ShellJob(job_id=entry["job_id"], command=entry["command"], pid=entry["pid"], process=None,
                            status=entry["status"], background=entry["background"], exit_code=entry["exit_code"],
                            started_at=entry["started_at"], ended_at=entry["ended_at"], output=output,
-                           error=entry["error"])
+                           error=entry["error"],
+                           launcher_exited=bool(entry.get("launcher_exited", entry["status"] != "running")),
+                           processes_drained=bool(entry.get("processes_drained", True)),
+                           readers_drained=bool(entry.get("readers_drained", True)),
+                           warnings=list(entry.get("warnings") or []))
             job._finished.set()
+            # A restored job has no lease and no tracked processes in this process.
+            job.resources_released = True
             self._store(job)
 
     def _store(self, job: ShellJob) -> None:
@@ -405,42 +552,167 @@ class ShellJobManager:
     def _monitor(self, job: ShellJob) -> None:
         try:
             self._wait_for_exit(job)
-        except Exception as exc:
+        except BaseException as exc:
+            self._fail_unconfirmed_exit(job, exc)
+
+    def _fail_unconfirmed_exit(self, job: ShellJob, exc: BaseException) -> None:
+        """Terminal state for a monitor that could not confirm the exit.
+
+        Termination is best effort: whatever survives keeps the write lease, so
+        a later ``close()`` still reports the retained resources instead of
+        assuming they were freed.
+        """
+        message = f"Process exit could not be confirmed: {type(exc).__name__}: {exc}"
+        with job._lock:
+            job.error = job.error or message
+        try:
+            self._terminate_process_tree(job)
+        except BaseException as cleanup_exc:  # cleanup must not hide the original failure
             with job._lock:
-                job.error = f"Process exit could not be confirmed: {exc}"
+                job.warnings.append(f"terminating processes after an unconfirmed exit failed: {cleanup_exc}")
+        try:
+            self._prune_dead(job)
+            with job._lock:
+                job.processes_drained = not any(
+                    _process_running(proc) for proc in job._processes.values()
+                )
+            job.mark("failed", error=message, warning=message)
+        except BaseException:
+            with job._lock:
+                job.status = "failed"
+                job.error = job.error or message
+                job.ended_at = job.ended_at or time.time()
+                job._finished.set()
 
     def _wait_for_exit(self, job: ShellJob) -> None:
         process = job.process
         if process is None:
+            with job._lock:
+                job.processes_drained = True
+                job.readers_drained = True
+            job.mark("stopped" if job.status == "stopping" else "exited")
             return
         while process.poll() is None:
             self._track_process_tree(job)
-            with job._lock:
-                job._processes = {key: proc for key, proc in job._processes.items() if _process_running(proc)}
+            self._prune_dead(job)
             time.sleep(0.1)
         exit_code = process.wait()
-        while True:
-            self._track_process_tree(job)
-            with job._lock:
-                processes = list(job._processes.values())
-            if not any(_process_running(proc) for proc in processes):
-                break
-            time.sleep(0.1)
-        for thread in list(job._reader_threads):
-            thread.join()
+        with job._lock:
+            job.launcher_exited = True
+            job.exit_code = exit_code
+        self._drain(job)
         if job.status in {"running", "stopping"}:
             job.mark("stopped" if job.status == "stopping" else "exited", exit_code=exit_code)
+        else:
+            job.release_resources()
+
+    def _prune_dead(self, job: ShellJob) -> None:
+        with job._lock:
+            job._processes = {
+                key: proc for key, proc in job._processes.items() if _process_running(proc)
+            }
+
+    def _drain(self, job: ShellJob) -> None:
+        """Wait for managed processes and output readers, always with a bound.
+
+        A background job's descendants *are* the job, so they are followed for
+        as long as they live.  A foreground command has already produced its
+        result; descendants that outlive it get a grace period and are then
+        terminated, because otherwise the tool call would block until its own
+        timeout with nothing left to report.
+        """
+        deadline = None
+        if not job.background:
+            deadline = time.monotonic() + config.SHELL_JOB_EXIT_DRAIN_SECONDS
+        while True:
+            self._track_process_tree(job)
+            self._prune_dead(job)
+            with job._lock:
+                alive = [proc for proc in job._processes.values() if _process_running(proc)]
+            if not alive:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                self._terminate_survivors(job, len(alive))
+                break
+            time.sleep(0.1)
+        self._join_readers(job)
+        self._prune_dead(job)
+        with job._lock:
+            job.processes_drained = not any(
+                _process_running(proc) for proc in job._processes.values()
+            )
+
+    def _terminate_survivors(self, job: ShellJob, count: int) -> None:
+        with job._lock:
+            job.warnings.append(
+                f"terminated {count} process(es) still running "
+                f"{config.SHELL_JOB_EXIT_DRAIN_SECONDS:g}s after the command exited"
+            )
+        try:
+            self._terminate_process_tree(job)
+        except Exception as exc:
+            with job._lock:
+                job.warnings.append(f"terminating surviving processes failed: {exc}")
+            return
+        deadline = time.monotonic() + config.SHELL_JOB_TERMINATION_CONFIRM_SECONDS
+        while time.monotonic() < deadline:
+            self._prune_dead(job)
+            with job._lock:
+                if not any(_process_running(proc) for proc in job._processes.values()):
+                    return
+            time.sleep(0.05)
+
+    def _join_readers(self, job: ShellJob) -> None:
+        deadline = time.monotonic() + config.SHELL_JOB_READER_JOIN_SECONDS
+        for thread in list(job._reader_threads):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+        stuck = [thread.name for thread in job._reader_threads if thread.is_alive()]
+        with job._lock:
+            job.readers_drained = not stuck
+            if stuck:
+                job._retain(
+                    f"output readers did not finish within "
+                    f"{config.SHELL_JOB_READER_JOIN_SECONDS:g}s; captured output may be incomplete"
+                )
 
     def _track_process_tree(self, job):
+        """Refresh the tracked tree and decide whether a failure may be cleared.
+
+        Only a pass that enumerated the children of the *live* launcher is
+        authoritative: it re-reads the whole tree from its root.  Once the
+        launcher has exited, an empty tracked set proves nothing — the
+        descendants that could not be read earlier are exactly the ones missing
+        from it — so a previous tracking failure stays set and keeps the lease
+        instead of being cleared by "this pass raised nothing".
+        """
+        if job.launcher_alive():
+            if job.pid is None:
+                return
+            try:
+                root = psutil.Process(job.pid)
+            except psutil.NoSuchProcess:
+                # The launcher reports alive but cannot be resolved: no evidence either way.
+                return
+            except (psutil.Error, OSError) as exc:
+                self._mark_tracking_failed(job, exc)
+                return
+            try:
+                job.track_process(root)
+                for child in root.children(recursive=True):
+                    job.track_process(child)
+            except psutil.NoSuchProcess:
+                return
+            except (psutil.Error, OSError) as exc:
+                self._mark_tracking_failed(job, exc)
+                return
+            with job._lock:
+                job.tracking_failed = False
+            return
         with job._lock:
             processes = list(job._processes.values())
-        if not processes and job.pid is not None and job.process is not None and job.process.poll() is None:
-            try:
-                processes.append(psutil.Process(job.pid))
-            except psutil.NoSuchProcess:
-                pass
-        if job.process is not None and job.process.poll() is None:
-            processes = processes[:1]
         for process in processes:
             try:
                 job.track_process(process)
@@ -448,6 +720,14 @@ class ShellJobManager:
                     job.track_process(child)
             except psutil.NoSuchProcess:
                 continue
+            except (psutil.Error, OSError) as exc:
+                self._mark_tracking_failed(job, exc)
+                return
+
+    def _mark_tracking_failed(self, job: ShellJob, exc: BaseException) -> None:
+        with job._lock:
+            job.tracking_failed = True
+            job._retain(f"process tracking failed: {type(exc).__name__}: {exc}")
 
     def _terminate_process_tree(self, job: ShellJob, *, grace_seconds: float = 5.0) -> None:
         if job.pid is None:
@@ -497,10 +777,20 @@ def _safe_kill(process) -> None:
 
 
 def _process_running(process) -> bool:
+    """Whether a managed process must still be considered alive.
+
+    A state that cannot be read (AccessDenied, a recycled pid, an OS error)
+    counts as running: an empty tracked set may only be trusted when every
+    read succeeded.
+    """
     try:
-        return process.is_running() and process.status() not in {psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD}
+        if not process.is_running():
+            return False
+        return process.status() not in {psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD}
     except psutil.NoSuchProcess:
         return False
+    except (psutil.Error, OSError):
+        return True
 
 
 def _clamp_int(value: int, *, minimum: int, maximum: int) -> int:

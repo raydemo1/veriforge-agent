@@ -86,6 +86,12 @@ def _job_result(job, metadata, error=None):
     metadata.update(job_status=job.status, exit_code=job.exit_code,
                     output_bytes=job.output.path.stat().st_size if job.output.path else len(output.encode("utf-8")),
                     output_chars=job.output.total_chars)
+    if job.warnings:
+        metadata["warnings"] = list(job.warnings)
+    if not job.readers_drained:
+        # Readers are still draining: the captured output is not complete, and
+        # the model must not treat it as the whole result.
+        metadata["output_complete"] = False
     if job.output.path is not None:
         metadata.update(artifact_path=str(job.output.path), output_spilled=True)
     return ToolResult(tool="run_bash", status="failed" if error else "success",
@@ -113,6 +119,10 @@ def list_shell_jobs(runtime_state=None) -> ToolResult:
             "started_at": job.started_at,
             "ended_at": job.ended_at,
             "uptime_seconds": job.uptime_seconds(),
+            # A background job keeps running while its descendants live, so the
+            # launcher exit is reported next to the job state, not instead of it.
+            "launcher_exited": job.launcher_exited,
+            "warnings": list(job.warnings),
         }
         for job in manager.list_jobs()
         if job.background
