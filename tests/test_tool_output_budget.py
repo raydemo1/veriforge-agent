@@ -15,7 +15,7 @@ def observe(root, output, *, result=None):
     store = ObservationStore(root / '.harness' / 'observations' / 'session')
     result = result or ToolResult(tool='test', status='success', output=output)
     observation = store.create(tool=result.tool, args={}, result=result, fact_tracker=FactTracker())
-    return observation, store.observed_message(observation, result)
+    return observation, observation.message
 
 
 def test_small_output_is_inline_without_artifact(tmp_path):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 
+from ..agent_roles import AGENT_ROLES
 from .filesystem import READ_FILE_MAX_LINES
 
 CORE_TOOL_SCHEMAS = [
@@ -124,7 +125,7 @@ CORE_TOOL_SCHEMAS = [
                 "required": ["name", "role", "task"],
                 "properties": {
                     "name": {"type": "string", "description": "Short unique agent name."},
-                    "role": {"type": "string", "enum": ["explorer", "test_designer", "reviewer", "verifier", "worker"]},
+                    "role": {"type": "string", "enum": list(AGENT_ROLES)},
                     "task": {"type": "string", "description": "Bounded delegated task."},
                     "expected_output": {"type": "string"},
                     "allowed_paths": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Required writable ownership paths for worker; optional for read-only roles."},

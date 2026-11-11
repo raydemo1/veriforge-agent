@@ -25,7 +25,6 @@ SECTION_EVENTS = {
     "artifacts": "artifact_updated",
 }
 
-_TERMINAL_AGENT_STATES = {"completed", "failed", "blocked", "interrupted"}
 _PLAN_STEP_LIMIT = 12
 
 

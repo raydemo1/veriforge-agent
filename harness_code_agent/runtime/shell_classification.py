@@ -1014,22 +1014,6 @@ def command_matches_stage_prefixes(command: str, prefixes: list[list[str]]) -> b
     return checked == len(prefixes)
 
 
-def derive_persistent_prefix(command: str) -> list[str] | None:
-    """Return one stable approval prefix for a simple command or compound."""
-    segments = _split_simple_compound(command)
-    if len(segments) > 1:
-        prefixes = [
-            prefix
-            for segment in segments
-            if not _is_literal_expression(segment)
-            for prefix in [_derive_single_prefix(segment)]
-        ]
-        if prefixes and all(prefix == prefixes[0] for prefix in prefixes):
-            return prefixes[0]
-        return None
-    return _derive_single_prefix(command)
-
-
 def command_matches_prefix(command: str, prefix: list[str]) -> bool:
     """Match every meaningful segment against one normalized approval prefix."""
     segments = _split_simple_compound(command)
@@ -1046,31 +1030,6 @@ def command_matches_prefix(command: str, prefix: list[str]) -> bool:
             return False
         matched = True
     return matched
-
-
-def _derive_single_prefix(command: str) -> list[str] | None:
-    tokens = _tokenize_approval_command(command)
-    if len(tokens) < 2:
-        return None
-    normalized = [_normalize_token(token) for token in tokens]
-    python_index = next(
-        (index for index, token in enumerate(normalized) if token in _PYTHON_COMMANDS),
-        None,
-    )
-    if python_index is not None:
-        if len(normalized) <= python_index + 1:
-            return None
-        launcher = normalized[python_index + 1]
-        if launcher in {"-", "-c", "-i"}:
-            return None
-        if launcher == "-m":
-            if len(normalized) <= python_index + 2:
-                return None
-            return normalized[: python_index + 3]
-        if launcher.startswith("-"):
-            return None
-        return normalized[: python_index + 2]
-    return normalized[: min(3, len(normalized))]
 
 
 def _split_simple_compound(command: str) -> list[str]:
@@ -1144,16 +1103,6 @@ def is_verify_shell_command(command: str) -> bool:
         normalized == prefix or normalized.startswith(prefix + " ")
         for prefix in _PARALLEL_VERIFY_PREFIXES
     )
-
-
-def is_workspace_write_shell_command(command: str, workspace_root: str | None = None) -> bool:
-    """Boundary used by read-only review mode."""
-    analysis = analyze_shell_command(command, workspace_root)
-    if ShellEffect.GIT_MUTATION in analysis.effects and ShellEffect.NETWORK not in analysis.effects:
-        return True
-    if not (analysis.effects & {ShellEffect.WRITE, ShellEffect.DELETE}):
-        return False
-    return any(target.scope is TargetScope.WORKSPACE for target in analysis.targets)
 
 
 def is_long_running_shell_command(command: str) -> bool:

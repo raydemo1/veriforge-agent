@@ -66,7 +66,6 @@ include = ["harness_code_agent*"]
 "harness_code_agent/core/interactive.py" = ["BLE001"]
 "harness_code_agent/headless.py" = ["BLE001"]
 "harness_code_agent/runtime/approvals.py" = ["BLE001"]
-"harness_code_agent/runtime/builtins/browser.py" = ["BLE001"]
 "harness_code_agent/runtime/builtins/shell.py" = ["BLE001"]
 "harness_code_agent/runtime/builtins/web.py" = ["BLE001"]
 "harness_code_agent/runtime/mcp.py" = ["BLE001"]
@@ -78,7 +77,6 @@ include = ["harness_code_agent*"]
 "harness_code_agent/tui/approval.py" = ["BLE001"]
 "harness_code_agent/tui_bridge.py" = ["BLE001"]
 "harness_code_agent/workspace/shell_jobs.py" = ["BLE001"]
-"harness_code_agent/workspace/shell_session.py" = ["BLE001"]
 # Benchmark entrypoints must record arbitrary agent/runtime failures as failed
 # trials. The terminal runner also catches BaseException to preserve partial
 # artifacts when the benchmark process is interrupted.

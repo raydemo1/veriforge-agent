@@ -51,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="veriforge", description="VeriForge interactive local coding agent")
     parser.add_argument("task", nargs="*", help="Optional first task to submit after startup")
     parser.add_argument("-p", "--print", dest="print_mode", action="store_true",
-        help="Execute a single task and print results (no REPL)")
+        help="Execute one task headlessly and print results")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     parser.add_argument("--no-alt-screen", action="store_true",
         help="Keep the OpenTUI frontend in the main terminal screen")

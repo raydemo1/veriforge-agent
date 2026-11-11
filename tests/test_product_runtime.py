@@ -176,19 +176,20 @@ class ProductRuntimeTests(unittest.TestCase):
         from harness_code_agent.support.llm import resolve_provider_name
 
         self.assertEqual(
-            resolve_provider_name(provider="auto", base_url="https://api.openai.com/v1", model="gpt-4o"),
+            resolve_provider_name(provider="auto", base_url="https://api.openai.com/v1"),
             "openai",
         )
         self.assertEqual(
-            resolve_provider_name(provider="auto", base_url="https://api.deepseek.com", model="deepseek-chat"),
+            resolve_provider_name(provider="auto", base_url="https://api.deepseek.com"),
             "deepseek",
         )
         self.assertEqual(
-            resolve_provider_name(provider="auto", base_url="https://example.invalid/v1", model="custom"),
+            resolve_provider_name(provider="auto", base_url="https://example.invalid/v1"),
             "openai-compatible",
         )
+        # A gateway is never classified by the path or by the model name it serves.
         self.assertEqual(
-            resolve_provider_name(provider="auto", base_url="https://example.invalid/v1", model="my-deepseek-fork-v1"),
+            resolve_provider_name(provider="auto", base_url="https://example.invalid/proxy/deepseek/v1"),
             "openai-compatible",
         )
 
@@ -1318,6 +1319,8 @@ class ProductRuntimeTests(unittest.TestCase):
                 self.exit_code = None
                 self.started_at = 10.0
                 self.ended_at = None
+                self.launcher_exited = False
+                self.warnings = []
 
             def uptime_seconds(self):
                 return 2.0

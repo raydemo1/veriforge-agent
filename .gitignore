@@ -53,7 +53,7 @@ eval/report_internal.md
 eval/report_resume.md
 tmp/
 temp/
-docs/
+# Local copy of the retired wiki export (kept outside the repo).
 VeriForge-Wiki.pdf
 
 # Local evaluation probes and real-model experiment scripts
@@ -76,7 +76,7 @@ Thumbs.db
 global_plan/
 SPEC.md
 
-# Vendored dependency wheels can be rebuilt/downloaded from requirements.txt
+# Vendored dependency wheels can be rebuilt/downloaded from pyproject.toml
 vendor_wheels/
 
 # TRAE local planning documents

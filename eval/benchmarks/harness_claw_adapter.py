@@ -255,14 +255,19 @@ if [ "$need_python" = "1" ]; then
   ln -sf /opt/hca-python/bin/python3 /usr/local/bin/python
 fi
 python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
-python3 -m pip install --break-system-packages -q -r {CONTAINER_REPO}/requirements.txt || (
+# Dependency versions live in pyproject.toml.  The repo is mounted read-only and
+# a build may still write metadata next to the sources, so the tree is copied to
+# a writable directory first; --no-build-isolation keeps the container's own
+# setuptools instead of downloading one.
+rm -rf /tmp/hca-src && mkdir -p /tmp/hca-src && cp -a {CONTAINER_REPO}/. /tmp/hca-src/
+if python3 -m pip install --break-system-packages -q --no-build-isolation /tmp/hca-src; then
+  python3 -c 'import harness_code_agent, openai, psutil'
+else
+  echo "full install failed; installing the minimal dependency set" >&2
   python3 -m pip install --break-system-packages --no-index --find-links={CONTAINER_REPO}/vendor_wheels -q openai &&
   python3 -m pip install --break-system-packages -q psutil
-)
-python3 - <<'PY'
-import openai
-import psutil
-PY
+  python3 -c 'import openai, psutil'
+fi
 """.strip()
 
 

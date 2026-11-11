@@ -1,13 +1,11 @@
 import asyncio
-import os
 import shutil
+import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
-
-from harness_code_agent.support.cancellation import CancellationToken
 
 from harness_code_agent.runtime.builtins.registry import (
     BUILTIN_TOOL_REGISTRY,
@@ -24,23 +22,20 @@ from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.runtime.tool_registry import ToolRegistry
 from harness_code_agent.sessions.events import EventBus
+from harness_code_agent.support.cancellation import CancellationToken
 from harness_code_agent.workspace.service import WorkspaceService
 
 
 class ParallelToolTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(os.getcwd(), "workspace", "test-parallel-tools")
-        shutil.rmtree(self.root, ignore_errors=True)
-        self.root.mkdir(parents=True)
+        self.root = Path(tempfile.mkdtemp(prefix="veriforge-parallel-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         (self.root / "sample.txt").write_text("needle\n", encoding="utf-8")
         self.context = ToolContext(
             workspace=WorkspaceService(root=self.root),
             permission_policy=PermissionPolicy(mode="danger-full-access"),
             event_bus=EventBus(),
         )
-
-    def tearDown(self):
-        shutil.rmtree(self.root, ignore_errors=True)
 
     def test_planner_allows_independent_files_to_share_a_wave(self):
         root = self.context.workspace.root
@@ -125,9 +120,8 @@ class ParallelToolTests(unittest.TestCase):
         self.assertIs(captured["expected_binding"], binding)
 
     def test_mcp_loop_cancels_one_call_and_remains_usable(self):
-        from harness_code_agent.support.cancellation import CancelledError
-
         from harness_code_agent.runtime.mcp import _AsyncLoopThread
+        from harness_code_agent.support.cancellation import CancelledError
 
         loop_thread = _AsyncLoopThread()
         token = CancellationToken()
@@ -142,7 +136,7 @@ class ParallelToolTests(unittest.TestCase):
         def invoke():
             try:
                 loop_thread.run(blocked(), timeout=5, cancellation_token=token)
-            except Exception as exc:  # noqa: BLE001 - thread records the result for assertion
+            except Exception as exc:  # noqa: BLE001 - the worker records whatever the call raised
                 errors.append(exc)
 
         worker = threading.Thread(target=invoke)

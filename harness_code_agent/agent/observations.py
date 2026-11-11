@@ -228,9 +228,6 @@ class ObservationStore:
         del self.observations[:-self.MAX_OBSERVATIONS]
         return observation
 
-    def observed_message(self, observation: ToolObservation, result: ToolResult) -> str:
-        return observation.message
-
 
 def _norm_path(path: object) -> str:
     return str(path).replace("\\", "/").strip()

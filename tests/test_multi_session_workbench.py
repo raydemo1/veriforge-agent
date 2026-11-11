@@ -7,9 +7,9 @@ import threading
 from unittest.mock import patch
 
 import pytest
-from harness_code_agent.support.cancellation import CancellationToken, CancelledError
 
 from harness_code_agent import config
+from harness_code_agent.support.cancellation import CancellationToken, CancelledError
 from harness_code_agent.workspace.access import (
     WorkspaceAccessCoordinator,
     WorkspaceConflict,

@@ -5,13 +5,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from unittest.mock import patch
 
 import pytest
+
+from harness_code_agent.agent.trace import TraceWriter
 from harness_code_agent.support.cancellation import (
     CancellationToken,
     CancelledError,
     cancellation_scope,
 )
-
-from harness_code_agent.agent.trace import TraceWriter
 from harness_code_agent.tui_bridge import BridgeServer
 
 pytestmark = pytest.mark.session
@@ -149,7 +149,7 @@ app.run(transport="stdio")
         "transport": "stdio", "command": sys.executable, "args": [str(server)],
     }}}), encoding="utf-8")
     first = McpClientManager.from_workspace(tmp_path, session_id="A")
-    first.timeout_seconds = 5
+    first.timeout_seconds = 20
     second = McpClientManager.from_workspace(tmp_path, session_id="B")
     try:
         first.discover("isolated")

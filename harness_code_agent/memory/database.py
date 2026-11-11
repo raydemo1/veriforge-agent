@@ -15,7 +15,7 @@ from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 from .extraction_schema import EXTRACTION_SCHEMA
 from .search_index import search_terms
@@ -58,7 +58,7 @@ def _database_is_writable(path: Path) -> bool:
         return False
 
 MemoryKind = Literal["preference", "project_fact", "convention", "decision", "lesson", "workflow"]
-KINDS = frozenset({"preference", "project_fact", "convention", "decision", "lesson", "workflow"})
+KINDS = frozenset(get_args(MemoryKind))
 
 
 @dataclass(frozen=True)

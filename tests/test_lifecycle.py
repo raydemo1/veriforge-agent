@@ -50,14 +50,13 @@ class ExecutionBoundaryTests(unittest.TestCase):
     def test_cancelled_resource_wait_never_enters_handler(self):
         import threading
 
-        from harness_code_agent.support.cancellation import (
-            CancellationToken,
-            CancelledError,
-        )
-
         from harness_code_agent.runtime.execution_planner import (
             ResourceClaim,
             ResourceCoordinator,
+        )
+        from harness_code_agent.support.cancellation import (
+            CancellationToken,
+            CancelledError,
         )
         coordinator = ResourceCoordinator()
         claim = ResourceClaim("workspace", "file", access="write")
@@ -92,9 +91,8 @@ class ExecutionBoundaryTests(unittest.TestCase):
     def test_supervisor_keeps_running_future_until_real_completion(self):
         from concurrent.futures import Future
 
-        from harness_code_agent.support.cancellation import CancellationToken
-
         from harness_code_agent.runtime.task_supervisor import ToolTaskSupervisor
+        from harness_code_agent.support.cancellation import CancellationToken
         supervisor, future, token = ToolTaskSupervisor(), Future(), CancellationToken()
         future.set_running_or_notify_cancel()
         supervisor.track(future, turn_id="old", cancellation_token=token)
@@ -116,7 +114,6 @@ class ExecutionBoundaryTests(unittest.TestCase):
             CancelledError,
             cancellation_scope,
         )
-
         from harness_code_agent.tui_bridge import BridgeInteractionProvider
         opened, exited = threading.Event(), threading.Event()
         token = CancellationToken()
@@ -149,13 +146,12 @@ class ExecutionBoundaryTests(unittest.TestCase):
     def test_cancelled_startup_wait_retains_session_future(self):
         from concurrent.futures import Future
 
+        from harness_code_agent.core.interactive import InteractiveSession
         from harness_code_agent.support.cancellation import (
             CancellationToken,
             CancelledError,
             cancellation_scope,
         )
-
-        from harness_code_agent.core.interactive import InteractiveSession
         future, token = Future(), CancellationToken()
         future.set_running_or_notify_cancel()
         token.cancel()

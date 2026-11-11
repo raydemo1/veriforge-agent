@@ -146,11 +146,11 @@ Python 通信与文件监听依赖 `pygls` 和 `watchfiles` 随 `pip install -e 
 
 | 权限模式（`HARNESS_PERMISSION_MODE`） | 用途 |
 | --- | --- |
-| `workspace-write` | 默认。写工作区需要批准，危险删除、覆盖和系统命令直接拒绝 |
-| `read-only` | 只读检查与代码审查，写操作和风险命令一律拒绝 |
-| `llm-auto` | 由模型判断哪些操作需要批准 |
-| `danger-full-access` | 评测容器内使用，不做写范围限制 |
-| `terminal-eval` | Terminal-Bench / Harbor 任务的评测姿态 |
+| `workspace-write` | 默认。结构化编辑工具、以及写入范围可被证明在 workspace 内的 Shell 直接放行；副作用无法判定的命令与未声明的工具询问；工作区外写入、系统写入、危险删除和破坏性 Git 直接拒绝 |
+| `read-only` | 只读检查与代码审查：编辑工具、Shell 写入和风险工具一律拒绝 |
+| `llm-auto` | 工作区写入和未知副作用命令交给模型判断是否需要批准；工作区外/系统写入仍然拒绝，破坏性 Git 仍然直接拒绝 |
+| `danger-full-access` | 评测容器内使用，不做写范围限制；破坏性 Git 仍然拒绝 |
+| `terminal-eval` | Terminal-Bench / Harbor 任务的评测姿态：Shell 工作区写入和未知副作用放行，外部/系统写入仍拒绝，破坏性 Git 仍直接拒绝 |
 
 需要先想清楚再动手时用显式计划流，而不是切换到另一个"模式"：
 
@@ -203,7 +203,7 @@ Schema 里不再重复提示词已经写过的行为策略。子代理协作工�
 | `OPENAI_BASE_URL` | OpenAI-compatible API 地址 |
 | `HARNESS_MODEL` | 默认模型 |
 | `HARNESS_MODEL_INTENSITY` | `fast` / `normal` / `hard` / `max` |
-| `HARNESS_PERMISSION_MODE` | `workspace-write` / `llm-auto` / `danger-full-access` |
+| `HARNESS_PERMISSION_MODE` | `workspace-write` / `read-only` / `llm-auto` / `danger-full-access` / `terminal-eval` |
 | `HARNESS_MODEL_INPUT_MODE` | `text` 或 `multimodal` |
 
 完整配置见 `.env.template`。
@@ -267,10 +267,11 @@ python eval/scripts/rebuild_eval_results.py --results-root eval/results --jobs-r
 
 - [eval/README.md](eval/README.md)
 - [eval/benchmarks/README.md](eval/benchmarks/README.md)
-- [eval/results/SUMMARY.md](eval/results/SUMMARY.md)
 
 ## 相关文档
 
+- [架构与资源生命周期](docs/architecture.md)
+- [上下文版本与运行时状态](docs/deepseek-context-runtime.md)
 - [环境变量模板](.env.template)
 
 ## 注意

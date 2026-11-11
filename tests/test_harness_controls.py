@@ -9,8 +9,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from harness_code_agent.support.cancellation import CancellationToken, CancelledError
-
 from harness_code_agent import config
 from harness_code_agent.agent import llm_channel
 from harness_code_agent.agent.coordinator import AgentCoordinator
@@ -19,6 +17,7 @@ from harness_code_agent.runtime.builtins.registry import BUILTIN_TOOL_REGISTRY
 from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.sessions.events import EventBus
+from harness_code_agent.support.cancellation import CancellationToken, CancelledError
 from harness_code_agent.workspace.service import WorkspaceQuotaError, WorkspaceService
 
 

@@ -1,6 +1,6 @@
 import json
-import os
 import shutil
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -21,15 +21,13 @@ def _items():
 
 class UpdateTodoToolTests(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = os.path.join(os.getcwd(), "workspace", "test-todo-tool")
+        self.temp_dir = tempfile.mkdtemp(prefix="veriforge-todo-")
+        self.addCleanup(shutil.rmtree, self.temp_dir, ignore_errors=True)
         self.old_workspace = config.WORKSPACE
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-        os.makedirs(self.temp_dir, exist_ok=True)
         config.WORKSPACE = self.temp_dir
 
     def tearDown(self):
         config.WORKSPACE = self.old_workspace
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def _state_path(self, session_id: str = "test-session") -> Path:
         return Path(self.temp_dir, ".harness", "sessions", session_id, "todo", "state.json")

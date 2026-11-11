@@ -196,7 +196,7 @@ class ObservationArtifactAdoptionTests(unittest.TestCase):
         self.assertEqual(observation.output_hash, sha)
         self.assertEqual(list(art_dir.glob("obs_*.txt")), [])
 
-        message = store.observed_message(observation, result)
+        message = observation.message
         self.assertIn("raw_output: artifacts/shell_output_deadbeef.txt", message)
         self.assertNotIn(preview, message)
         self.assertIn("read_file", message)

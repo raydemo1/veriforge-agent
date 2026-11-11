@@ -246,7 +246,7 @@ class HarnessAgent(BaseInstalledAgent):
         3. If no python3 → install standalone python from an uploaded tarball
            or download it from GitHub (~34MB)
         4. Install only the lightweight runtime deps needed by the headless
-           terminal runner. Avoid full requirements.txt because eval/UI deps
+           terminal runner. Avoid the full project install because eval/UI deps
            make per-task container setup slow.
         """
         # Step 1: Get the current local harness code into the container so evals

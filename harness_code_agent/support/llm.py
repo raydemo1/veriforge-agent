@@ -173,7 +173,6 @@ def current_adapter() -> ProviderAdapter:
         name=resolve_provider_name(
             provider=config.PROVIDER,
             base_url=config.BASE_URL,
-            model=config.MODEL,
         )
     )
 

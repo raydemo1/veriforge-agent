@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import ClassVar
 from unittest.mock import patch
 
+import pytest
+
 from harness_code_agent.agent.change_proposal import ChangeProposalStore
 from harness_code_agent.agent.coordinator import AgentCoordinator, AgentRecord
 from harness_code_agent.runtime.builtins.registry import (
@@ -724,3 +726,40 @@ class AgentCoordinatorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_agent_role_contract_is_single_sourced():
+    """Coordinator, permission policy and tool schema read one role definition."""
+    from harness_code_agent.agent.coordinator import AGENT_ROLES as coordinator_roles
+    from harness_code_agent.runtime.agent_roles import (
+        AGENT_ROLE_DEFINITIONS,
+        AGENT_ROLE_NAMES,
+        AGENT_ROLES,
+        READ_ONLY_ROLE_NAMES,
+        WRITING_ROLE_NAMES,
+        role_definition,
+    )
+    from harness_code_agent.runtime.builtins.schemas import CORE_TOOL_SCHEMAS
+
+    schema = next(
+        entry["function"] for entry in CORE_TOOL_SCHEMAS if entry["function"]["name"] == "spawn_agent"
+    )
+    assert schema["parameters"]["properties"]["role"]["enum"] == list(AGENT_ROLES)
+    assert coordinator_roles == AGENT_ROLE_NAMES
+
+    assert READ_ONLY_ROLE_NAMES | WRITING_ROLE_NAMES == AGENT_ROLE_NAMES
+    assert not READ_ONLY_ROLE_NAMES & WRITING_ROLE_NAMES
+    for definition in AGENT_ROLE_DEFINITIONS:
+        assert definition.instruction.strip(), definition.name
+        assert role_definition(definition.name) is definition
+
+    for name in AGENT_ROLES:
+        policy = PermissionPolicy.for_role(name)
+        assert policy.mode == (
+            PermissionPolicy.READ_ONLY if name in READ_ONLY_ROLE_NAMES else PermissionPolicy.EVAL
+        )
+
+    with pytest.raises(ValueError):
+        PermissionPolicy.for_role("does-not-exist")
+    with pytest.raises(ValueError):
+        role_definition("does-not-exist")

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import config
+from ..runtime.agent_roles import AGENT_ROLE_NAMES, role_definition
 from ..runtime.builtins.discovery import discovery_catalog_prompt
 from ..runtime.errors import SubagentCapacityError
 from ..runtime.execution_planner import workspace_claim
@@ -31,7 +32,7 @@ from ..workspace.paths import path_within
 from ..workspace.service import WorkspaceService
 from .change_proposal import ChangeProposalStore
 
-AGENT_ROLES = {"explorer", "test_designer", "reviewer", "verifier", "worker"}
+AGENT_ROLES = AGENT_ROLE_NAMES
 ACTIVE_STATES = {"queued", "running"}
 TERMINAL_STATES = {"completed", "blocked", "failed", "interrupted", "closed"}
 MAX_OPEN_AGENTS = max(1, int(config.MAX_OPEN_AGENTS))
@@ -634,13 +635,7 @@ class AgentCoordinator:
 
 
 def _role_prompt(record: AgentRecord, parent_messages: list[dict], system: str) -> str:
-    role_text = {
-        "explorer": "Investigate code and return evidence. Do not modify files.",
-        "test_designer": "Design focused tests and failure cases. Do not modify files.",
-        "reviewer": "Review for correctness, regressions, security, and missing tests. Do not modify files.",
-        "verifier": "Run focused verification and interpret results. Do not modify source files.",
-        "worker": "Implement the assigned change in your isolated workspace and verify it.",
-    }[record.role]
+    role_text = role_definition(record.role).instruction
     inherited = _forked_context(parent_messages, record.fork_turns)
     return (
         f"You are the {record.name} subagent with role {record.role}. {role_text}\n"

@@ -14,6 +14,7 @@ from enum import Enum
 from typing import ClassVar
 
 from ..workspace.paths import normalize_rel_path, path_within
+from .agent_roles import role_definition
 from .shell_classification import (
     ShellEffect,
     ShellTrait,
@@ -68,11 +69,6 @@ class PermissionDecision:
     @property
     def requires_approval(self) -> bool:
         return self.action == PermissionAction.ASK.value
-
-
-_READ_ONLY_ROLE_NAMES = frozenset(
-    {"explorer", "test_designer", "reviewer", "verifier"}
-)
 
 
 class PermissionPolicy:
@@ -164,25 +160,24 @@ class PermissionPolicy:
         Read-only roles may only inspect/verify; workers may write inside their
         declared allowed_paths but never touch external/system state.
         """
-        if role in _READ_ONLY_ROLE_NAMES:
+        definition = role_definition(role)
+        if definition.read_only:
             return cls(
                 cls.READ_ONLY,
                 role=role,
             )
-        if role == "worker":
-            return cls(
-                cls.EVAL,
-                shell_config=ShellPermissionConfig(
-                    PermissionAction.ALLOW,
-                    PermissionAction.DENY,
-                    PermissionAction.DENY,
-                    PermissionAction.DENY,
-                    PermissionAction.DENY,
-                ),
-                role="worker",
-                allowed_paths=allowed_paths,
-            )
-        raise ValueError(f"Unknown agent role: {role}")
+        return cls(
+            cls.EVAL,
+            shell_config=ShellPermissionConfig(
+                PermissionAction.ALLOW,
+                PermissionAction.DENY,
+                PermissionAction.DENY,
+                PermissionAction.DENY,
+                PermissionAction.DENY,
+            ),
+            role=role,
+            allowed_paths=allowed_paths,
+        )
 
     @classmethod
     def delegated_from(
@@ -358,12 +353,14 @@ class PermissionPolicy:
 
     def _edit_path_block(self, tool_name: str, args: dict) -> str | None:
         """Role / allowed_paths enforcement for structured edit tools."""
-        if self.role in _READ_ONLY_ROLE_NAMES and tool_name in {"write_file", "apply_patch"}:
+        if self.role is None or tool_name not in {"write_file", "apply_patch"}:
+            return None
+        definition = role_definition(self.role)
+        if definition.read_only:
             return f"{self.role} role cannot modify the workspace"
-        if self.role == "worker" and tool_name in {"write_file", "apply_patch"}:
-            path = normalize_rel_path(str(args.get("path") or ""))
-            if not path_within(path, self.allowed_paths):
-                return f"write path is outside allowed_paths: {path or '<empty>'}"
+        path = normalize_rel_path(str(args.get("path") or ""))
+        if not path_within(path, self.allowed_paths):
+            return f"write path is outside allowed_paths: {path or '<empty>'}"
         return None
 
 
