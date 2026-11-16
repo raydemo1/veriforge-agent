@@ -61,13 +61,26 @@ def is_relative_to(path: Path, root: Path, *, resolve: bool = False) -> bool:
 
 
 def observation_dir_for(
-    root: str | Path, session_id: str | None, agent_id: str | None = None
+    root: str | Path,
+    session_id: str | None,
+    agent_id: str | None = None,
+    *,
+    session_root: str | Path | None = None,
 ) -> Path:
-    """Directory for observation files and streamed tool-output artifacts."""
-    safe_session_id = "".join(
-        ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(session_id or "default")
-    )
+    """Directory for observation files and streamed tool-output artifacts.
+
+    Session-scoped callers pass ``session_root`` so observations live beside
+    the session journal.  Callers without a session fall back to the
+    workspace state root.
+    """
     safe_agent_id = "".join(
         ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(agent_id or "main")
     )
-    return Path(root) / ".harness" / "observations" / safe_session_id / safe_agent_id
+    if session_root is not None:
+        return Path(session_root) / "observations" / safe_agent_id
+    safe_session_id = "".join(
+        ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(session_id or "default")
+    )
+    from .state_paths import ensure_workspace_state
+
+    return ensure_workspace_state(root) / "observations" / safe_session_id / safe_agent_id

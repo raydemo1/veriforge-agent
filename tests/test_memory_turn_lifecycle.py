@@ -105,8 +105,9 @@ def test_consolidation_updates_facts_while_vectors_are_unavailable(tmp_path, mod
 
 def test_user_turns_do_not_search_or_inject_memory_bodies(tmp_path, monkeypatch):
     monkeypatch.setenv("HARNESS_MEMORY_GENERATION_DISABLED", "1")
-    (tmp_path / ".harness").mkdir()
-    (tmp_path / ".harness/mcp.json").write_text('{"servers":{}}', encoding="utf-8")
+    from harness_code_agent.workspace.state_paths import ensure_workspace_state
+
+    (ensure_workspace_state(tmp_path) / "mcp.json").write_text('{"servers":{}}', encoding="utf-8")
     service = MemoryService(tmp_path)
     service.stores["project"].write(topic="构建入口", fact_key="build.command", kind="project_fact",
                                      body="UNREQUESTED_MEMORY_BODY",

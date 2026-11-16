@@ -81,8 +81,10 @@ def prepare_merge_review(directory, files, originals):
 class WorktreeService:
     def __init__(self, project: Path):
         self.project = project.resolve()
-        self.access = WorkspaceAccessCoordinator(self.project)
-        self.blobs = RecoveryStore(self.project)
+        from .state_paths import ensure_workspace_state
+        self.state_root = ensure_workspace_state(self.project)
+        self.access = WorkspaceAccessCoordinator(self.project, state_root=self.state_root)
+        self.blobs = RecoveryStore(self.project, state_root=self.state_root)
 
     @staticmethod
     def _git(root, *args):
@@ -93,7 +95,7 @@ class WorktreeService:
         names = self._git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard").decode("utf-8").split("\0")
         result = {}
         for name in sorted(set(filter(None, names))):
-            if any(part in {".git", ".harness"} for part in Path(name).parts):
+            if any(part in {".git"} for part in Path(name).parts):
                 continue
             path = root / name
             if path.is_symlink():
@@ -103,7 +105,7 @@ class WorktreeService:
         return result
 
     def create(self, session_id: str):
-        destination = self.project / ".harness" / "worktrees" / session_id
+        destination = self.state_root / "worktrees" / session_id
         with self.access.acquire([self.access.write_claim()], current_token.get()):
             files = self._files(self.project)
             self._git(self.project, "worktree", "add", "--detach", str(destination), "HEAD")
@@ -120,12 +122,12 @@ class WorktreeService:
                 shutil.copy2(self.project / name, path)
             baseline = {name: self.blobs._put_blob(data) for name, data in files.items()}
             descriptor = {"root": str(destination), "project": str(self.project), "baseline": baseline}
-            atomic_json(self.project / ".harness" / "worktree-environments" / f"{session_id}.json", descriptor)
+            atomic_json(self.state_root / "worktrees" / "environments" / f"{session_id}.json", descriptor)
         return destination
 
     def apply(self, session_id, *, turn_id="worktree-apply", approved=None):
         from .merge import git_merge_text
-        descriptor = json.loads((self.project / ".harness" / "worktree-environments" / f"{session_id}.json").read_text(encoding="utf-8"))
+        descriptor = json.loads((self.state_root / "worktrees" / "environments" / f"{session_id}.json").read_text(encoding="utf-8"))
         root = Path(descriptor["root"])
         work_access = WorkspaceAccessCoordinator(root)
         with self.access.acquire([self.access.write_claim()], current_token.get()), work_access.acquire([work_access.write_claim()], current_token.get()):
@@ -166,7 +168,7 @@ class WorktreeService:
                 changes[name] = desired
             if conflicts:
                 raise WorktreeMergeConflict(conflicts)
-            descriptor_path = self.project / ".harness" / "worktree-environments" / f"{session_id}.json"
+            descriptor_path = self.state_root / "worktrees" / "environments" / f"{session_id}.json"
             records = [(session_id, turn_id, name, originals[name], desired) for name, desired in changes.items()]
             with self.access.transaction(changes, participants=[descriptor_path], change_records=records):
                 descriptor["baseline"] = {name: self.blobs._put_blob(data) for name, data in after.items()}

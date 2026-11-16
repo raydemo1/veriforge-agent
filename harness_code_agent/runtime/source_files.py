@@ -21,7 +21,6 @@ _SOURCE_SUFFIXES = {
 }
 _EXCLUDE = {
     ".git",
-    ".harness",
     ".harbor",
     "node_modules",
     ".venv",

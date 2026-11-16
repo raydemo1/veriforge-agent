@@ -97,7 +97,8 @@ def _todo_state_path(workspace: Path, runtime_state, tool_context: ToolContext |
         or "default"
     )
     safe_session_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(session_id))
-    return workspace / ".harness" / "sessions" / safe_session_id / "todo" / "state.json"
+    from ...workspace.state_paths import ensure_workspace_state
+    return ensure_workspace_state(workspace) / "sessions" / safe_session_id / "todo" / "state.json"
 
 
 def _atomic_write_json(path: Path, payload: dict) -> tuple[bool, str | None]:

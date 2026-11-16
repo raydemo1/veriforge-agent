@@ -149,8 +149,9 @@ def _build_stream_callback():
 def show_latest_session(cwd: Path) -> int:
     from .core.formatters import print_session
     from .sessions.store import SessionStore
+    from .workspace.state_paths import ensure_workspace_state
 
-    store = SessionStore(cwd / ".harness")
+    store = SessionStore(ensure_workspace_state(cwd))
     try:
         print_session(store, _latest_session_id(store))
     except (FileNotFoundError, ValueError, KeyError) as e:
@@ -178,7 +179,9 @@ def observe_session(cwd: Path, args: list[str]) -> int:
         return 2
 
     target = target_args[0]
-    store = SessionStore(cwd / ".harness")
+    from .workspace.state_paths import ensure_workspace_state
+
+    store = SessionStore(ensure_workspace_state(cwd))
     try:
         if target == "project":
             if export:

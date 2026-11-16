@@ -5,6 +5,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from ..workspace.state_paths import veriforge_home
+
 GIT_IDENTITY_TIMEOUT_SECONDS = 0.5
 
 
@@ -39,4 +41,6 @@ def _noninteractive_git_env() -> dict[str, str]:
 
 
 def default_memory_root() -> Path:
-    return Path(os.environ.get("HARNESS_MEMORY_ROOT", str(Path.home() / ".harness" / "memory-v3"))).expanduser().resolve()
+    return Path(
+        os.environ.get("VERIFORGE_MEMORY_ROOT", str(veriforge_home() / "memory-v3"))
+    ).expanduser().resolve()

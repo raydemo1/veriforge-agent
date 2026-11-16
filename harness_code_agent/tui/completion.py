@@ -10,7 +10,6 @@ MENTION_CACHE_TTL_SECONDS = 30.0
 
 EXCLUDED_DIRS = {
     ".git",
-    ".harness",
     "__pycache__",
     ".mypy_cache",
     ".pytest_cache",

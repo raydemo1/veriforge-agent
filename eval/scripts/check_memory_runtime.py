@@ -51,8 +51,9 @@ def wait_workers():
 def checks(root):
     workspace = root / "workspace"
     workspace.mkdir()
-    (workspace / ".harness").mkdir()
-    (workspace / ".harness/mcp.json").write_text('{"servers":{}}', encoding="utf-8")
+    from harness_code_agent.workspace.state_paths import ensure_workspace_state
+
+    (ensure_workspace_state(workspace) / "mcp.json").write_text('{"servers":{}}', encoding="utf-8")
     raw = "请记住：和我交流使用简体中文。"
     replies = [completion(tool={"topic": "交流", "fact_key": "reply.language", "kind": "preference",
                                "body": "用户偏好简体中文交流。", "source_quote": raw, "scope": "user"}),
@@ -62,7 +63,7 @@ def checks(root):
         requests.append(deepcopy(kwargs))
         return replies.pop(0)
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)), close=lambda: None)
-    with (patch.dict(os.environ, {"HARNESS_MEMORY_ROOT": str(root / "memory"), "HARNESS_MEMORY_DISABLED": "0"}),
+    with (patch.dict(os.environ, {"VERIFORGE_MEMORY_ROOT": str(root / "memory"), "HARNESS_MEMORY_DISABLED": "0"}),
           patch("harness_code_agent.agent.conversation.get_client", return_value=client),
           patch.object(extraction, "_call_model", return_value=response({"complete": True, "candidates": [], "episode": ""})),
           patch.object(SiliconFlowEmbeddings, "embed", lambda self, texts: LocalVectors().embed(texts))):

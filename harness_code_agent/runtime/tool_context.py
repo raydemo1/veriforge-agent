@@ -30,6 +30,7 @@ class ToolContext:
     event_bus: EventBus
     session_id: str | None = None
     session_root: Path | None = None
+    state_root: Path | None = None
     environment: str = "local"
     ui_request_id: str | None = None
     project_resources: ProjectResourceBudget | None = None

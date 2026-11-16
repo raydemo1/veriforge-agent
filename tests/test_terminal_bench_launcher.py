@@ -186,8 +186,8 @@ class TerminalBenchLauncherTests(unittest.TestCase):
                 "large runtime archive",
                 encoding="utf-8",
             )
-            (repo_root / ".harness" / "traces").mkdir(parents=True)
-            (repo_root / ".harness" / "traces" / "trace.jsonl").write_text("trace", encoding="utf-8")
+            (repo_root / ".veriforge" / "traces").mkdir(parents=True)
+            (repo_root / ".veriforge" / "traces" / "trace.jsonl").write_text("trace", encoding="utf-8")
             (repo_root / ".harbor" / "tmp").mkdir(parents=True)
             (repo_root / ".harbor" / "tmp" / "leftover.txt").write_text("tmp", encoding="utf-8")
             (repo_root / "eval" / "results" / "old-run").mkdir(parents=True)
@@ -199,7 +199,7 @@ class TerminalBenchLauncherTests(unittest.TestCase):
             self.assertTrue((snapshot / "harness_code_agent" / "__init__.py").exists())
             self.assertTrue((snapshot / "vendor_wheels" / "openai-1.0.0-py3-none-any.whl").exists())
             self.assertFalse((snapshot / "vendor_wheels" / "python-3.12.13-x86_64-unknown-linux-gnu.tar.gz").exists())
-            self.assertFalse((snapshot / ".harness").exists())
+            self.assertFalse((snapshot / ".veriforge").exists())
             self.assertFalse((snapshot / ".harbor").exists())
             self.assertFalse((snapshot / "eval" / "results").exists())
             self.assertFalse((snapshot / ".env").exists())

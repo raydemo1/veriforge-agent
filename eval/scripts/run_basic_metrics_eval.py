@@ -120,13 +120,13 @@ def run_memory_suite(args: argparse.Namespace) -> Path:
     raw_path = run_dir / "raw_cases.jsonl"
     results: list[CaseResult] = []
     learning_results: list[CaseResult] = []
-    evidence_root = PROJECT_ROOT / ".harness" / "memory-eval-evidence" / run_dir.name
+    evidence_root = PROJECT_ROOT / "eval" / "results" / "memory-eval-evidence" / run_dir.name
     evidence_root.mkdir(parents=True, exist_ok=True)
     for task in tasks:
         for variant in ("disabled", "enabled"):
             env = base_env()
             memory_root = run_dir / "memory_roots" / str(task["id"]) / variant
-            env["HARNESS_MEMORY_ROOT"] = str(memory_root)
+            env["VERIFORGE_MEMORY_ROOT"] = str(memory_root)
             env["HARNESS_PERMISSION_MODE"] = "danger-full-access"
             env["HARNESS_STREAM"] = "0"
             _apply_metrics_eval_limits(env, suite="memory")
@@ -279,9 +279,9 @@ def _run_hca_case(
 
 def _metrics_eval_prompt(prompt: str, *, suite: str) -> str:
     common = (
-        "Use repo_search for code/text search, list_files for file discovery, and read_file for bounded reads. "
+        "Use `rg` through run_bash for code/text search and file discovery, and read_file for bounded reads. "
         "Use PowerShell-compatible shell only for execution tasks such as builds, installs, and tests. "
-        "Do not inspect .harness, __pycache__, virtualenvs, or generated artifacts. "
+        "Do not inspect .veriforge, __pycache__, virtualenvs, or generated artifacts. "
         "Do not run tests, broad recursive listings, or repeated shell variants after a failure. "
         "Stop as soon as you have the first reliable answer."
     )
@@ -297,7 +297,7 @@ def _metrics_eval_prompt(prompt: str, *, suite: str) -> str:
     return (
         prompt.strip()
         + "\n\nBasic eval constraints: answer this as a read-only repository lookup. "
-        "Use at most 8 tool calls. Prefer repo_search/list_files/read_file with narrow paths. "
+        "Use at most 8 tool calls. Prefer run_bash (`rg`) and read_file with narrow paths. "
         "Do not inspect eval/results. "
         + common
     )
@@ -326,7 +326,7 @@ def _seed_memory(
     *,
     extra_source_path: Path | None = None,
 ) -> None:
-    with patch.dict(os.environ, {"HARNESS_MEMORY_ROOT": str(memory_root)}):
+    with patch.dict(os.environ, {"VERIFORGE_MEMORY_ROOT": str(memory_root)}):
         service = MemoryService(PROJECT_ROOT)
     for number, candidate in enumerate(task.get("memory_records") or []):
         service.write(
@@ -345,7 +345,9 @@ def _seed_memory(
 
 
 def _session_metrics(session_id: str) -> dict[str, Any]:
-    store = SessionStore(PROJECT_ROOT / ".harness")
+    from harness_code_agent.workspace.state_paths import ensure_workspace_state
+
+    store = SessionStore(ensure_workspace_state(PROJECT_ROOT))
     try:
         metadata = store.read_metadata(session_id)
         events = store.read_events(session_id)

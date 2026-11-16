@@ -130,6 +130,7 @@ def test_mcp_cached_catalog_connects_separate_sessions_only_on_call(tmp_path):
     import sys
 
     from harness_code_agent.runtime.mcp import McpClientManager
+    from harness_code_agent.workspace.state_paths import ensure_workspace_state
 
     server = tmp_path / "server.py"
     server.write_text('''import os
@@ -143,8 +144,7 @@ def counter() -> str:
     return f"{os.getpid()}:{count}"
 app.run(transport="stdio")
 ''', encoding="utf-8")
-    directory = tmp_path / ".harness"
-    directory.mkdir()
+    directory = ensure_workspace_state(tmp_path)
     (directory / "mcp.json").write_text(json.dumps({"servers": {"isolated": {
         "transport": "stdio", "command": sys.executable, "args": [str(server)],
     }}}), encoding="utf-8")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,13 +12,25 @@ from harness_code_agent.memory import extraction, reconciliation
 from harness_code_agent.runtime.questions import QuestionResult
 
 
+@pytest.fixture(scope="session", autouse=True)
+def isolate_veriforge_home(tmp_path_factory):
+    home = tmp_path_factory.mktemp("veriforge-home")
+    previous = os.environ.get("VERIFORGE_HOME")
+    os.environ["VERIFORGE_HOME"] = str(home)
+    yield home
+    if previous is None:
+        os.environ.pop("VERIFORGE_HOME", None)
+    else:
+        os.environ["VERIFORGE_HOME"] = previous
+
+
 @pytest.fixture(autouse=True)
 def isolate_model_credentials(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "API_KEY", "test-key")
     monkeypatch.setattr(config, "BASE_URL", "https://model.example.invalid/v1")
     monkeypatch.setenv("SILICONFLOW_API_KEY", "")
     monkeypatch.setenv("SILICONFLOW_BASE_URL", "https://embedding.example.invalid/v1")
-    monkeypatch.setenv("HARNESS_MEMORY_ROOT", str(tmp_path / "isolated-memory"))
+    monkeypatch.setenv("VERIFORGE_MEMORY_ROOT", str(tmp_path / "isolated-memory"))
     def reject_memory_request(**kwargs):
         raise AssertionError("Background memory model calls require an explicit offline fixture")
     monkeypatch.setattr(extraction, "_call_model", reject_memory_request)

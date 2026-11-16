@@ -73,14 +73,15 @@ def main():
     root.mkdir(parents=True)
     (root / "protocol.json").write_text(json.dumps(protocol, indent=2), encoding="utf-8")
     workspace = root / "workspace"
-    (workspace / ".harness").mkdir(parents=True)
-    (workspace / ".harness/mcp.json").write_text('{"servers":{}}', encoding="utf-8")
+    from harness_code_agent.workspace.state_paths import ensure_workspace_state
+
+    (ensure_workspace_state(workspace) / "mcp.json").write_text('{"servers":{}}', encoding="utf-8")
     ledger = HttpLedger(root)
     def send(client, request, **kwargs):
         return ledger.send(client, request, **kwargs)
     fast = config.resolve_model_profile("fast")
     result = {"protocol": protocol, "sessions": []}
-    with (patch.dict(os.environ, {"HARNESS_MEMORY_ROOT": str(root / "memory"), "HARNESS_MEMORY_DISABLED": "0",
+    with (patch.dict(os.environ, {"VERIFORGE_MEMORY_ROOT": str(root / "memory"), "HARNESS_MEMORY_DISABLED": "0",
                                  "HARNESS_MEMORY_GENERATION_DISABLED": "1"}),
           patch.object(config, "MODEL_INTENSITY", "fast"), patch.object(config, "MODEL", fast.model),
           patch.object(config, "MODEL_PROFILE", fast),

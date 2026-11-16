@@ -30,7 +30,9 @@ class UpdateTodoToolTests(unittest.TestCase):
         config.WORKSPACE = self.old_workspace
 
     def _state_path(self, session_id: str = "test-session") -> Path:
-        return Path(self.temp_dir, ".harness", "sessions", session_id, "todo", "state.json")
+        from harness_code_agent.workspace.state_paths import ensure_workspace_state
+
+        return ensure_workspace_state(self.temp_dir) / "sessions" / session_id / "todo" / "state.json"
 
     def test_create_todo_writes_only_session_state_json(self):
         state = AgentRuntimeState(session_id="test-session")

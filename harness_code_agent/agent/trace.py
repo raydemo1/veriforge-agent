@@ -33,7 +33,8 @@ class TraceWriter:
         self._lock = threading.Lock()
         self._path = None
         safe = lambda value: re.sub(r"[^a-zA-Z0-9_-]", "_", value)
-        trace_dir = Path(workspace or Path.cwd()).resolve() / ".harness" / "traces" / safe(self.session_id)
+        from ..workspace.state_paths import ensure_workspace_state
+        trace_dir = ensure_workspace_state(Path(workspace or Path.cwd())) / "traces" / safe(self.session_id)
         try:
             trace_dir.mkdir(parents=True, exist_ok=True)
             self._path = trace_dir / f"{safe(agent_name)}_{uuid.uuid4().hex}.jsonl"

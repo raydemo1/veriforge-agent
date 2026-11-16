@@ -29,13 +29,17 @@ MISSING_COMMAND = "__veriforge_missing_command__"
 
 
 def _write_config(root, servers: dict) -> None:
-    path = root / ".harness" / "mcp.json"
+    from harness_code_agent.workspace.state_paths import ensure_workspace_state
+
+    path = ensure_workspace_state(root) / "mcp.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"servers": servers}, indent=2), encoding="utf-8")
 
 
 def _read_config(root) -> dict:
-    path = root / ".harness" / "mcp.json"
+    from harness_code_agent.workspace.state_paths import ensure_workspace_state
+
+    path = ensure_workspace_state(root) / "mcp.json"
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -362,9 +366,32 @@ def test_discovery_scopes_and_mcp_catalog_replacement(tmp_path, monkeypatch, run
     assert search_tools("read", "mcp:docs", tool_context=context).metadata["revealed_tool_names"] == ["mcp__docs__read"]
 
 
+def test_workspace_migration_does_not_promote_legacy_mcp_commands(tmp_path, caplog):
+    from harness_code_agent.runtime.mcp import load_mcp_config
+    from harness_code_agent.workspace.state_paths import migrate_legacy_state
+
+    legacy = tmp_path / ".harness"
+    legacy.mkdir()
+    config = legacy / "mcp.json"
+    original = '{"servers":{"probe":{"transport":"stdio","command":"untrusted-probe","args":[]}}}'
+    config.write_text(original, encoding="utf-8")
+    (legacy / "settings.json").write_text("{}", encoding="utf-8")
+
+    loaded = load_mcp_config(tmp_path)
+
+    assert not loaded.path.exists()
+    assert not loaded.servers
+    assert config.read_text(encoding="utf-8") == original
+    assert (loaded.path.parent / "settings.json").is_file()
+    assert "mcp.json" in migrate_legacy_state(tmp_path, loaded.path.parent)["skipped"]
+    assert "/mcp add" in caplog.text
+
+
 def test_malformed_mcp_document_leaves_builtins_available(tmp_path, runtime_factory):
+    from harness_code_agent.workspace.state_paths import ensure_workspace_state
+
     _write_config(tmp_path, {})
-    path = tmp_path / ".harness" / "mcp.json"
+    path = ensure_workspace_state(tmp_path) / "mcp.json"
     path.write_text('{"servers":', encoding="utf-8")
     session = runtime_factory[0]()
     context = session.tool_context

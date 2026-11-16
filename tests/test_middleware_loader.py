@@ -1,4 +1,4 @@
-"""Tests for the user middleware loader (~/.harness/middlewares.json)."""
+"""Tests for the user middleware loader (~/.veriforge/middlewares.json)."""
 import json
 import os
 import tempfile

@@ -79,7 +79,7 @@ def worker(group, prompt):
                     Path.cwd(),
                     "/trial/first-intervention",
                     symlinks=True,
-                    ignore=shutil.ignore_patterns(".git", ".harness", "__pycache__"),
+                    ignore=shutil.ignore_patterns(".git", "__pycache__"),
                 )
             interventions.append({"timestamp": time.time(), "message": injection})
             write_json(Path("/trial/interventions.json"), interventions)
@@ -238,10 +238,10 @@ def read_lines(path):
 
 
 def trial_metrics(trial, args):
-    workspace = trial / "workspace"
+    state_workspaces = trial / "state" / "workspaces"
     traces = [
         row
-        for path in (workspace / ".harness" / "traces").glob("*/*.jsonl")
+        for path in state_workspaces.glob("*/traces/*/*.jsonl")
         for row in read_lines(path)
     ]
     requests = [row for row in traces if row["event"] == "request_diagnostics"]
@@ -265,7 +265,7 @@ def trial_metrics(trial, args):
     )
     events = [
         row
-        for path in (workspace / ".harness" / "sessions").glob("*/events.jsonl")
+        for path in state_workspaces.glob("*/sessions/*/events.jsonl")
         for row in read_lines(path)
     ]
     checks = [
@@ -280,7 +280,7 @@ def trial_metrics(trial, args):
     test_commands = [
         command
         for call in tools
-        if call["tool"] == "run_bash"
+        if call["tool"] == "bash"
         and isinstance(command := call["args"].get("command"), str)
         and TEST_COMMAND.search(command)
     ]
@@ -541,6 +541,8 @@ def main():
                 "-w",
                 "/workspace",
                 *[flag for key in settings for flag in ("--env", key)],
+                "--env",
+                "VERIFORGE_HOME=/trial/state",
                 IMAGE,
                 "python",
                 "-B",

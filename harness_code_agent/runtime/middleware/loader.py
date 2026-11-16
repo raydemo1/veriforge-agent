@@ -3,7 +3,7 @@
 Loads custom ``AgentMiddleware`` subclasses declared in the user's
 persistent JSON config::
 
-    ~/.harness/middlewares.json
+    ~/.veriforge/middlewares.json
 
 Only this user-home config is read. Workspace-local middleware configs are
 intentionally unsupported: otherwise cloning a repository and starting the
@@ -22,9 +22,10 @@ import json
 import sys
 from pathlib import Path
 
+from ...workspace.state_paths import veriforge_home
 from .base import AgentMiddleware
 
-CONFIG_PATH = Path.home() / ".harness" / "middlewares.json"
+CONFIG_PATH = veriforge_home() / "middlewares.json"
 
 
 class MiddlewareConfigError(Exception):

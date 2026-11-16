@@ -9,8 +9,10 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
+from ..workspace.state_paths import LEGACY_STATE_DIR_NAME
+
 EXCLUDED_NAMES = frozenset({
-    ".git", ".harness", ".harbor", "node_modules", ".venv", "venv", "__pycache__",
+    ".git", ".harbor", LEGACY_STATE_DIR_NAME, "node_modules", ".venv", "venv", "__pycache__",
     ".pytest_cache", ".ruff_cache", ".mypy_cache", ".cache", "build", "dist",
 })
 
@@ -42,9 +44,14 @@ def atomic_json(path: Path, value: dict) -> None:
 
 
 class RecoveryStore:
-    def __init__(self, workspace: str | Path):
+    def __init__(self, workspace: str | Path, *, state_root: str | Path | None = None):
         self.workspace = Path(workspace).resolve()
-        self.root = self.workspace / ".harness" / "recovery"
+        from ..workspace.state_paths import ensure_workspace_state
+        self.root = (
+            Path(state_root).expanduser().resolve()
+            if state_root is not None
+            else ensure_workspace_state(self.workspace)
+        ) / "recovery"
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _put_blob(self, data: bytes) -> str:
@@ -124,10 +131,10 @@ class RecoveryStore:
 
 
 class RecoveryService:
-    def __init__(self, workspace: str | Path):
+    def __init__(self, workspace: str | Path, *, state_root: str | Path | None = None):
         from ..workspace.access import WorkspaceAccessCoordinator
-        self.store = RecoveryStore(workspace)
-        self.access = WorkspaceAccessCoordinator(workspace)
+        self.store = RecoveryStore(workspace, state_root=state_root)
+        self.access = WorkspaceAccessCoordinator(workspace, state_root=state_root)
         self.origin = None
 
     def begin_turn(self, **location):

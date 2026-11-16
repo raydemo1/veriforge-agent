@@ -6,13 +6,13 @@ import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
 
 from .. import config
 from ..support.cancellation import current_token
 from .access import WorkspaceAccessCoordinator, WorkspaceConflict, fingerprint
 from .change_journal import WorkspaceChangeJournal
 from .paths import is_relative_to
+from .state_paths import ensure_workspace_state
 
 _UNOBSERVED = object()
 
@@ -59,23 +59,29 @@ class WorkspaceService:
     unrelated files. Metadata bookkeeping has its own short critical section.
     """
 
-    DEFAULT_PROTECTED_NAMES: ClassVar[set] = {".env", ".env.local", ".env.production"}
-
     def __init__(
         self,
         *,
         root: str | Path,
         snapshots_dir: str | Path | None = None,
-        protected_names: set[str] | None = None,
         session_id: str | None = None,
+        state_root: str | Path | None = None,
     ):
         self.root = Path(root).resolve()
         self.session_id = session_id
         self.turn_id = ""
-        self.access = WorkspaceAccessCoordinator(self.root)
+        self.state_root = (
+            Path(state_root).expanduser().resolve()
+            if state_root is not None
+            else ensure_workspace_state(self.root)
+        )
+        self.access = WorkspaceAccessCoordinator(self.root, state_root=self.state_root)
         self._versions = {}
-        self.snapshots_dir = Path(snapshots_dir).resolve() if snapshots_dir else self.root / ".harness" / "snapshots"
-        self.protected_names = protected_names or self.DEFAULT_PROTECTED_NAMES
+        self.snapshots_dir = (
+            Path(snapshots_dir).resolve()
+            if snapshots_dir
+            else self.state_root / "recovery" / "snapshots"
+        )
         self.change_journal = WorkspaceChangeJournal()
         self._metadata_lock = threading.RLock()
         self._path_locks_lock = threading.Lock()
@@ -123,12 +129,22 @@ class WorkspaceService:
 
     def write_text_batch(self, changes: dict[str, str], *, expected=None) -> list[WorkspaceWriteResult]:
         """Apply a validated text change set, rolling every file back on failure."""
+        return self.write_batch(
+            {path: str(content).encode("utf-8") for path, content in changes.items()},
+            expected=expected,
+        )
+
+    def write_batch(
+        self, changes: dict[str, bytes | None], *, expected=None
+    ) -> list[WorkspaceWriteResult]:
+        """Apply bytes or deletions atomically, rolling every path back on failure.
+
+        A ``None`` value deletes the file. Binary content is written as-is;
+        text callers use :meth:`write_text_batch`.
+        """
         if not changes:
             return []
-        resolved_changes = {
-            self.resolve(path): str(content)
-            for path, content in changes.items()
-        }
+        resolved_changes = {self.resolve(path): value for path, value in changes.items()}
         ordered = sorted(resolved_changes, key=lambda path: str(path).casefold())
         versions = {self.resolve(path): data for path, data in expected.items()} if expected is not None else {}
         with ExitStack() as stack:
@@ -143,18 +159,26 @@ class WorkspaceService:
                 if existed and not path.is_file():
                     raise ValueError(f"Refusing to replace non-file path: {path.relative_to(self.root)}")
                 old_bytes = path.read_bytes() if existed else None
+                new_bytes = resolved_changes[path]
+                if new_bytes is None and not existed:
+                    raise FileNotFoundError(f"File not found: {path.relative_to(self.root)}")
                 old_content = old_bytes.decode("utf-8", errors="replace") if old_bytes is not None else None
                 originals[path] = (existed, old_bytes)
-                new_bytes = resolved_changes[path].encode("utf-8")
-                total_net_new += len(new_bytes) - (len(old_bytes) if old_bytes is not None else 0)
+                total_net_new += (len(new_bytes) if new_bytes is not None else 0) - (
+                    len(old_bytes) if old_bytes is not None else 0
+                )
                 snapshot_path = self._snapshot_unlocked(path) if existed else None
                 results.append(WorkspaceWriteResult(path=path, snapshot_path=snapshot_path, old_content=old_content))
             self._check_write_quota(total_net_new)
             try:
                 from ..runtime.recovery import atomic_bytes
                 for path in ordered:
+                    new_bytes = resolved_changes[path]
+                    if new_bytes is None:
+                        path.unlink()
+                        continue
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    atomic_bytes(path, resolved_changes[path].encode("utf-8"))
+                    atomic_bytes(path, new_bytes)
             except Exception:
                 for path in reversed(ordered):
                     existed, old_bytes = originals[path]
@@ -168,7 +192,7 @@ class WorkspaceService:
             for result in results:
                 self._record_changed(
                     result.path.relative_to(self.root),
-                    operation="write_file",
+                    operation="write_file" if resolved_changes[result.path] is not None else "delete_file",
                     snapshot_path=result.snapshot_path,
                 )
             return results
@@ -290,15 +314,10 @@ class WorkspaceService:
                 snapshot_path=snapshot_path,
             )
 
-    _SAFE_ENV_SUFFIXES: ClassVar[set] = {'.example', '.template', '.sample', '.default', '.dist'}
-
     def _ensure_writable(self, path: Path) -> None:
-        rel = path.relative_to(self.root)
-        parts = rel.parts
-        if ".git" in parts:
-            raise ValueError(f"Refusing to write inside .git: {rel}")
-        if self._is_protected_name(path.name):
-            raise ValueError(f"Refusing to write protected file: {rel}")
+        # Workspace boundary only: .git, .env and other project files are
+        # ordinary workspace content. Snapshot and conflict checks still apply.
+        path.relative_to(self.root)
 
     def _check_write_quota(self, net_new_bytes: int) -> None:
         """Reject a write that would cross the free-disk floor or write quota."""
@@ -328,13 +347,5 @@ class WorkspaceService:
     def _charge_quota(self, net_new_bytes: int) -> None:
         with self._metadata_lock:
             self._charged_bytes += max(0, int(net_new_bytes))
-
-    def _is_protected_name(self, name: str) -> bool:
-        if name in self.protected_names:
-            return True
-        for p in self.protected_names:
-            if name.startswith(p + '.') and not any(name.endswith(s) for s in self._SAFE_ENV_SUFFIXES):
-                return True
-        return False
 
     _is_relative_to = staticmethod(is_relative_to)

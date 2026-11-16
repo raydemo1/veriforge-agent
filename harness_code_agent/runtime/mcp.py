@@ -39,7 +39,7 @@ _static_lock = threading.RLock()
 _config_cache = {}
 _schema_cache = {}
 
-MCP_CONFIG_RELATIVE_PATH = Path(".harness") / "mcp.json"
+MCP_CONFIG_NAME = "mcp.json"
 MCP_TOOL_PREFIX = "mcp__"
 MCP_TOOL_NAME_LIMIT = 64
 MCP_TRANSPORTS = ("stdio", "streamable_http")
@@ -48,7 +48,7 @@ log = logging.getLogger(__name__)
 
 
 class McpConfigError(ValueError):
-    """Raised when .harness/mcp.json cannot be parsed or validated."""
+    """Raised when the workspace MCP config cannot be parsed or validated."""
 
 
 @dataclass(frozen=True)
@@ -148,8 +148,12 @@ class _ConnectFlight:
 
 def load_mcp_config(workspace: str | Path) -> McpConfig:
     root = Path(workspace).resolve()
-    path = root / MCP_CONFIG_RELATIVE_PATH
+    from ..workspace.state_paths import ensure_workspace_state, legacy_state_root
+    path = ensure_workspace_state(root) / MCP_CONFIG_NAME
     if not path.exists():
+        legacy_path = legacy_state_root(root) / MCP_CONFIG_NAME
+        if legacy_path.is_file():
+            log.warning("Review the legacy MCP config at %s and re-register trusted servers with /mcp add.", legacy_path)
         return McpConfig(path=path)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -287,7 +291,10 @@ class McpClientManager:
         self._state_lock = threading.RLock()
         self._catalog_only = set()
         self._closed = False
-        self.config = config or McpConfig(path=self.workspace / MCP_CONFIG_RELATIVE_PATH)
+        from ..workspace.state_paths import ensure_workspace_state
+        self.config = config or McpConfig(
+            path=ensure_workspace_state(self.workspace) / MCP_CONFIG_NAME
+        )
         self.config_error = config_error
         self.timeout_seconds = timeout_seconds
         self.tool_timeout_seconds = tool_timeout_seconds
@@ -305,7 +312,8 @@ class McpClientManager:
     @classmethod
     def from_workspace(cls, workspace: str | Path, *, project_resources=None, session_id=None) -> McpClientManager:
         try:
-            path = Path(workspace).resolve() / MCP_CONFIG_RELATIVE_PATH
+            from ..workspace.state_paths import ensure_workspace_state
+            path = ensure_workspace_state(workspace) / MCP_CONFIG_NAME
             info = path.stat() if path.exists() else None
             signature = (info.st_mtime_ns, info.st_size) if info else None
             with _static_lock:
@@ -317,9 +325,10 @@ class McpClientManager:
             return cls(workspace=workspace, config=config, project_resources=project_resources, session_id=session_id)
         except (McpConfigError, OSError) as exc:
             root = Path(workspace).resolve()
+            from ..workspace.state_paths import ensure_workspace_state
             return cls(
                 workspace=root,
-                config=McpConfig(path=root / MCP_CONFIG_RELATIVE_PATH),
+                config=McpConfig(path=ensure_workspace_state(root) / MCP_CONFIG_NAME),
                 config_error=str(exc),
                 project_resources=project_resources, session_id=session_id,
             )

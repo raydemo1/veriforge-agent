@@ -204,7 +204,7 @@ class HarnessCodeAgentAdapter(BaseClawAdapter):
         if state_dest.exists():
             shutil.rmtree(state_dest, ignore_errors=True)
         subprocess.run(
-            ["docker", "cp", f"{workspace.container_name}:/testbed/.harness", str(state_dest)],
+            ["docker", "cp", f"{workspace.container_name}:/root/.veriforge/workspaces", str(state_dest)],
             capture_output=True,
             check=False,
         )
@@ -279,8 +279,9 @@ import json
 from pathlib import Path
 from harness_code_agent.sessions.observability import build_session_observability
 from harness_code_agent.sessions.store import SessionStore
+from harness_code_agent.workspace.state_paths import ensure_workspace_state
 
-store = SessionStore(Path('/testbed/.harness'))
+store = SessionStore(ensure_workspace_state('/testbed'))
 sessions = store.list_sessions()
 if not sessions:
     print(json.dumps({{}}))

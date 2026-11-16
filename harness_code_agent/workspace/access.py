@@ -51,9 +51,14 @@ class WriteLease:
 
 
 class WorkspaceAccessCoordinator:
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, *, state_root: str | Path | None = None):
         self.root = Path(root).resolve()
-        self.directory = self.root / ".harness" / "workspace"
+        from .state_paths import workspace_state_root
+        self.directory = (
+            Path(state_root).expanduser().resolve()
+            if state_root is not None
+            else workspace_state_root(self.root)
+        ) / "workspace"
         self.directory.mkdir(parents=True, exist_ok=True)
         self.database = self.directory / "access.sqlite3"
         self.pid = os.getpid()
@@ -233,7 +238,7 @@ class WorkspaceAccessCoordinator:
         for name in changes:
             path = (self.root / name).resolve()
             path.relative_to(self.root)
-            if ".git" in path.relative_to(self.root).parts or ".harness" in path.relative_to(self.root).parts:
+            if ".git" in path.relative_to(self.root).parts:
                 raise ValueError(f"不允许修改内部路径：{name}")
             originals[name] = path.read_bytes() if path.exists() else None
         key = uuid.uuid4().hex
