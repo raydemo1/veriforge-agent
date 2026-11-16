@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import logging
+import os
 import stat
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from ..runtime.execution_planner import (
     CallEffect,
     ExecutionPlanner,
+    ToolExecutionPlan,
+)
+from ..runtime.permissions import TOOL_PERMISSION_SHELL
+from ..runtime.shell_classification import (
+    analyze_shell_command,
+    is_long_running_shell_command,
 )
 from ..runtime.tool_call_validation import ToolCall, validate_tool_call
 from ..runtime.tool_failures import (
@@ -47,6 +54,10 @@ class PreparedToolCall:
     blocked_result: ToolResult | None = None
     emit_events: bool = True
     permission_decision: Any = None
+    execution_plan: ToolExecutionPlan | None = None
+    #: Optional preparation timings, merged into the result metadata when
+    #: ``HARNESS_TRACE_STAGES=1``.
+    timings: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -76,7 +87,12 @@ class ToolExecutor:
         self.conversation.compaction_gate.begin_tool_call()
         try:
             prepared = self._prepare_calls(tool_calls)
+            planner_started = time.perf_counter()
             planner = ExecutionPlanner((call.index, call.effect) for call in prepared)
+            if os.environ.get("HARNESS_TRACE_STAGES", "").lower() in {"1", "true", "yes"}:
+                planner_ms = round((time.perf_counter() - planner_started) * 1000, 2)
+                for call in prepared:
+                    call.timings.setdefault("planner_ms", planner_ms)
             by_index = {call.index: call for call in prepared}
             pending = set(by_index)
             completed: set[int] = set()
@@ -166,10 +182,19 @@ class ToolExecutor:
     def _prepare_calls(self, tool_calls: list) -> list[PreparedToolCall]:
         registry = self._call_registry = _registry_for_context(self.agent.tool_context).copy()
         prepared: list[PreparedToolCall] = []
+        trace_stages = os.environ.get("HARNESS_TRACE_STAGES", "").lower() in {
+            "1", "true", "yes",
+        }
         for index, tc in enumerate(tool_calls):
+            timings: dict[str, float] = {}
             call = ToolCall.from_raw(tc, index)
             fn_name = call.name or "<unknown>"
+            validation_started = time.perf_counter()
             validation = validate_tool_call(call, registry, self.agent.tool_context)
+            if trace_stages:
+                timings["validation_ms"] = round(
+                    (time.perf_counter() - validation_started) * 1000, 2
+                )
             if validation.error is not None:
                 rejected = validation.error.to_result(fn_name)
                 report = log.debug if rejected.metadata.get("failure_visibility") == FailureVisibility.PROTOCOL else log.warning
@@ -193,12 +218,33 @@ class ToolExecutor:
                         effect=CallEffect.global_exclusive(kind="blocked"),
                         raw=tc,
                         blocked_result=rejected,
+                        timings=timings,
                     )
                 )
                 continue
 
             fn_args = validation.arguments
-            effect = registry.effect_for(fn_name, fn_args, self.agent.tool_context)
+            shell_analysis = None
+            background = None
+            if registry.permission_for(fn_name) == TOOL_PERMISSION_SHELL:
+                analysis_started = time.perf_counter()
+                shell_analysis, background = self._prepare_shell(fn_args)
+                if trace_stages:
+                    timings["analysis_ms"] = round(
+                        (time.perf_counter() - analysis_started) * 1000, 2
+                    )
+            effect_started = time.perf_counter()
+            effect = registry.effect_for(
+                fn_name,
+                fn_args,
+                self.agent.tool_context,
+                shell_analysis=shell_analysis,
+                background=background,
+            )
+            if trace_stages:
+                timings["effect_ms"] = round(
+                    (time.perf_counter() - effect_started) * 1000, 2
+                )
             blocked = None
             blocked_reason = self._tool_surface_block_reason(fn_name, registry)
             if blocked_reason is not None:
@@ -212,6 +258,14 @@ class ToolExecutor:
                 )
                 effect = CallEffect.global_exclusive(kind="blocked")
                 self.conversation.trace.middleware_inject("ToolSchemaGuard", "before_tool", output)
+            permission_started = time.perf_counter()
+            decision = self._permission_decision(
+                fn_name, fn_args, registry, shell_analysis=shell_analysis
+            )
+            if trace_stages:
+                timings["permission_ms"] = round(
+                    (time.perf_counter() - permission_started) * 1000, 2
+                )
             prepared.append(
                 PreparedToolCall(
                     index=index,
@@ -221,12 +275,33 @@ class ToolExecutor:
                     effect=effect,
                     raw=tc,
                     blocked_result=blocked,
-                    permission_decision=self._permission_decision(fn_name, fn_args, registry),
+                    permission_decision=decision,
+                    execution_plan=ToolExecutionPlan(
+                        effect=effect,
+                        analysis=shell_analysis,
+                        permission_decision=decision,
+                        background=background,
+                    ),
+                    timings=timings,
                 )
             )
         return prepared
 
-    def _permission_decision(self, name: str, args: dict, registry):
+    def _prepare_shell(self, args: dict):
+        """Analyze the command once, before scheduling and authorization."""
+        context = self.agent.tool_context
+        workspace = getattr(context, "workspace", None)
+        root = str(workspace.root) if workspace is not None and getattr(workspace, "root", None) is not None else None
+        policy = getattr(context, "permission_policy", None)
+        analysis_root = policy.shell_analysis_root(root) if policy is not None else root
+        command = str(args.get("command") or "")
+        requested = args.get("background")
+        background = (
+            bool(requested) if requested is not None else is_long_running_shell_command(command)
+        )
+        return analyze_shell_command(command, analysis_root), background
+
+    def _permission_decision(self, name: str, args: dict, registry, *, shell_analysis=None):
         context = self.agent.tool_context
         if context is None:
             return None
@@ -237,6 +312,7 @@ class ToolExecutor:
             args,
             tool_permission=registry.permission_for(name),
             workspace_root=root,
+            shell_analysis=shell_analysis,
         )
 
     def _tool_surface_block_reason(self, name: str, registry) -> str | None:
@@ -332,6 +408,7 @@ class ToolExecutor:
                         arguments=prepared.args,
                         tool_context=self.agent.tool_context,
                         agent_name=self.agent.name,
+                        tool_call_id=prepared.tool_call_id,
                     )
                 child_token = self._make_child_token()
                 if prepared.effect.kind in {"control", "agent_wait"}:
@@ -402,7 +479,7 @@ class ToolExecutor:
                     token.cancel()
                 future.cancel()
             if pending:
-                shell_futures = [future for future in pending if futures[future].name == "run_bash"]
+                shell_futures = [future for future in pending if futures[future].name == "bash"]
                 wait(shell_futures or pending, timeout=10 if shell_futures else 0.25)
             for item in executed:
                 self._cancelled_results.setdefault(item.prepared.tool_call_id, item.result)
@@ -417,6 +494,34 @@ class ToolExecutor:
                     self._cancelled_results.setdefault(prepared.tool_call_id, item.result)
             raise
         return executed
+
+    def _decision_mismatch(self, prepared: PreparedToolCall) -> ToolResult | None:
+        """Refuse to run arguments the permission decision was not made for.
+
+        The decision (and any approval granted for it) is only valid for the
+        exact command and write scope it was computed from. A middleware or a
+        later mutation that changes them invalidates the grant instead of
+        inheriting it.
+        """
+        decision = prepared.permission_decision
+        fingerprint = getattr(decision, "fingerprint", None)
+        if fingerprint is None:
+            return None
+        from ..runtime.permissions import shell_call_fingerprint
+
+        if shell_call_fingerprint(prepared.args) == fingerprint:
+            return None
+        output = (
+            "[blocked] 工具未执行：审批后参数发生变化，需要重新授权。"
+            "请向用户明确说明未执行。"
+        )
+        return ToolResult(
+            tool=prepared.name,
+            status="failed",
+            output=output,
+            error=output.removeprefix("[blocked] "),
+            metadata={"status_source": "permission", "reason": "arguments_changed_after_decision"},
+        )
 
     def _make_child_token(self) -> CancellationToken | None:
         """Per-call child token: parent turn cancellation propagates down."""
@@ -462,6 +567,9 @@ class ToolExecutor:
 
     def _execute_one(self, prepared: PreparedToolCall, cancellation_token=None) -> ExecutedToolCall:
         context = self.agent.tool_context
+        changed = self._decision_mismatch(prepared)
+        if changed is not None:
+            return ExecutedToolCall(prepared, changed, intercepted=True)
         resource_guard = context.resource_coordinator.acquire(prepared.effect.resources, cancellation_token) if context is not None else nullcontext()
         project_claims = () if prepared.effect.kind in {"long_running", "native_shell"} else prepared.effect.resources
         # Leases are owned by the session: its own background shells never
@@ -532,12 +640,21 @@ class ToolExecutor:
                 validate_arguments=False,
                 cancellation_token=cancellation_token,
                 registry=self._call_registry,
+                permission_decision=prepared.permission_decision,
+                execution_plan=prepared.execution_plan,
             )
             return ExecutedToolCall(prepared, tool_result)
 
     def _record_executed_result(self, item: ExecutedToolCall) -> None:
         prepared = item.prepared
         tool_result = item.result
+        # Keep the runtime call identity on the result event so diagnostics can
+        # pair calls and results without relying on tool-name ordering.
+        tool_result.metadata.setdefault("tool_call_id", prepared.tool_call_id)
+        if prepared.timings:
+            stages = tool_result.metadata.setdefault("stage_timings", {})
+            for key, value in prepared.timings.items():
+                stages.setdefault(key, value)
 
         # Normalize every outcome into the canonical failure model *before*
         # finalization so events, messages and middleware all see it.
@@ -588,6 +705,7 @@ class ToolExecutor:
                     arguments=prepared.args,
                     tool_context=self.agent.tool_context,
                     agent_name=self.agent.name,
+                    tool_call_id=prepared.tool_call_id,
                 )
             result = tool_result.to_text()
             self.conversation.trace.tool_call(prepared.name, prepared.args, result,
@@ -605,22 +723,12 @@ class ToolExecutor:
             emit_call=False,
         )
         self._reveal_tool_schemas_from_result(tool_result)
-        if tool_result.metadata.get("file_changes") or prepared.name == "run_bash":
+        if tool_result.metadata.get("file_changes") or prepared.name == "bash":
             self.runtime_state.verification_stale = True
         result = tool_result.to_text()
         log.debug("[%s] tool result: %s", self.agent.name, result[:200])
         self.conversation.trace.tool_call(prepared.name, prepared.args, result,
                                           tool_call_id=prepared.tool_call_id, shell_job_id=tool_result.metadata.get("job_id"))
-        invalidation = self.conversation.fact_tracker.apply_mutation(
-            tool=prepared.name,
-            args=prepared.args,
-            result=tool_result,
-            observations=self.conversation.observation_store.observations,
-            exclude_ids={observation.id},
-        )
-        if invalidation:
-            self._deferred_user_messages.append(invalidation)
-
         post_started = time.perf_counter()
         activity = self._middleware_activity.setdefault(
             prepared.tool_call_id,

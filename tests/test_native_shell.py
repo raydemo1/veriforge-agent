@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -37,6 +39,110 @@ def tmp_path():
         shutil.rmtree(root)
 
 
+def test_wrapped_powershell_keeps_object_output_and_exit_code(
+    tmp_path, require_integration_tool
+):
+    require_integration_tool(os.name == "nt", "Windows only")
+    from harness_code_agent.workspace.native_shell import _powershell_script
+    from harness_code_agent.workspace.shell_environment import shell_executable
+
+    (tmp_path / "app").mkdir()
+    (tmp_path / "README.md").write_text("readme\n", encoding="utf-8")
+
+    def run(command: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                shell_executable(), "-NoLogo", "-NoProfile", "-NonInteractive",
+                "-Command", _powershell_script(tmp_path, command),
+            ],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    listing = run("Get-ChildItem -Force | Select-Object Mode,Name")
+    assert listing.returncode == 0
+    assert "app" in listing.stdout
+    assert "README.md" in listing.stdout
+
+    text = run("Write-Output '---'")
+    assert text.returncode == 0
+    assert "---" in text.stdout
+
+    failed = run(f'& "{sys.executable}" -c "import sys; sys.exit(3)"')
+    assert failed.returncode == 3
+
+
+def test_private_temp_is_writable_and_outside_the_workspace(native_manager, tmp_path):
+    runtime = SimpleNamespace(shell_job_manager=native_manager)
+    result = run_bash(
+        'Write-Output $env:TEMP; Set-Content -Path "$env:TEMP\\probe.txt" -Value ok; '
+        'Get-Content "$env:TEMP\\probe.txt"',
+        runtime_state=runtime,
+    )
+    assert result.return_code == 0, result.output
+    lines = [line.strip() for line in result.output.splitlines() if line.strip()]
+    temp_path = next(line for line in lines if "veriforge-shell-" in line)
+    assert str(tmp_path).lower() not in temp_path.lower()
+    assert "ok" in result.output
+
+
+def test_native_process_output_can_be_piped(native_manager):
+    runtime = SimpleNamespace(shell_job_manager=native_manager)
+    result = run_bash(
+        f'& "{sys.executable}" -c "print(1)" | Select-Object -First 1',
+        runtime_state=runtime,
+    )
+    assert result.return_code == 0, result.output
+    assert result.output.splitlines()[0] == "1"
+
+
+def test_write_outside_the_workspace_is_denied(native_manager, tmp_path):
+    runtime = SimpleNamespace(shell_job_manager=native_manager)
+    outside = tmp_path.parent / f"veriforge-outside-{uuid.uuid4().hex}"
+    outside.mkdir()
+    try:
+        target = outside / "escape.txt"
+        result = run_bash(f"Set-Content -LiteralPath '{target}' -Value bad", runtime_state=runtime)
+        assert result.return_code != 0
+        assert not target.exists()
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+def test_scoped_extra_directory_grant_stays_sandboxed(native_manager, tmp_path):
+    from harness_code_agent.runtime.permissions import PermissionPolicy
+
+    runtime = SimpleNamespace(shell_job_manager=native_manager)
+    with tempfile.TemporaryDirectory(prefix="veriforge-extra-") as directory:
+        outside = Path(directory).resolve()
+        granted = outside / "granted"
+        blocked = outside / "blocked"
+        granted.mkdir()
+        blocked.mkdir()
+        target = granted / "probe.txt"
+        forbidden = blocked / "probe.txt"
+        command = (
+            f"Set-Content -LiteralPath '{target}' -Value ok; "
+            f"[System.IO.File]::WriteAllText('{forbidden}', 'bad')"
+        )
+        args = {
+            "command": command,
+            "sandbox_permissions": "with_additional_permissions",
+            "additional_permissions": {"file_system": {"write": [str(granted)]}},
+        }
+        decision = PermissionPolicy("llm-auto").decide_tool_call(
+            "bash", args, workspace_root=str(tmp_path)
+        )
+        assert decision.requires_approval
+        result = run_bash(command, runtime_state=runtime, permission_decision=decision)
+        assert result.return_code != 0, result.output
+        assert target.read_text(encoding="utf-8").strip() == "ok"
+        assert not forbidden.exists()
+
+
 @pytest.fixture
 def native_manager(tmp_path, require_integration_tool):
     require_integration_tool(os.name == "nt", "Native sandbox requires Windows")
@@ -61,9 +167,14 @@ def test_native_directory_grants_do_not_leak_between_calls(native_manager, tmp_p
         assert result.return_code != 0
     assert not (tmp_path / "b" / "forbidden.txt").exists()
     assert (tmp_path / "b" / "keep.txt").read_text(encoding="utf-8").strip() == "keep"
-    result = run_bash("Set-Content a/readonly.txt 'bad'", runtime_state=runtime)
+    # Without write_paths a foreground command gets the workspace grant; a
+    # narrowed grant still keeps every other directory read-only.
+    result = run_bash("Set-Content a/default.txt 'ok'", runtime_state=runtime)
+    assert result.return_code == 0
+    assert (tmp_path / "a" / "default.txt").exists()
+    result = run_bash("Set-Content a/narrowed.txt 'bad'", write_paths=["b"], runtime_state=runtime)
     assert result.return_code != 0
-    assert not (tmp_path / "a" / "readonly.txt").exists()
+    assert not (tmp_path / "a" / "narrowed.txt").exists()
 
 
 def test_background_native_job_holds_only_its_directory_until_exit(native_manager, tmp_path):
@@ -90,11 +201,49 @@ def test_background_native_job_holds_only_its_directory_until_exit(native_manage
         pass
 
 
-def test_native_rejects_whole_local_background_without_creating_worktree(native_manager, tmp_path):
-    job = native_manager.start("Set-Content unwanted.txt 'bad'", write_paths=["."])
-    assert job.status == "failed"
-    assert not (tmp_path / "unwanted.txt").exists()
-    assert not (tmp_path / ".harness" / "worktrees").exists()
+def test_background_workspace_write_does_not_hold_the_whole_project_lease(native_manager, tmp_path):
+    job = native_manager.start("Set-Content bg.txt 'ok'; Start-Sleep -Seconds 30")
+    deadline = time.monotonic() + 10
+    while not (tmp_path / "bg.txt").exists() and time.monotonic() < deadline:
+        time.sleep(.02)
+    assert (tmp_path / "bg.txt").exists(), job.output_tail
+
+    # The job may write the whole workspace, but must not hold the whole-project
+    # lease while it runs: another session can still take it and write.
+    access = WorkspaceAccessCoordinator(tmp_path)
+    with access.acquire([access.write_claim()]):
+        (tmp_path / "other-session.txt").write_text("other", encoding="utf-8")
+    assert (tmp_path / "other-session.txt").exists()
+
+    # An explicit whole-workspace declaration is accepted too, without holding
+    # a whole-project lease for the job's lifetime.
+    explicit = native_manager.start("Set-Content explicit-bg.txt 'ok'", write_paths=["."])
+    deadline = time.monotonic() + 10
+    while not (tmp_path / "explicit-bg.txt").exists() and time.monotonic() < deadline:
+        time.sleep(.02)
+    assert (tmp_path / "explicit-bg.txt").exists(), explicit.output_tail
+    with access.acquire([access.write_claim()]):
+        pass
+    native_manager.stop(explicit.job_id, grace_seconds=.2)
+    assert explicit._finished.wait(5)
+
+    native_manager.stop(job.job_id, grace_seconds=.2)
+    assert job._finished.wait(5)
+    with access.acquire([access.write_claim()]):
+        pass
+
+
+def test_workspace_write_reaches_git_and_harness_directories(native_manager, tmp_path):
+    runtime = SimpleNamespace(shell_job_manager=native_manager)
+    script = (
+        "New-Item -ItemType Directory .git, .harness -Force | Out-Null; "
+        "Set-Content .git/agent-note.txt 'git'; "
+        "Set-Content .harness/agent-note.txt 'state'"
+    )
+    result = run_bash(script, runtime_state=runtime)
+    assert result.return_code == 0, result.output
+    assert (tmp_path / ".git" / "agent-note.txt").read_text(encoding="utf-8").strip() == "git"
+    assert (tmp_path / ".harness" / "agent-note.txt").read_text(encoding="utf-8").strip() == "state"
 
 
 def test_cancelled_native_output_keeps_full_unicode_artifact(native_manager, tmp_path):

@@ -24,7 +24,7 @@ SHELL_GOLDEN_TABLE: dict[str, tuple[str, str, str, str]] = {
     "read_ls": ("ls", "allow", "allow", "allow"),
     "read_cat": ("cat README.md", "allow", "allow", "allow"),
     "read_grep_recursive": ("grep -r foo .", "allow", "allow", "allow"),
-    "read_network": ("curl http://example.com", "allow", "allow", "allow"),
+    "read_network": ("curl http://example.com", "allow", "ask", "allow"),
     # Workspace writes: read-only denies, the write modes trust them.
     "ws_redirect": ("echo hi > out.txt", "deny", "allow", "allow"),
     "ws_rm": ("rm out.txt", "deny", "allow", "allow"),
@@ -32,7 +32,7 @@ SHELL_GOLDEN_TABLE: dict[str, tuple[str, str, str, str]] = {
     "ws_sed_inplace": ("sed -i s/a/b/ f.txt", "deny", "allow", "allow"),
     # Local git mutation writes the workspace; remote mutation is external.
     "git_commit": ("git commit -m x", "deny", "allow", "allow"),
-    "git_push": ("git push", "deny", "deny", "allow"),
+    "git_push": ("git push", "deny", "ask", "allow"),
     # Writes outside the workspace are never trusted before full access.
     "external_tmp_write": (
         "echo hi > /tmp/hca_characterization_out.txt",
@@ -40,8 +40,8 @@ SHELL_GOLDEN_TABLE: dict[str, tuple[str, str, str, str]] = {
         "deny",
         "allow",
     ),
-    # Unknown effects ask in workspace-write and pass only under full access.
-    "unknown_program": ("./mystery.sh", "deny", "ask", "allow"),
+    # Unknown effects run inside the default sandbox and pass in workspace-write.
+    "unknown_program": ("./mystery.sh", "deny", "allow", "allow"),
     # An absolute path that resolves inside the workspace is a workspace
     # write once the policy knows the root.
     "absolute_inside_workspace": None,  # filled in at runtime (needs tmp root)
@@ -66,7 +66,7 @@ def _iter_shell_cases(workspace_root: str):
 
 def _decide(mode: str, command: str, workspace_root: str) -> str:
     return PermissionPolicy(mode).decide_tool_call(
-        "run_bash",
+        "bash",
         {"command": command},
         TOOL_PERMISSION_SHELL,
         workspace_root,

@@ -50,6 +50,8 @@ def execute_tool_result(
     validate_arguments: bool = True,
     cancellation_token=None,
     registry: ToolRegistry | None = None,
+    permission_decision=None,
+    execution_plan=None,
 ) -> ToolResult:
     """Execute a registered tool only after the runtime validation boundary.
 
@@ -115,6 +117,8 @@ def execute_tool_result(
             agent_name=agent_name,
             tool_context=tool_context,
             cancellation_token=cancellation_token,
+            permission_decision=permission_decision,
+            execution_plan=execution_plan,
         )
     except CancelledError:
         raise
@@ -167,14 +171,18 @@ def finalize_intercepted_tool_result(
     arguments: dict | None = None,
     tool_context: ToolContext | None,
     agent_name: str | None,
+    tool_call_id: str | None = None,
 ) -> ToolResult:
     """Record a tool call that was intercepted before native execution."""
+    if tool_call_id:
+        tool_result.metadata.setdefault("tool_call_id", tool_call_id)
     emit_tool_call_started(
         name=tool_result.tool,
         arguments=arguments or {},
         tool_context=tool_context,
         agent_name=agent_name,
         failure_visibility=tool_result.metadata.get("failure_visibility"),
+        tool_call_id=tool_call_id,
     )
     return _finalize_tool_result_object(
         tool_result,
@@ -190,6 +198,7 @@ def emit_tool_call_started(
     tool_context: ToolContext | None,
     agent_name: str | None,
     failure_visibility: str | None = None,
+    tool_call_id: str | None = None,
 ) -> None:
     if tool_context is None:
         return
@@ -199,6 +208,7 @@ def emit_tool_call_started(
             args=_redact_tool_args(arguments),
             agent=agent_name,
             failure_visibility=failure_visibility,
+            tool_call_id=tool_call_id,
         ).to_event()
     )
 
@@ -219,6 +229,8 @@ def _invoke_registered_tool(
     agent_name: str | None,
     tool_context: ToolContext | None,
     cancellation_token=None,
+    permission_decision=None,
+    execution_plan=None,
 ):
     kwargs = dict(arguments)
     parameters = inspect.signature(fn).parameters
@@ -233,6 +245,10 @@ def _invoke_registered_tool(
     }
     if cancellation_token is not None:
         extras["cancellation_token"] = cancellation_token
+    if permission_decision is not None:
+        extras["permission_decision"] = permission_decision
+    if execution_plan is not None:
+        extras["execution_plan"] = execution_plan
     for key, value in extras.items():
         if key not in kwargs and (key in parameters or accepts_kwargs):
             kwargs[key] = value
@@ -262,7 +278,7 @@ def _event_safe_tool_output(tool_result: ToolResult) -> tuple[str, dict]:
     metadata = dict(tool_result.metadata)
     output = tool_result.output or ""
     metadata["output_length"] = len(output)
-    if tool_result.tool in {"read_file", "read_agent_changes"} and output:
+    if tool_result.tool == "read_file" and output:
         metadata["output_redacted"] = True
         return f"[redacted {tool_result.tool} output: {len(output)} chars]", metadata
     if len(output) > TOOL_EVENT_OUTPUT_LIMIT:
@@ -292,6 +308,7 @@ def _emit_structured_tool_result(
             return_code=tool_result.return_code,
             metadata=event_metadata,
             agent=agent_name,
+            tool_call_id=event_metadata.get("tool_call_id"),
         ).to_event()
     )
     if tool_result.status == "failed":
@@ -365,12 +382,28 @@ def _redact_tool_args(arguments: dict) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def _is_secret_env_path(value: Any) -> bool:
+    from .approvals import is_secret_env_path
+
+    return is_secret_env_path(value)
+
+
 def _redact_tool_arg_value(value: Any) -> Any:
     if isinstance(value, dict):
+        from .approvals import redact_text
+
+        sensitive_path = any(
+            key in {"path", "file_path"} and _is_secret_env_path(item)
+            for key, item in value.items()
+        )
         redacted: dict[str, Any] = {}
         for key, item in value.items():
-            if key == "content":
+            if key == "content" or (
+                sensitive_path and key in {"search", "replace", "old_string", "new_string"}
+            ):
                 redacted[key] = f"[{len(str(item))} chars]"
+            elif isinstance(item, str):
+                redacted[key] = redact_text(item)
             else:
                 redacted[key] = _redact_tool_arg_value(item)
         return redacted

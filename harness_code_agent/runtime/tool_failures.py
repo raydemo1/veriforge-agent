@@ -77,6 +77,9 @@ class FailureKind:
     PROCESS_FAILED = "process_failed"
     TOOL_INTERNAL_ERROR = "tool_internal_error"
     EXECUTION_FAILED = "execution_failed"
+    #: Restricted-token Windows sandbox cannot create the .NET named pipe
+    #: used by PowerShell pipeline capture. This is an environment limit.
+    WINDOWS_NAMED_PIPE = "windows_named_pipe_denied"
     # verification
     VERIFICATION_FAILED = "verification_failed"
 
@@ -135,6 +138,7 @@ _KIND_SPECS: dict[str, tuple[str, bool, bool]] = {
     FailureKind.PROCESS_FAILED: (FailureCategory.EXECUTION, True, False),
     FailureKind.TOOL_INTERNAL_ERROR: (FailureCategory.EXECUTION, True, False),
     FailureKind.EXECUTION_FAILED: (FailureCategory.EXECUTION, True, False),
+    FailureKind.WINDOWS_NAMED_PIPE: (FailureCategory.EXECUTION, True, False),
     FailureKind.VERIFICATION_FAILED: (FailureCategory.VERIFICATION, True, False),
 }
 
@@ -154,6 +158,10 @@ FINGERPRINTED_CATEGORIES = frozenset(
 _SOURCE_DEFAULT_KIND = {
     "permission": FailureKind.PERMISSION_DENIED,
     "approval": FailureKind.APPROVAL_DENIED,
+    #: The automatic gate did not grant the call (reviewer denial, reviewer
+    #: outage, or no human available). The user did not say no, so the turn
+    #: continues and the agent can adapt.
+    "approval_auto": FailureKind.USER_ATTENTION_REQUIRED,
     "tool_policy": FailureKind.POLICY_VIOLATION,
     "delegate_policy": FailureKind.TOOL_SURFACE_BLOCKED,
     "agent_policy": FailureKind.TOOL_SURFACE_BLOCKED,
@@ -443,6 +451,10 @@ class FailureTracker:
 
     _streaks: dict[str, FailureStreak] = field(default_factory=dict)
     turn_failure_count: int = 0
+    #: Failures since the last successful tool call. Unlike the per-tool
+    #: streaks this resets on any success, so intermittent slips separated by
+    #: productive calls do not accumulate into a stop.
+    consecutive_failures: int = 0
 
     def observe(self, failure: ToolFailure, *, batch_key: str = "") -> ToolFailure:
         """Record a failure; return the failure with its streak attempt set.
@@ -499,6 +511,7 @@ class FailureTracker:
                 fingerprint=fingerprint,
             )
         self._streaks[failure.tool_name] = streak
+        self.consecutive_failures += 1
 
         if failure.visibility == FailureVisibility.TASK:
             self.turn_failure_count += 1
@@ -507,6 +520,7 @@ class FailureTracker:
 
     def observe_success(self, tool_name: str) -> None:
         self._streaks.pop(tool_name, None)
+        self.consecutive_failures = 0
 
     def current(self, tool_name: str) -> FailureStreak | None:
         return self._streaks.get(tool_name)
@@ -514,6 +528,7 @@ class FailureTracker:
     def reset(self) -> None:
         self._streaks.clear()
         self.turn_failure_count = 0
+        self.consecutive_failures = 0
 
 
 def failure_batch_key(messages: list[dict] | None) -> str:

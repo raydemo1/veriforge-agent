@@ -132,10 +132,25 @@ class ToolRegistry:
         return spec.permission if spec is not None else None
 
     def effect_for(
-        self, name: str, args: dict, context: ToolContext | None = None
+        self,
+        name: str,
+        args: dict,
+        context: ToolContext | None = None,
+        *,
+        shell_analysis=None,
+        background: bool | None = None,
     ) -> CallEffect:
         spec = self._specs.get(name)
         resolver = spec.effect_resolver if spec is not None else None
+        if spec is not None and spec.permission == "shell":
+            from .builtins.registry import shell_effect
+
+            return shell_effect(
+                dict(args or {}),
+                context,
+                shell_analysis=shell_analysis,
+                background=background,
+            )
         return (
             resolver(dict(args or {}), context)
             if resolver is not None

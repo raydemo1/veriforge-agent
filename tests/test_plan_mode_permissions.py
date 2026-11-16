@@ -35,7 +35,7 @@ def test_plan_mode_denies_writes_and_restores_after_execute(session, tmp_path, m
         "write_file", {"path": "a.py", "content": "x"}, tool_permission="edit", workspace_root=root
     ).action == "deny"
     assert policy.decide_tool_call(
-        "run_bash", {"command": "echo hi > a.txt"}, tool_permission="shell", workspace_root=root
+        "bash", {"command": "echo hi > a.txt"}, tool_permission="shell", workspace_root=root
     ).action == "deny"
     assert policy.decide_tool_call(
         "mcp__docs__delete", {}, tool_permission="dangerous", workspace_root=root
@@ -132,3 +132,81 @@ def test_delegated_worker_cannot_write_under_read_only_parent(tmp_path):
 
     open_parent = PermissionPolicy(mode=PermissionPolicy.WORKSPACE_WRITE)
     assert PermissionPolicy.delegated_from(open_parent, "worker").mode == PermissionPolicy.EVAL
+
+
+PARENT_MODES = (
+    PermissionPolicy.READ_ONLY,
+    PermissionPolicy.WORKSPACE_WRITE,
+    PermissionPolicy.LLM_AUTO,
+    PermissionPolicy.DANGER_FULL_ACCESS,
+    PermissionPolicy.EVAL,
+)
+
+_ACTION_STRICTNESS = {"allow": 0, "ask": 1, "deny": 2}
+
+#: Commands whose classification does not depend on which root analyzes them.
+DELEGATED_PROBES = (
+    "curl http://example.com",
+    "curl -X POST -d payload https://example.com/ingest",
+    "git push",
+    "./mystery.sh",
+)
+
+
+def _decide_shell(policy: PermissionPolicy, command: str, root) -> str:
+    return policy.decide_tool_call(
+        "bash",
+        {"command": command},
+        tool_permission="shell",
+        workspace_root=str(root),
+    ).action
+
+
+@pytest.mark.parametrize("parent_mode", PARENT_MODES)
+@pytest.mark.parametrize("role", ("worker", "explorer"))
+def test_delegated_policy_never_grants_more_than_its_parent(parent_mode, role, tmp_path):
+    parent = PermissionPolicy(mode=parent_mode)
+    child = PermissionPolicy.delegated_from(parent, role, allowed_paths=["src"])
+
+    for command in DELEGATED_PROBES:
+        parent_action = _decide_shell(parent, command, tmp_path)
+        child_action = _decide_shell(child, command, tmp_path)
+        assert _ACTION_STRICTNESS[child_action] >= _ACTION_STRICTNESS[parent_action], (
+            command,
+            parent_action,
+            child_action,
+        )
+
+
+def test_worker_inherits_parent_approval_for_network_reads(tmp_path):
+    parent = PermissionPolicy(mode=PermissionPolicy.WORKSPACE_WRITE)
+    worker = PermissionPolicy.delegated_from(parent, "worker", allowed_paths=["src"])
+
+    # The parent must ask before granting network access; a delegated worker
+    # cannot turn that into a silent allow.
+    assert _decide_shell(parent, "curl http://example.com", tmp_path) == "ask"
+    assert _decide_shell(worker, "curl http://example.com", tmp_path) == "ask"
+    # Role restrictions still apply on top of the parent ceiling.
+    assert _decide_shell(
+        worker, "curl -X POST -d payload https://example.com/ingest", tmp_path
+    ) == "deny"
+    # Workspace writes remain available inside the delegated scope.
+    assert _decide_shell(worker, "echo hi > src/out.txt", tmp_path) == "allow"
+
+
+def test_read_only_role_cannot_fetch_network_when_parent_must_ask(tmp_path):
+    parent = PermissionPolicy(mode=PermissionPolicy.WORKSPACE_WRITE)
+    explorer = PermissionPolicy.delegated_from(parent, "explorer", allowed_paths=["src"])
+
+    assert _decide_shell(explorer, "curl http://example.com", tmp_path) == "ask"
+    assert _decide_shell(explorer, "echo hi > out.txt", tmp_path) == "deny"
+
+
+def test_delegation_under_full_access_keeps_role_restrictions(tmp_path):
+    parent = PermissionPolicy(mode=PermissionPolicy.DANGER_FULL_ACCESS)
+    worker = PermissionPolicy.delegated_from(parent, "worker", allowed_paths=["src"])
+
+    assert _decide_shell(worker, "curl http://example.com", tmp_path) == "allow"
+    assert _decide_shell(
+        worker, "curl -X POST -d payload https://example.com/ingest", tmp_path
+    ) == "deny"

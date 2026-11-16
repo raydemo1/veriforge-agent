@@ -25,6 +25,7 @@ from harness_code_agent.runtime.tool_registry import (
 )
 from harness_code_agent.runtime.tool_result import ToolResult
 from harness_code_agent.runtime.tool_runner import execute_tool
+from harness_code_agent.workspace.state_paths import ensure_workspace_state
 
 
 def _result(text: str, *, status: str | None = None) -> ToolResult:
@@ -33,7 +34,7 @@ def _result(text: str, *, status: str | None = None) -> ToolResult:
         status = "failed" if text.startswith(("[error]", "[blocked]")) else "success"
     metadata = {"status_source": "permission"} if text.startswith("[blocked]") else {}
     error = text.removeprefix("[error] ").removeprefix("[blocked] ") if status == "failed" else None
-    return ToolResult(tool="run_bash", status=status, output=text, error=error, metadata=metadata)
+    return ToolResult(tool="bash", status=status, output=text, error=error, metadata=metadata)
 
 
 class ProductRuntimeTests(unittest.TestCase):
@@ -613,7 +614,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
         for command in safe_commands:
             with self.subTest(command=command):
-                decision = policy.decide_tool_call("run_bash", {"command": command})
+                decision = policy.decide_tool_call("bash", {"command": command})
                 self.assertNotEqual(decision.risk, "shell_blocked")
 
     def test_turn_summary_event_serializes_payload(self):
@@ -649,7 +650,7 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertFalse(should_summarize_turn(simple, duration_seconds=1))
         self.assertTrue(should_summarize_turn(three_tools, duration_seconds=1))
         self.assertTrue(should_summarize_turn([{"type": "file_change", "payload": {"path": "app.py"}}], duration_seconds=1))
-        self.assertTrue(should_summarize_turn([{"type": "tool_result", "payload": {"tool": "run_bash"}}], duration_seconds=1))
+        self.assertTrue(should_summarize_turn([{"type": "tool_result", "payload": {"tool": "bash"}}], duration_seconds=1))
         self.assertTrue(should_summarize_turn([{"type": "agent_fallback", "payload": {"reason": "tool_call_budget_exceeded"}}], duration_seconds=1))
         self.assertTrue(should_summarize_turn(simple, duration_seconds=45))
 
@@ -1284,7 +1285,7 @@ class ProductRuntimeTests(unittest.TestCase):
                         second_prompt = json.dumps(fake_client.chat.completions.calls[1], ensure_ascii=False)
                         self.assertIn("SECRET_FULL_CONTENT_UNSAFE", second_prompt)
                     if expect_observation_files:
-                        self.assertTrue(list((root / ".harness" / "observations").rglob("*.txt")))
+                        self.assertTrue(list((ensure_workspace_state(root) / "observations").rglob("*.txt")))
 
     def test_builtin_tool_registry_exposes_schema_and_dispatch_exports(self):
 
@@ -1584,7 +1585,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 "validation_error",
             ),
             (
-                ToolResult(tool="run_bash", status="failed", error="Command exited with code 1", metadata={"status_source": "shell"}),
+                ToolResult(tool="bash", status="failed", error="Command exited with code 1", metadata={"status_source": "shell"}),
                 "runtime_error",
             ),
             (
@@ -2085,8 +2086,8 @@ class ProductRuntimeTests(unittest.TestCase):
             {"sequence": 2, "type": "turn_started", "agent": "main_agent", "payload": {"turn": 1}},
             {"sequence": 3, "type": "tool_result", "agent": "main_agent", "payload": {"tool": "write_file", "status": "success", "ok": True}},
             {"sequence": 4, "type": "file_change", "agent": "main_agent", "payload": {"path": "app.py"}},
-            {"sequence": 5, "type": "approval_requested", "agent": "main_agent", "payload": {"tool": "run_bash"}},
-            {"sequence": 6, "type": "approval_decided", "agent": "main_agent", "payload": {"tool": "run_bash", "approved": False}},
+            {"sequence": 5, "type": "approval_requested", "agent": "main_agent", "payload": {"tool": "bash"}},
+            {"sequence": 6, "type": "approval_decided", "agent": "main_agent", "payload": {"tool": "bash", "approved": False}},
             {
                 "sequence": 7,
                 "type": "profile_switched",
@@ -2326,7 +2327,9 @@ class ProductRuntimeTests(unittest.TestCase):
 
         workspace_policy = PermissionPolicy(mode="workspace-write")
         read_decision = workspace_policy.decide_tool_call("read_file", {"path": "x.txt"})
-        repo_search_decision = workspace_policy.decide_tool_call("repo_search", {"pattern": "needle"})
+        code_intelligence_decision = workspace_policy.decide_tool_call(
+            "code_intelligence", {"operation": "definition", "path": "x.py"}
+        )
         agent_decision = workspace_policy.decide_tool_call("spawn_agent", {"role": "explorer"})
         edit_decision = workspace_policy.decide_tool_call("write_file", {"path": "x.txt"})
         todo_decision = workspace_policy.decide_tool_call(
@@ -2334,57 +2337,64 @@ class ProductRuntimeTests(unittest.TestCase):
             {"items": [{"text": "do work", "status": "in_progress"}]},
         )
         safe_shell_decision = workspace_policy.decide_tool_call(
-            "run_bash",
+            "bash",
             {"command": "git status --short"},
         )
         risky_shell_decision = workspace_policy.decide_tool_call(
-            "run_bash",
+            "bash",
             {"command": "npm install"},
         )
         mkdir_decision = workspace_policy.decide_tool_call(
-            "run_bash",
+            "bash",
             {"command": "mkdir generated"},
         )
         reset_decision = workspace_policy.decide_tool_call(
-            "run_bash",
+            "bash",
             {"command": "git commit --allow-empty -m test"},
         )
         blocked_commands = [
             "rm -rf /",
             "rm -rf ~",
             "Remove-Item C:\\ -Recurse",
-            "git reset --hard",
-            "git clean -fd",
-            "git push --force origin main",
             "mkfs.ext4 /dev/sda",
             "dd if=/dev/zero of=/dev/sda",
         ]
+        destructive_git_decisions = [
+            workspace_policy.decide_tool_call("bash", {"command": command})
+            for command in (
+                "git reset --hard",
+                "git clean -fd",
+                "git push --force origin main",
+            )
+        ]
         blocked_decisions = [
-            workspace_policy.decide_tool_call("run_bash", {"command": command})
+            workspace_policy.decide_tool_call("bash", {"command": command})
             for command in blocked_commands
         ]
         workspace_delete_decision = workspace_policy.decide_tool_call(
-            "run_bash", {"command": "rm -rf build"}
+            "bash", {"command": "rm -rf build"}
         )
         glob_delete_decision = workspace_policy.decide_tool_call(
-            "run_bash", {"command": "rm -rf *"}
+            "bash", {"command": "rm -rf *"}
         )
         unknown_decision = workspace_policy.decide_tool_call("new_tool", {})
 
         llm_auto_policy = PermissionPolicy(mode="llm-auto")
         llm_read_decision = llm_auto_policy.decide_tool_call("read_file", {"path": "x.txt"})
-        llm_repo_search_decision = llm_auto_policy.decide_tool_call("repo_search", {"pattern": "needle"})
+        llm_code_intelligence_decision = llm_auto_policy.decide_tool_call(
+            "code_intelligence", {"operation": "definition", "path": "x.py"}
+        )
         llm_edit_decision = llm_auto_policy.decide_tool_call("write_file", {"path": "x.txt"})
         llm_todo_decision = llm_auto_policy.decide_tool_call(
             "update_todo",
             {"items": [{"text": "do work", "status": "in_progress"}]},
         )
         llm_safe_shell_decision = llm_auto_policy.decide_tool_call(
-            "run_bash",
+            "bash",
             {"command": "git status --short"},
         )
         llm_risky_shell_decision = llm_auto_policy.decide_tool_call(
-            "run_bash",
+            "bash",
             {"command": "npm install"},
         )
         llm_unknown_decision = llm_auto_policy.decide_tool_call("new_tool", {})
@@ -2394,26 +2404,26 @@ class ProductRuntimeTests(unittest.TestCase):
             tool_permission="dangerous",
         )
         llm_blocked_decision = llm_auto_policy.decide_tool_call(
-            "run_bash",
+            "bash",
             {"command": "rm -rf /"},
         )
 
         full_access_policy = PermissionPolicy(mode="danger-full-access")
         full_access_decision = full_access_policy.decide_tool_call(
-            "run_bash",
+            "bash",
             {"command": "npm install"},
         )
         full_access_blocked_decision = full_access_policy.decide_tool_call(
-            "run_bash",
+            "bash",
             {"command": "dd if=/dev/zero of=/dev/sda"},
         )
         overwrite_decision = full_access_policy.decide_tool_call(
-            "run_bash",
+            "bash",
             {"command": "Set-Content out.txt bad"},
         )
 
         self.assertTrue(read_decision.allowed)
-        self.assertTrue(repo_search_decision.allowed)
+        self.assertTrue(code_intelligence_decision.allowed)
         self.assertTrue(agent_decision.allowed)
         self.assertTrue(edit_decision.allowed)
         self.assertTrue(todo_decision.allowed)
@@ -2432,11 +2442,17 @@ class ProductRuntimeTests(unittest.TestCase):
                 self.assertFalse(blocked_decision.allowed)
                 self.assertFalse(blocked_decision.requires_approval)
                 self.assertEqual(blocked_decision.risk, "shell_blocked")
+        for decision in destructive_git_decisions:
+            with self.subTest(reason=decision.reason):
+                self.assertTrue(decision.requires_approval)
         self.assertTrue(workspace_delete_decision.allowed)
-        self.assertTrue(glob_delete_decision.allowed)
+        # A wildcard target cannot be proven to stay inside the workspace, so
+        # the strictest fact decides: the whole line is refused, not allowed.
+        self.assertFalse(glob_delete_decision.allowed)
+        self.assertEqual(glob_delete_decision.risk, "shell_risky")
         self.assertTrue(unknown_decision.requires_approval)
         self.assertTrue(llm_read_decision.allowed)
-        self.assertTrue(llm_repo_search_decision.allowed)
+        self.assertTrue(llm_code_intelligence_decision.allowed)
         self.assertTrue(llm_edit_decision.allowed)
         self.assertTrue(llm_todo_decision.allowed)
         self.assertTrue(llm_safe_shell_decision.allowed)
@@ -2461,10 +2477,10 @@ class ProductRuntimeTests(unittest.TestCase):
         edit_decision = policy.decide_tool_call("write_file", {"path": "x.txt"})
         self.assertFalse(edit_decision.allowed)
         shell_decision = policy.decide_tool_call(
-            "run_bash", {"command": "mkdir generated"}
+            "bash", {"command": "mkdir generated"}
         )
         self.assertFalse(shell_decision.allowed)
-        read_shell = policy.decide_tool_call("run_bash", {"command": "git status"})
+        read_shell = policy.decide_tool_call("bash", {"command": "git status"})
         self.assertTrue(read_shell.allowed)
 
     def test_permission_policy_rejects_unknown_mode_names(self):
@@ -2497,7 +2513,7 @@ class ProductRuntimeTests(unittest.TestCase):
                 self.chat = SimpleNamespace(completions=FakeCompletions(content))
 
         request = ApprovalRequest(
-            tool_name="run_bash",
+            tool_name="bash",
             args={"command": "npm install"},
             risk="shell_risky",
             reason="llm-auto mode requires automatic LLM approval",
@@ -2528,7 +2544,7 @@ class ProductRuntimeTests(unittest.TestCase):
         )
 
         request = ApprovalRequest(
-            tool_name="run_bash",
+            tool_name="bash",
             args={"command": "npm install"},
             risk="shell_risky",
             reason="llm-auto mode requires automatic LLM approval",
@@ -2603,7 +2619,7 @@ class ProductRuntimeTests(unittest.TestCase):
             )
 
             blocked = middleware.before_tool(
-                "run_bash",
+                "bash",
                 {"command": "npm install"},
                 messages=[],
                 agent_name="main_agent",
@@ -2615,14 +2631,17 @@ class ProductRuntimeTests(unittest.TestCase):
             ]
 
             self.assertIsNotNone(blocked)
-            self.assertEqual(blocked.metadata["status_source"], "approval")
+            # No interactive gate is configured here, so this is "not granted"
+            # rather than a person saying no: the turn continues and the agent
+            # must tell the user what it could not run.
+            self.assertEqual(blocked.metadata["status_source"], "approval_auto")
             self.assertIn("[approval_denied]", blocked.output)
             event_types = [event["type"] for event in events]
             self.assertIn("approval_requested", event_types)
             self.assertIn("approval_decided", event_types)
             approval = next(
                 event for event in events
-                if event["type"] == "approval_decided" and event["payload"].get("tool") == "run_bash"
+                if event["type"] == "approval_decided" and event["payload"].get("tool") == "bash"
             )
             self.assertFalse(approval["payload"]["approved"])
 
@@ -2650,7 +2669,7 @@ class ProductRuntimeTests(unittest.TestCase):
                                 id="tc_shell",
                                 type="function",
                                 function=SimpleNamespace(
-                                    name="run_bash",
+                                    name="bash",
                                     arguments='{"command":"rm -rf /"}',
                                 ),
                             )
@@ -3166,7 +3185,7 @@ class ProductRuntimeTests(unittest.TestCase):
             )
 
             blocked = middleware.before_tool(
-                "run_bash",
+                "bash",
                 {"command": "rm -rf /"},
                 messages=[],
                 agent_name="main_agent",
@@ -3181,7 +3200,7 @@ class ProductRuntimeTests(unittest.TestCase):
         from harness_code_agent.runtime.permissions import PermissionPolicy
 
         policy = PermissionPolicy(mode="workspace-write")
-        decision = policy.decide_tool_call("run_bash", {"command": "env"})
+        decision = policy.decide_tool_call("bash", {"command": "env"})
 
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.risk, "shell_safe")
@@ -3252,7 +3271,7 @@ class ProductRuntimeTests(unittest.TestCase):
             )
 
             result = middleware.before_tool(
-                "run_bash",
+                "bash",
                 {"command": "npm install"},
                 messages=[],
                 agent_name="main_agent",
@@ -3265,9 +3284,9 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertIsNone(result)
             requested = next(event for event in events if event["type"] == "approval_requested")
             decided = next(event for event in events if event["type"] == "approval_decided")
-            self.assertEqual(requested["payload"]["tool"], "run_bash")
+            self.assertEqual(requested["payload"]["tool"], "bash")
             self.assertEqual(requested["payload"]["risk"], "shell_risky")
-            self.assertEqual(decided["payload"]["tool"], "run_bash")
+            self.assertEqual(decided["payload"]["tool"], "bash")
             self.assertTrue(decided["payload"]["approved"])
 
     def test_permission_middleware_records_llm_auto_approval_metadata(self):
@@ -3308,7 +3327,7 @@ class ProductRuntimeTests(unittest.TestCase):
             )
 
             result = middleware.before_tool(
-                "run_bash",
+                "bash",
                 {"command": "npm install"},
                 messages=[],
                 agent_name="main_agent",

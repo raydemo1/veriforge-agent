@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import os
 
-from ..execution_planner import CallEffect, ResourceClaim, workspace_claim
+from ..execution_planner import (
+    CallEffect,
+    ResourceClaim,
+    analyzed_shell_write_claims,
+    workspace_claim,
+)
 from ..permissions import (
     TOOL_PERMISSION_CONTROL,
     TOOL_PERMISSION_EDIT,
@@ -18,7 +23,6 @@ from ..shell_classification import (
     TargetScope,
     analyze_shell_command,
     is_long_running_shell_command,
-    is_verify_shell_command,
 )
 from ..tool_call_validation import strict_tool_schema
 from ..tool_registry import (
@@ -29,11 +33,9 @@ from ..tool_registry import (
     ToolRegistry,
 )
 from .agents import (
-    apply_agent_changes,
     close_agent,
     followup_agent,
     interrupt_agent,
-    read_agent_changes,
     send_agent_message,
     send_parent_message,
     spawn_agent,
@@ -43,10 +45,8 @@ from .code_intelligence import code_intelligence
 from .discovery import search_tools
 from .filesystem import (
     apply_patch,
-    list_files,
     read_file,
     read_skill_file,
-    repo_search,
     write_file,
 )
 from .interaction import ask_user
@@ -104,20 +104,6 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         TOOL_PERMISSION_READ,
         capabilities=all_agents,
     )
-    add(
-        "repo_search",
-        repo_search,
-        TOOL_PERMISSION_READ,
-        _path_effect("path", access="read", scope="subtree", default="."),
-        capabilities=all_agents,
-    )
-    add(
-        "list_files",
-        list_files,
-        TOOL_PERMISSION_READ,
-        _path_effect("directory", access="read", scope="subtree", default="."),
-        capabilities=all_agents,
-    )
     add("memory_search", memory_search, TOOL_PERMISSION_READ, capabilities=all_agents)
     add("memory_read", memory_read, TOOL_PERMISSION_READ, capabilities=all_agents)
     add(
@@ -141,7 +127,7 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         capabilities=all_agents,
     )
     add(
-        "run_bash",
+        "bash",
         run_bash,
         TOOL_PERMISSION_SHELL,
         _shell_effect,
@@ -220,22 +206,6 @@ def _build_builtin_tool_registry() -> ToolRegistry:
         discovery_scope=BUILTIN_AGENTS_SCOPE,
     )
     add(
-        "read_agent_changes",
-        read_agent_changes,
-        TOOL_PERMISSION_READ,
-        _agent_effect("proposal_id", access="read", domain="agent-proposal"),
-        disclosure="deferred",
-        discovery_scope=BUILTIN_AGENTS_SCOPE,
-    )
-    add(
-        "apply_agent_changes",
-        apply_agent_changes,
-        TOOL_PERMISSION_EDIT,
-        _apply_effect,
-        disclosure="deferred",
-        discovery_scope=BUILTIN_AGENTS_SCOPE,
-    )
-    add(
         "close_agent",
         close_agent,
         TOOL_PERMISSION_CONTROL,
@@ -310,66 +280,46 @@ def _agent_effect(argument: str, *, access: str, domain: str = "agent"):
     return resolve
 
 
-def _proposal_effect(args, context):
-    coordinator = (
-        getattr(context, "agent_coordinator", None) if context is not None else None
+def shell_effect(args, context, *, shell_analysis=None, background=None):
+    root = _root(context)
+    effect = _analyzed_shell_effect(
+        args, root, shell_analysis=shell_analysis, background=background
     )
-    if coordinator is None:
-        return CallEffect.global_exclusive(kind="agent_proposal")
-    try:
-        paths = coordinator.proposal_paths(str(args.get("proposal_id") or ""))
-    except (KeyError, ValueError):
-        return CallEffect.global_exclusive(kind="agent_proposal")
-    return CallEffect(
-        tuple(
-            workspace_claim(_root(context), path, scope="exact", access="write")
-            for path in paths
-        ),
-        kind="agent_proposal",
-    )
-
-
-def _conflict_effect(args, context):
-    coordinator = (
-        getattr(context, "agent_coordinator", None) if context is not None else None
-    )
-    if coordinator is None:
-        return CallEffect.global_exclusive(kind="agent_conflict")
-    try:
-        paths = coordinator.conflict_paths(str(args.get("conflict_id") or ""))
-    except (KeyError, ValueError):
-        return CallEffect.global_exclusive(kind="agent_conflict")
-    return CallEffect(
-        tuple(
-            workspace_claim(_root(context), path, scope="exact", access="write")
-            for path in paths
-        ),
-        kind="agent_conflict",
-    )
-
-
-def _apply_effect(args, context):
-    """applying a proposal writes its paths; resolving a conflict writes theirs."""
-    if args.get("resolutions") is not None:
-        return _conflict_effect(args, context)
-    return _proposal_effect(args, context)
+    if os.name == "nt":
+        # The shell-job manager owns the concrete write lease on Windows; this
+        # effect only orders calls inside one batch and must not make the
+        # executor claim a project scope the manager did not.
+        return CallEffect(
+            effect.resources,
+            barrier=effect.barrier,
+            concurrency_key=effect.concurrency_key,
+            kind="native_shell",
+        )
+    return effect
 
 
 def _shell_effect(args, context):
+    return shell_effect(args, context)
+
+
+def _analyzed_shell_effect(args, root, *, shell_analysis=None, background=None):
     command = str(args.get("command") or "")
-    root = _root(context)
-    if os.name == "nt":
-        from ...workspace.native_shell import write_claims
-        return CallEffect(write_claims(root, args.get("write_paths", [])), kind="native_shell")
-    analysis = analyze_shell_command(command, root)
+    # Reuse the preparation-time analysis when the executor supplied one.
+    analysis = shell_analysis or analyze_shell_command(command, root)
     effects = analysis.effects
     traits = analysis.traits
-    scopes = {t.scope for t in analysis.targets}
+    scopes = analysis.scopes
 
     workspace_read = workspace_claim(root, ".", scope="global", access="read")
+    workspace_write = workspace_claim(root, ".", scope="global", access="write")
 
-    if is_long_running_shell_command(command):
-        return CallEffect.global_exclusive(kind="long_running")
+    background = (
+        is_long_running_shell_command(command) if background is None else bool(background)
+    )
+    if background:
+        # A background job may write anywhere in the workspace but must not be
+        # an unconditional batch barrier: unrelated tools can still run.
+        return CallEffect((workspace_write,), kind="long_running")
     non_workspace = scopes & {
         TargetScope.SYSTEM,
         TargetScope.EXTERNAL,
@@ -380,8 +330,9 @@ def _shell_effect(args, context):
     if ShellTrait.RECURSIVE in traits:
         return CallEffect.global_exclusive(kind="recursive_delete")
     if ShellTrait.UNKNOWN_EFFECT in traits:
-        # Unknown programs may touch anything: run alone as a batch barrier.
-        return CallEffect.global_exclusive(kind="unknown_execution")
+        # Unknown programs may touch anything: keep them mutually serial, but
+        # only against workspace claims instead of every unrelated tool.
+        return CallEffect((workspace_write,), kind="unknown_execution")
     if ShellEffect.GIT_MUTATION in effects:
         # Git index lock + whole-repo state: serialize against other mutations.
         return CallEffect.global_exclusive(
@@ -392,11 +343,17 @@ def _shell_effect(args, context):
             return CallEffect.global_exclusive(kind="system_mutation")
         if TargetScope.EXTERNAL in scopes or TargetScope.UNKNOWN in scopes:
             return CallEffect.global_exclusive(kind="external_mutation")
-        claims = _shell_target_write_claims(analysis, root)
+        claims = analyzed_shell_write_claims(root, command, analysis=analysis)
         if not claims:
+            if analysis.write_targets and all(
+                target.scope is TargetScope.TEMP for target in analysis.write_targets
+            ):
+                # The private per-call temp directory is disposable and not part
+                # of the workspace, so no workspace lease is needed.
+                return CallEffect((workspace_read,), kind="temp_mutation")
             claims = (workspace_claim(root, ".", scope="global", access="write"),)
         return CallEffect(claims, kind="workspace_mutation")
-    if is_verify_shell_command(command):
+    if ShellTrait.VERIFY in traits:
         return CallEffect(
             (workspace_read, ResourceClaim("workspace:derived", "*", "global", "write")),
             kind="verify",
@@ -405,28 +362,6 @@ def _shell_effect(args, context):
         claims = [ResourceClaim("network", "*", "global", "read"), workspace_read]
         return CallEffect(tuple(claims), kind="inspect")
     return CallEffect((workspace_read,), kind="inspect")
-
-
-def _shell_target_write_claims(analysis, root) -> tuple[ResourceClaim, ...]:
-    claims: list[ResourceClaim] = []
-    for target in analysis.targets:
-        if target.scope is not TargetScope.WORKSPACE or not target.raw:
-            continue
-        raw = target.raw.rstrip("/\\")
-        claims.append(
-            workspace_claim(
-                root,
-                raw or ".",
-                scope="subtree" if _looks_like_directory_target(raw) else "exact",
-                access="write",
-            )
-        )
-    return tuple(claims)
-
-
-def _looks_like_directory_target(raw: str) -> bool:
-    tail = raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
-    return "." not in tail
 
 
 BUILTIN_TOOL_REGISTRY = _build_builtin_tool_registry()

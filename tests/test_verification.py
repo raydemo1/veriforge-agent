@@ -87,7 +87,7 @@ def test_automatic_verification_never_executes_project_code(
     results = provider.verify(files, tmp_path)
     assert not (tmp_path / "executed").exists()
     assert any(
-        result.status == "skipped" and "run_bash" in " ".join(result.details)
+        result.status == "skipped" and "bash" in " ".join(result.details)
         for result in results
     )
 
@@ -123,7 +123,7 @@ def test_project_execution_skip_records_command_without_blocking_exit(tmp_path):
     middleware.after_turn(runtime_state=state)
     check = state.verification["checks"][0]
     assert check["status"] == "skipped"
-    assert "run_bash" in check["detail"]
+    assert "bash" in check["detail"]
     assert '"cargo", "check"' in check["detail"]
 
 
@@ -324,7 +324,7 @@ def test_eslint_inherited_by_nested_package(tmp_path, monkeypatch):
     results = TypeScriptProvider().verify(["nested/main.js"], tmp_path)
     assert calls == []
     assert results[0].status == "skipped"
-    assert "run_bash" in results[0].details[0]
+    assert "bash" in results[0].details[0]
 
 
 def test_typescript_configuration_only_change_is_verified(tmp_path, monkeypatch):

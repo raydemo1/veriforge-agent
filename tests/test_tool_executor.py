@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from harness_code_agent.agent.conversation import Agent, AgentConversation
 from harness_code_agent.runtime import shell_classification
@@ -110,6 +110,44 @@ def _conversation_with_registry(root: Path, registry: ToolRegistry, tool_calls, 
 
 
 class ToolExecutorTests(unittest.TestCase):
+    def test_shell_denials_skip_approval_and_job_start(self):
+        from harness_code_agent.runtime.approvals import ApprovalGate
+        from harness_code_agent.runtime.permission_middleware import PermissionMiddleware
+
+        for mode in ("workspace-write", "llm-auto"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                conversation, context = _conversation_with_registry(
+                    Path(tmp),
+                    BUILTIN_TOOL_REGISTRY,
+                    [
+                        _tool_call("escalation", "bash", {
+                            "command": "Write-Output probe",
+                            "sandbox_permissions": "require_escalated",
+                        }),
+                        _tool_call("parser_limit", "bash", {"command": "x" * 32_001}),
+                    ],
+                )
+                context.permission_policy = PermissionPolicy(mode)
+                reviewer, human = Mock(), Mock()
+                context.approval_provider = ApprovalGate(reviewer, human)
+                conversation.agent.middlewares.append(
+                    PermissionMiddleware(context, BUILTIN_TOOL_REGISTRY)
+                )
+                try:
+                    with patch("harness_code_agent.workspace.shell_jobs.ShellJobManager.start") as start:
+                        conversation.run_until_idle()
+                    reviewer.request.assert_not_called()
+                    human.request.assert_not_called()
+                    start.assert_not_called()
+                    results = [
+                        event.payload for event in context.event_bus.events
+                        if event.type == "tool_result"
+                    ]
+                    self.assertEqual([result["status"] for result in results], ["failed", "failed"])
+                    self.assertIn("analysis failed", results[1]["error"])
+                finally:
+                    conversation.close()
+
     def test_middleware_exception_closes_every_tool_call_and_preserves_error(self):
         class Broken(AgentMiddleware):
             def before_tool(self, *args, **kwargs):
@@ -230,11 +268,9 @@ class ToolExecutorTests(unittest.TestCase):
     def test_shell_effect_uses_shared_stateful_classifier(self):
         # Stateful shell prefixes (cd/export/source/...) cannot be analyzed
         # statically, so they run conservatively as unknown serial executions.
-        shell_classification.analyze_shell_command.cache_clear()
         analysis = shell_classification.analyze_shell_command("cd src; rg needle .")
         from harness_code_agent.runtime.shell_classification import ShellTrait
         self.assertIn(ShellTrait.UNKNOWN_EFFECT, analysis.traits)
-        shell_classification.analyze_shell_command.cache_clear()
 
     def test_parallel_read_tools_finish_faster_but_results_keep_original_order(self):
         registry = ToolRegistry()
@@ -732,7 +768,7 @@ class ToolExecutorTests(unittest.TestCase):
         registry = BUILTIN_TOOL_REGISTRY.copy()
         tool_calls = [
             _tool_call("tc_write", "write_file", {"path": "note.txt", "content": "created"}),
-            _tool_call("tc_risky", "run_bash", {"command": "npm install"}),
+            _tool_call("tc_risky", "bash", {"command": "npm install"}),
         ]
 
         approval_reads_file = []

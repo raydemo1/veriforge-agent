@@ -18,6 +18,10 @@ dependencies = [
     "mcp>=1.0.0,<2",
     "pygls>=2.1,<3",
     "watchfiles>=1.1,<2",
+    # Static bash parsing for the shell analyzer. The grammar is abi3, so one
+    # wheel covers 3.10-3.13; this is the combination the test suite runs on.
+    "tree-sitter>=0.25,<0.27",
+    "tree-sitter-bash>=0.25,<0.26",
 ]
 
 [project.optional-dependencies]
@@ -71,6 +75,7 @@ include = ["harness_code_agent*"]
 "harness_code_agent/runtime/mcp.py" = ["BLE001"]
 "harness_code_agent/runtime/language_service.py" = ["BLE001"]
 "harness_code_agent/runtime/middleware/verification.py" = ["BLE001"]
+"harness_code_agent/runtime/shell_parser.py" = ["BLE001"]
 "harness_code_agent/runtime/tool_runner.py" = ["BLE001"]
 "harness_code_agent/sessions/events.py" = ["BLE001"]
 "harness_code_agent/sessions/turn_summary.py" = ["BLE001"]

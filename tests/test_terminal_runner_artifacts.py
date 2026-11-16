@@ -76,7 +76,7 @@ class TerminalRunnerArtifactTests(unittest.TestCase):
                     "type": "tool_call",
                     "agent": "main_agent",
                     "payload": {
-                        "tool": "run_bash",
+                        "tool": "bash",
                         "args": {"command": "pytest -q"},
                     },
                 },
@@ -85,7 +85,7 @@ class TerminalRunnerArtifactTests(unittest.TestCase):
                     "type": "tool_result",
                     "agent": "main_agent",
                     "payload": {
-                        "tool": "run_bash",
+                        "tool": "bash",
                         "status": "failed",
                         "return_code": 1,
                         "output": "preview",
@@ -237,7 +237,7 @@ class TerminalRunnerArtifactTests(unittest.TestCase):
             session_id = "session-partial-jsonl"
             session_root = harness_root / "sessions" / session_id
             session_root.mkdir(parents=True)
-            complete_event = {"sequence": 1, "type": "tool_call", "payload": {"tool": "run_bash"}}
+            complete_event = {"sequence": 1, "type": "tool_call", "payload": {"tool": "bash"}}
             (session_root / "events.jsonl").write_text(
                 json.dumps(complete_event) + "\n" + '{"sequence": 2, "type":',
                 encoding="utf-8",

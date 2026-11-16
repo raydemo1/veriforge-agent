@@ -457,8 +457,6 @@ _PATH_ARGUMENTS = {
     "read_file": "path",
     "write_file": "path",
     "apply_patch": "path",
-    "repo_search": "path",
-    "list_files": "directory",
 }
 
 
@@ -482,7 +480,12 @@ def _validate_semantics(
             )
         if tool_context is not None:
             try:
-                tool_context.workspace.resolve(path or ".")
+                if name == "read_file":
+                    from .builtins.filesystem import resolve_read_path
+
+                    resolve_read_path(path, tool_context)
+                else:
+                    tool_context.workspace.resolve(path or ".")
             except (OSError, TypeError, ValueError):
                 return ToolError(
                     kind="workspace_escape",
@@ -499,7 +502,7 @@ def _validate_semantics(
             phase="semantic",
         )
 
-    if name == "run_bash":
+    if name == "bash":
         command = str(arguments.get("command", ""))
         if not command.strip():
             return ToolError(

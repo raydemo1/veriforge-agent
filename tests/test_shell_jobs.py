@@ -12,6 +12,84 @@ import psutil
 import pytest
 
 
+class ShellResultClassificationTests(unittest.TestCase):
+    def test_named_pipe_access_denied_is_an_ipc_environment_failure(self):
+        from harness_code_agent.runtime.builtins.shell import _job_result
+        from harness_code_agent.workspace.shell_jobs import ShellOutputBuffer
+
+        output = ShellOutputBuffer()
+        output.append(
+            "ResourceUnavailable: Access to the path "
+            "'\\\\.\\pipe\\LOCAL\\dotnet_abc' is denied.\n"
+        )
+        job = SimpleNamespace(
+            output=output,
+            status="exited",
+            exit_code=1,
+            warnings=[],
+            readers_drained=True,
+            stage_timings={},
+        )
+
+        result = _job_result(job, {})
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.metadata["failure_kind"], "windows_named_pipe_denied")
+        self.assertIn("Windows sandbox IPC error", result.error)
+        self.assertNotIn("Access to the path", result.error)
+        self.assertIn("Access to the path", result.output)
+
+    def test_ordinary_test_failure_stays_a_successful_tool_call(self):
+        from harness_code_agent.runtime.builtins.shell import _job_result
+        from harness_code_agent.workspace.shell_jobs import ShellOutputBuffer
+
+        output = ShellOutputBuffer()
+        output.append("1 failed, 1 passed in 0.5s\n")
+        job = SimpleNamespace(
+            output=output,
+            status="exited",
+            exit_code=1,
+            warnings=[],
+            readers_drained=True,
+            stage_timings={},
+        )
+
+        result = _job_result(job, {})
+
+        self.assertEqual(result.status, "success")
+        self.assertNotIn("failure_kind", result.metadata)
+        self.assertIsNone(result.error)
+
+    def test_timeout_does_not_report_process_exit_zero_as_completion(self):
+        from harness_code_agent.runtime.builtins.shell import _job_result
+        from harness_code_agent.workspace.shell_jobs import ShellOutputBuffer
+
+        output = ShellOutputBuffer()
+        output.append("partial output\n")
+        job = SimpleNamespace(
+            output=output,
+            status="stopped",
+            exit_code=0,
+            warnings=[],
+            readers_drained=True,
+            stage_timings={},
+        )
+
+        result = _job_result(
+            job,
+            {"timed_out": True, "effective_timeout": 300},
+            "Command timed out after 300s",
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertIsNone(result.return_code)
+        self.assertIn("[timed out]", result.output)
+        self.assertNotIn("[exit_code: 0]", result.output)
+        self.assertIsNone(result.metadata["exit_code"])
+        self.assertEqual(result.metadata["process_exit_code"], 0)
+        self.assertIn("timed out", result.error)
+
+
 class ShellJobManagerTests(unittest.TestCase):
 
     def test_natural_exit_records_status_and_exit_code(self):

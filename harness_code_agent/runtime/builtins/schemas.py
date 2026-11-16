@@ -1,8 +1,6 @@
 """OpenAI function-calling schemas for built-in tools."""
 from __future__ import annotations
 
-import os
-
 from ..agent_roles import AGENT_ROLES
 from .filesystem import READ_FILE_MAX_LINES
 
@@ -44,7 +42,7 @@ CORE_TOOL_SCHEMAS = [
                 "type": "object",
                 "required": ["path"],
                 "properties": {
-                    "path": {"type": "string", "description": "Relative path inside workspace"},
+                    "path": {"type": "string", "description": "Relative path inside the workspace, or an absolute path of spilled tool output"},
                     "start_line": {
                         "type": "integer",
                         "minimum": 1,
@@ -119,16 +117,16 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "spawn_agent",
-            "description": 'Start a focused background agent and return its id immediately.',
+            "description": 'Optional subagent for explicitly requested delegation. Prefer direct tools for ordinary tasks; explorer is read-only research, worker edits assigned paths in the shared workspace.',
             "parameters": {
                 "type": "object",
                 "required": ["name", "role", "task"],
                 "properties": {
                     "name": {"type": "string", "description": "Short unique agent name."},
-                    "role": {"type": "string", "enum": list(AGENT_ROLES)},
+                    "role": {"type": "string", "enum": list(AGENT_ROLES), "description": "explorer: read-only research; worker: shared-workspace code changes."},
                     "task": {"type": "string", "description": "Bounded delegated task."},
                     "expected_output": {"type": "string"},
-                    "allowed_paths": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Required writable ownership paths for worker; optional for read-only roles."},
+                    "allowed_paths": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Required writable ownership paths for worker; optional for read-only roles. Prefer directories: Shell write grants cover only these directory trees. Concurrent workers may not overlap."},
                     "fork_turns": {"oneOf": [{"type": "string", "enum": ["none", "all"]}, {"type": "integer", "minimum": 1, "maximum": 5}], "default": "none"},
                     "model_intensity": {"type": "string", "enum": ["fast", "normal", "hard", "max"]},
                 },
@@ -139,7 +137,11 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": 'Create or overwrite a file in the workspace.',
+            "description": (
+                "Create or overwrite a file in the workspace. Before overwriting an "
+                "existing file you must read its current version with read_file; "
+                "otherwise the write is rejected."
+            ),
             "parameters": {
                 "type": "object",
                 "required": ["path", "content"],
@@ -199,92 +201,6 @@ CORE_TOOL_SCHEMAS = [
                                 },
                             },
                         },
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "repo_search",
-            "description": 'Search workspace code and text with bounded ripgrep. The harness supplies an explicit path, a short timeout, generated-directory excludes and a result cap.',
-            "parameters": {
-                "type": "object",
-                "required": ["pattern"],
-                "properties": {
-                    "pattern": {"type": "string", "description": "Text or regex pattern to search for."},
-                    "path": {
-                        "type": "string",
-                        "description": "Relative file or directory path to search. Defaults to workspace root.",
-                        "default": ".",
-                    },
-                    "glob": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional ripgrep glob filters, e.g. ['*.py'] or ['!*.lock'].",
-                        "default": [],
-                    },
-                    "case_sensitive": {
-                        "type": "boolean",
-                        "description": "Whether search should be case-sensitive.",
-                        "default": False,
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 500,
-                        "description": "Maximum result lines to return.",
-                        "default": 100,
-                    },
-                    "context_lines": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "maximum": 5,
-                        "description": "Context lines around each match.",
-                        "default": 0,
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": 'List workspace files and directories with bounded depth. depth=1 lists direct children; the default depth=2 adds one nested level.',
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "directory": {
-                        "type": "string",
-                        "description": "Relative directory path (default: root)",
-                        "default": ".",
-                    },
-                    "depth": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 20,
-                        "description": "Maximum listing depth. depth=1 lists only direct children; default depth=2 includes one nested level.",
-                        "default": 2,
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 1000,
-                        "description": "Maximum entries to return.",
-                        "default": 200,
-                    },
-                    "include_hidden": {
-                        "type": "boolean",
-                        "description": "Include hidden dot paths except protected internal/generated defaults.",
-                        "default": False,
-                    },
-                    "exclude": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Additional directory names to exclude.",
-                        "default": [],
                     },
                 },
             },
@@ -439,17 +355,53 @@ CORE_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "run_bash",
-            "description": 'Execute a shell command in the workspace directory. On Windows use PowerShell 7 syntax; processes run under the native directory write sandbox: the project is read-only unless write_paths declares writable directories (private TEMP is always writable), and a background job cannot claim the whole shared workspace. A command that runs to completion is reported as success even when it exits non-zero - the code is appended as [exit_code: N]; only timeouts and runtime errors are failures. Dev servers and watch mode return a background job id for the shell-job tools. Unbounded repository-wide listing or searching may be blocked. Never create a git worktree on your own.',
+            "name": "bash",
+            "description": ('Execute a shell command in the workspace directory. Use PowerShell 7 syntax on Windows and bash syntax on Linux. Processes run under a directory write sandbox: a command may write the workspace, and write_paths narrows that grant to specific directories (a private TEMP is also writable outside read-only mode). A background job gets the same write grant but does not hold a whole-workspace write lease, so a long-running process never blocks the project exclusively. A command that runs to completion is reported as success even when it exits non-zero - the code is appended as [exit_code: N]; only timeouts and runtime errors are failures. Dev servers and watch mode return a background job id for the shell-job tools. Use background=true for long-running commands that the heuristic may not recognize. Search and file discovery are ordinary shell commands.'),
             "parameters": {
                 "type": "object",
                 "required": ["command"],
                 "properties": {
                     "command": {"type": "string", "description": "Shell command to run."},
-                    **({"write_paths": {
+                    "write_paths": {
                         "type": "array", "items": {"type": "string"}, "default": [],
-                        "description": "Workspace directories this process may write, relative to the workspace. Omit for a read-only project. Permits last until the process tree exits."
-                    }} if os.name == "nt" else {}),
+                        "description": "Optional workspace directories that narrow this command's write grant, relative to the workspace. A command may already write the workspace; declare these only to restrict it to a subtree. Grants last until the process tree exits."
+                    },
+                    "sandbox_permissions": {
+                        "type": "string",
+                        "enum": ["use_default", "with_additional_permissions"],
+                        "default": "use_default",
+                        "description": "use_default uses the session's sandbox settings. with_additional_permissions requests approval for the scoped capabilities in additional_permissions."
+                    },
+                    "additional_permissions": {
+                        "type": "object",
+                        "description": "Scoped capabilities requested with sandbox_permissions=with_additional_permissions.",
+                        "properties": {
+                            "file_system": {
+                                "type": "object",
+                                "properties": {
+                                    "write": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "Absolute directories outside the workspace this call may write. Each must be approved."
+                                    }
+                                },
+                                "additionalProperties": False
+                            },
+                            "network": {
+                                "type": "boolean",
+                                "description": "Keep host network access for this call."
+                            }
+                        },
+                        "additionalProperties": False
+                    },
+                    "justification": {
+                        "type": "string",
+                        "description": "Why this call needs the additional permissions; shown to the approver."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Run as a background job. Omit to use the long-running command heuristic."
+                    },
                     "timeout": {
                         "type": "integer",
                         "description": "Timeout in seconds (default 300). Increase for long builds and training.",
@@ -463,7 +415,7 @@ CORE_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_shell_jobs",
-            "description": 'List background shell jobs started by long-running run_bash commands in the current session.',
+            "description": 'List background shell jobs started by long-running bash commands in the current session.',
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -476,7 +428,7 @@ CORE_TOOL_SCHEMAS = [
                 "type": "object",
                 "required": ["job_id"],
                 "properties": {
-                    "job_id": {"type": "string", "description": "Background shell job id returned by run_bash."},
+                    "job_id": {"type": "string", "description": "Background shell job id returned by bash."},
                     "offset": {"type": "integer", "minimum": 0, "default": 0,
                                "description": "0-based Unicode character offset, returned as next_offset."},
                     "max_chars": {
@@ -497,7 +449,7 @@ CORE_TOOL_SCHEMAS = [
                 "type": "object",
                 "required": ["job_id"],
                 "properties": {
-                    "job_id": {"type": "string", "description": "Background shell job id returned by run_bash."},
+                    "job_id": {"type": "string", "description": "Background shell job id returned by bash."},
                 },
             },
         },
@@ -545,43 +497,9 @@ CORE_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "read_agent_changes",
-            "description": 'Read an isolated change proposal with pagination. Pass conflict_id instead to read base, main, worker and marked merge content for that conflict.',
-            "parameters": {
-                "type": "object",
-                "anyOf": [{"required": ["proposal_id"]}, {"required": ["conflict_id"]}],
-                "properties": {
-                    "proposal_id": {"type": "string", "description": "Proposal to read. Optional when conflict_id is given."},
-                    "conflict_id": {"type": "string", "default": "", "description": "Conflict id returned by apply_agent_changes; reads the conflicted files."},
-                    "path": {"type": "string"},
-                    "offset": {"type": "integer", "minimum": 0, "default": 0},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50000, "default": 12000},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "apply_agent_changes",
-            "description": 'Three-way merge and atomically apply a worker proposal. Overlapping edits return a conflict id without changing the workspace. Pass conflict_id with resolutions to commit the final content and complete the merge after revalidation.',
-            "parameters": {
-                "type": "object",
-                "anyOf": [{"required": ["proposal_id"]}, {"required": ["conflict_id"]}],
-                "properties": {
-                    "proposal_id": {"type": "string", "description": "Proposal to apply. Optional when resolving with conflict_id; when both are given they must name the same proposal."},
-                    "conflict_id": {"type": "string", "default": "", "description": "Conflict id returned by a previous apply. Requires resolutions."},
-                    "resolutions": {"type": "object", "additionalProperties": {"type": "string"}},
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "close_agent",
-            "description": 'Close an idle agent thread and release its isolated workspace. Unapplied changes require explicit discard_changes.',
-            "parameters": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}, "discard_changes": {"type": "boolean", "default": False}}},
+            "description": 'Close an idle agent thread and release its runtime resources.',
+            "parameters": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}}},
         },
     },
     {

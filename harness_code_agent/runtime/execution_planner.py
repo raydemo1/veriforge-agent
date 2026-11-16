@@ -29,6 +29,22 @@ class CallEffect:
         return cls((ResourceClaim("global", "*", "global", "write"),), barrier=True, kind=kind)
 
 
+@dataclass(frozen=True)
+class ToolExecutionPlan:
+    """Immutable snapshot shared by scheduling, authorization and execution.
+
+    The shell analysis is computed once during call preparation. The planner
+    reads ``effect``; the permission middleware reads ``permission_decision``;
+    ``run_bash`` reads ``background`` and the authorization snapshot instead of
+    re-analyzing the command.
+    """
+
+    effect: CallEffect
+    analysis: object | None = None
+    permission_decision: object | None = None
+    background: bool | None = None
+
+
 @dataclass
 class PlannedCall:
     index: int
@@ -86,6 +102,38 @@ def normalize_workspace_key(root: str | Path, value: str | Path = ".") -> str:
 
 def workspace_claim(root: str | Path, value: str | Path, *, scope: str, access: str) -> ResourceClaim:
     return ResourceClaim("workspace", normalize_workspace_key(root, value), scope, access)
+
+
+def analyzed_shell_write_claims(
+    root: str | Path, command: str, *, analysis=None
+) -> tuple[ResourceClaim, ...]:
+    """Write claims for exactly the paths a shell command is proven to mutate.
+
+    The sandbox grant may be wider (the workspace itself); the concurrent-write
+    lease follows the actual operation, not the capability.
+    """
+    from .shell_classification import TargetScope, analyze_shell_command
+
+    analysis = analysis or analyze_shell_command(command, root)
+    claims: list[ResourceClaim] = []
+    for target in analysis.write_targets:
+        if target.scope is not TargetScope.WORKSPACE or not target.raw:
+            continue
+        raw = target.raw.rstrip("/\\")
+        claims.append(
+            workspace_claim(
+                root,
+                raw or ".",
+                scope="subtree" if _looks_like_directory_target(raw) else "exact",
+                access="write",
+            )
+        )
+    return tuple(claims)
+
+
+def _looks_like_directory_target(raw: str) -> bool:
+    tail = raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    return "." not in tail
 
 
 def _is_same_or_child(value: str, parent: str) -> bool:

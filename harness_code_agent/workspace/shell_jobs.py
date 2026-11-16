@@ -15,6 +15,10 @@ from typing import Literal
 import psutil
 
 from .. import config
+from ..runtime.execution_planner import (
+    analyzed_shell_write_claims,
+    normalize_workspace_key,
+)
 from ..runtime.tool_output import output_limit
 from ..support.cancellation import CancellationToken, CancelledError
 from ..support.tokens import count_text_tokens
@@ -83,7 +87,10 @@ class ShellOutputBuffer:
                     if count_text_tokens(self._text) <= output_limit():
                         self.total_chars += len(text)
                         return
-                    directory = self.artifact_dir or Path.cwd() / ".harness" / "observations" / "default" / "jobs"
+                    from .state_paths import ensure_workspace_state
+                    directory = self.artifact_dir or (
+                        ensure_workspace_state(Path.cwd()) / "observations" / "default" / "jobs"
+                    )
                     directory.mkdir(parents=True, exist_ok=True)
                     self.path = directory / f"job_{uuid.uuid4().hex}.txt"
                     with self.path.open("x", encoding="utf-8", newline="") as stream:
@@ -139,6 +146,8 @@ class ShellJob:
     #: Set when a tracking pass could not read a process state.  A later
     #: successful pass clears it; until then the tree cannot be confirmed empty.
     tracking_failed: bool = False
+    #: Optional per-launch timings (lease, sandbox setup, process spawn).
+    stage_timings: dict[str, float] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _reader_threads: list[threading.Thread] = field(default_factory=list, repr=False)
@@ -268,11 +277,27 @@ class ShellJob:
 
 
 class ShellJobManager:
-    def __init__(self, workspace: str | Path, *, artifact_dir: Path | None = None, environment="local", session_id=None):
+    def __init__(
+        self,
+        workspace: str | Path,
+        *,
+        artifact_dir: Path | None = None,
+        environment="local",
+        session_id=None,
+        sandbox: str = "auto",
+        state_root=None,
+    ):
         self.workspace = str(Path(workspace).resolve())
+        self.state_root = Path(state_root).resolve() if state_root is not None else None
         self.environment = environment
         self.session_id = session_id
-        self.artifact_dir = artifact_dir or Path(workspace) / ".harness" / "observations" / "default" / "jobs"
+        #: ``auto`` confines every job with the platform sandbox and fails when
+        #: no backend exists; ``off`` is the explicit danger-full-access opt-in.
+        self.sandbox = sandbox
+        from .state_paths import ensure_workspace_state
+        self.artifact_dir = artifact_dir or (
+            ensure_workspace_state(workspace) / "observations" / "default" / "jobs"
+        )
         self._jobs: dict[str, ShellJob] = {}
         self._lock = threading.RLock()
         self._closed = False
@@ -283,7 +308,8 @@ class ShellJobManager:
         self._starts_idle.set()
 
     def start(self, command: str, *, early_exit_seconds: float = 0.0, write_paths=(),
-              background=True, cancellation_token=None, turn_id="") -> ShellJob:
+              background=True, cancellation_token=None, turn_id="",
+              allow_network: bool = True, authorization=None, shell_analysis=None) -> ShellJob:
         with self._lock:
             if self._closing:
                 raise RuntimeError("Shell job manager is closing")
@@ -293,7 +319,9 @@ class ShellJobManager:
         remove_callback = cancellation_token.add_callback(token.cancel) if cancellation_token else lambda: None
         try:
             return self._start_job(command, early_exit_seconds=early_exit_seconds, write_paths=write_paths,
-                                   background=background, cancellation_token=token, turn_id=turn_id)
+                                   background=background, cancellation_token=token, turn_id=turn_id,
+                                   allow_network=allow_network, authorization=authorization,
+                                   shell_analysis=shell_analysis)
         finally:
             remove_callback()
             token.close()
@@ -302,9 +330,29 @@ class ShellJobManager:
                 if not self._starting:
                     self._starts_idle.set()
 
-    def _start_job(self, command, *, early_exit_seconds, write_paths, background, cancellation_token, turn_id):
+    def _start_job(self, command, *, early_exit_seconds, write_paths, background, cancellation_token,
+                   turn_id, allow_network=True, authorization=None, shell_analysis=None):
         cancellation_token.check()
         command = str(command or "").strip()
+        # The authorization is a per-call snapshot from the permission policy.
+        # It wins over the manager's mutable mode so a queued call cannot
+        # inherit a later mode switch.
+        full_access = (
+            authorization.mode == "danger-full-access"
+            if authorization is not None
+            else self.sandbox == "off"
+        )
+        read_only = (
+            authorization.mode == "read-only"
+            if authorization is not None
+            else False
+        )
+        extra_dirs = tuple(
+            str(path) for path in getattr(authorization, "writable_paths", ()) or ()
+        ) if authorization is not None else ()
+        effective_network = (
+            bool(authorization.network) if authorization is not None else allow_network
+        )
         job_id = f"shell-job-{uuid.uuid4().hex[:8]}"
         output = ShellOutputBuffer(self.artifact_dir)
         if not command:
@@ -314,38 +362,110 @@ class ShellJobManager:
             return job
 
         lease, temporary = None, None
+        stages: dict[str, float] = {}
         try:
+            if extra_dirs and not full_access:
+                from ..runtime.permissions import revalidate_extra_dirs
+
+                extra_dirs = revalidate_extra_dirs(extra_dirs)
             if os.name == "nt":
                 from .access import WorkspaceAccessCoordinator
                 from .native_shell import (
+                    direct_arguments,
                     launch_arguments,
-                    write_claims,
                     write_directories,
                 )
 
                 root = Path(self.workspace)
-                directories = write_directories(root, write_paths)
-                if background and root in directories and self.environment != "worktree":
-                    raise ValueError("后台任务不能申请整个共享 Local 的写入许可；请缩小 write_paths，或由用户主动创建 Worktree")
-                access = WorkspaceAccessCoordinator(root)
-                lease = access.lease(write_claims(root, write_paths), cancellation_token, owner=self.session_id)
-                if directories and self.session_id is not None:
-                    access.limit_recovery(self.session_id, turn_id, "Shell：目录内写入无法完整回撤")
-                for directory in directories:
-                    directory.mkdir(parents=True, exist_ok=True)
-                temporary = tempfile.TemporaryDirectory(prefix="veriforge-shell-")
-                args = launch_arguments(root, directories, temporary.name, command)
-                if cancellation_token is not None:
-                    cancellation_token.check()
-                process = subprocess.Popen(
-                    args, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    env=dict(os.environ, TEMP=temporary.name, TMP=temporary.name, TMPDIR=temporary.name),
-                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                # Explicit write_paths narrow the grant; without them the
+                # command may write the workspace itself, background or not.
+                # Full access has no sandbox to narrow, so those paths are not
+                # validated against the workspace boundary.
+                if full_access:
+                    explicit = ()
+                    granted = (root,)
+                    lease_claims = ()
+                elif read_only:
+                    # Read-only mode gets no workspace grant at all: the ACL
+                    # sandbox must enforce the policy, not just the classifier.
+                    explicit = ()
+                    granted = ()
+                    lease_claims = ()
+                else:
+                    explicit = write_directories(root, write_paths)
+                    granted = explicit or (root,)
+                    lease_claims = self._lease_claims(
+                        root, command, write_paths, background=background,
+                        shell_analysis=shell_analysis,
+                    )
+                access = WorkspaceAccessCoordinator(root, state_root=self.state_root)
+                lease_started = time.perf_counter()
+                lease = access.lease(
+                    lease_claims,
+                    cancellation_token,
+                    owner=self.session_id,
                 )
+                stages["lease_ms"] = round((time.perf_counter() - lease_started) * 1000, 2)
+                if granted and self.session_id is not None:
+                    access.limit_recovery(self.session_id, turn_id, "Shell：目录内写入无法完整回撤")
+                for directory in granted:
+                    directory.mkdir(parents=True, exist_ok=True)
+                if full_access:
+                    # The per-call authorization is the explicit full-access
+                    # opt-in: no ACL sandbox at all.
+                    process = subprocess.Popen(
+                        direct_arguments(root, command), cwd=self.workspace,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(os.environ),
+                        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                    )
+                else:
+                    for extra in extra_dirs:
+                        Path(extra).mkdir(parents=True, exist_ok=True)
+                    temporary = tempfile.TemporaryDirectory(prefix="veriforge-shell-")
+                    launch_started = time.perf_counter()
+                    args = launch_arguments(
+                        root, granted, temporary.name, command,
+                        extra_dirs=extra_dirs, read_only=read_only,
+                    )
+                    stages["launch_build_ms"] = round(
+                        (time.perf_counter() - launch_started) * 1000, 2
+                    )
+                    if cancellation_token is not None:
+                        cancellation_token.check()
+                    spawn_started = time.perf_counter()
+                    process = subprocess.Popen(
+                        args, cwd=self.workspace, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        env=dict(os.environ, TEMP=temporary.name, TMP=temporary.name, TMPDIR=temporary.name),
+                        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                    )
+                    stages["spawn_ms"] = round(
+                        (time.perf_counter() - spawn_started) * 1000, 2
+                    )
             else:
-                if write_paths:
-                    raise ValueError("write_paths requires the Windows directory sandbox")
-                process = self._start_posix_process(command)
+                if full_access:
+                    granted = (Path(self.workspace).resolve(),)
+                elif read_only:
+                    granted = ()
+                else:
+                    granted = self._posix_write_directories(write_paths) if write_paths else (
+                        Path(self.workspace).resolve(),
+                    )
+                if full_access:
+                    # The per-call authorization is the explicit full-access
+                    # opt-in: no confinement backend, even with directories.
+                    process = self._start_posix_process(command, confined=False)
+                else:
+                    for extra in extra_dirs:
+                        Path(extra).mkdir(parents=True, exist_ok=True)
+                    temporary = tempfile.TemporaryDirectory(prefix="veriforge-shell-")
+                    write_dirs = granted + tuple(Path(extra) for extra in extra_dirs)
+                    process = self._start_posix_process(
+                        command,
+                        write_dirs=write_dirs,
+                        temporary=temporary,
+                        allow_network=effective_network,
+                        confined=True,
+                    )
         except BaseException as exc:
             if temporary is not None:
                 temporary.cleanup()
@@ -371,6 +491,7 @@ class ShellJobManager:
             _write_lease=lease,
             _temporary_directory=temporary,
             background=background,
+            stage_timings=stages,
         )
         self._store(job)
         try:
@@ -517,13 +638,75 @@ class ShellJobManager:
         with self._lock:
             self._jobs[job.job_id] = job
 
-    def _start_posix_process(self, command: str) -> subprocess.Popen:
+    def _lease_claims(self, root: Path, command: str, write_paths, *, background: bool,
+                      shell_analysis=None):
+        """Write claims for the concurrent-write coordinator.
+
+        The sandbox grant and the lease are separate: a command may write the
+        workspace, while the lease covers what it is actually proven to mutate
+        (or the directories it explicitly declared). A background job keeps
+        only directory-level claims: a long-running job must not hold the whole
+        project exclusively until it exits.
+        """
+        from .native_shell import write_claims
+
+        if background:
+            claims = write_claims(root, write_paths) if write_paths else ()
+            root_key = normalize_workspace_key(root, ".")
+            return tuple(claim for claim in claims if claim.key != root_key)
+        if write_paths:
+            return write_claims(root, write_paths)
+        return analyzed_shell_write_claims(root, command, analysis=shell_analysis)
+
+    def _posix_write_directories(self, values) -> tuple[Path, ...]:
+        """Declared writable directories, resolved and held inside the workspace."""
+        root = Path(self.workspace)
+        directories: list[Path] = []
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("write_paths must contain workspace directory paths")
+            directory = (root / value).resolve()
+            if directory != root and not directory.is_relative_to(root):
+                raise ValueError("Shell writable directories must stay within the workspace")
+            if directory.exists() and not directory.is_dir():
+                raise ValueError(f"Shell write_paths requires directories, not files: {value}")
+            directory.mkdir(parents=True, exist_ok=True)
+            directories.append(directory)
+        return tuple(sorted(set(directories)))
+
+    def _start_posix_process(
+        self, command: str, *, write_dirs: tuple[Path, ...] = (), temporary=None,
+        allow_network: bool = True, confined: bool = True,
+    ) -> subprocess.Popen:
+        from .posix_sandbox import unavailable_reason, wrap_command
+
+        environment = dict(os.environ)
+        if temporary is not None:
+            environment.update(
+                TEMP=temporary.name, TMP=temporary.name, TMPDIR=temporary.name
+            )
+        args = None
+        if confined:
+            args = wrap_command(
+                command,
+                root=self.workspace,
+                shell=shell_executable(),
+                write_dirs=write_dirs,
+                temp_dir=temporary.name if temporary is not None else None,
+                allow_network=allow_network,
+            )
+            if args is None:
+                # No confinement backend: refuse instead of running unconfined.
+                raise RuntimeError(unavailable_reason())
+        if args is None:
+            args = [shell_executable(), "-lc", command]
         return subprocess.Popen(
-            [shell_executable(), "-lc", command],
+            args,
             cwd=self.workspace,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=False,
+            env=environment,
             start_new_session=True,
             # rlimits must be set between fork and exec; this is the only
             # stdlib hook for it and it stays None unless a limit is configured.

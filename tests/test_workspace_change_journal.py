@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from harness_code_agent.workspace.change_journal import WorkspaceChangeJournal
+from harness_code_agent.workspace.file_changes import diff, snapshot
 from harness_code_agent.workspace.service import WorkspaceService
 
 
@@ -62,6 +63,39 @@ class WorkspaceChangeJournalTests(unittest.TestCase):
 
             self.assertEqual(binary_path.read_bytes(), original_bytes)
             self.assertFalse(failing_path.exists())
+
+
+class FileChangeSnapshotTests(unittest.TestCase):
+    def test_diff_reports_created_modified_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "keep.txt").write_text("keep", encoding="utf-8")
+            (root / "change.txt").write_text("old", encoding="utf-8")
+            (root / "delete.txt").write_text("x", encoding="utf-8")
+            before = snapshot(root)
+
+            (root / "new.txt").write_text("new", encoding="utf-8")
+            (root / "change.txt").write_text("new", encoding="utf-8")
+            (root / "delete.txt").unlink()
+            changes = diff(before, snapshot(root))
+
+            self.assertEqual(changes["created"], ["new.txt"])
+            self.assertEqual(changes["modified"], ["change.txt"])
+            self.assertEqual(changes["deleted"], ["delete.txt"])
+            self.assertEqual(
+                changes["counts"],
+                {"created": 1, "modified": 1, "deleted": 1},
+            )
+
+    def test_generated_directories_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "__pycache__").mkdir()
+            (root / "__pycache__" / "x.pyc").write_bytes(b"x")
+            (root / ".git").mkdir()
+            (root / ".git" / "index").write_bytes(b"x")
+
+            self.assertEqual(snapshot(root)["files"], {})
 
 
 if __name__ == "__main__":

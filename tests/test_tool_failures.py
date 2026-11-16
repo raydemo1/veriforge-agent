@@ -14,7 +14,6 @@ from harness_code_agent.runtime.execution_planner import (
 from harness_code_agent.runtime.middleware import (
     AgentMiddleware,
     ToolFailurePolicyMiddleware,
-    ToolGuardMiddleware,
 )
 from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_call_validation import ToolError
@@ -30,6 +29,29 @@ from harness_code_agent.runtime.tool_registry import ToolRegistry
 from harness_code_agent.runtime.tool_result import ToolResult
 from harness_code_agent.sessions.events import EventBus, classify_tool_failure
 from harness_code_agent.workspace.service import WorkspaceService
+
+
+def test_windows_named_pipe_is_an_execution_failure():
+    result = ToolResult(
+        tool="bash",
+        status="failed",
+        output="raw pipe stderr",
+        error="Windows sandbox IPC error",
+        metadata={"failure_kind": FailureKind.WINDOWS_NAMED_PIPE},
+    )
+
+    failure = ToolFailure.from_result(
+        tool_call_id="call_pipe",
+        tool_name="bash",
+        result=result,
+        intercepted=False,
+    )
+
+    assert failure.kind == FailureKind.WINDOWS_NAMED_PIPE
+    assert failure.category == FailureCategory.EXECUTION
+    assert failure.retryable is True
+    assert failure.user_action_required is False
+
 
 _READ_EFFECT = CallEffect((ResourceClaim("workspace", "*", "global", "read"),))
 
@@ -63,7 +85,7 @@ def _tool_call(call_id: str, name: str, args=None):
 _RUN_BASH_SCHEMA = {
     "type": "function",
     "function": {
-        "name": "run_bash",
+        "name": "bash",
         "description": "run a shell command",
         "parameters": {
             "type": "object",
@@ -79,7 +101,7 @@ _RUN_BASH_SCHEMA = {
 _RECURSIVE_LIST_ARGS = {"command": "Get-ChildItem -Recurse"}
 
 
-def _shell_guard_registry():
+def _blocked_registry():
     registry = ToolRegistry()
 
     def _must_not_run(**kwargs):
@@ -87,6 +109,30 @@ def _shell_guard_registry():
 
     registry.register(_RUN_BASH_SCHEMA, _must_not_run, permission="shell")
     return registry
+
+
+class _BlockingPolicyMiddleware(AgentMiddleware):
+    """Stands in for a structural guard that intercepts a tool call."""
+
+    def before_tool(
+        self,
+        tool_name: str,
+        tool_args: dict,
+        messages: list[dict],
+        runtime_state=None,
+        agent_name: str | None = None,
+        permission_decision=None,
+    ) -> ToolResult | None:
+        if tool_name != "bash":
+            return None
+        message = "[blocked] blocked by policy for this test"
+        return ToolResult(
+            tool="bash",
+            status="failed",
+            output=message,
+            error=message,
+            metadata={"status_source": "tool_policy", "policy_violation": "test"},
+        )
 
 
 class _RepeatCompletions:
@@ -256,14 +302,14 @@ class NormalizationTests(unittest.TestCase):
         for text, kind, category in cases:
             with self.subTest(text=text):
                 result = ToolResult(
-                    tool="run_bash",
+                    tool="bash",
                     status="failed",
                     output=text,
                     error=text,
                     metadata={"status_source": "shell", "return_code": 1},
                 )
                 failure = ToolFailure.from_result(
-                    tool_call_id="tc", tool_name="run_bash", result=result, intercepted=False
+                    tool_call_id="tc", tool_name="bash", result=result, intercepted=False
                 )
                 self.assertEqual(failure.kind, kind)
                 self.assertEqual(failure.category, category)
@@ -331,14 +377,14 @@ class NormalizationTests(unittest.TestCase):
 
     def test_backend_timeout_is_execution_not_resource(self):
         result = ToolResult(
-            tool="run_bash",
+            tool="bash",
             status="failed",
             output="timed out",
             error="timed out",
             metadata={"status_source": "shell", "timed_out": True},
         )
         failure = ToolFailure.from_result(
-            tool_call_id="tc", tool_name="run_bash", result=result, intercepted=False
+            tool_call_id="tc", tool_name="bash", result=result, intercepted=False
         )
         self.assertEqual(failure.kind, FailureKind.TIMEOUT)
         self.assertEqual(failure.category, FailureCategory.EXECUTION)
@@ -531,12 +577,24 @@ class PolicyDecisionTests(unittest.TestCase):
         # Protocol failures never consume the turn budget.
         self.assertEqual(self.state.failures.turn_failure_count, 0)
 
-    def test_unknown_tool_returns_once_then_stops(self):
+    def test_unknown_tool_returns_twice_then_stops(self):
         first = self._decide(self._observe(FailureKind.UNKNOWN_TOOL, tool="nope"))
         self.assertEqual(first.mode, FailureMode.RETURN_TO_AGENT)
         second = self._decide(self._observe(FailureKind.UNKNOWN_TOOL, tool="nope"))
-        self.assertEqual(second.mode, FailureMode.STOP)
-        self.assertEqual(second.stop_reason, "retry_budget_exhausted")
+        self.assertEqual(second.mode, FailureMode.RETURN_TO_AGENT)
+        third = self._decide(self._observe(FailureKind.UNKNOWN_TOOL, tool="nope"))
+        self.assertEqual(third.mode, FailureMode.STOP)
+        self.assertEqual(third.stop_reason, "retry_budget_exhausted")
+        self.assertEqual(third.stop_limit_type, "unknown_tool")
+        self.assertEqual(third.stop_limit, 3)
+
+    def test_unknown_tool_streak_resets_after_success(self):
+        self._decide(self._observe(FailureKind.UNKNOWN_TOOL, tool="nope"))
+        self._decide(self._observe(FailureKind.UNKNOWN_TOOL, tool="nope"))
+        self.state.failures.observe_success("bash")
+        third = self._decide(self._observe(FailureKind.UNKNOWN_TOOL, tool="nope"))
+        self.assertEqual(third.mode, FailureMode.RETURN_TO_AGENT)
+        self.assertEqual(self.state.failures.consecutive_failures, 1)
 
     def test_tool_schema_error_is_exposed_as_infrastructure_error(self):
         first = self._decide(self._observe(FailureKind.TOOL_SCHEMA_ERROR))
@@ -951,10 +1009,12 @@ class FailureObservabilityTests(unittest.TestCase):
         self.assertGreaterEqual(activities[0]["hooks"], 2)
 
     def test_trace_jsonl_records_failure_policy_decisions(self):
+        from harness_code_agent.workspace.state_paths import ensure_workspace_state
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _run_schema_streak(root)
-            trace_path = next((root / ".harness" / "traces").rglob("*.jsonl"))
+            trace_path = next((ensure_workspace_state(root) / "traces").rglob("*.jsonl"))
             lines = [
                 json.loads(line)
                 for line in trace_path.read_text(encoding="utf-8").splitlines()
@@ -1077,9 +1137,9 @@ class FailureObservabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             conversation, context = _conversation(
                 Path(tmp),
-                _shell_guard_registry(),
-                [_tool_call("tc_b1", "run_bash", _RECURSIVE_LIST_ARGS)],
-                [ToolGuardMiddleware(), spy, ToolFailurePolicyMiddleware()],
+                _blocked_registry(),
+                [_tool_call("tc_b1", "bash", _RECURSIVE_LIST_ARGS)],
+                [_BlockingPolicyMiddleware(), spy, ToolFailurePolicyMiddleware()],
                 repeat=3,
             )
             with (
@@ -1117,15 +1177,15 @@ class FailureObservabilityTests(unittest.TestCase):
     def test_parallel_guard_blocks_in_one_batch_do_not_stop(self):
         spy = FailureSpyMiddleware()
         calls = [
-            _tool_call("tc_a", "run_bash", _RECURSIVE_LIST_ARGS),
-            _tool_call("tc_b", "run_bash", _RECURSIVE_LIST_ARGS),
+            _tool_call("tc_a", "bash", _RECURSIVE_LIST_ARGS),
+            _tool_call("tc_b", "bash", _RECURSIVE_LIST_ARGS),
         ]
         with tempfile.TemporaryDirectory() as tmp:
             conversation, _context = _conversation(
                 Path(tmp),
-                _shell_guard_registry(),
+                _blocked_registry(),
                 calls,
-                [ToolGuardMiddleware(), spy, ToolFailurePolicyMiddleware()],
+                [_BlockingPolicyMiddleware(), spy, ToolFailurePolicyMiddleware()],
             )
             with (
                 patch("harness_code_agent.agent.conversation.context.count_tokens", return_value=1),
@@ -1138,7 +1198,7 @@ class FailureObservabilityTests(unittest.TestCase):
         self.assertFalse(state.fallback.stop_requested)
         # Sibling failures are one streak attempt but two real turn failures.
         self.assertEqual(state.failures.turn_failure_count, 2)
-        self.assertEqual(state.failures.current("run_bash").count, 1)
+        self.assertEqual(state.failures.current("bash").count, 1)
 
 
 if __name__ == "__main__":
