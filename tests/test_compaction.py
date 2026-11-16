@@ -302,10 +302,11 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.store import SessionStore
         from harness_code_agent.workspace.service import WorkspaceService
+        from harness_code_agent.workspace.state_paths import ensure_workspace_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            store = SessionStore(root / ".harness")
+            store = SessionStore(ensure_workspace_state(root))
             session = store.create(
                 cwd=root,
                 model="test-model",
@@ -494,7 +495,7 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Compacted storage — persistence in .harness/sessions/<id>/compacted/
+# Compacted storage — persistence in the workspace state sessions/<id>/compacted/
 # ---------------------------------------------------------------------------
 
 class CompactedStorageTests(unittest.TestCase):
@@ -602,6 +603,18 @@ class TuiStateCompactionTests(unittest.TestCase):
         # Compaction progress lives in the status bar only, not the transcript.
         self.assertIsNone(block)
         self.assertIn("compact", state.snapshot.status.lower())
+
+    def test_child_compaction_does_not_change_main_status(self):
+        state = self._make_state()
+        state.snapshot.status = "idle"
+        event = MagicMock()
+        event.to_dict.return_value = {
+            "type": "context_compaction_started",
+            "agent": "worker-1",
+            "payload": {"token_count": 100000, "forced": False},
+        }
+        self.assertIsNone(state.apply_event(event))
+        self.assertEqual(state.snapshot.status, "idle")
 
     def test_compaction_committed_restores_idle(self):
         state = self._make_state()

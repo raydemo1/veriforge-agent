@@ -1,7 +1,7 @@
 export type ThemePreference = "auto" | "dark" | "light";
 export type IconPreference = "auto" | "nerd" | "unicode";
 
-export const UI_PROTOCOL_VERSION = 9;
+export const UI_PROTOCOL_VERSION = 10;
 
 export type Snapshot = {
   permissionMode: string;
@@ -42,7 +42,7 @@ export type TranscriptItem = {
   kind: "user" | "assistant" | "tool" | "status" | "plan" | "error" | "file" | "thought" | "agent";
   title: string;
   body: string;
-  state?: "running" | "success" | "failed" | "pending" | "changed";
+  state?: "running" | "success" | "failed" | "pending" | "changed" | "interrupted";
   role?: "group" | "message";
   parentId?: string;
   turn?: number;
@@ -54,7 +54,30 @@ export type ApprovalInteraction = {
   type: "interaction";
   id: string;
   kind: "approval";
-  payload: { toolName: string; args: Record<string, unknown>; risk: string; reason: string; persistAvailable: boolean };
+  payload: {
+    toolName: string;
+    args: Record<string, unknown>;
+    risk: string;
+    reason: string;
+    // What the run asks to write, and why the runtime could not settle it.
+    taskSummary?: string;
+    cwd?: string;
+    writeDirs?: string[];
+    uncertainty?: string;
+    // The operation may not be approved automatically (irreversible or
+    // outbound data); a person must decide.
+    requiresHuman?: boolean;
+    // One-time sandbox capability requested for this call.
+    sandboxPermissions?: "use_default" | "with_additional_permissions";
+    additionalPermissions?: {
+      file_system?: { write?: string[] };
+      network?: boolean;
+    };
+    networkAccess?: boolean;
+    justification?: string;
+    canPersist?: boolean;
+    persistAvailable: boolean;
+  };
 };
 export type QuestionInteraction = {
   type: "interaction";
@@ -100,30 +123,17 @@ export type WorkAgent = {
   role: string;
   task: string;
   status: "queued" | "running" | "completed" | "failed" | "blocked" | "interrupted";
-  isolation: "read-only" | "isolated workspace";
+  isolation: "read-only" | "shared workspace";
   summary: string;
   error: string | null;
-  proposalId: string | null;
   durationSeconds: number | null;
 };
 
 export type WorkFile = { path: string; operation: string; additions: number; deletions: number };
-export type WorkProposal = {
-  id: string;
-  agentId: string;
-  agentName: string;
-  status: "ready" | "invalid" | "conflict" | "applied";
-  files: WorkFile[];
-  additions: number;
-  deletions: number;
-  invalidReasons: string[];
-  conflict: { id: string; paths: string[] } | null;
-};
 export type ChangesState = {
   workspace: WorkFile[];
   additions: number;
   deletions: number;
-  proposals: WorkProposal[];
 };
 
 export type Check = {
@@ -153,7 +163,7 @@ export const initialWorkState: WorkState = {
   plan: null,
   tasks: { items: [], completed: 0, total: 0 },
   agents: [],
-  changes: { workspace: [], additions: 0, deletions: 0, proposals: [] },
+  changes: { workspace: [], additions: 0, deletions: 0 },
   checks: [],
   artifacts: [],
 };
@@ -169,7 +179,6 @@ export type ActionName =
   | "complete_mention"
   | "stage_attachments"
   | "remove_attachment"
-  | "workbench_action"
   | "switch_session" | "hide_session" | "fork_session" | "fork_worktree" | "apply_worktree" | "sync_session";
 export type ActionResult = {
   ok: boolean;
@@ -181,21 +190,7 @@ export type ActionResult = {
   candidates?: Array<{ insertText: string; display: string; description: string; kind: "file" | "session" }>;
   attachments?: AttachmentItem[];
   queued?: boolean;
-  content?: string;
-  paths?: string[];
-  totalChars?: number;
-  status?: string;
-  conflictId?: string;
-  conflictPaths?: string[];
-  changedFiles?: string[];
 };
-
-export type WorkbenchOp =
-  | "read_proposal"
-  | "read_conflict";
-export type WorkbenchParams =
-  | { op: "read_proposal"; proposalId: string }
-  | { op: "read_conflict"; conflictId: string };
 
 export type ResourceUse = { resource: string; sessionId: string | null; turnId: string | null; label: string; since: number };
 export type ProjectResourcesSnapshot = {

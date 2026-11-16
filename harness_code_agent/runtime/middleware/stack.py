@@ -12,9 +12,7 @@ from typing import Any
 
 from ..permission_middleware import PermissionMiddleware
 from .base import AgentMiddleware
-from .integration import ProposalIntegrationMiddleware
 from .tool_failure_policy import ToolFailurePolicyMiddleware
-from .tool_guard import ToolGuardMiddleware
 from .verification import StaticVerifierMiddleware
 
 
@@ -27,14 +25,13 @@ def build_main_agent_middlewares(
 ) -> list[AgentMiddleware]:
     """Build the main-agent middleware stack.
 
-    Order: user middlewares from ``~/.harness/middlewares.json`` (loaded
+    Order: user middlewares from ``~/.veriforge/middlewares.json`` (loaded
     once per session and shared across profile switches) first, then
-    structural guards, failure policy, permission enforcement, passive
-    turn-end diagnostics, and the proposal integration gate. The interactive
-    session injects the memory index into the system prompt separately.
+    failure policy, permission enforcement, and passive turn-end diagnostics.
+    The interactive session injects the memory index into the system prompt
+    separately.
     """
     middlewares: list[AgentMiddleware] = list(user_middlewares)
-    middlewares.append(ToolGuardMiddleware())
     middlewares.append(
         ToolFailurePolicyMiddleware(
             tool_registry=tool_registry,
@@ -50,9 +47,6 @@ def build_main_agent_middlewares(
     middlewares.append(
         StaticVerifierMiddleware(workspace_root=str(workspace), workspace=tool_context.workspace)
     )
-    # Last exit gate: worker proposals are the main agent's integration
-    # responsibility, so a ready/conflicting proposal blocks turn completion.
-    middlewares.append(ProposalIntegrationMiddleware(tool_context))
     return middlewares
 
 
@@ -64,7 +58,6 @@ def build_subagent_middlewares(
     """Build the subagent middleware stack.
 
     Subagents intentionally run with permission enforcement only; they do
-    not get the main agent's tool guard, failure policy, or verification
-    middlewares.
+    not get the main agent's failure policy or verification middlewares.
     """
     return [PermissionMiddleware(tool_context=tool_context, tool_registry=tool_registry)]

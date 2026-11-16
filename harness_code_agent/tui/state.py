@@ -33,23 +33,61 @@ class TranscriptBlock:
     turn: int | None = None
     id: str | None = None
     direction: str = ""
+    #: Set for rows that belong to one inline subagent timeline.
+    parent_id: str | None = None
+    #: ``group`` marks the collapsed subagent row that owns ``parent_id`` rows.
+    role: str = ""
+
+
+_MAIN_AGENT_NAMES = (None, "", "main", "main_agent")
+_AGENT_EVENTS = {"agent_spawned", "agent_status", "agent_message", "agent_parent_message"}
+_AGENT_TERMINAL_STATUSES = {"success", "failed", "interrupted"}
+_AGENT_STATUS_LABELS = {
+    "queued": "等待中",
+    "running": "运行中",
+    "completed": "已完成",
+    "failed": "失败",
+    "blocked": "受阻",
+    "interrupted": "已中断",
+}
 
 
 @dataclass
 class TuiState:
     snapshot: SessionStatusSnapshot
     blocks: list[TranscriptBlock] = field(default_factory=list)
-    active_tool_blocks: dict[str, list[TranscriptBlock]] = field(default_factory=dict)
+    #: (scope, tool) -> call blocks without a tool_call_id (older journals).
+    active_tool_blocks: dict[tuple[str, str], list[TranscriptBlock]] = field(default_factory=dict)
+    #: (scope, tool_call_id) -> call block; the primary pairing key.
+    active_tool_calls: dict[tuple[str, str], TranscriptBlock] = field(default_factory=dict)
     tool_call_counter: int = 0
     active_thought_block: TranscriptBlock | None = None
+    #: agent block id -> running thought row for that subagent.
+    agent_thoughts: dict[str, TranscriptBlock] = field(default_factory=dict)
+    #: stable agent id (or name for old journals) -> inline agent block.
+    agent_blocks: dict[str, TranscriptBlock] = field(default_factory=dict)
+    agent_keys_by_name: dict[str, str] = field(default_factory=dict)
+    #: Parent rows whose visible summary/state changed; drained by the bridge.
+    pending_agent_updates: list[TranscriptBlock] = field(default_factory=list)
     thought_counter: int = 0
     block_counter: int = 0
+
+    def drain_agent_updates(self) -> list[TranscriptBlock]:
+        updates, self.pending_agent_updates = self.pending_agent_updates, []
+        return updates
 
     def apply_event(self, event: Any) -> TranscriptBlock | None:
         data = event.to_dict() if hasattr(event, "to_dict") else dict(event)
         event_type = str(data.get("type", ""))
         payload = data.get("payload") or {}
+        agent = data.get("agent")
+        if event_type in _AGENT_EVENTS:
+            return self._apply_agent_event(event_type, payload, agent)
+        if str(payload.get("agent_id") or "") or agent not in _MAIN_AGENT_NAMES:
+            return self._apply_child_event(event_type, payload, agent)
+        return self._apply_main_event(event_type, payload)
 
+    def _apply_main_event(self, event_type: str, payload: dict[str, Any]) -> TranscriptBlock | None:
         if event_type == "session_started":
             self.snapshot.status = "ready"
             if payload.get("session_id"):
@@ -84,32 +122,6 @@ class TuiState:
             return self._apply_tool_call(payload)
         if event_type == "tool_result":
             return self._apply_tool_result(payload)
-        if event_type == "agent_spawned":
-            name = str(payload.get("name") or payload.get("agent_id") or "子代理")
-            return TranscriptBlock("agent", f"{name} 已启动", "", "running", turn=self.snapshot.turn)
-        if event_type == "agent_message":
-            name = str(payload.get("name") or payload.get("agent_id") or "子代理")
-            message = str(payload.get("message") or "")
-            return TranscriptBlock("agent", f"{name} 已补充", message, "running", turn=self.snapshot.turn, direction="out")
-        if event_type == "agent_parent_message":
-            name = str(payload.get("name") or payload.get("agent_id") or "子代理")
-            message = str(payload.get("message") or "")
-            return TranscriptBlock("agent", f"{name} 上报", message, "running", turn=self.snapshot.turn, direction="in")
-        if event_type == "agent_status":
-            name = str(payload.get("name") or payload.get("agent_id") or "子代理")
-            status = str(payload.get("status") or "unknown")
-            # spawned already expressed the start, and closing an agent adds no
-            # outcome information; only outcome-bearing states reach the UI.
-            if status in {"running", "closed"}:
-                return None
-            labels = {"completed": "已完成", "failed": "失败", "blocked": "受阻", "interrupted": "已中断"}
-            body = ""
-            if status == "completed":
-                if payload.get("proposal_id"):
-                    body = "有改动待应用"
-            else:
-                body = str(payload.get("error") or "")
-            return TranscriptBlock("agent", f"{name} {labels.get(status, status)}", body, status, turn=self.snapshot.turn)
         if event_type == "middleware_activity":
             return self._apply_middleware_activity(payload)
         if event_type == "file_change":
@@ -187,13 +199,14 @@ class TuiState:
         if event_type == "turn_finished":
             self.snapshot.status = "idle"
             self.snapshot.running_tool = ""
-            self.active_tool_blocks.clear()
-            self.active_thought_block = None
+            self._clear_scope("main")
             return None
         if event_type == "session_finished":
             self.snapshot.status = str(payload.get("status") or "closed")
             self.active_tool_blocks.clear()
+            self.active_tool_calls.clear()
             self.active_thought_block = None
+            self.agent_thoughts.clear()
             return None
         if event_type == "thought_started":
             self.snapshot.status = "thinking"
@@ -233,12 +246,19 @@ class TuiState:
             return
         self.blocks.append(block)
 
-    def _apply_tool_call(self, payload: dict[str, Any]) -> TranscriptBlock | None:
+    def _apply_tool_call(
+        self,
+        payload: dict[str, Any],
+        *,
+        scope: str = "main",
+        parent: TranscriptBlock | None = None,
+    ) -> TranscriptBlock | None:
         if payload.get("failure_visibility") == FailureVisibility.PROTOCOL:
             return None
         tool = str(payload.get("tool", "tool"))
-        self.snapshot.running_tool = tool
-        self.snapshot.status = "tool"
+        if scope == "main":
+            self.snapshot.running_tool = tool
+            self.snapshot.status = "tool"
         if tool in _HIDDEN_TOOL_CALLS:
             return None
         title = _tool_call_title(tool, payload.get("args"))
@@ -249,23 +269,39 @@ class TuiState:
             "",
             "running",
             turn=self.snapshot.turn,
-            id=f"tool-{self.snapshot.turn}-{self.tool_call_counter}",
+            id=f"tool-{self.snapshot.turn}-{self.tool_call_counter}"
+            if scope == "main"
+            else f"{scope}-tool-{self.tool_call_counter}",
+            parent_id=parent.id if parent is not None else None,
         )
-        self.active_tool_blocks.setdefault(tool, []).append(block)
+        call_id = str(payload.get("tool_call_id") or "")
+        if call_id:
+            self.active_tool_calls[(scope, call_id)] = block
+        self.active_tool_blocks.setdefault((scope, tool), []).append(block)
+        if parent is not None:
+            self._set_agent_activity(parent, title)
         return block
 
-    def _apply_tool_result(self, payload: dict[str, Any]) -> TranscriptBlock | None:
+    def _apply_tool_result(
+        self,
+        payload: dict[str, Any],
+        *,
+        scope: str = "main",
+        parent: TranscriptBlock | None = None,
+    ) -> TranscriptBlock | None:
         tool = str(payload.get("tool", "tool"))
+        call_id = str(payload.get("tool_call_id") or "")
         if _is_protocol_failure(payload):
             # Older persisted calls may already have created a visible row.
-            block = self._take_active_tool_block(tool)
+            block = self._take_active_tool_block(tool, scope=scope, tool_call_id=call_id)
             if block is not None:
-                if self.snapshot.running_tool == tool:
-                    self.snapshot.running_tool = ""
-                self.snapshot.status = "running"
+                if scope == "main":
+                    if self.snapshot.running_tool == tool:
+                        self.snapshot.running_tool = ""
+                    self.snapshot.status = "running"
                 block.status = "failed"
             return block
-        if self.snapshot.running_tool == tool:
+        if scope == "main" and self.snapshot.running_tool == tool:
             self.snapshot.running_tool = ""
         status = str(payload.get("status", "unknown"))
         if tool == "ask_user":
@@ -273,9 +309,11 @@ class TuiState:
         if tool == "update_todo" and status == "success":
             # Task detail lives in the Workbench Tasks section; the transcript
             # only keeps the Work Strip counter.
-            self.snapshot.status = "running"
+            if scope == "main":
+                self.snapshot.status = "running"
             return None
-        self.snapshot.status = "running"
+        if scope == "main":
+            self.snapshot.status = "running"
         raw_metadata = payload.get("metadata")
         metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
         # Approval/policy rejections collapse to a single short line in the
@@ -289,14 +327,14 @@ class TuiState:
         # run_bash reports status="success" even on non-zero exit; treat a bad
         # exit as failure so the title/color match reality, and keep the raw
         # output tail (pytest failures, ModuleNotFoundError, ...).
-        bash_failed = tool == "run_bash" and return_code not in (None, 0)
+        bash_failed = tool == "bash" and return_code not in (None, 0)
         if bash_failed:
             status = "failed"
         if rejection:
-            # A guard block is an intermediate self-correction step (the model
-            # retries with list_files/repo_search), so it is not shown to the
-            # user at all. Approval denials and permission bans stay visible.
-            self._take_active_tool_block(tool)
+            # A policy interception is an intermediate self-correction step, so
+            # it is not shown to the user at all. Approval denials and
+            # permission bans stay visible.
+            self._take_active_tool_block(tool, scope=scope, tool_call_id=call_id)
             if str(metadata.get("status_source")) == "tool_policy":
                 return None
             body = rejection
@@ -316,22 +354,264 @@ class TuiState:
             output_tail = _bounded_tail(str(payload.get("output") or ""), 1200)
             if output_tail and output_tail not in body:
                 body += f"\n{output_tail}" if body else output_tail
-        block = self._take_active_tool_block(tool)
+        block = self._take_active_tool_block(tool, scope=scope, tool_call_id=call_id)
         if block is not None:
             block.title = _tool_result_title_with_detail(tool, status, block.title)
             block.body = body
             block.status = status
+            if parent is not None:
+                self._set_agent_activity(parent, _tool_result_title(tool, status))
             return block
-        return TranscriptBlock("tool", _tool_result_title(tool, status), body, status, turn=self.snapshot.turn)
+        if parent is not None:
+            self._set_agent_activity(parent, _tool_result_title(tool, status))
+        return TranscriptBlock(
+            "tool",
+            _tool_result_title(tool, status),
+            body,
+            status,
+            turn=self.snapshot.turn,
+            parent_id=parent.id if parent is not None else None,
+        )
 
-    def _take_active_tool_block(self, tool: str) -> TranscriptBlock | None:
-        blocks = self.active_tool_blocks.get(tool)
+    def _take_active_tool_block(
+        self,
+        tool: str,
+        *,
+        scope: str = "main",
+        tool_call_id: str = "",
+    ) -> TranscriptBlock | None:
+        if tool_call_id:
+            block = self.active_tool_calls.pop((scope, tool_call_id), None)
+            if block is not None:
+                self._forget_queued_tool(scope, tool, block)
+                return block
+        blocks = self.active_tool_blocks.get((scope, tool))
         if not blocks:
             return None
         block = blocks.pop(0)
         if not blocks:
-            self.active_tool_blocks.pop(tool, None)
+            self.active_tool_blocks.pop((scope, tool), None)
         return block
+
+    def _forget_queued_tool(self, scope: str, tool: str, block: TranscriptBlock) -> None:
+        blocks = self.active_tool_blocks.get((scope, tool))
+        if not blocks:
+            return
+        remaining = [item for item in blocks if item is not block]
+        if remaining:
+            self.active_tool_blocks[(scope, tool)] = remaining
+        else:
+            self.active_tool_blocks.pop((scope, tool), None)
+
+    def _clear_scope(self, scope: str) -> None:
+        for key in [key for key in self.active_tool_blocks if key[0] == scope]:
+            self.active_tool_blocks.pop(key, None)
+        for key in [key for key in self.active_tool_calls if key[0] == scope]:
+            self.active_tool_calls.pop(key, None)
+        if scope == "main":
+            self.active_thought_block = None
+        else:
+            self.agent_thoughts.pop(scope, None)
+
+    # ------------------------------------------------------------------
+    # Subagent inline timelines
+    # ------------------------------------------------------------------
+
+    def _apply_child_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        agent_name: str | None,
+    ) -> TranscriptBlock | None:
+        block = self._agent_block(payload, agent_name)
+        if event_type == "thought_started":
+            self.thought_counter += 1
+            thought = TranscriptBlock(
+                "thought",
+                "正在思考",
+                "",
+                "running",
+                turn=self.snapshot.turn,
+                id=f"{block.id}-thought-{self.thought_counter}",
+                parent_id=block.id,
+            )
+            self.agent_thoughts[block.id] = thought
+            self._set_agent_activity(block, "思考中")
+            return thought
+        if event_type == "thought_finished":
+            duration = payload.get("duration_seconds", 0)
+            body = _format_elapsed(duration)
+            if payload.get("truncated"):
+                body += "  内容已截断"
+            thought = self.agent_thoughts.pop(block.id, None)
+            if thought is not None:
+                thought.title = "思考"
+                thought.body = body
+                thought.status = "success"
+                return thought
+            return TranscriptBlock(
+                "thought",
+                "思考",
+                body,
+                "success",
+                turn=self.snapshot.turn,
+                parent_id=block.id,
+            )
+        if event_type == "tool_call":
+            return self._apply_tool_call(payload, scope=block.id or "", parent=block)
+        if event_type == "tool_result":
+            return self._apply_tool_result(payload, scope=block.id or "", parent=block)
+        if event_type == "failure":
+            if _is_protocol_failure(payload) or payload.get("tool"):
+                return None
+            message = _localize_error(payload.get("message")) if payload.get("message") else ""
+            body = str(message or "")
+            self._set_agent_activity(block, body or "执行失败")
+            return TranscriptBlock(
+                "failure",
+                "错误",
+                body,
+                "failed",
+                turn=self.snapshot.turn,
+                parent_id=block.id,
+            )
+        if event_type == "agent_fallback":
+            reason = str(payload.get("reason") or "stopped")
+            if payload.get("limit_type") == "schema_failures" or reason == "approval_denied":
+                return None
+            display_reason = reason.replace("_", " ")
+            body = f"已停止：{_FAILURE_LABELS.get(display_reason, '任务未完成')}"
+            last_tool = str(payload.get("last_tool") or "")
+            if last_tool:
+                body += f"（最后工具：{last_tool}）"
+            self._set_agent_activity(block, body)
+            return TranscriptBlock(
+                "failure",
+                "代理已停止",
+                body,
+                "blocked",
+                turn=self.snapshot.turn,
+                parent_id=block.id,
+            )
+        if event_type == "file_change":
+            self.snapshot.dirty_count += 1
+            operation = str(payload.get("operation") or "changed")
+            path = str(payload.get("path") or "")
+            verb = _FILE_OPERATION_LABELS.get(operation, operation)
+            diff = str(payload.get("diff") or "")
+            additions, deletions = _file_change_counts(
+                diff,
+                payload.get("additions"),
+                payload.get("deletions"),
+            )
+            title = f"{verb} {path}  +{additions}  -{deletions}"
+            self._set_agent_activity(block, title)
+            return TranscriptBlock(
+                "file",
+                title,
+                diff,
+                "changed",
+                turn=self.snapshot.turn,
+                parent_id=block.id,
+            )
+        # Usage, compaction and turn bookkeeping stay out of the inline
+        # timeline; they describe the agent, not its work.
+        return None
+
+    def _apply_agent_event(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+        agent_name: str | None,
+    ) -> TranscriptBlock | None:
+        raw_status = str(payload.get("status") or "")
+        if event_type == "agent_status" and raw_status == "closed":
+            # Closing adds no outcome; the final inline state stays visible.
+            return None
+        block = self._agent_block(payload, agent_name)
+        if event_type == "agent_spawned":
+            block.title = str(payload.get("name") or payload.get("agent_name") or block.title)
+            # A very fast worker may finish before its spawn event reaches the
+            # shared bus; never reopen a terminal record.
+            if block.status not in _AGENT_TERMINAL_STATUSES:
+                block.status = "running"
+            task = str(payload.get("task") or "").strip()
+            if task and block.body in {"", "运行中", "等待中"}:
+                block.body = _short_line(task, 120)
+            self._touch_agent(block)
+            return block
+        if event_type == "agent_status":
+            mapped = _agent_ui_status(raw_status)
+            if mapped is not None:
+                block.status = mapped
+            summary = str(payload.get("summary") or "").strip()
+            error = str(payload.get("error") or "").strip()
+            if raw_status == "completed":
+                block.body = _short_line(summary or "已完成", 160)
+            elif raw_status in {"failed", "blocked", "interrupted"}:
+                block.body = _short_line(error or summary or _AGENT_STATUS_LABELS[raw_status], 160)
+            elif raw_status in {"queued", "running"} and not summary:
+                block.body = _AGENT_STATUS_LABELS[raw_status]
+            self._touch_agent(block)
+            return block
+        # agent_message / agent_parent_message: a message row inside the
+        # timeline, never a new top-level "已补充"/"已上报" block.
+        mapped = _agent_ui_status(raw_status)
+        if mapped in {"running", "pending"}:
+            block.status = mapped
+        message = str(payload.get("message") or "")
+        outbound = event_type == "agent_message"
+        self._set_agent_activity(block, "继续任务" if outbound else "上报消息")
+        return TranscriptBlock(
+            "agent",
+            "已补充" if outbound else "上报",
+            message,
+            "running",
+            turn=self.snapshot.turn,
+            parent_id=block.id,
+            direction="out" if outbound else "in",
+        )
+
+    def _agent_block(
+        self,
+        payload: dict[str, Any],
+        agent_name: str | None,
+    ) -> TranscriptBlock:
+        raw_id = str(payload.get("agent_id") or "")
+        name = str(
+            payload.get("name")
+            or payload.get("agent_name")
+            or (agent_name if agent_name not in _MAIN_AGENT_NAMES else "")
+            or "子代理"
+        )
+        key = raw_id or self.agent_keys_by_name.get(name) or name
+        block = self.agent_blocks.get(key)
+        if block is None:
+            block = TranscriptBlock(
+                "agent",
+                name,
+                _short_line(str(payload.get("task") or ""), 120) or "运行中",
+                "running",
+                turn=self.snapshot.turn,
+                id=f"agent-{key}",
+                role="group",
+            )
+            self.agent_blocks[key] = block
+        self.agent_keys_by_name[name] = key
+        return block
+
+    def _set_agent_activity(self, block: TranscriptBlock, text: str) -> None:
+        if block.status in _AGENT_TERMINAL_STATUSES:
+            return
+        body = _short_line(text, 160)
+        if not body or body == block.body:
+            return
+        block.body = body
+        self._touch_agent(block)
+
+    def _touch_agent(self, block: TranscriptBlock) -> None:
+        if all(item is not block for item in self.pending_agent_updates):
+            self.pending_agent_updates.append(block)
 
     def _apply_middleware_activity(self, payload: dict[str, Any]) -> None:
         return None
@@ -448,19 +728,15 @@ def _localize_error(value: Any, fallback: str = "操作失败，请稍后重试"
 
 # Tools whose call titles are reduced to their single most useful argument.
 _TOOL_PRIMARY_ARGS = {
-    "run_bash": "command",
+    "bash": "command",
     "read_file": "path",
     "write_file": "path",
     "apply_patch": "path",
-    "list_files": "directory",
     "spawn_agent": "task",
     "send_agent_message": "message",
     "followup_agent": "task",
-    "read_agent_changes": "proposal_id",
-    "apply_agent_changes": "proposal_id",
     "close_agent": "agent_id",
     "read_skill_file": "path",
-    "repo_search": "query",
     "web_search": "query",
     "web_fetch": "url",
 }
@@ -468,19 +744,15 @@ _TOOL_PRIMARY_ARGS = {
 _HIDDEN_TOOL_CALLS = {"ask_user", "update_todo"}
 
 _TOOL_DISPLAY_LABELS = {
-    "list_files": "查看目录",
     "read_file": "阅读文件",
     "write_file": "写入文件",
     "apply_patch": "修改文件",
-    "repo_search": "搜索代码",
-    "run_bash": "执行命令",
+    "bash": "执行命令",
     "spawn_agent": "启动子代理",
     "send_agent_message": "补充子代理消息",
     "followup_agent": "继续子代理任务",
     "wait_agents": "等待子代理",
     "interrupt_agent": "中断子代理",
-    "read_agent_changes": "查看子代理改动",
-    "apply_agent_changes": "应用子代理改动",
     "close_agent": "关闭子代理",
     "web_search": "搜索网页",
     "web_fetch": "阅读网页",
@@ -497,19 +769,15 @@ _TOOL_DISPLAY_LABELS = {
 }
 
 _TOOL_RESULT_LABELS = {
-    "list_files": "目录已查看",
     "read_file": "文件已阅读",
     "write_file": "文件已写入",
     "apply_patch": "文件已修改",
-    "repo_search": "代码已搜索",
-    "run_bash": "命令已执行",
+    "bash": "命令已执行",
     "spawn_agent": "子代理已启动",
     "send_agent_message": "消息已补充",
     "followup_agent": "后续任务已发送",
     "wait_agents": "子代理状态已更新",
     "interrupt_agent": "子代理已中断",
-    "read_agent_changes": "子代理改动已读取",
-    "apply_agent_changes": "子代理改动已应用",
     "close_agent": "子代理已关闭",
     "web_search": "网页已搜索",
     "web_fetch": "网页已阅读",
@@ -524,6 +792,24 @@ _TOOL_RESULT_LABELS = {
     "read_shell_output": "后台输出已读取",
     "stop_shell_job": "后台任务已停止",
 }
+
+
+def _agent_ui_status(status: str) -> str | None:
+    return {
+        "queued": "pending",
+        "running": "running",
+        "completed": "success",
+        "failed": "failed",
+        "blocked": "failed",
+        "interrupted": "interrupted",
+    }.get(status)
+
+
+def _short_line(text: Any, limit: int) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) > limit:
+        return value[: max(0, limit - 1)] + "…"
+    return value
 
 
 def _payload_turn(payload: dict[str, Any], default: int) -> int:
@@ -550,7 +836,7 @@ def _tool_result_title(tool: str, status: str) -> str:
         if result_label:
             return result_label
         return f"{_tool_display_label(tool)}已完成"
-    if tool == "run_bash":
+    if tool == "bash":
         return "命令执行失败"
     return f"{_tool_display_label(tool)}失败"
 

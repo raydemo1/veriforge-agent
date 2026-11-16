@@ -1,9 +1,9 @@
 """UI read-model projection: runtime events -> Work State.
 
-The layer is deliberately dumb.  It owns no business rules: proposal
-applicability, conflict state and isolation mode all come from the runtime;
-this module only shapes the event stream into the six Work State sections the
-terminal renders (Plan / Tasks / Agents / Changes / Checks / Artifacts).
+The layer is deliberately dumb.  It owns no business rules: check status and
+agent state all come from the runtime; this module only shapes the event
+stream into the six Work State sections the terminal renders
+(Plan / Tasks / Agents / Changes / Checks / Artifacts).
 
 Replaying the same journaled events produces the same state, so resume and
 live streaming share one code path.
@@ -35,7 +35,6 @@ class WorkStateProjection:
         self._tasks: list[dict[str, Any]] = []
         self._agents: dict[str, dict[str, Any]] = {}
         self._files: dict[str, dict[str, Any]] = {}
-        self._proposals: list[dict[str, Any]] = []
         self._checks: dict[str, dict[str, Any]] = {}
         self._artifacts: dict[str, dict[str, Any]] = {}
 
@@ -52,6 +51,11 @@ class WorkStateProjection:
         if not isinstance(payload, dict):
             payload = {}
         agent = data.get("agent")
+        is_main = agent in (None, "", "main", "main_agent")
+        if not is_main and event_type not in {"agent_spawned", "agent_status", "file_change"}:
+            # Workers share the event bus, but only their lifecycle and real
+            # shared-workspace file changes belong to the main work state.
+            return set()
 
         changed: set[str] = set()
         if event_type == "turn_started":
@@ -89,7 +93,7 @@ class WorkStateProjection:
                 changed.add("plan")
         elif event_type == "tool_result":
             changed |= self._apply_tool_result(payload)
-        elif event_type == "file_change" and (agent is None or agent == "main_agent"):
+        elif event_type == "file_change":
             self._apply_file_change(payload)
             changed.add("changes")
         elif event_type == "agent_spawned":
@@ -104,15 +108,6 @@ class WorkStateProjection:
                         check = {**check, "status": "warning", "detail": "结果已过期，检查期间工作区发生变化。"}
                     changed |= self._upsert_check(check)
         return changed
-
-    def merge_proposals(self, proposals: list[dict[str, Any]] | None) -> bool:
-        """Merge live ChangeProposal snapshots owned by the coordinator."""
-
-        normalized = list(proposals or [])
-        if normalized == self._proposals:
-            return False
-        self._proposals = normalized
-        return True
 
     # ------------------------------------------------------------------
     # Section snapshots
@@ -227,12 +222,15 @@ class WorkStateProjection:
             self._agents[agent_id] = _agent_from_payload(payload)
         else:
             existing["status"] = status
-            existing.update({
+            update = {
                 "summary": str(payload.get("summary") or existing["summary"]),
-                "error": payload.get("error") or existing["error"],
-                "proposalId": payload.get("proposal_id") or existing["proposalId"],
                 "durationSeconds": _duration(payload.get("duration_seconds"), existing),
-            })
+            }
+            # A follow-up clears the previous failure in the runtime; honour
+            # an explicit null instead of keeping the stale message alive.
+            if "error" in payload:
+                update["error"] = payload.get("error")
+            existing.update(update)
         return {"agents"}
 
     # ------------------------------------------------------------------
@@ -257,20 +255,11 @@ class WorkStateProjection:
 
     def _snapshot_changes(self) -> dict[str, Any]:
         workspace = sorted(self._files.values(), key=lambda item: item["path"])
-        proposals = [self._decorate_proposal(item) for item in self._proposals]
-        proposals = [item for item in proposals if item["status"] != "applied"]
         return {
             "workspace": workspace,
             "additions": sum(item["additions"] for item in workspace),
             "deletions": sum(item["deletions"] for item in workspace),
-            "proposals": proposals,
         }
-
-    def _decorate_proposal(self, item: dict[str, Any]) -> dict[str, Any]:
-        decorated = dict(item)
-        agent = self._agents.get(str(item.get("agentId") or ""))
-        decorated["agentName"] = str(agent["name"] if agent else item.get("agentName") or item.get("agentId") or "worker")
-        return decorated
 
     # ------------------------------------------------------------------
     # Checks / artifacts
@@ -333,10 +322,9 @@ def _agent_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "role": role,
         "task": str(payload.get("task") or ""),
         "status": str(payload.get("status") or "queued"),
-        "isolation": "isolated workspace" if role == "worker" else "read-only",
+        "isolation": "shared workspace" if role == "worker" else "read-only",
         "summary": str(payload.get("summary") or ""),
         "error": payload.get("error"),
-        "proposalId": payload.get("proposal_id"),
         "durationSeconds": _duration(payload.get("duration_seconds"), None),
     }
 

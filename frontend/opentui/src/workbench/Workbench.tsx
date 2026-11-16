@@ -1,16 +1,13 @@
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useKeyboard } from "@opentui/react";
 import type {
-  ActionResult,
   Artifact,
   Check,
   PlanState,
   TasksState,
   WorkAgent,
   WorkFile,
-  WorkProposal,
   WorkState,
-  WorkbenchParams,
 } from "../protocol.ts";
 import type { Theme } from "../theme.ts";
 import type { WorkbenchTab } from "./strip.ts";
@@ -79,66 +76,12 @@ function EmptyState({ text, theme }: { text: string; theme: Theme }) {
   return <text fg={theme.subtle}>{text}</text>;
 }
 
-function WButton({ label, color, theme, disabled = false, busy = false, onInvoke }: {
-  label: string;
-  color: string;
-  theme: Theme;
-  disabled?: boolean;
-  busy?: boolean;
-  onInvoke: () => void;
-}) {
-  const [hover, setHover] = useState(false);
-  const active = hover && !disabled;
+function FileStats({ file, theme }: { file: WorkFile; theme: Theme }) {
   return (
-    <box
-      focusable={!disabled}
-      onMouseOver={() => setHover(true)}
-      onMouseOut={() => setHover(false)}
-      onMouseDown={() => { if (!disabled && !busy) onInvoke(); }}
-      onKeyDown={(key) => {
-        if (!disabled && !busy && (key.name === "return" || key.name === "kpenter" || key.name === "space")) onInvoke();
-      }}
-      style={{
-        flexDirection: "row",
-        paddingLeft: 1,
-        paddingRight: 1,
-        backgroundColor: disabled ? theme.surface : active ? theme.surfaceSelected : theme.surfaceRaised,
-      }}
-    >
-      <text fg={disabled ? theme.subtle : color}>{busy ? "› …" : label}</text>
-    </box>
-  );
-}
-
-function FileStats({ file, theme, marker, indent }: {
-  file: WorkFile;
-  theme: Theme;
-  marker?: string;
-  indent?: boolean;
-}) {
-  return (
-    <box style={{ flexDirection: "row", gap: 1, paddingLeft: indent ? 2 : 0 }}>
-      {marker ? <text fg={theme.subtle}>{marker}</text> : null}
+    <box style={{ flexDirection: "row", gap: 1 }}>
       <text fg={theme.subtle}>{file.path}</text>
       <text fg={theme.diffAdd}>{file.additions ? `+${file.additions}` : ""}</text>
       <text fg={theme.diffDelete}>{file.deletions ? `-${file.deletions}` : ""}</text>
-    </box>
-  );
-}
-
-function DiffText({ content, theme }: { content: string; theme: Theme }) {
-  const allLines = content.split("\n");
-  const lines = allLines.slice(0, 300);
-  return (
-    <box style={{ flexDirection: "column", paddingLeft: 2 }}>
-      {lines.map((line, index) => {
-        let color = theme.subtle;
-        if (line.startsWith("@@")) color = theme.accent;
-        else if (line.startsWith("+") && !line.startsWith("+++")) color = theme.diffAdd;
-        else if (line.startsWith("-") && !line.startsWith("---")) color = theme.diffDelete;
-        return <text key={index} fg={color}>{line || " "}</text>;
-      })}
-      {allLines.length > 300 ? <text fg={theme.subtle}>… 其余内容已省略</text> : null}
     </box>
   );
 }
@@ -212,128 +155,20 @@ function TasksView({ tasks, theme }: { tasks: TasksState; theme: Theme }) {
   );
 }
 
-type ExpandedDiff = { kind: "proposal" | "conflict"; content: string };
-
-function ProposalCard({ proposal, theme, busy, expanded, onToggleReview, onToggleConflict }: {
-  proposal: WorkProposal;
-  theme: Theme;
-  busy: string | null;
-  expanded: ExpandedDiff | undefined;
-  onToggleReview: () => void;
-  onToggleConflict: () => void;
-}) {
-  // Worker-centric observation language: the main agent owns integration,
-  // so a live proposal waits for the main agent, never for user approval.
-  const status = proposal.status === "ready"
-    ? { text: "待主代理整合", tone: "accent" as const }
-    : proposal.status === "conflict"
-      ? { text: "冲突", tone: "warning" as const }
-      : { text: "无效", tone: "error" as const };
-
-  return (
-    <box style={{ flexDirection: "column", gap: 1 }}>
-      <box style={{ flexDirection: "row", justifyContent: "space-between" }}>
-        <text fg={theme.text}>{proposal.agentName}</text>
-        <text fg={toneColor(theme, status.tone)}>{status.text}</text>
-      </box>
-      <text fg={theme.subtle} style={{ paddingLeft: 2 }}>
-        {`${proposal.files.length} 文件 · +${proposal.additions} -${proposal.deletions}`}
-      </text>
-      {proposal.files.map((file) => <FileStats key={file.path} file={file} theme={theme} marker="~" indent />)}
-      {proposal.invalidReasons.length ? (
-        <box style={{ flexDirection: "column", paddingLeft: 2 }}>
-          {proposal.invalidReasons.map((reason, index) => (
-            <text key={index} fg={theme.error}>{`! ${reason}`}</text>
-          ))}
-        </box>
-      ) : null}
-      <box style={{ flexDirection: "row", gap: 1, paddingLeft: 2 }}>
-        <WButton
-          label={expanded?.kind === "proposal" ? "收起差异" : "查看差异"}
-          color={theme.muted}
-          theme={theme}
-          busy={busy === "read_proposal"}
-          onInvoke={onToggleReview}
-        />
-        {proposal.conflict ? (
-          <WButton
-            label={expanded?.kind === "conflict" ? "收起冲突" : "查看冲突"}
-            color={theme.warning}
-            theme={theme}
-            busy={busy === "read_conflict"}
-            onInvoke={onToggleConflict}
-          />
-        ) : null}
-      </box>
-      {expanded ? <DiffText content={expanded.content} theme={theme} /> : null}
-    </box>
-  );
-}
-
-function ChangesView({ changes, theme, onWorkbench }: {
+function ChangesView({ changes, theme }: {
   changes: WorkState["changes"];
   theme: Theme;
-  onWorkbench: (params: WorkbenchParams) => Promise<ActionResult | undefined>;
 }) {
-  const [busy, setBusy] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState<Record<string, ExpandedDiff>>({});
-
-  if (!changes.workspace.length && !changes.proposals.length) {
+  if (!changes.workspace.length) {
     return <EmptyState text="暂无变更" theme={theme} />;
   }
 
-  const toggleDiff = async (proposal: WorkProposal, op: WorkbenchParams, label: string, kind: "proposal" | "conflict") => {
-    if (expanded[proposal.id]?.kind === kind) {
-      setExpanded((current) => {
-        const next = { ...current };
-        delete next[proposal.id];
-        return next;
-      });
-      return;
-    }
-    setBusy(label);
-    try {
-      const result = await onWorkbench(op);
-      if (result?.content) {
-        setExpanded((current) => ({ ...current, [proposal.id]: { kind, content: result.content ?? "" } }));
-      }
-    } finally {
-      setBusy(null);
-    }
-  };
-
   return (
     <box style={{ flexDirection: "column", gap: 1 }}>
-      {changes.workspace.length ? (
-        <box style={{ flexDirection: "column" }}>
-          <text fg={theme.muted}>{`工作区 · ${changes.workspace.length} 文件 · +${changes.additions} -${changes.deletions}`}</text>
-          {changes.workspace.map((file) => <FileStats key={file.path} file={file} theme={theme} />)}
-        </box>
-      ) : null}
-      {changes.proposals.length ? (
-        <box style={{ flexDirection: "column", gap: 2 }}>
-          <text fg={theme.muted}>{`执行者 · ${changes.proposals.length}`}</text>
-          {changes.proposals.map((proposal) => (
-            <ProposalCard
-              key={proposal.id}
-              proposal={proposal}
-              theme={theme}
-              busy={busy}
-              expanded={expanded[proposal.id]}
-              onToggleReview={() => void toggleDiff(proposal, { op: "read_proposal", proposalId: proposal.id }, "read_proposal", "proposal")}
-              onToggleConflict={() => {
-                if (!proposal.conflict) return;
-                void toggleDiff(
-                  proposal,
-                  { op: "read_conflict", conflictId: proposal.conflict.id },
-                  "read_conflict",
-                  "conflict",
-                );
-              }}
-            />
-          ))}
-        </box>
-      ) : null}
+      <box style={{ flexDirection: "column" }}>
+        <text fg={theme.muted}>{`工作区 · ${changes.workspace.length} 文件 · +${changes.additions} -${changes.deletions}`}</text>
+        {changes.workspace.map((file) => <FileStats key={file.path} file={file} theme={theme} />)}
+      </box>
     </box>
   );
 }
@@ -436,9 +271,7 @@ function tabBadge(tab: WorkbenchTab, work: WorkState): string {
     case "tasks":
       return work.tasks.total ? `${work.tasks.completed}/${work.tasks.total}` : "";
     case "changes": {
-      const count = work.changes.workspace.length
-        + work.changes.proposals.reduce((sum, item) => sum + item.files.length, 0);
-      return count ? String(count) : "";
+      return work.changes.workspace.length ? String(work.changes.workspace.length) : "";
     }
     case "agents":
       return work.agents.length ? String(work.agents.length) : "";
@@ -451,7 +284,7 @@ function tabBadge(tab: WorkbenchTab, work: WorkState): string {
   }
 }
 
-export function Workbench({ work, theme, terminalWidth, terminalHeight, initialTab, onTabChange, onClose, onWorkbench }: {
+export function Workbench({ work, theme, terminalWidth, terminalHeight, initialTab, onTabChange, onClose }: {
   work: WorkState;
   theme: Theme;
   terminalWidth: number;
@@ -459,7 +292,6 @@ export function Workbench({ work, theme, terminalWidth, terminalHeight, initialT
   initialTab: WorkbenchTab;
   onTabChange?: (tab: WorkbenchTab) => void;
   onClose: () => void;
-  onWorkbench: (params: WorkbenchParams) => Promise<ActionResult | undefined>;
 }) {
   const tab = initialTab;
   const setTab = (value: WorkbenchTab) => onTabChange?.(value);
@@ -525,7 +357,7 @@ export function Workbench({ work, theme, terminalWidth, terminalHeight, initialT
       case "tasks":
         return <TasksView tasks={work.tasks} theme={theme} />;
       case "changes":
-        return <ChangesView changes={work.changes} theme={theme} onWorkbench={onWorkbench} />;
+        return <ChangesView changes={work.changes} theme={theme} />;
       case "agents":
         return <AgentsView agents={work.agents} theme={theme} />;
       case "checks":
@@ -535,9 +367,6 @@ export function Workbench({ work, theme, terminalWidth, terminalHeight, initialT
       default:
         return null;
     }
-    // onWorkbench identity changes each render; the view only needs
-    // recomputation when the data or selected tab does.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, work, theme]);
 
   return (

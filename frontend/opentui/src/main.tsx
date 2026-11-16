@@ -80,8 +80,8 @@ function mockSessionEvents(): AsyncIterable<SessionEvent> {
         agents: [
           {
             id: "agent-1", name: "worker-1", role: "worker", task: "实现 Workbench 变更视图",
-            status: "running", isolation: "isolated workspace", summary: "", error: null,
-            proposalId: "proposal_demo1", durationSeconds: 18,
+            status: "running", isolation: "shared workspace", summary: "", error: null,
+            durationSeconds: 18,
           },
         ],
       };
@@ -91,13 +91,6 @@ function mockSessionEvents(): AsyncIterable<SessionEvent> {
           workspace: [{ path: "harness_code_agent/tui/protocol.py", operation: "modify", additions: 8, deletions: 2 }],
           additions: 8,
           deletions: 2,
-          proposals: [
-            {
-              id: "proposal_demo1", agentId: "agent-1", agentName: "worker-1", status: "ready",
-              files: [{ path: "frontend/opentui/src/workbench/Workbench.tsx", operation: "create", additions: 420, deletions: 0 }],
-              additions: 420, deletions: 0, invalidReasons: [], conflict: null,
-            },
-          ],
         },
       };
       yield {
@@ -111,7 +104,7 @@ function mockSessionEvents(): AsyncIterable<SessionEvent> {
       yield {
         type: "artifact_updated",
         artifacts: [
-          { id: "browser-png", kind: "image", path: ".harness/artifacts/browser.png", title: "browser.png", detail: "http://localhost:5173" },
+          { id: "browser-png", kind: "image", path: ".veriforge/artifacts/browser.png", title: "browser.png", detail: "http://localhost:5173" },
         ],
       };
       yield { type: "notice", text: "OpenTUI 已就绪：输入 / 查看命令" };
@@ -347,8 +340,8 @@ function mockAction(name: ActionName, params?: Record<string, unknown>, sessionI
       kind: "permission",
       title: "审批模式",
       options: [
-        { id: "workspace-write", label: "请求批准", description: "编辑外部文件和使用互联网时始终询问", selected: true },
-        { id: "llm-auto", label: "替我审批", description: "仅对检测到的风险操作请求批准" },
+        { id: "workspace-write", label: "请求批准", description: "工作区内写入直接放行；需要审批的操作由你确认", selected: true },
+        { id: "llm-auto", label: "替我审批", description: "与请求批准相同的权限；需要审批的操作交给命令审查模型" },
         { id: "danger-full-access", label: "完全访问权限", description: "不受限制地访问互联网和电脑上的任何文件", tone: "danger" },
       ],
     } });
@@ -361,17 +354,6 @@ function mockAction(name: ActionName, params?: Record<string, unknown>, sessionI
     { insertText: "session:session-1", display: "重构命令栏滚动与焦点", description: "历史会话", kind: "session" },
     { insertText: "file:README.md", display: "README.md", description: "当前工作区文件", kind: "file" },
   ] });
-  if (name === "workbench_action") {
-    const op = String(params?.op ?? "");
-    if (op === "read_proposal" || op === "read_conflict") {
-      return Promise.resolve({
-        ok: true,
-        content: "@@ -1,3 +1,4 @@\n context\n+added line\n-removed line\n more context",
-        paths: ["frontend/opentui/src/workbench/Workbench.tsx"],
-        totalChars: 86,
-      });
-    }
-  }
   return Promise.resolve({ ok: true, message: "操作已完成" });
 }
 

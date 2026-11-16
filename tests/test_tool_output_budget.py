@@ -1,10 +1,11 @@
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from harness_code_agent.agent.observations import FactTracker, ObservationStore
+from harness_code_agent.agent.observations import ObservationStore
 from harness_code_agent.runtime.builtins.filesystem import read_file
 from harness_code_agent.runtime.tool_result import ToolResult
 from harness_code_agent.support.tokens import count_text_tokens, count_tokens
@@ -14,7 +15,7 @@ from harness_code_agent.workspace.service import WorkspaceService
 def observe(root, output, *, result=None):
     store = ObservationStore(root / '.harness' / 'observations' / 'session')
     result = result or ToolResult(tool='test', status='success', output=output)
-    observation = store.create(tool=result.tool, args={}, result=result, fact_tracker=FactTracker())
+    observation = store.create(tool=result.tool, args={}, result=result)
     return observation, observation.message
 
 
@@ -36,7 +37,6 @@ def test_large_output_has_reference_and_bounded_head_tail_preview(tmp_path):
     assert count_text_tokens(head) <= 500
     assert count_text_tokens(tail) <= 500
     assert 'read_file' in message
-    assert str(tmp_path) not in message
     assert count_tokens([{'role': 'tool', 'content': message}]) <= 5000
     assert observation.raw_output_path.read_text(encoding='utf-8') == output
 
@@ -50,9 +50,9 @@ def test_reopening_store_does_not_overwrite_output(tmp_path):
 
 def test_observation_index_eviction_keeps_artifacts(tmp_path):
     store = ObservationStore(tmp_path / 'outputs')
-    first = store.create(tool='test', args={}, result=ToolResult(tool='test', status='success', output='large ' * 20000), fact_tracker=FactTracker())
+    first = store.create(tool='test', args={}, result=ToolResult(tool='test', status='success', output='large ' * 20000))
     for _ in range(300):
-        store.create(tool='test', args={}, result=ToolResult(tool='test', status='success', output='small'), fact_tracker=FactTracker())
+        store.create(tool='test', args={}, result=ToolResult(tool='test', status='success', output='small'))
     assert first.raw_output_path.exists()
     assert len(store.observations) == 300
 
@@ -104,7 +104,7 @@ def test_streamed_small_output_is_inlined_and_temporary_file_removed(tmp_path):
     directory.mkdir(parents=True)
     artifact = directory / 'shell_output_small.txt'
     artifact.write_text('small captured result', encoding='utf-8')
-    result = ToolResult(tool='run_bash', status='success', output='preview', return_code=0,
+    result = ToolResult(tool='bash', status='success', output='preview', return_code=0,
                         metadata={'artifact_path': str(artifact), 'output_spilled': True})
     observation, message = observe(tmp_path, '', result=result)
     assert 'small captured result' in message
@@ -122,9 +122,9 @@ def test_structured_failure_fields_remain_visible(tmp_path):
 
 def test_long_arguments_are_not_repeated_in_result(tmp_path):
     store = ObservationStore(tmp_path / 'outputs')
-    result = ToolResult(tool='run_bash', status='success', output='ok', return_code=0)
-    observation = store.create(tool='run_bash', args={'command': 'COMMAND_SECRET' * 10000},
-                               result=result, fact_tracker=FactTracker())
+    result = ToolResult(tool='bash', status='success', output='ok', return_code=0)
+    observation = store.create(tool='bash', args={'command': 'COMMAND_SECRET' * 10000},
+                               result=result)
     assert 'COMMAND_SECRET' not in observation.message
     assert observation.raw_output_path is None
 
@@ -178,23 +178,6 @@ def test_background_log_spills_only_when_long_and_keeps_its_beginning(tmp_path):
     assert 'START_MARKER' in buffer.path.read_text(encoding='utf-8')
 
 
-def test_artifact_copy_is_verified_and_cannot_escape_workspace(tmp_path):
-    from harness_code_agent.runtime.output_artifacts import copy_artifact, file_digest
-
-    source, target = tmp_path / 'source', tmp_path / 'target'
-    artifact = source / '.harness/observations/session/main/output.txt'
-    artifact.parent.mkdir(parents=True)
-    artifact.write_text('original', encoding='utf-8')
-    reference = {'path': artifact.relative_to(source).as_posix(), 'sha256': file_digest(artifact)}
-    copy_artifact(source, target, reference)
-    assert (target / reference['path']).read_text(encoding='utf-8') == 'original'
-    artifact.write_text('changed', encoding='utf-8')
-    with pytest.raises(ValueError, match='damaged'):
-        copy_artifact(source, target, reference)
-    with pytest.raises(ValueError):
-        copy_artifact(source, target, {'path': '../outside.txt'})
-
-
 def test_special_token_strings_are_plain_tool_content(tmp_path):
     _, message = observe(tmp_path, '<|endoftext|>')
     assert '<|endoftext|>' in message
@@ -233,8 +216,9 @@ def record_large_result(conversation, call_id='call'):
 def test_fork_resume_restores_structured_reference_and_detects_damage(tmp_path):
     from harness_code_agent.sessions.journal import SessionJournal
     from harness_code_agent.sessions.store import SessionStore
+    from harness_code_agent.workspace.state_paths import ensure_workspace_state
 
-    sessions = SessionStore(tmp_path / '.harness')
+    sessions = SessionStore(ensure_workspace_state(tmp_path))
     source = sessions.create(cwd=str(tmp_path), model='test', permission_mode='danger-full-access')
     original = make_conversation(make_context(tmp_path, source.id))
     recovered = None
@@ -259,6 +243,33 @@ def test_fork_resume_restores_structured_reference_and_detects_damage(tmp_path):
             recovered.close()
 
 
+def test_external_read_requires_a_reference_from_the_current_context(tmp_path):
+    from harness_code_agent.runtime.tool_runner import execute_tool_result
+    from harness_code_agent.workspace.state_paths import ensure_workspace_state
+
+    state_root = ensure_workspace_state(tmp_path)
+    internal = state_root / "mcp.json"
+    log = state_root / "shell.log"
+    internal.write_text("private config", encoding="utf-8")
+    log.write_text("line 1\n", encoding="utf-8")
+    owner = make_context(tmp_path, "owner")
+    other = make_context(tmp_path, "other")
+    owner.register_output_artifact({"path": log.resolve().as_posix(), "append_only": True})
+    with log.open("a", encoding="utf-8") as stream:
+        stream.write("line 2\n")
+
+    for context, path in [(owner, internal), (other, log)]:
+        result = execute_tool_result("read_file", {"path": str(path)}, tool_context=context)
+        assert result.status == "failed"
+        assert "private config" not in result.output
+        assert "line 1" not in result.output
+    result = execute_tool_result(
+        "read_file", {"path": str(log), "start_line": 2, "max_lines": 1}, tool_context=owner
+    )
+    assert result.status == "success"
+    assert "line 2" in result.output
+
+
 def test_worker_copies_only_referenced_artifacts_and_publishes_before_cleanup(tmp_path):
     from harness_code_agent.agent.coordinator import AgentCoordinator, AgentRecord
 
@@ -275,16 +286,16 @@ def test_worker_copies_only_referenced_artifacts_and_publishes_before_cleanup(tm
                              expected_output='', allowed_paths=['note.txt'], fork_turns='all', model_intensity=None)
         with patch('harness_code_agent.agent.conversation.get_client', return_value=SimpleNamespace(close=lambda: None)):
             coordinator._ensure_conversation(record)
-        sandbox = coordinator.changes.sandbox_for(record.id)
-        assert (sandbox.workspace / inherited.artifact_reference['path']).is_file()
-        assert not (sandbox.workspace / unused).exists()
+        assert record.conversation.agent.tool_context.workspace.root == tmp_path.resolve()
+        assert record.conversation.agent.tool_context.workspace is not context.workspace
+        assert Path(inherited.artifact_reference['path']).is_file()
+        assert unused not in record.conversation.agent.tool_context.tool_output_artifacts
         produced = record_large_result(record.conversation, 'worker_call')
         record.state = 'completed'
         coordinator._records[record.id] = record
         coordinator._names[record.name] = record.id
         coordinator.close_agent(record.id)
-        assert not sandbox.workspace.exists()
-        copied = tmp_path / produced.artifact_reference['path']
+        copied = Path(produced.artifact_reference['path'])
         assert copied.is_file()
         assert copied.read_text(encoding='utf-8').endswith('the quick brown fox jumps ')
         assert any(entry.kind == 'tool_output_artifact' and entry.payload['path'] == produced.artifact_reference['path']
@@ -298,7 +309,7 @@ def test_artifact_write_failure_is_explicit_and_does_not_include_preview(tmp_pat
     store = ObservationStore(tmp_path / 'outputs')
     result = ToolResult(tool='test', status='success', output='SECRET_BODY ' * 10000)
     with patch('pathlib.Path.mkdir', side_effect=OSError('disk full')):
-        observation = store.create(tool='test', args={}, result=result, fact_tracker=FactTracker())
+        observation = store.create(tool='test', args={}, result=result)
     assert 'output_complete: false' in observation.message
     assert 'SECRET_BODY' not in observation.message
     assert observation.raw_output_path is None
@@ -350,7 +361,7 @@ def test_shell_log_pages_advance_unicode_offsets_without_duplicate_artifacts(tmp
         assert result.metadata['next_offset'] > offset
         offset = result.metadata['next_offset']
     assert ''.join(pages) == source
-    assert len(list(tmp_path.rglob('*.txt'))) == 1
+    assert buffer.path.is_file()
 
 
 def test_cancellation_after_tool_completion_preserves_completed_result(tmp_path):

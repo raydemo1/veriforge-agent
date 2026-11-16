@@ -26,6 +26,7 @@ class SessionEmitter:
                 threshold=threshold,
                 forced=False,
                 phase=phase,
+                agent=self.agent_name,
             ).to_event()
         )
 
@@ -46,6 +47,7 @@ class SessionEmitter:
                 messages_before=messages_before,
                 messages_after=messages_after,
                 tokens_saved=tokens_saved,
+                agent=self.agent_name,
             ).to_event()
         )
 
@@ -60,6 +62,7 @@ class SessionEmitter:
                 score=getattr(signal, "score", 0),
                 reasons=list(getattr(signal, "reasons", [])),
                 source=getattr(signal, "source", "assistant_recent_messages"),
+                agent=self.agent_name,
             ).to_event()
         )
 

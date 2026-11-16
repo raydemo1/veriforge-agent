@@ -250,7 +250,8 @@ def test_worker_uses_parent_project_memory_once(tmp_path):
         try:
             coordinator._ensure_conversation(worker)
             child_context = worker.conversation.agent.tool_context
-            assert child_context.workspace.root != workspace
+            assert child_context.workspace.root == workspace.resolve()
+            assert child_context.workspace is not context.workspace
             assert child_context.memory_service is service
             content = worker.conversation.messages[0]["content"]
             assert content.count("[HARNESS_MEMORY_INDEX]\nHistorical references") == 1

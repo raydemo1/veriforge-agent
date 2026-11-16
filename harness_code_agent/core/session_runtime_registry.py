@@ -30,9 +30,10 @@ class SessionRuntime:
 class SessionRuntimeRegistry:
     def __init__(self, project, factory, emit):
         self.project = Path(project).resolve()
-        self.store = SessionStore(self.project / ".harness")
+        from ..workspace.state_paths import ensure_workspace_state
+        self.store = SessionStore(ensure_workspace_state(self.project))
         from ..workspace.access import WorkspaceAccessCoordinator
-        self.access = WorkspaceAccessCoordinator(self.project)
+        self.access = WorkspaceAccessCoordinator(self.project, state_root=self.store.root)
         self.factory, self.emit = factory, emit
         self._lock = threading.RLock()
         self._records = {}
@@ -187,17 +188,6 @@ class SessionRuntimeRegistry:
         else:
             fork = self.store.fork(source.id)
             root = source.cwd
-        if root != source.cwd:
-            from ..runtime.output_artifacts import copy_artifact
-            from ..sessions.journal import SessionJournal
-            for entry in SessionJournal(fork.journal_path).read():
-                references = []
-                if entry.kind == "tool_output_artifact":
-                    references = [entry.payload]
-                elif entry.kind == "message":
-                    references = entry.payload.get("metadata", {}).get("tool_output_artifacts", [])
-                for reference in references:
-                    copy_artifact(source.cwd, root, reference)
         from ..runtime.recovery import atomic_json
         metadata = self.store.read_metadata(fork.id)
         metadata.update(cwd=str(root), environment="worktree" if worktree else source.environment)

@@ -45,7 +45,6 @@ def test_coordinator_close_is_bounded_and_preserves_dependencies():
     record = SimpleNamespace(token=CancellationToken(), future=future, conversation=Mock())
     coordinator._records = {"blocked": record}
     coordinator.context = SimpleNamespace(tool_tasks=ToolTaskSupervisor())
-    coordinator.changes = Mock()
     coordinator._publish_outputs = Mock()
     try:
         before = time.monotonic()
@@ -53,14 +52,12 @@ def test_coordinator_close_is_bounded_and_preserves_dependencies():
             coordinator.close(timeout=0.05)
         assert time.monotonic() - before < 1
         record.conversation.close.assert_not_called()
-        coordinator.changes.close.assert_not_called()
         assert record.token.is_cancelled
     finally:
         release.set()
         executor.shutdown(wait=True)
     coordinator.close(timeout=1)
     record.conversation.close.assert_called_once()
-    coordinator.changes.close.assert_called_once()
 
 
 def test_busy_mcp_toggle_does_not_write_config(tmp_path, runtime_factory):

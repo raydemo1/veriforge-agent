@@ -56,23 +56,18 @@ describe("work strip", () => {
     expect(failed.find((s) => s.key === "checks")).toMatchObject({ tone: "error" });
   });
 
-  test("change count merges workspace files and proposal files", () => {
+  test("change count follows workspace files", () => {
     const segments = workSegments(work({
       changes: {
-        workspace: [{ path: "a.py", operation: "modify", additions: 1, deletions: 1 }],
-        additions: 1,
+        workspace: [
+          { path: "a.py", operation: "modify", additions: 1, deletions: 1 },
+          { path: "b.py", operation: "create", additions: 1, deletions: 0 },
+        ],
+        additions: 2,
         deletions: 1,
-        proposals: [{
-          id: "p1", agentId: "x", agentName: "w", status: "ready",
-          files: [
-            { path: "b.py", operation: "create", additions: 1, deletions: 0 },
-            { path: "c.py", operation: "create", additions: 1, deletions: 0 },
-          ],
-          additions: 2, deletions: 0, invalidReasons: [], conflict: null,
-        }],
       },
     }));
-    expect(segments.find((s) => s.key === "changes")).toMatchObject({ text: "3 变更" });
+    expect(segments.find((s) => s.key === "changes")).toMatchObject({ text: "2 变更" });
   });
 
   test("skipped checks never look like passed evidence", () => {
@@ -87,7 +82,7 @@ describe("work strip", () => {
       plan: { status: "ready", revision: 1, path: "plan.md", steps: [], completedCount: 0, totalCount: 1 },
       agents: [{
         id: "a", name: "w", role: "worker", task: "", status: "running",
-        isolation: "isolated workspace", summary: "", error: null, proposalId: null, durationSeconds: null,
+        isolation: "shared workspace", summary: "", error: null, durationSeconds: null,
       }],
       checks: [{ id: "a", name: "A", status: "running", detail: "" }],
       artifacts: [{ id: "x", kind: "image", path: "x.png", title: "x.png", detail: "" }],

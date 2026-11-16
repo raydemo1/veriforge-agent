@@ -19,7 +19,7 @@ from typing import Any
 from .. import config
 from ..agent.conversation import AgentConversation
 from ..agent.coordinator import AgentCoordinator
-from ..agent.prompts import GlobalRulesDoc, PromptPrefixBuilder
+from ..agent.prompts import GlobalRulesDoc, PromptPrefixBuilder, platform_prompt
 from ..attachments import (
     Attachment,
     AttachmentError,
@@ -40,6 +40,7 @@ from ..memory.background import (
 )
 from ..runtime.agent_config import RuntimeOptions
 from ..runtime.approvals import (
+    ApprovalGate,
     ApprovalProvider,
     ApprovalRequest,
     ConsoleApprovalProvider,
@@ -124,8 +125,8 @@ implementation plan as your final answer: what you will change, in which files,
 in what order, how it will be verified, and the risks that need a decision.
 
 Do not modify the workspace. During planning the runtime denies file edits,
-patches and mutating shell commands, so the proposal is the deliverable and
-applying it is a later turn after the user approves the plan.
+patches and mutating shell commands, so the plan is the deliverable and
+executing it is a later turn after the user approves the plan.
 """
 
 
@@ -172,7 +173,12 @@ class InteractiveSession:
         self.cwd = Path(cwd).resolve()
         self._requested_session_id = session_id
         self.environment = environment
-        self.state_root = Path(state_root).resolve() if state_root else self.cwd / ".harness"
+        if state_root:
+            self.state_root = Path(state_root).resolve()
+            self.state_root.mkdir(parents=True, exist_ok=True)
+        else:
+            from ..workspace.state_paths import ensure_workspace_state
+            self.state_root = ensure_workspace_state(self.cwd)
         self.model_selection = config.ModelSelection()
         self.lifecycle = LifecycleScope()
         from ..runtime.project_resources import ProjectResourceBudget
@@ -195,10 +201,14 @@ class InteractiveSession:
             self.question_provider = question_provider or ConsoleQuestionProvider()
             self.output_sink = output_sink or print
             self.enable_turn_summary = enable_turn_summary
-            self.memory_use_enabled = os.environ.get("HARNESS_MEMORY_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
-            self.memory_auto_extract_enabled = os.environ.get("HARNESS_MEMORY_GENERATION_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
+            memory_disabled = os.environ.get("HARNESS_MEMORY_DISABLED", "").lower() in {"1", "true", "yes", "on"}
+            generation_disabled = os.environ.get(
+                "HARNESS_MEMORY_GENERATION_DISABLED", ""
+            ).lower() in {"1", "true", "yes", "on"}
+            self.memory_use_enabled = not memory_disabled
+            self.memory_auto_extract_enabled = not memory_disabled and not generation_disabled
             self.memory_service = MemoryService(self.cwd)
-            self.recovery = RecoveryService(self.cwd)
+            self.recovery = RecoveryService(self.cwd, state_root=self.state_root)
             self._report_startup("loading skills")
             self.skill_registry = SkillRegistry()
             self._slash_registry = None
@@ -280,6 +290,7 @@ class InteractiveSession:
         prefix = PromptPrefixBuilder().build(
             global_rules_docs=[harness_rules] if harness_rules is not None else [],
             skill_catalog=catalog,
+            platform_notes=platform_prompt(self.environment),
         )
         middlewares = build_main_agent_middlewares(
             user_middlewares=self.user_middlewares,
@@ -611,11 +622,13 @@ class InteractiveSession:
                 root=self.cwd,
                 snapshots_dir=self.session.snapshots_dir,
                 session_id=self.session.id,
+                state_root=self.state_root,
             ),
             permission_policy=self._effective_permission_policy(),
             event_bus=self.event_bus,
             session_id=self.session.id,
             session_root=self.session.root,
+            state_root=self.state_root,
             environment=self.environment,
             project_resources=self.project_resources,
             discover_mcp_tools=self._discover_mcp_tools,
@@ -675,6 +688,17 @@ class InteractiveSession:
         """Push the effective policy into the live tool context."""
         if self.tool_context is not None:
             self.tool_context.permission_policy = self._effective_permission_policy()
+            manager = getattr(
+                getattr(self.conversation, "runtime_state", None), "shell_job_manager", None
+            )
+            if manager is not None:
+                # Only the explicit full-access mode runs shell jobs unconfined.
+                manager.sandbox = (
+                    "off"
+                    if self.tool_context.permission_policy.mode
+                    == PermissionPolicy.DANGER_FULL_ACCESS
+                    else "auto"
+                )
 
     def _queue_parent_message(self, text: str, tag: str) -> None:
         # Child -> Main upward channel. The message is queued on the main
@@ -1034,7 +1058,7 @@ class InteractiveSession:
             approval_source="/plan",
         )
         return (
-            f"计划已写入 `{plan_path.relative_to(self.cwd)}`，请选择下一步。"
+            f"计划已写入 `{plan_path}`，请选择下一步。"
             "审批请用 /plan execute，反馈则直接发送修改意见。"
         )
 
@@ -1046,7 +1070,7 @@ class InteractiveSession:
             "plan_ready",
             agent="main_agent",
             payload={
-                "plan_path": str(plan_path.relative_to(self.cwd)),
+                "plan_path": str(plan_path),
                 "plan_revision": revision,
                 "plan_markdown": plan_markdown,
                 "approval_source": approval_source,
@@ -1055,7 +1079,7 @@ class InteractiveSession:
         return plan_path
 
     def _write_pending_plan_artifact(self, plan_markdown: str) -> Path:
-        plan_path = self.cwd / ".harness" / "sessions" / self.session.id / "plan.md"
+        plan_path = self.state_root / "sessions" / self.session.id / "plan.md"
         plan_path.parent.mkdir(parents=True, exist_ok=True)
         plan_path.write_text(plan_markdown.rstrip() + "\n", encoding="utf-8")
         return plan_path
@@ -1085,6 +1109,29 @@ class InteractiveSession:
         lines.extend(f"- {labels[key]}：{value}" for key, value in breakdown.items())
         return "\n".join(lines)
 
+    def set_memory_enabled(self, enabled: bool) -> str:
+        """One switch for reading memory and automatic extraction."""
+        self.memory_use_enabled = enabled
+        self.memory_auto_extract_enabled = enabled
+        self.memory_service.enabled = enabled
+        if self.tool_context is not None:
+            self.tool_context.memory_use_enabled = enabled
+            self.tool_context.memory_auto_extract_enabled = enabled
+        if enabled and self.session is not None:
+            self.memory_service.extraction.resume(self.session.id)
+            open_memory_session(self.cwd, self.session.id, self.session.journal_path)
+        elif self.session is not None:
+            self.memory_service.extraction.cancel(self.session.id)
+        if self.conversation is not None:
+            self.conversation.refresh_memory_index()
+        if enabled:
+            return "memory: on；启动记忆索引已刷新，下一轮生效"
+        return (
+            "memory: off；后续回合不再读取或写入记忆。"
+            "该设置仅作用于当前会话，新会话仍按环境变量或默认值初始化。"
+            "已经进入当前上下文的历史记忆不会自动移除，彻底隔离请开始新会话。"
+        )
+
     def memory_command(self, args: list[str]) -> str:
         service = self.memory_service
         if not args or args == ["status"]:
@@ -1094,12 +1141,17 @@ class InteractiveSession:
                 f"generate: {'on' if self.memory_auto_extract_enabled else 'off'}; "
                 f"project={counts['project']}; user={counts['user']}"
             )
+        if args in (["on"], ["off"]):
+            return self.set_memory_enabled(args[0] == "on")
         if len(args) == 2 and args[0] in {"use", "generate"} and args[1] in {"on", "off"}:
             enabled = args[1] == "on"
             if args[0] == "use":
                 self.memory_use_enabled = enabled
+                self.memory_service.enabled = enabled
                 if self.tool_context is not None:
                     self.tool_context.memory_use_enabled = enabled
+                if self.conversation is not None:
+                    self.conversation.refresh_memory_index()
             else:
                 self.memory_auto_extract_enabled = enabled
                 if self.tool_context is not None:
@@ -1109,7 +1161,7 @@ class InteractiveSession:
                     open_memory_session(self.cwd, self.session.id, self.session.journal_path)
                 elif self.session is not None:
                     service.extraction.cancel(self.session.id)
-            suffix = "；启动索引将在下次新会话刷新" if args[0] == "use" else ""
+            suffix = "；启动记忆索引已刷新，下一轮生效" if args[0] == "use" else ""
             return f"memory {args[0]}: {args[1]}{suffix}"
         if args[0] == "topics":
             return json.dumps(service.topics(args[1] if len(args) > 1 else "project"), ensure_ascii=False, indent=2)
@@ -1241,9 +1293,21 @@ class InteractiveSession:
         return self.set_permission_mode(next_mode)
 
     def _approval_provider_for_mode(self, permission_mode: str) -> ApprovalProvider:
+        """Who answers an ``ask`` in this mode.
+
+        ``workspace-write`` and ``llm-auto`` share the same sandbox and the
+        same approval policy; the preset only selects the approvals reviewer:
+
+        * ``workspace-write`` — the user answers every ``ask``.
+        * ``llm-auto`` — the command reviewer answers; a request that must not
+          be shown to a model still goes to the user when one is available.
+        * ``read-only`` / ``danger-full-access`` — never ask, so the plain
+          surface is used for the rare explicit request.
+        """
+        manual = self._manual_approval_provider
         if permission_mode == PermissionPolicy.LLM_AUTO:
-            return LlmAutoApprovalProvider()
-        return self._manual_approval_provider
+            return ApprovalGate(LlmAutoApprovalProvider(), human=manual)
+        return manual
 
     def mcp_status(self) -> str:
         self._ensure_mcp_tools_loaded()
@@ -1633,7 +1697,7 @@ class InteractiveSession:
         if self.session is None:
             raise RuntimeError("Cannot externalize turn input before the session is bound.")
         safe_label = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in label) or "input"
-        inputs_dir = self.cwd / ".harness" / "sessions" / self.session.id / "inputs"
+        inputs_dir = self.state_root / "sessions" / self.session.id / "inputs"
         inputs_dir.mkdir(parents=True, exist_ok=True)
         path = inputs_dir / f"turn-{self.turn_count + 1:04d}-{safe_label}.txt"
         suffix = 1
@@ -1648,8 +1712,6 @@ class InteractiveSession:
 
     def _suspend_blocker(self) -> str | None:
         coordinator = self.tool_context.agent_coordinator
-        if coordinator.changes.has_pending_changes():
-            return "尚有未应用的代码提案或待解决冲突"
         if self._turn_thread is not None:
             return "回合仍在执行"
         if self.tool_context.tool_tasks.pending_count:

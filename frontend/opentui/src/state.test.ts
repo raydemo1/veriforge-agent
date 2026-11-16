@@ -52,14 +52,14 @@ describe("OpenTUI state", () => {
 
     const withChanges = reduceEvent(withChecks, {
       type: "changes_updated",
-      changes: { workspace: [], additions: 0, deletions: 0, proposals: [] },
+      changes: { workspace: [], additions: 0, deletions: 0 },
     });
-    expect(withChanges.work.changes).toEqual({ workspace: [], additions: 0, deletions: 0, proposals: [] });
+    expect(withChanges.work.changes).toEqual({ workspace: [], additions: 0, deletions: 0 });
   });
   test("session reset clears accumulated work state", () => {
     const populated = reduceEvent(initialState, {
       type: "artifact_updated",
-      artifacts: [{ id: "shot", kind: "image", path: ".harness/artifacts/browser.png", title: "browser.png", detail: "" }],
+      artifacts: [{ id: "shot", kind: "image", path: ".veriforge/artifacts/browser.png", title: "browser.png", detail: "" }],
     });
     expect(populated.work.artifacts).toHaveLength(1);
     const reset = reduceEvent(populated, { type: "session_reset", snapshot: initialState.snapshot, items: [] });

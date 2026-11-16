@@ -97,11 +97,16 @@ class ToolCallEvent:
     args: dict[str, Any]
     agent: str | None = "main_agent"
     failure_visibility: str | None = None
+    #: Runtime call identity, so diagnostics can pair a call with its result
+    #: without relying on tool-name order (parallel batches may interleave).
+    tool_call_id: str | None = None
 
     def to_event(self) -> StructuredEvent:
         payload = {"tool": self.tool, "args": self.args}
         if self.failure_visibility is not None:
             payload["failure_visibility"] = self.failure_visibility
+        if self.tool_call_id:
+            payload["tool_call_id"] = self.tool_call_id
         return StructuredEvent("tool_call", payload, self.agent)
 
 
@@ -115,6 +120,7 @@ class ToolResultEvent:
     metadata: dict[str, Any] | None = None
     ok: bool | None = None
     agent: str | None = "main_agent"
+    tool_call_id: str | None = None
 
     def to_event(self) -> StructuredEvent:
         status = self.status or _tool_status_from_ok(self.ok)
@@ -124,6 +130,8 @@ class ToolResultEvent:
             "ok": _ok_from_tool_status(status),
             "output": self.output,
         }
+        if self.tool_call_id:
+            payload["tool_call_id"] = self.tool_call_id
         if self.error is not None:
             payload["error"] = self.error
         if self.return_code is not None:
@@ -575,6 +583,47 @@ class EventBus:
             agent=event.agent,
             payload=event.payload,
         )
+
+
+class ScopedEventBus:
+    """One child agent's view of the shared event bus.
+
+    The bus itself stays shared; this view stamps the stable ``agent_id`` and
+    forces the agent name onto every event emitted from that conversation, so
+    tools, thoughts, usage and failures can be attributed without touching
+    each emission site or relying on name matching.
+    """
+
+    def __init__(self, bus: EventBus, *, agent_id: str, agent_name: str):
+        self._bus = bus
+        self.agent_id = agent_id
+        self.agent_name = agent_name
+
+    @property
+    def events(self) -> list[SessionEvent]:
+        return self._bus.events
+
+    @property
+    def events_path(self) -> Path | None:
+        return self._bus.events_path
+
+    @property
+    def listener(self) -> Callable[[SessionEvent], None] | None:
+        return self._bus.listener
+
+    def emit(
+        self,
+        event_type: str,
+        *,
+        agent: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> SessionEvent:
+        data = dict(payload or {})
+        data.setdefault("agent_id", self.agent_id)
+        return self._bus.emit(event_type, agent=self.agent_name, payload=data)
+
+    def emit_event(self, structured_event: StructuredEvent) -> SessionEvent:
+        return self.emit(structured_event.type, payload=structured_event.payload)
 
 
 def _tool_status_from_ok(ok: bool | None) -> str:

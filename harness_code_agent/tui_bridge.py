@@ -61,8 +61,8 @@ from .tui.state import SessionStatusSnapshot, TranscriptBlock, TuiState, _locali
 log = logging.getLogger("harness.opentui")
 
 _PERMISSION_COPY = {
-    PermissionPolicy.WORKSPACE_WRITE: ("请求批准", "工作区内写入允许，风险操作询问，工作区外写入拒绝"),
-    PermissionPolicy.LLM_AUTO: ("替我审批", "由模型判断风险并自动批准具体、范围明确的安全操作"),
+    PermissionPolicy.WORKSPACE_WRITE: ("请求批准", "工作区内写入直接放行；需要审批的操作由你确认"),
+    PermissionPolicy.LLM_AUTO: ("替我审批", "与请求批准相同的权限；需要审批的操作交给命令审查模型"),
     PermissionPolicy.DANGER_FULL_ACCESS: ("完全访问", "工作区内外修改均不询问；灾难性命令仍会被拦截"),
     PermissionPolicy.READ_ONLY: ("只读", "禁止一切修改与未知程序执行"),
 }
@@ -158,14 +158,27 @@ class BridgeInteractionProvider:
         self._closed = False
 
     def request(self, request: ApprovalRequest) -> ApprovalResult:
-        if request.tool_name == "run_bash":
-            rule = self._allowlist.match(str(request.args.get("command", "")))
+        if request.tool_name == "bash":
+            rule = self._allowlist.match(
+                str(request.args.get("command", "")),
+                write_paths=request.write_dirs,
+                sandbox_permissions=request.sandbox_permissions,
+                additional_permissions=request.additional_permissions,
+                network_access=request.network_access,
+            )
             if rule is not None:
                 return ApprovalResult(
                     True,
                     "approved by project allowlist",
-                    {"ui": "opentui", "approval_source": "project_allowlist", "prefix": rule.get("prefix", [])},
+                    {
+                        "ui": "opentui",
+                        "approval_source": "project_allowlist",
+                        "prefix": rule.get("prefixes", []),
+                        "write_paths": rule.get("write_paths", []),
+                        "decided_by": "human",
+                    },
                 )
+        persistent = _persistent_prefix_for_request(request)
         interaction_id, result = self._open(
             "approval",
             {
@@ -173,19 +186,39 @@ class BridgeInteractionProvider:
                 "args": request.args,
                 "risk": request.risk,
                 "reason": request.reason,
-                "persistAvailable": _persistent_prefix_for_request(request) is not None,
+                "taskSummary": request.task_summary,
+                "cwd": request.cwd,
+                "writeDirs": list(request.write_dirs),
+                "uncertainty": request.uncertainty,
+                "requiresHuman": request.requires_human,
+                "sandboxPermissions": request.sandbox_permissions,
+                "additionalPermissions": request.additional_permissions,
+                "networkAccess": request.network_access,
+                "justification": request.justification,
+                "canPersist": persistent is not None,
+                "persistAvailable": persistent is not None,
             },
         )
         decision = str(result.get("decision") or "deny")
         approved = decision in {"approve", "persist"}
-        if decision == "persist":
-            prefix = _persistent_prefix_for_request(request)
-            if prefix:
-                self._allowlist.add_prefix_rule(prefix, command=str(request.args.get("command", "")))
+        if decision == "persist" and persistent:
+            self._allowlist.add_prefix_rule(
+                persistent,
+                command=str(request.args.get("command", "")),
+                write_paths=request.write_dirs,
+                sandbox_permissions=request.sandbox_permissions,
+                additional_permissions=request.additional_permissions,
+                network_access=request.network_access,
+            )
         return ApprovalResult(
             approved,
             "approved in OpenTUI" if approved else "denied in OpenTUI",
-            {"ui": "opentui", "interaction_id": interaction_id, "persisted": decision == "persist"},
+            {
+                "ui": "opentui",
+                "interaction_id": interaction_id,
+                "persisted": decision == "persist",
+                "decided_by": "human",
+            },
         )
 
     def ask(self, request: QuestionRequest) -> QuestionResult:
@@ -314,6 +347,7 @@ class SessionBridge:
         self._worker = None
         self._session_error: str | None = None
         self._assistant_group_id: str | None = None
+        self._agent_group_parents: dict[str, str | None] = {}
         self._assistant_group_counter = 0
         self._assistant_id: str | None = None
         self._assistant_text = ""
@@ -437,28 +471,32 @@ class SessionBridge:
     def _event_listener(self, event: SessionEvent) -> None:
         try:
             block = self.state.apply_event(event)
+            for parent in self.state.drain_agent_updates():
+                if parent is not block:
+                    # An inline subagent's header row changed (progress or
+                    # state) while its timeline stayed in place.
+                    self._send_transcript(parent)
             changed = self.work.apply_event(event)
-            if self._refresh_proposal_state():
-                changed.add("changes")
             for key in changed:
                 self._send_work_section(key)
             event_type = event.type
-            if event_type == "turn_started":
+            is_child = getattr(event, "agent", None) not in (None, "", "main", "main_agent")
+            if not is_child and event_type == "turn_started":
                 self._begin_assistant_group(int(event.payload.get("turn") or self.state.snapshot.turn))
                 if not self._stopping.is_set():
                     self._send_event({"type": "turn_state", "state": "running"})
-            elif event_type == "turn_finished":
+            elif not is_child and event_type == "turn_finished":
                 self._close_assistant_group({"completed": "success", "cancelled": "cancelled", "failed": "error"}.get(event.payload.get("status"), "success"))
-            elif event_type == "recovery_point_created":
+            elif not is_child and event_type == "recovery_point_created":
                 self._send_event({"type": "recovery_available", "turn": event.payload["turn"], "pointId": event.payload["point_id"]})
                 self._send_event({"type": "turn_state", "state": "idle"})
-            elif event_type == "session_started":
+            elif not is_child and event_type == "session_started":
                 self._send_snapshot()
-            elif event_type == "session_finished":
+            elif not is_child and event_type == "session_finished":
                 self._close_assistant_group("success")
                 self._send_event({"type": "turn_state", "state": "idle"})
 
-            if event_type == "assistant_message":
+            if not is_child and event_type == "assistant_message":
                 if self._assistant_id is not None:
                     # Streaming already created this child item; deltas own its body.
                     self._send_event(
@@ -471,7 +509,7 @@ class SessionBridge:
                     )
                     block = None
                 self._reset_assistant_segment()
-            elif event_type in {"tool_call", "tool_result"}:
+            elif not is_child and event_type in {"tool_call", "tool_result"}:
                 # A tool boundary ends the current model-text child, but not
                 # the parent assistant group for this user turn.
                 self._reset_assistant_segment("success")
@@ -573,7 +611,14 @@ class SessionBridge:
         self._close_assistant_group("failed")
 
     def _send_transcript(self, block: TranscriptBlock) -> None:
-        self._send_event({"type": "transcript", "item": self._block_item(block)})
+        item = self._block_item(block)
+        if block.kind == "agent" and block.role == "group":
+            parent = self._agent_group_parents.setdefault(item["id"], item.get("parentId"))
+            if parent is None:
+                item.pop("parentId", None)
+            else:
+                item["parentId"] = parent
+        self._send_event({"type": "transcript", "item": item})
 
     def _block_item(self, block: TranscriptBlock) -> dict[str, Any]:
         kind_map = {
@@ -594,6 +639,7 @@ class SessionBridge:
             "failed": "failed",
             "blocked": "failed",
             "cancelled": "failed",
+            "interrupted": "interrupted",
             "pending": "pending",
         }.get(block.status, "success")
         item = {
@@ -607,28 +653,20 @@ class SessionBridge:
             item["turn"] = block.turn
         if block.direction:
             item["direction"] = block.direction
-        if self._assistant_group_id:
-            item["parentId"] = self._assistant_group_id
+        if block.role:
+            item["role"] = block.role
+        parent_id = block.parent_id or self._assistant_group_id
+        if parent_id:
+            item["parentId"] = parent_id
         return item
 
     def _send_snapshot(self) -> None:
         self._send_event({"type": "snapshot", "snapshot": self._snapshot_payload()})
 
-    def _refresh_proposal_state(self) -> bool:
-        session = self._session
-        coordinator = getattr(getattr(session, "tool_context", None), "agent_coordinator", None)
-        if coordinator is None:
-            return False
-        try:
-            return self.work.merge_proposals(coordinator.changes.snapshot_proposals())
-        except Exception:
-            return False
-
     def _send_work_section(self, key: str) -> None:
         self._send_event({"type": SECTION_EVENTS[key], key: self.work.section(key)})
 
     def _send_work_state(self) -> None:
-        self._refresh_proposal_state()
         for key in SECTION_EVENTS:
             self._send_work_section(key)
 
@@ -965,26 +1003,6 @@ class SessionBridge:
             return {"ok": True}
         return {"ok": True, "message": str(message or "")}
 
-    def _workbench_action(self, params: dict[str, Any]) -> dict[str, Any]:
-        # Workbench is observation-only: these ops are pure inspections.
-        # Proposal integration/conflict resolution are owned by the main
-        # agent, and the plan decision is a question interaction.
-        session = self._require_session()
-        coordinator = getattr(session.tool_context, "agent_coordinator", None)
-        op = str(params.get("op") or "")
-
-        if coordinator is None:
-            raise RuntimeError("当前会话没有多代理协调器")
-        changes = coordinator.changes
-        proposal_id = str(params.get("proposalId") or "")
-        if op == "read_proposal":
-            result = changes.read_changes(proposal_id)
-            return {"ok": True, "content": result["content"], "paths": result["paths"], "totalChars": result["total_chars"]}
-        if op == "read_conflict":
-            result = changes.read_conflicts(str(params.get("conflictId") or ""))
-            return {"ok": True, "content": result["content"], "paths": result["paths"], "totalChars": result["total_chars"]}
-        raise ValueError(f"unknown workbench action: {op}")
-
     def _history_items(self, session_id: str) -> list[dict[str, Any]]:
         from .sessions.store import SessionStore
         store = SessionStore(self.state_root)
@@ -1006,13 +1024,18 @@ class SessionBridge:
         for event in store.read_history_events(session_id):
             if event["type"] in {"recovery_point_created", "session_rewound"}:
                 point_id = event["payload"]["point_id"]
-                path = self.cwd / ".harness" / "recovery" / "points" / f"{point_id}.json"
+                path = self.state_root / "recovery" / "points" / f"{point_id}.json"
                 if path.is_file():
                     point = json.loads(path.read_text(encoding="utf-8"))
                     if point["session_id"] == session_id:
                         owned_points[point_id] = point
         boundary = metadata.get("history_boundary")
-        for index, event in enumerate(store.read_history_events(session_id, event_count=boundary["event_count"] if boundary else 0)):
+        parent_ids: dict[str, str] = {}
+        item_ids: dict[str, str] = {}
+        for index, event in enumerate(store.read_history_events(
+            session_id,
+            event_count=boundary["event_count"] if boundary else None,
+        )):
             if event["type"] == "recovery_point_created" and event["payload"]["point_id"] not in owned_points:
                 continue
             if event["type"] == "turn_started":
@@ -1021,14 +1044,41 @@ class SessionBridge:
                 items.append(group)
             block = replay.apply_event(event)
             self.work.apply_event(event)
+            replay.drain_agent_updates()
             if block is not None:
                 replay.add_block(block)
                 item = self._block_item(block)
-                item["id"] = f"history-{index}-{block.kind}"
-                item.pop("parentId", None)
-                if group is not None and item["kind"] != "user":
-                    item["parentId"] = group["id"]
-                items.append(item)
+                key = block.id or ""
+                is_agent_group = block.kind == "agent" and block.role == "group"
+                parent = parent_ids.get(block.parent_id or "")
+                if parent is None and group is not None and item["kind"] != "user":
+                    parent = group["id"]
+                if parent is not None:
+                    item["parentId"] = parent
+                else:
+                    item.pop("parentId", None)
+                existing_id = item_ids.get(key)
+                if existing_id is not None:
+                    # The same block was updated in place (tool call -> result,
+                    # spawn -> completion); replace its row instead of adding
+                    # a second history entry.
+                    item["id"] = existing_id
+                    position = next(
+                        position for position, row in enumerate(items) if row.get("id") == existing_id
+                    )
+                    if is_agent_group:
+                        parent = items[position].get("parentId")
+                        if parent is None:
+                            item.pop("parentId", None)
+                        else:
+                            item["parentId"] = parent
+                    items[position] = item
+                else:
+                    item["id"] = key if is_agent_group else f"history-{index}-{block.kind}"
+                    item_ids[key] = item["id"]
+                    if is_agent_group:
+                        parent_ids[key] = item["id"]
+                    items.append(item)
             if event["type"] == "recovery_point_created":
                 turn = event["payload"]["turn"]
                 for item in items:
@@ -1043,6 +1093,11 @@ class SessionBridge:
                 if item.get("role") == "group" and item.get("turn") == point["turn"]:
                     item["recoveryPointId"] = point_id
         self.state = replay
+        self._agent_group_parents = {
+            item["id"]: item.get("parentId")
+            for item in items
+            if item["kind"] == "agent" and item.get("role") == "group"
+        }
         self.state.snapshot.session_id = session_id
         self.state.snapshot.permission_mode = metadata.get("permission_mode", "workspace-write")
         self.state.snapshot.status = "idle"
@@ -1084,13 +1139,11 @@ class SessionBridge:
         interactions = bool(self._interactions._pending)
         jobs, agents = [], []
         tools = 0
-        pending_changes = False
         if session is not None:
             tools = session.tool_context.tool_tasks.pending_count
             managers = [session.conversation.runtime_state.shell_job_manager]
             coordinator = session.tool_context.agent_coordinator
             if coordinator is not None:
-                pending_changes = coordinator.changes.has_pending_changes()
                 with coordinator._condition:
                     records = list(coordinator._records.values())
                 agents = [record.id for record in records if record.future is not None and not record.future.done()]
@@ -1105,7 +1158,7 @@ class SessionBridge:
         executing = resources.snapshot() if resources is not None else {"active": [], "waiting": []}
         occupied = any(entry["sessionId"] == self.runtime_id for entry in [*executing["active"], *executing["waiting"]])
         active = bool(turn or pending or interactions or tools or jobs or agents or constructing or occupied
-                      or pending_changes or self._runtime_users)
+                      or self._runtime_users)
         return {"state": "active" if active else "warm" if session is not None else "dormant",
                     "turn": turn, "queue": max(0, pending - int(turn)), "approvals": int(interactions),
                     "tools": tools, "agents": len(agents),
@@ -1244,8 +1297,6 @@ class SessionBridge:
             return {"ok": True, "panel": self._panel(str(params.get("panel") or ""))}
         if name == "panel_action":
             return self._panel_action(str(params.get("panel") or ""), str(params.get("action") or ""))
-        if name == "workbench_action":
-            return self._workbench_action(params)
         if name == "toggle_permission":
             self._require_session().toggle_permission_mode()
             self._send_snapshot()
@@ -1586,7 +1637,8 @@ class BridgeServer:
                 for name, versions in exc.files.items():
                     originals.setdefault(name, versions)
                 if attempt == 2:
-                    directory = record.cwd / ".harness" / "apply-conflicts" / uuid.uuid4().hex
+                    from .workspace.state_paths import ensure_workspace_state
+                    directory = ensure_workspace_state(record.cwd) / "apply-conflicts" / uuid.uuid4().hex
                     details, approved = prepare_merge_review(directory, exc.files, originals)
                     answer = session.question_provider.ask(QuestionRequest(
                         question="Agent 已完成两轮协调。请审阅合并结果，确认后才会写入 Local。",
@@ -1597,7 +1649,8 @@ class BridgeServer:
                         paths = service.apply(record.id, approved=approved)
                         record.host._notice("info", f"已应用确认的合并结果：{len(paths)} 个文件")
                     return
-                directory = record.cwd / ".harness" / "apply-conflicts" / uuid.uuid4().hex
+                from .workspace.state_paths import ensure_workspace_state
+                directory = ensure_workspace_state(record.cwd) / "apply-conflicts" / uuid.uuid4().hex
                 descriptions = []
                 for name, versions in exc.files.items():
                     descriptions.append(f"- {name}")
@@ -1637,7 +1690,7 @@ class BridgeServer:
                     raise ValueError("请求缺少 sessionId")
                 if method == "action":
                     name, action_params = params["name"], params.get("params") or {}
-                    slow_action = name in {"fork_session", "fork_worktree", "apply_worktree", "panel_action", "workbench_action"} or (
+                    slow_action = name in {"fork_session", "fork_worktree", "apply_worktree", "panel_action"} or (
                         name == "open_panel" and action_params.get("panel") == "mcp")
                     global_action = name in {"watch_resources", "new_session", "open_sessions", "switch_session",
                                              "hide_session", "sync_session"} or (

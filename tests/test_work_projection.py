@@ -4,7 +4,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from harness_code_agent.agent.change_proposal import ChangeProposalStore
 from harness_code_agent.sessions.events import SessionEvent
 from harness_code_agent.tui.projection import WorkStateProjection
 from harness_code_agent.tui.protocol import validate_ui_event
@@ -38,7 +37,7 @@ class WorkStateProjectionTests(unittest.TestCase):
         validate_ui_event({"type": "plan_updated", "plan": None})
         validate_ui_event({"type": "tasks_updated", "tasks": {"items": [], "completed": 0, "total": 0}})
         validate_ui_event({"type": "agent_run_updated", "agents": []})
-        validate_ui_event({"type": "changes_updated", "changes": {"workspace": [], "proposals": []}})
+        validate_ui_event({"type": "changes_updated", "changes": {"workspace": [], "additions": 0, "deletions": 0}})
         validate_ui_event({"type": "verification_updated", "checks": []})
         validate_ui_event({"type": "artifact_updated", "artifacts": []})
         with self.assertRaises(ValueError):
@@ -188,7 +187,7 @@ class WorkStateProjectionTests(unittest.TestCase):
             "task": "read code", "status": "queued",
         }))
         agents = {item["id"]: item for item in self.projection.section("agents")}
-        self.assertEqual(agents["a1"]["isolation"], "isolated workspace")
+        self.assertEqual(agents["a1"]["isolation"], "shared workspace")
         self.assertEqual(agents["a2"]["isolation"], "read-only")
         self.assertEqual(agents["a1"]["task"], "build the thing")
 
@@ -202,7 +201,28 @@ class WorkStateProjectionTests(unittest.TestCase):
         self.projection.apply_event(event("agent_status", {"agent_id": "a2", "status": "closed"}))
         self.assertEqual([item["id"] for item in self.projection.section("agents")], ["a1"])
 
-    def test_workspace_changes_aggregate_counts_and_ignore_subagents(self) -> None:
+    def test_agent_status_explicit_null_error_clears_the_previous_failure(self) -> None:
+        self.projection.apply_event(event("agent_spawned", {
+            "agent_id": "a1", "name": "worker-1", "role": "worker", "task": "t",
+        }))
+        self.projection.apply_event(event("agent_status", {
+            "agent_id": "a1", "status": "failed", "error": "RuntimeError: boom",
+        }))
+        self.projection.apply_event(event("agent_status", {
+            "agent_id": "a1", "status": "running", "error": None,
+        }))
+        agent = next(item for item in self.projection.section("agents") if item["id"] == "a1")
+        self.assertEqual(agent["status"], "running")
+        self.assertIsNone(agent["error"])
+
+        # Payloads that do not mention the field keep the last known value.
+        self.projection.apply_event(event("agent_status", {
+            "agent_id": "a1", "status": "completed",
+        }))
+        agent = next(item for item in self.projection.section("agents") if item["id"] == "a1")
+        self.assertIsNone(agent["error"])
+
+    def test_workspace_changes_include_shared_worker_changes(self) -> None:
         self.projection.apply_event(event("file_change", {
             "path": "a.py", "operation": "modify", "diff": "--- a\n+++ b\n-old\n+new1\n+new2\n",
         }))
@@ -213,16 +233,40 @@ class WorkStateProjectionTests(unittest.TestCase):
         self.projection.apply_event(event("file_change", {
             "path": "b.py", "operation": "create", "additions": 2, "deletions": 0,
         }))
-        # Subagent file changes live in sandboxes and must not hit the workspace view.
+        # Workers share the main workspace; their real changes must appear.
         self.projection.apply_event(event("file_change", {
-            "path": "sandbox.py", "operation": "modify", "additions": 9, "deletions": 9,
+            "path": "worker.py", "operation": "modify", "additions": 9, "deletions": 9,
         }, agent="worker-1"))
 
         changes = self.projection.section("changes")
-        self.assertEqual([item["path"] for item in changes["workspace"]], ["a.py", "b.py"])
+        self.assertEqual([item["path"] for item in changes["workspace"]], ["a.py", "b.py", "worker.py"])
         a_py = changes["workspace"][0]
         self.assertEqual((a_py["additions"], a_py["deletions"]), (5, 1))
-        self.assertEqual((changes["additions"], changes["deletions"]), (7, 1))
+        self.assertEqual((changes["additions"], changes["deletions"]), (16, 10))
+
+    def test_worker_internal_events_do_not_drive_main_work_state(self) -> None:
+        self.projection.apply_event(event("checks_recorded", {"checks": [
+            {"name": "Ruff lint", "status": "passed"},
+        ]}))
+        self.projection.apply_event(event("tool_result", {
+            "tool": "update_todo",
+            "status": "success",
+            "metadata": {"todo_state": {"items": [
+                {"id": "main", "text": "main task", "status": "pending"},
+            ]}},
+        }))
+        # A worker turn/tool result must not clear main checks or replace todos.
+        self.projection.apply_event(event("turn_started", {}, agent="worker-1"))
+        self.projection.apply_event(event("tool_result", {
+            "tool": "update_todo",
+            "status": "success",
+            "metadata": {"todo_state": {"items": [
+                {"id": "worker", "text": "worker task", "status": "completed"},
+            ]}},
+        }, agent="worker-1"))
+
+        self.assertEqual([item["id"] for item in self.projection.section("checks")], ["ruff-lint"])
+        self.assertEqual([item["id"] for item in self.projection.section("tasks")["items"]], ["main"])
 
     def test_checks_upsert_and_turn_reset_with_artifacts_persisting(self) -> None:
         # Static verifier evidence upserts by check name.
@@ -236,12 +280,12 @@ class WorkStateProjectionTests(unittest.TestCase):
 
         # Tool results contribute artifacts without inventing checks.
         self.projection.apply_event(event("tool_result", {
-            "tool": "run_bash",
+            "tool": "bash",
             "status": "success",
             "metadata": {
                 "artifacts": [{
                     "kind": "image",
-                    "path": ".harness/artifacts/screenshot.png",
+                    "path": ".veriforge/artifacts/screenshot.png",
                     "title": "screenshot.png",
                     "detail": "captured by a script",
                 }],
@@ -257,28 +301,6 @@ class WorkStateProjectionTests(unittest.TestCase):
         self.projection.apply_event(event("turn_started", {"turn": 2}))
         self.assertEqual(self.projection.section("checks"), [])
         self.assertEqual(len(self.projection.section("artifacts")), 1)
-
-    def test_proposal_merge_decorates_agent_and_filters_applied(self) -> None:
-        self.projection.apply_event(event("agent_spawned", {
-            "agent_id": "w1", "name": "worker-1", "role": "worker",
-            "task": "edit", "status": "running",
-        }))
-        self.assertTrue(self.projection.merge_proposals([
-            {
-                "id": "p1", "agentId": "w1", "status": "ready",
-                "files": [{"path": "x.py", "operation": "modify", "additions": 3, "deletions": 1}],
-                "additions": 3, "deletions": 1, "invalidReasons": [], "conflict": None,
-            },
-            {
-                "id": "p2", "agentId": "gone", "status": "applied",
-                "files": [], "additions": 0, "deletions": 0, "invalidReasons": [], "conflict": None,
-            },
-        ]))
-        changes = self.projection.section("changes")
-        self.assertEqual([item["id"] for item in changes["proposals"]], ["p1"])
-        self.assertEqual(changes["proposals"][0]["agentName"], "worker-1")
-        # Identical snapshots are no-ops.
-        self.assertFalse(self.projection.merge_proposals(self.projection._proposals))
 
     def test_event_replay_reconstructs_identical_state(self) -> None:
         events = [
@@ -300,31 +322,6 @@ class WorkStateProjectionTests(unittest.TestCase):
         for item in events:
             replay.apply_event(item)
         self.assertEqual(replay.changed_sections(), self.projection.changed_sections())
-
-
-class ChangeProposalSnapshotTests(unittest.TestCase):
-    def test_snapshot_reports_files_stats_and_conflict_state(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "src" / "a.py").write_text("before\n", encoding="utf-8")
-            store = ChangeProposalStore()
-            sandbox = store.create_sandbox("agent-1", root)
-            (sandbox.workspace / "src" / "a.py").write_text("before\nafter\n", encoding="utf-8")
-            (sandbox.workspace / "src" / "new.py").write_text("new\n", encoding="utf-8")
-            proposal = store.finalize("agent-1", ["src"])
-
-            snapshots = store.snapshot_proposals()
-            self.assertEqual(len(snapshots), 1)
-            snapshot = snapshots[0]
-            self.assertEqual(snapshot["id"], proposal.id)
-            self.assertEqual(snapshot["status"], "ready")
-            self.assertIsNone(snapshot["conflict"])
-            paths = {item["path"]: item for item in snapshot["files"]}
-            self.assertEqual(paths["src/a.py"]["additions"], 1)
-            self.assertEqual(paths["src/new.py"]["additions"], 1)
-            self.assertEqual(snapshot["additions"], 2)
-            store.close()
 
 
 if __name__ == "__main__":

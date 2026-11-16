@@ -8,7 +8,7 @@ import { resolveIcons } from "./icons.ts";
 import type { IconSet } from "./icons.ts";
 import { formatUserError } from "./errors.ts";
 import { clipboardFilePaths, formatBytes } from "./attachment-utils.ts";
-import type { ActionName, ActionResult, AttachmentItem, CommandItem, IconPreference, Interaction, PanelOption, PanelSpec, SubmitResult, ThemePreference, TranscriptItem, TurnSubmission, UiEvent, SessionEvent, WorkbenchParams } from "./protocol.ts";
+import type { ActionName, ActionResult, AttachmentItem, CommandItem, IconPreference, Interaction, PanelOption, PanelSpec, SubmitResult, ThemePreference, TranscriptItem, TurnSubmission, UiEvent, SessionEvent } from "./protocol.ts";
 import { initialState as initialAppState, initialSessionState as initialState, reduceEvent } from "./state.ts";
 import { resolveTheme } from "./theme.ts";
 import type { Theme, ThemeMode } from "./theme.ts";
@@ -66,6 +66,7 @@ function Spinner({ color }: { color: string }) {
 function markerFor(item: TranscriptItem, icons: IconSet): string {
   if (item.state === "success") return icons.success;
   if (item.state === "failed") return icons.failure;
+  if (item.state === "interrupted") return icons.stop;
   if (item.state === "pending") return icons.pending;
   if (item.kind === "file") return icons.file;
   if (item.kind === "tool") return icons.tool;
@@ -75,6 +76,7 @@ function markerFor(item: TranscriptItem, icons: IconSet): string {
 
 function toneFor(item: TranscriptItem, theme: Theme): string {
   if (item.state === "failed" || item.kind === "error") return theme.error;
+  if (item.state === "interrupted") return theme.muted;
   if (item.state === "success") return theme.success;
   if (item.state === "pending" || item.kind === "plan") return theme.warning;
   return theme.accent;
@@ -316,23 +318,92 @@ function ToolGroupSummary({ rows, theme, icons }: { rows: TranscriptItem[]; them
   );
 }
 
-function AssistantGroupBlock({ item, rows, theme, icons }: { item: TranscriptItem; rows: TranscriptItem[]; theme: Theme; icons: IconSet }) {
+function renderChildRows(
+  rows: TranscriptItem[],
+  theme: Theme,
+  icons: IconSet,
+  childrenByGroup?: Map<string, TranscriptItem[]>,
+  collapseTools = true,
+): ReactNode[] {
   // Collapse only *consecutive* runs of successful tool/thought rows; a
   // failure or text block ends a run, preserving the real execution order.
+  // An expanded subagent shows its rows directly: the header already is the
+  // collapsed form, and tool bodies stay bounded by the projector.
   const rendered: ReactNode[] = [];
   let cursor = 0;
   while (cursor < rows.length) {
-    if (isCollapsibleRow(rows[cursor])) {
+    const row = rows[cursor];
+    if (row.kind === "agent" && row.role === "group") {
+      rendered.push(
+        <InlineAgentBlock
+          key={row.id}
+          item={row}
+          rows={childrenByGroup?.get(row.id) ?? []}
+          childrenByGroup={childrenByGroup}
+          theme={theme}
+          icons={icons}
+        />
+      );
+      cursor += 1;
+    } else if (collapseTools && isCollapsibleRow(row)) {
       const start = cursor;
       while (cursor < rows.length && isCollapsibleRow(rows[cursor])) cursor += 1;
       rendered.push(
         <ToolGroupSummary key={`collapsed-${rows[start].id}`} rows={rows.slice(start, cursor)} theme={theme} icons={icons} />
       );
     } else {
-      rendered.push(<GroupChildRow key={rows[cursor].id} item={rows[cursor]} theme={theme} icons={icons} />);
+      rendered.push(<GroupChildRow key={row.id} item={row} theme={theme} icons={icons} />);
       cursor += 1;
     }
   }
+  return rendered;
+}
+
+function InlineAgentBlock({ item, rows, childrenByGroup, theme, icons }: {
+  item: TranscriptItem;
+  rows: TranscriptItem[];
+  childrenByGroup?: Map<string, TranscriptItem[]>;
+  theme: Theme;
+  icons: IconSet;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const toggleFocus = useKeyboardFocusVisible<BoxRenderable>();
+  const running = item.state === "running";
+  const tone = toneFor(item, theme);
+  const toggle = () => setExpanded((value) => !value);
+  return (
+    <box style={{ flexDirection: "column", maxWidth: 110 }}>
+      <box
+        ref={toggleFocus.ref}
+        id={`inline-agent-${item.id}`}
+        focusable
+        onMouseDown={() => { toggle(); setTimeout(() => toggleFocus.ref.current?.blur(), 0); }}
+        onKeyDown={(key) => { if (isEnterKey(key.name) || key.name === "space") { key.preventDefault(); toggle(); } }}
+        style={{ flexDirection: "row", paddingLeft: 1, paddingRight: 1, backgroundColor: toggleFocus.focused ? theme.surfaceSelected : undefined }}
+      >
+        {running ? <Spinner color={tone} /> : <text fg={tone}>{markerFor(item, icons)}</text>}
+        <text fg={theme.text}>{` ${item.title}`}</text>
+        {item.body ? <text fg={theme.muted}>{`  · ${item.body}`}</text> : null}
+        <text fg={theme.accent}>{expanded ? "  ▾" : "  ▸"}</text>
+      </box>
+      {expanded ? (
+        <box border={["left"]} borderStyle="single" borderColor={theme.border} style={{ flexDirection: "column", marginLeft: 1, paddingLeft: 1 }}>
+          {rows.length
+            ? renderChildRows(rows, theme, icons, childrenByGroup, false)
+            : <text fg={theme.subtle}>暂无执行记录</text>}
+        </box>
+      ) : null}
+    </box>
+  );
+}
+
+function AssistantGroupBlock({ item, rows, childrenByGroup, theme, icons }: {
+  item: TranscriptItem;
+  rows: TranscriptItem[];
+  childrenByGroup: Map<string, TranscriptItem[]>;
+  theme: Theme;
+  icons: IconSet;
+}) {
   return (
     <box style={{ flexDirection: "column", maxWidth: 96, gap: 1 }}>
       {/* Thinking indicator: spinner under the title while the group is
@@ -343,7 +414,7 @@ function AssistantGroupBlock({ item, rows, theme, icons }: { item: TranscriptIte
         {item.state === "running" ? <Spinner color={theme.accent} /> : null}
         {item.state === "running" ? <text fg={theme.muted}>思考中</text> : null}
       </box>
-      {rendered}
+      {renderChildRows(rows, theme, icons, childrenByGroup)}
     </box>
   );
 }
@@ -399,7 +470,10 @@ function Transcript({ items, theme, icons, narrow, onRewind, scrollTop, onSaveSc
   const renderItem = (item: TranscriptItem) => {
 
     if (item.kind === "assistant" && item.role === "group") {
-      return <AssistantGroupBlock key={item.id} item={item} rows={childrenByGroup.get(item.id) ?? []} theme={theme} icons={icons} />;
+      return <AssistantGroupBlock key={item.id} item={item} rows={childrenByGroup.get(item.id) ?? []} childrenByGroup={childrenByGroup} theme={theme} icons={icons} />;
+    }
+    if (item.kind === "agent" && item.role === "group") {
+      return <InlineAgentBlock key={item.id} item={item} rows={childrenByGroup.get(item.id) ?? []} childrenByGroup={childrenByGroup} theme={theme} icons={icons} />;
     }
     if (item.kind === "user" || item.kind === "assistant") {
       const assistant = item.kind === "assistant";
@@ -414,25 +488,6 @@ function Transcript({ items, theme, icons, narrow, onRewind, scrollTop, onSaveSc
       );
     }
     if (item.kind === "file") return <FileDiffBlock key={item.id} item={item} theme={theme} icons={icons} />;
-    if (item.kind === "agent") {
-      const directed = item.direction !== undefined;
-      const running = item.state === "running";
-      const markerColor = directed ? theme.accent : toneFor(item, theme);
-      const stackBody = directed || item.state === "failed" || item.body.includes("\n");
-      return (
-        <box key={item.id} style={{ flexDirection: "column", maxWidth: 110 }}>
-          <box style={{ flexDirection: "row" }}>
-            {directed
-              ? <text fg={markerColor}>{item.direction === "in" ? "←" : "→"}</text>
-              : running
-                ? <Spinner color={markerColor} />
-                : <text fg={markerColor}>{markerFor(item, icons)}</text>}
-            <text fg={markerColor}>{` ${item.title}${!stackBody && item.body ? `  · ${item.body}` : ""}`}</text>
-          </box>
-          {stackBody && item.body ? <text fg={theme.muted} style={{ marginLeft: 2 }}>{item.body}</text> : null}
-        </box>
-      );
-    }
     if (item.id === "welcome" && item.kind === "status") {
       // Startup/welcome row: bare copy when ready, spinner while loading,
       // failure marker only when it actually failed. Scoped to the
@@ -767,7 +822,13 @@ const APPROVAL_REASON_LABELS: Record<string, string> = {
   "shell command mutates external paths": "将修改工作区外的文件",
   "shell command writes inside the workspace": "将修改工作区文件",
   "shell command mutates git remote state": "将修改远程 Git 状态",
+  "shell command mutates paths it cannot prove are inside the workspace":
+    "将修改无法确认位于工作区内的路径",
+  "shell command removes a whole workspace tree": "将删除整个工作区目录树（难以恢复）",
   "shell executes a program whose effects cannot be determined": "将运行无法完全判断影响的程序",
+  "shell runs project verification or a build task": "将运行项目验证或构建任务",
+  "shell command uses the network": "将访问网络",
+  "shell sends local data over the network (upload or POST body)": "将把本地数据发送到网络（上传）",
 };
 
 function InteractionView({ interaction, theme, icons, narrow, onResolve }: { interaction: Interaction; theme: Theme; icons: IconSet; narrow: boolean; onResolve: (result: Record<string, unknown>) => void }) {
@@ -827,7 +888,7 @@ function InteractionView({ interaction, theme, icons, narrow, onResolve }: { int
       }
     }
   });
-  const isBash = interaction.kind === "approval" && interaction.payload.toolName === "run_bash";
+  const isBash = interaction.kind === "approval" && interaction.payload.toolName === "bash";
   const isExternalRead = interaction.kind === "approval" && interaction.payload.toolName === "read_external_attachment";
   const externalPaths = isExternalRead && Array.isArray(interaction.payload.args?.paths)
     ? interaction.payload.args.paths.map((path) => String(path))
@@ -839,6 +900,18 @@ function InteractionView({ interaction, theme, icons, narrow, onResolve }: { int
   const reasonText = interaction.kind === "approval"
     ? (APPROVAL_REASON_LABELS[interaction.payload.reason] ?? interaction.payload.reason)
     : "";
+  // What the run asks to write, and why the runtime could not settle it.
+  const writeDirs = interaction.kind === "approval" && Array.isArray(interaction.payload.writeDirs)
+    ? interaction.payload.writeDirs.map((path) => String(path))
+    : [];
+  const uncertaintyText = interaction.kind === "approval" ? String(interaction.payload.uncertainty ?? "") : "";
+  const requestedCapability = interaction.kind === "approval" && interaction.payload.sandboxPermissions === "with_additional_permissions"
+    ? [
+        ...(interaction.payload.additionalPermissions?.file_system?.write ?? []).map((path) => `写入 ${String(path)}`),
+        interaction.payload.additionalPermissions?.network ? "网络访问" : "",
+      ].filter(Boolean).join("、")
+    : "";
+  const justificationText = interaction.kind === "approval" ? String(interaction.payload.justification ?? "") : "";
   return (
     <box border borderStyle="rounded" borderColor={interaction.kind === "approval" ? theme.warning : theme.accent} style={{ flexDirection: "column", flexShrink: 0, marginLeft: narrow ? 1 : 2, marginRight: narrow ? 1 : 2, paddingLeft: 1, paddingRight: 1, paddingTop: 1, paddingBottom: 1, backgroundColor: theme.surfaceRaised }}>
       <text fg={interaction.kind === "approval" ? theme.warning : theme.accent}><strong>{interaction.kind === "approval" ? "需要确认" : interaction.payload.question}</strong></text>
@@ -873,6 +946,14 @@ function InteractionView({ interaction, theme, icons, narrow, onResolve }: { int
             </>
           )}
           <text fg={theme.muted}>{reasonText}</text>
+          {interaction.payload.requiresHuman ? <text fg={theme.warning}>需人工确认（自动审批不适用）</text> : null}
+          {requestedCapability ? <text fg={theme.warning}>{`本次调用申请额外权限：${requestedCapability}`}</text> : null}
+          {isBash && process.platform === "win32" && interaction.payload.networkAccess
+            ? <text fg={theme.subtle}>Windows 沙箱只限制文件写入。此处审批的是命令的网络访问。</text>
+            : null}
+          {justificationText ? <text fg={theme.subtle}>{`理由：${justificationText}`}</text> : null}
+          {writeDirs.length ? <text fg={theme.subtle}>{`写入目录：${writeDirs.join("、")}`}</text> : null}
+          {uncertaintyText ? <text fg={theme.warning}>{`风险不确定：${uncertaintyText}`}</text> : null}
         </box>
       ) : null}
       <box style={{ flexDirection: "column", paddingTop: 1 }}>
@@ -1311,15 +1392,6 @@ const SessionPane = React.memo(function SessionPane({ resolvedTheme: theme, stat
     setWorkbenchTab(tab);
     setWorkbenchOpen(true);
   };
-  const workbenchOp = async (params: WorkbenchParams): Promise<ActionResult | undefined> => {
-    if (!onAction) return undefined;
-    try {
-      return await onAction("workbench_action", params as unknown as Record<string, unknown>);
-    } catch (error) {
-      dispatch({ type: "notice", level: "error", text: formatUserError(error) });
-      return undefined;
-    }
-  };
 
   useKeyboard((key) => {
     if (key.ctrl && key.name === "c") {
@@ -1459,7 +1531,6 @@ const SessionPane = React.memo(function SessionPane({ resolvedTheme: theme, stat
           initialTab={workbenchTab}
           onTabChange={setWorkbenchTab}
           onClose={() => setWorkbenchOpen(false)}
-          onWorkbench={workbenchOp}
         />
       ) : null}
     </box>

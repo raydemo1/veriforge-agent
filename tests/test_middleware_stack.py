@@ -5,10 +5,8 @@ from types import SimpleNamespace
 
 from harness_code_agent.runtime.middleware import (
     AgentMiddleware,
-    ProposalIntegrationMiddleware,
     StaticVerifierMiddleware,
     ToolFailurePolicyMiddleware,
-    ToolGuardMiddleware,
 )
 from harness_code_agent.runtime.middleware.stack import (
     build_main_agent_middlewares,
@@ -45,22 +43,19 @@ class MiddlewareStackFactoryTests(unittest.TestCase):
             self.assertEqual(
                 [type(mw) for mw in stack],
                 [
-                    ToolGuardMiddleware,
                     ToolFailurePolicyMiddleware,
                     PermissionMiddleware,
                     StaticVerifierMiddleware,
-                    ProposalIntegrationMiddleware,
                 ],
             )
-            self.assertIs(stack[1].tool_registry, registry)
-            self.assertIs(stack[2]._ctx, context)
-            self.assertIs(stack[2]._registry, registry)
-            self.assertEqual(stack[3]._root, workspace.root)
-            self.assertIsInstance(stack[3].engine, VerificationEngine)
-            self.assertIs(stack[4]._tool_context, context)
+            self.assertIs(stack[0].tool_registry, registry)
+            self.assertIs(stack[1]._ctx, context)
+            self.assertIs(stack[1]._registry, registry)
+            self.assertEqual(stack[2]._root, workspace.root)
+            self.assertIsInstance(stack[2].engine, VerificationEngine)
 
     def test_user_middlewares_run_before_guards(self):
-        # User middlewares from ~/.harness/middlewares.json run before the
+        # User middlewares from ~/.veriforge/middlewares.json run before the
         # structural guards. Memory lives outside the middleware stack (its
         # index is injected into the system prompt).
         with tempfile.TemporaryDirectory() as tmp:
@@ -79,11 +74,9 @@ class MiddlewareStackFactoryTests(unittest.TestCase):
                 [type(mw) for mw in stack],
                 [
                     _MarkerMiddleware,
-                    ToolGuardMiddleware,
                     ToolFailurePolicyMiddleware,
                     PermissionMiddleware,
                     StaticVerifierMiddleware,
-                    ProposalIntegrationMiddleware,
                 ],
             )
             # The same instance, loaded once per session.
@@ -98,6 +91,25 @@ class MiddlewareStackFactoryTests(unittest.TestCase):
         self.assertEqual([type(mw) for mw in stack], [PermissionMiddleware])
         self.assertIs(stack[0]._ctx, context)
         self.assertIs(stack[0]._registry, registry)
+
+
+def test_shell_risky_denial_includes_the_decision_reason():
+    middleware = PermissionMiddleware(
+        tool_context=SimpleNamespace(
+            permission_policy=SimpleNamespace(mode="workspace-write")
+        ),
+        tool_registry=None,
+    )
+    decision = SimpleNamespace(
+        risk="shell_risky",
+        reason="shell command mutates paths it cannot prove are inside the workspace",
+        analysis=SimpleNamespace(effects=frozenset(), targets=()),
+    )
+
+    message = middleware._deny_message("bash", decision)
+
+    assert "当前权限模式不允许此命令" in message
+    assert "原因：shell command mutates paths it cannot prove" in message
 
 
 if __name__ == "__main__":

@@ -189,7 +189,7 @@ class SubagentControlTests(unittest.TestCase):
 
     def test_role_registries_cannot_spawn_agents(self):
         # Structural depth cap: neither read-only roles nor worker may spawn.
-        for role in ("explorer", "reviewer", "verifier", "test_designer", "worker"):
+        for role in ("explorer", "worker"):
             names = {spec.name for spec in self.coordinator._role_registry(role).specs()}
             self.assertNotIn("spawn_agent", names, msg=f"role {role} can spawn agents")
 

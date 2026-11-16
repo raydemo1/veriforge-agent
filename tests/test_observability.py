@@ -17,6 +17,27 @@ def _event(sequence, event_type, payload, agent="main_agent"):
     }
 
 
+def test_platform_prompt_describes_the_real_shell():
+    from harness_code_agent.agent.prompts import platform_prompt
+
+    windows = platform_prompt("local", os_name="nt")
+    posix = platform_prompt("local", os_name="posix")
+
+    assert "PowerShell 7" in windows
+    assert "POSIX" in windows
+    assert "bash" in posix
+
+
+def test_tool_events_carry_the_runtime_call_id():
+    from harness_code_agent.sessions.events import ToolCallEvent, ToolResultEvent
+
+    call = ToolCallEvent(tool="bash", args={"command": "echo hi"}, tool_call_id="call_1")
+    result = ToolResultEvent(tool="bash", status="success", tool_call_id="call_1")
+
+    assert call.to_event().payload["tool_call_id"] == "call_1"
+    assert result.to_event().payload["tool_call_id"] == "call_1"
+
+
 class ObservabilityAggregationTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
@@ -41,15 +62,15 @@ class ObservabilityAggregationTests(unittest.TestCase):
             _event(2, "llm_usage", {"prompt_tokens": None, "cached_tokens": 4, "completion_tokens": None, "total_tokens": None}),
             _event(3, "tool_call", {"tool": "read_file", "args": {"path": "README.md"}}),
             _event(4, "tool_result", {"tool": "read_file", "status": "success", "output": "ok"}),
-            _event(5, "tool_call", {"tool": "run_bash", "args": {"command": "pytest"}}),
-            _event(6, "tool_result", {"tool": "run_bash", "status": "failed", "error": "exit 1"}),
+            _event(5, "tool_call", {"tool": "bash", "args": {"command": "pytest"}}),
+            _event(6, "tool_result", {"tool": "bash", "status": "failed", "error": "exit 1"}),
             _event(7, "tool_call", {"tool": "write_file", "args": {"path": "app.py"}}),
             _event(8, "tool_result", {"tool": "inspect_state", "status": "unknown"}),
             _event(9, "failure", {"category": "runtime_error", "message": "exit 1"}),
             _event(10, "failure", {"category": "validation_error", "message": "bad args"}),
             _event(11, "agent_fallback", {"reason": "token_budget_exceeded"}),
             _event(12, "context_compaction_committed", {"tokens_saved": 40000}),
-            _event(13, "approval_requested", {"tool": "run_bash"}),
+            _event(13, "approval_requested", {"tool": "bash"}),
             _event(14, "approval_decided", {"approved": True}),
             _event(15, "approval_decided", {"approved": False}),
             _event(16, "file_change", {"path": "app.py"}),
@@ -77,7 +98,7 @@ class ObservabilityAggregationTests(unittest.TestCase):
         self.assertEqual(snapshot.tools.pending_calls, 1)
         self.assertAlmostEqual(snapshot.tools.success_rate, 1 / 3)
         self.assertEqual(snapshot.tools.by_tool["read_file"].successes, 1)
-        self.assertEqual(snapshot.tools.by_tool["run_bash"].failures, 1)
+        self.assertEqual(snapshot.tools.by_tool["bash"].failures, 1)
         self.assertEqual(snapshot.audit.failure_categories["runtime_error"], 1)
         self.assertEqual(snapshot.audit.failure_categories["validation_error"], 1)
         self.assertEqual(snapshot.audit.fallbacks, 1)
@@ -103,7 +124,7 @@ class ObservabilityAggregationTests(unittest.TestCase):
         first = store.create(cwd=self.root, model="model-a", permission_mode="workspace-write")
         second = store.create(cwd=self.root, model="model-a", permission_mode="workspace-write")
         store.event_bus(first).emit("llm_usage", payload={"prompt_tokens": 100, "cached_tokens": 50, "total_tokens": 150})
-        store.event_bus(first).emit("tool_result", payload={"tool": "run_bash", "status": "failed"})
+        store.event_bus(first).emit("tool_result", payload={"tool": "bash", "status": "failed"})
         store.event_bus(first).emit("failure", payload={"category": "runtime_error", "message": "failed"})
         store.event_bus(second).emit("llm_usage", payload={"prompt_tokens": 20, "cached_tokens": 20, "total_tokens": 30})
         bad = store.sessions_dir / "bad-session"
@@ -157,7 +178,7 @@ class ObservationArtifactAdoptionTests(unittest.TestCase):
     def test_streamed_artifact_is_adopted_without_second_spill(self):
         import hashlib
 
-        from harness_code_agent.agent.observations import FactTracker, ObservationStore
+        from harness_code_agent.agent.observations import ObservationStore
         from harness_code_agent.runtime.tool_result import ToolResult
 
         art_dir = self.root / "artifacts"
@@ -169,7 +190,7 @@ class ObservationArtifactAdoptionTests(unittest.TestCase):
         preview = "x" * 100 + "...omitted..." + "x" * 100
 
         result = ToolResult(
-            tool="run_bash",
+            tool="bash",
             status="success",
             output=preview,
             metadata={
@@ -183,10 +204,9 @@ class ObservationArtifactAdoptionTests(unittest.TestCase):
         )
         store = ObservationStore(art_dir)
         observation = store.create(
-            tool="run_bash",
+            tool="bash",
             args={"command": "big"},
             result=result,
-            fact_tracker=FactTracker(),
         )
 
         # The observation points at the streamed artifact, not a new .txt.
@@ -197,18 +217,18 @@ class ObservationArtifactAdoptionTests(unittest.TestCase):
         self.assertEqual(list(art_dir.glob("obs_*.txt")), [])
 
         message = observation.message
-        self.assertIn("raw_output: artifacts/shell_output_deadbeef.txt", message)
+        self.assertIn(f"raw_output: {artifact.as_posix()}", message)
         self.assertNotIn(preview, message)
         self.assertIn("read_file", message)
 
     def test_artifact_outside_store_is_not_adopted_or_unlinked(self):
-        from harness_code_agent.agent.observations import FactTracker, ObservationStore
+        from harness_code_agent.agent.observations import ObservationStore
         from harness_code_agent.runtime.tool_result import ToolResult
 
         external = self.root / "outside.txt"
         external.write_text("do not delete me", encoding="utf-8")
         result = ToolResult(
-            tool="run_bash",
+            tool="bash",
             status="success",
             output="preview text",
             metadata={
@@ -220,10 +240,9 @@ class ObservationArtifactAdoptionTests(unittest.TestCase):
         )
         store = ObservationStore(self.root / "obs")
         observation = store.create(
-            tool="run_bash",
+            tool="bash",
             args={"command": "big"},
             result=result,
-            fact_tracker=FactTracker(),
         )
         # Not adopted; the store spills its own copy and leaves the external
         # file untouched.
@@ -235,21 +254,20 @@ class ObservationArtifactAdoptionTests(unittest.TestCase):
         self.assertIn("incomplete", observation.message)
 
     def test_small_output_is_inline_without_a_file(self):
-        from harness_code_agent.agent.observations import FactTracker, ObservationStore
+        from harness_code_agent.agent.observations import ObservationStore
         from harness_code_agent.runtime.tool_result import ToolResult
 
         result = ToolResult(
-            tool="run_bash",
+            tool="bash",
             status="success",
             output="small",
             metadata={"status_source": "shell"},
         )
         store = ObservationStore(self.root / "obs")
         observation = store.create(
-            tool="run_bash",
+            tool="bash",
             args={"command": "echo small"},
             result=result,
-            fact_tracker=FactTracker(),
         )
         self.assertIsNone(observation.raw_output_path)
         self.assertIn("small", observation.message)

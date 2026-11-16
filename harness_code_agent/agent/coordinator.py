@@ -7,7 +7,6 @@ import uuid
 import weakref
 from collections.abc import Callable
 from concurrent.futures import wait
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,10 +15,8 @@ from .. import config
 from ..runtime.agent_roles import AGENT_ROLE_NAMES, role_definition
 from ..runtime.builtins.discovery import discovery_catalog_prompt
 from ..runtime.errors import SubagentCapacityError
-from ..runtime.execution_planner import workspace_claim
 from ..runtime.mcp import PublishedMcpCatalog
 from ..runtime.middleware.stack import build_subagent_middlewares
-from ..runtime.output_artifacts import copy_artifact, file_digest
 from ..runtime.permissions import PermissionPolicy
 from ..runtime.tool_context import ToolContext
 from ..runtime.tool_registry import (
@@ -30,7 +27,6 @@ from ..runtime.tool_registry import (
 from ..support.cancellation import CancellationToken, CancelledError
 from ..workspace.paths import path_within
 from ..workspace.service import WorkspaceService
-from .change_proposal import ChangeProposalStore
 
 AGENT_ROLES = AGENT_ROLE_NAMES
 ACTIVE_STATES = {"queued", "running"}
@@ -51,7 +47,6 @@ class AgentRecord:
     state: str = "queued"
     summary: str = ""
     error: str | None = None
-    proposal_id: str | None = None
     conversation: Any = None
     token: CancellationToken | None = None
     followups: list[str] = field(default_factory=list)
@@ -65,7 +60,7 @@ class AgentRecord:
 
 
 class AgentCoordinator:
-    """Deep module for agent threads, inboxes, isolation, and change integration."""
+    """Deep module for agent threads, inboxes, lifecycle, and shared-workspace scopes."""
 
     def __init__(
         self,
@@ -89,7 +84,6 @@ class AgentCoordinator:
         self._names: dict[str, str] = {}
         self._version = 0
         self._closed = False
-        self.changes = ChangeProposalStore()
 
     def spawn(
         self,
@@ -129,8 +123,7 @@ class AgentCoordinator:
                 )
             if clean_name in self._names:
                 raise ValueError(f"agent name is already in use: {clean_name}")
-            if role == "worker":
-                self._check_worker_ownership(paths)
+            self._ensure_worker_scope_available(role, paths)
             agent_id = f"agent_{uuid.uuid4().hex[:16]}"
             record = AgentRecord(
                 id=agent_id,
@@ -146,10 +139,43 @@ class AgentCoordinator:
                 parent_cancellation_token.check()
             self._records[agent_id] = record
             self._names[clean_name] = agent_id
-            record.future = self._submit_record(record)
+            try:
+                record.future = self._submit_record(record)
+            except BaseException:
+                # The executor rejected the task (for example while the project
+                # is closing). Do not leave a queued record holding the name
+                # and a concurrency slot.
+                self._names.pop(clean_name, None)
+                self._records.pop(agent_id, None)
+                record.token = None
+                raise
             self._changed_locked()
         self._emit(record, "agent_spawned")
         return self._snapshot(record)
+
+    def _ensure_worker_scope_available(
+        self, role: str, paths: list[str], *, exclude_id: str | None = None
+    ) -> None:
+        """Reject a worker scope that overlaps another active worker.
+
+        Called with ``self._condition`` held, for both a fresh spawn and a
+        follow-up that restarts a finished worker: two legal-at-spawn scopes
+        can overlap once one of them is resumed later.
+        """
+        if role != "worker":
+            return
+        for existing in self._records.values():
+            if existing.id == exclude_id:
+                continue
+            if (
+                existing.role == "worker"
+                and existing.state in ACTIVE_STATES
+                and _paths_overlap(paths, existing.allowed_paths)
+            ):
+                raise ValueError(
+                    "worker write scopes overlap with active agent "
+                    f"{existing.name}: re-split the task or run them sequentially"
+                )
 
     def send(self, agent_id: str, message: str) -> dict:
         record = self._record(agent_id)
@@ -195,13 +221,31 @@ class AgentCoordinator:
             elif record.state == "queued":
                 record.followups.append(text)
             elif record.state in TERMINAL_STATES:
+                self._ensure_worker_scope_available(
+                    record.role, list(record.allowed_paths), exclude_id=record.id
+                )
+                previous_state = record.state
+                previous_error = record.error
+                previous_future = record.future
+                previous_token = record.token
+                record.error = None
+                record.state = "queued"
+                try:
+                    record.future = self._submit_record(record)
+                except BaseException:
+                    # Submission failed after the record was re-armed; restore
+                    # the terminal state so it does not look active forever.
+                    record.state = previous_state
+                    record.error = previous_error
+                    record.future = previous_future
+                    record.token = previous_token
+                    raise
+                # The worker cannot advance past this condition lock, so the
+                # turn is queued before it observes the new run.
                 if record.conversation is None:
                     record.followups.append(text)
                 else:
                     record.conversation.add_user_turn(text)
-                record.error = None
-                record.state = "queued"
-                record.future = self._submit_record(record)
             else:
                 raise ValueError(f"cannot follow up agent in state: {record.state}")
             self._changed_locked()
@@ -238,7 +282,7 @@ class AgentCoordinator:
                 self._finish(record, "interrupted", error="Agent cancelled before execution")
         return self._snapshot(record)
 
-    def close_agent(self, agent_id: str, *, discard_changes: bool = False) -> dict:
+    def close_agent(self, agent_id: str) -> dict:
         with self._condition:
             record = self._record(agent_id)
             if record.state in ACTIVE_STATES:
@@ -253,14 +297,8 @@ class AgentCoordinator:
             if record.conversation is not None:
                 record.conversation.close()
             self._publish_outputs(record)
-            self.changes.close_agent(record.id, discard_changes=discard_changes)
         except Exception as exc:  # noqa: BLE001 - continue closing owned resources
             error = exc
-        try:
-            if record.conversation is not None:
-                record.conversation.close()
-        except Exception as exc:  # noqa: BLE001 - preserve the first cleanup failure
-            error = error or exc
         with self._condition:
             record.state = "closed"
             self._changed_locked()
@@ -270,7 +308,7 @@ class AgentCoordinator:
         return {"agent_id": record.id, "status": "closed"}
 
     _SAVED_FIELDS = ("id", "name", "role", "task", "expected_output", "allowed_paths", "fork_turns",
-                     "model_intensity", "state", "summary", "error", "proposal_id", "created_at",
+                     "model_intensity", "state", "summary", "error", "created_at",
                      "started_at", "ended_at", "output_artifacts")
 
     def export_state(self) -> list[dict]:
@@ -299,12 +337,6 @@ class AgentCoordinator:
         with self._condition:
             return any(record.state in ACTIVE_STATES for record in self._records.values())
 
-    def proposal_paths(self, proposal_id: str) -> list[str]:
-        return self.changes.proposal_paths(proposal_id)
-
-    def conflict_paths(self, conflict_id: str) -> list[str]:
-        return self.changes.conflict_paths(conflict_id)
-
     def close(self, *, timeout: float = 10.0) -> None:
         deadline = time.monotonic() + max(0.0, timeout)
         with self._condition:
@@ -329,7 +361,6 @@ class AgentCoordinator:
             if record.conversation is not None:
                 record.conversation.close()
             self._publish_outputs(record)
-        self.changes.close()
         self._resource_owner()
 
     def _submit_record(self, record):
@@ -362,12 +393,6 @@ class AgentCoordinator:
                 with self._condition:
                     if record.conversation.has_queued_messages():
                         continue
-                if record.role == "worker":
-                    proposal = self.changes.finalize(record.id, record.allowed_paths)
-                    record.proposal_id = proposal.id
-                    if proposal.invalid_reasons:
-                        self._finish(record, "failed", error="; ".join(proposal.invalid_reasons))
-                        return
                 followup = self._take_followup(record)
                 if followup:
                     record.conversation.add_user_turn(followup)
@@ -384,10 +409,15 @@ class AgentCoordinator:
         from .conversation import Agent
 
         if record.role == "worker":
-            root_claim = workspace_claim(self.context.workspace.root, ".", scope="global", access="read")
-            with self.context.resource_coordinator.acquire((root_claim,)):
-                sandbox = self.changes.create_sandbox(record.id, self.context.workspace.root)
-            workspace = WorkspaceService(root=sandbox.workspace)
+            # Workers share the main workspace. Each gets its own
+            # WorkspaceService so version tracking and path locks stay
+            # instance-local while the tree is the same.
+            workspace = WorkspaceService(
+                root=self.context.workspace.root,
+                snapshots_dir=self.context.workspace.snapshots_dir,
+                session_id=self.context.session_id,
+                state_root=getattr(self.context, "state_root", None),
+            )
         else:
             workspace = self.context.workspace
         parent_sync = self.context.sync_mcp_catalog
@@ -415,6 +445,16 @@ class AgentCoordinator:
             record.role,
             allowed_paths=record.allowed_paths,
         )
+        from ..sessions.events import ScopedEventBus
+
+        # Same shared bus, but every event carries this agent's stable id so a
+        # name cannot misattribute parallel workers (names can be reused after
+        # close).
+        child_bus = ScopedEventBus(
+            self.context.event_bus,
+            agent_id=record.id,
+            agent_name=record.name,
+        )
         sub_context = ToolContext(
             workspace=workspace,
             project_resources=self.context.project_resources,
@@ -424,7 +464,7 @@ class AgentCoordinator:
             mcp_discovery_statuses=self.context.mcp_discovery_statuses,
             mcp_discovery_scopes=self.context.mcp_discovery_scopes,
             permission_policy=policy,
-            event_bus=self.context.event_bus,
+            event_bus=child_bus,
             session_id=self.context.session_id,
             session_root=self.context.session_root,
             model_selection=config.ModelSelection(model=self.context.model_selection.model, reasoning_effort=self.context.model_selection.reasoning_effort),
@@ -444,8 +484,6 @@ class AgentCoordinator:
         inherited = role_prompt + "\n" + _task_prompt(record)
         for reference in self.context.tool_output_artifacts.copy().values():
             if reference["path"] in inherited:
-                if workspace.root != self.context.workspace.root:
-                    copy_artifact(self.context.workspace.root, workspace.root, reference)
                 sub_context.tool_output_artifacts[reference["path"]] = dict(reference)
         agent = Agent(
             name=record.name,
@@ -484,12 +522,8 @@ class AgentCoordinator:
     def _materialize_outputs(self, record: AgentRecord, text: str) -> None:
         if record.conversation is None or record.role != "worker":
             return
-        sandbox = self.changes.sandbox_for(record.id)
-        if sandbox is None:
-            return
         for reference in self.context.tool_output_artifacts.copy().values():
             if reference["path"] in text:
-                copy_artifact(self.context.workspace.root, sandbox.workspace, reference)
                 record.conversation.agent.tool_context.tool_output_artifacts[reference["path"]] = dict(reference)
 
     def _refresh_child_mcp(self, agent, context: ToolContext, catalog: PublishedMcpCatalog | None = None) -> None:
@@ -552,28 +586,19 @@ class AgentCoordinator:
         self._emit(record, "agent_status", previous=previous, status=state)
 
     def _publish_outputs(self, record: AgentRecord) -> None:
-        if record.conversation is None:
+        conversation = record.conversation
+        store = getattr(conversation, "observation_store", None)
+        if store is None:
             return
-        sandbox = self.changes.sandbox_for(record.id)
-        from ..workspace.paths import observation_dir_for
-
-        source_root = sandbox.workspace if sandbox is not None else self.context.workspace.root
-        directory = observation_dir_for(source_root, self.context.session_id, record.id)
-        if not directory.resolve().is_relative_to(source_root.resolve()):
-            raise ValueError("Tool output directory escapes its workspace")
-        manager = getattr(getattr(record.conversation, "runtime_state", None), "shell_job_manager", None)
-        jobs = manager.list_jobs() if manager is not None else []
-        for path in directory.glob("*.txt"):
-            if path.is_symlink() or not path.resolve().is_relative_to(directory.resolve()):
-                raise ValueError("Tool output artifact escapes its directory")
-            output = next((job.output for job in jobs if job.output.path == path), None)
-            with output._lock if output is not None else nullcontext():
-                reference = {"path": path.relative_to(source_root).as_posix(), "sha256": file_digest(path),
-                             "bytes": path.stat().st_size, "append_only": output is not None}
-                copy_artifact(source_root, self.context.workspace.root, reference)
+        directory = store.root
+        for observation in store.observations:
+            reference = observation.artifact_reference
+            if reference:
                 self.context.register_output_artifact(reference)
-        record.output_artifacts = [reference for reference in self.context.tool_output_artifacts.copy().values()
-                                   if Path(reference["path"]).parent == directory.relative_to(source_root)]
+        record.output_artifacts = [
+            reference for reference in self.context.tool_output_artifacts.values()
+            if Path(reference["path"]).parent == directory
+        ]
 
     def _take_followup(self, record: AgentRecord) -> str | None:
         with self._condition:
@@ -595,13 +620,6 @@ class AgentCoordinator:
             return list(self._records.values())
         return [self._record(agent_id) for agent_id in agent_ids]
 
-    def _check_worker_ownership(self, paths: list[str]) -> None:
-        for record in self._records.values():
-            if record.role != "worker":
-                continue
-            if any(_paths_overlap(left, right) for left in paths for right in record.allowed_paths):
-                raise ValueError(f"worker paths overlap open agent {record.name}: {record.allowed_paths}")
-
     def _snapshot(self, record: AgentRecord) -> dict:
         duration = None
         if record.started_at is not None:
@@ -614,7 +632,6 @@ class AgentCoordinator:
             "status": record.state,
             "summary": record.summary,
             "error": record.error,
-            "proposal_id": record.proposal_id,
             "output_artifacts": list(record.output_artifacts),
             "allowed_paths": list(record.allowed_paths),
             "duration_seconds": round(duration, 3) if duration is not None else None,
@@ -653,7 +670,11 @@ def _task_prompt(record: AgentRecord) -> str:
     if record.expected_output:
         parts.append(f"Expected output:\n{record.expected_output}")
     if record.allowed_paths:
-        parts.append("Writable paths:\n" + "\n".join(f"- {path}" for path in record.allowed_paths))
+        parts.append(
+            "Shared workspace writable paths:\n"
+            + "\n".join(f"- {path}" for path in record.allowed_paths)
+            + "\nEdits outside these paths are rejected; message the parent before touching shared files."
+        )
     return "\n\n".join(parts)
 
 
@@ -694,5 +715,9 @@ def _normalize_rel(value: str) -> str:
     return raw.as_posix().removeprefix("./")
 
 
-def _paths_overlap(left: str, right: str) -> bool:
-    return path_within(left, [right]) or path_within(right, [left])
+def _paths_overlap(left: list[str], right: list[str]) -> bool:
+    return any(
+        path_within(a, [b]) or path_within(b, [a])
+        for a in left
+        for b in right
+    )

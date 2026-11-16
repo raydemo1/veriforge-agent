@@ -1,5 +1,6 @@
-import json
+import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import types
@@ -10,7 +11,6 @@ from unittest.mock import patch
 
 import pytest
 
-from harness_code_agent.agent.change_proposal import ChangeProposalStore
 from harness_code_agent.agent.coordinator import AgentCoordinator, AgentRecord
 from harness_code_agent.runtime.builtins.registry import (
     BUILTIN_TOOL_REGISTRY,
@@ -19,6 +19,7 @@ from harness_code_agent.runtime.builtins.registry import (
 from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.sessions.events import EventBus
+from harness_code_agent.workspace.access import WorkspaceConflict
 from harness_code_agent.workspace.paths import path_within
 from harness_code_agent.workspace.service import WorkspaceService
 
@@ -39,108 +40,121 @@ class AgentPathOwnershipTests(unittest.TestCase):
         self.assertFalse(path_within(".", ["src"]))
         self.assertFalse(path_within("src2/app.py", ["src"]))
 
-    def test_worker_scopes_overlap_when_one_owns_the_root(self):
-        from harness_code_agent.agent.coordinator import _paths_overlap
 
-        self.assertTrue(_paths_overlap(".", "src"))
-        self.assertTrue(_paths_overlap("src", "src/app.py"))
-        self.assertFalse(_paths_overlap("src", "docs"))
+def _make_directory_link(link: Path, target: Path) -> bool:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return True
+    except OSError:
+        if os.name != "nt":
+            return False
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return completed.returncode == 0
 
 
-class ChangeProposalTests(unittest.TestCase):
+class WorkerScopePathTests(unittest.TestCase):
     def setUp(self):
-        self.temp = Path(tempfile.mkdtemp(prefix="hca-proposal-test-"))
-        self.root = self.temp / "workspace"
-        self.root.mkdir()
-        self.workspace = WorkspaceService(root=self.root)
-        self.store = ChangeProposalStore()
+        self.root = Path(tempfile.mkdtemp(prefix="hca-worker-scope-"))
+        (self.root / "src").mkdir()
+        (self.root / "docs").mkdir()
+        (self.root / "other.txt").write_text("keep", encoding="utf-8")
 
     def tearDown(self):
-        self.store.close()
-        shutil.rmtree(self.temp, ignore_errors=True)
+        shutil.rmtree(self.root, ignore_errors=True)
 
-    def _proposal(self, base: str, worker: str, *, path: str = "app.py"):
-        (self.root / path).parent.mkdir(parents=True, exist_ok=True)
-        (self.root / path).write_text(base, encoding="utf-8")
-        sandbox = self.store.create_sandbox("agent_worker", self.root)
-        (sandbox.workspace / path).write_text(worker, encoding="utf-8")
-        return self.store.finalize("agent_worker", [path])
-
-    def test_non_overlapping_same_file_changes_three_way_merge(self):
-        proposal = self._proposal("one\ntwo\nthree\n", "ONE\ntwo\nthree\n")
-        (self.root / "app.py").write_text("one\ntwo\nTHREE\n", encoding="utf-8")
-
-        result = self.store.apply(proposal.id, self.workspace)
-
-        self.assertEqual(result["status"], "applied")
-        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "ONE\ntwo\nTHREE\n")
-
-    def test_true_conflict_writes_nothing_until_parent_resolves(self):
-        proposal = self._proposal("value = 1\n", "value = 2\n")
-        (self.root / "app.py").write_text("value = 3\n", encoding="utf-8")
-
-        result = self.store.apply(proposal.id, self.workspace)
-
-        self.assertEqual(result["status"], "conflict")
-        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "value = 3\n")
-        self.assertNotIn("<<<<<<<", (self.root / "app.py").read_text(encoding="utf-8"))
-        conflict = self.store.read_conflicts(result["conflict_id"])
-        self.assertIn("value = 2", conflict["content"])
-
-        resolved = self.store.resolve(
-            result["conflict_id"],
-            {"app.py": "value = 4\n"},
-            self.workspace,
+    def _decide(self, path):
+        policy = PermissionPolicy.for_role("worker", allowed_paths=["src"])
+        return policy.decide_tool_call(
+            "write_file", {"path": path}, tool_permission="edit", workspace_root=str(self.root)
         )
-        self.assertEqual(resolved["status"], "applied")
-        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "value = 4\n")
 
-    def test_conflict_resolution_rejects_stale_main_workspace(self):
-        proposal = self._proposal("value = 1\n", "value = 2\n")
-        (self.root / "app.py").write_text("value = 3\n", encoding="utf-8")
-        conflict = self.store.apply(proposal.id, self.workspace)
-        (self.root / "app.py").write_text("value = 5\n", encoding="utf-8")
+    def test_inside_scope_is_allowed(self):
+        self.assertTrue(self._decide("src/nested/new.txt").allowed)
 
-        with self.assertRaisesRegex(ValueError, "workspace changed"):
-            self.store.resolve(conflict["conflict_id"], {"app.py": "value = 4\n"}, self.workspace)
-        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "value = 5\n")
+    def test_dotdot_escape_is_denied(self):
+        decision = self._decide("src/../other.txt")
+        self.assertFalse(decision.allowed)
+        self.assertIn("resolves outside allowed_paths", decision.reason)
 
-    def test_large_proposal_is_paged_but_artifact_remains_complete(self):
-        proposal = self._proposal("", "x" * 40_000 + "\n")
+    def test_link_escape_is_denied(self):
+        link = self.root / "src" / "linked"
+        if not _make_directory_link(link, self.root / "docs"):
+            self.skipTest("cannot create a directory symlink or junction")
+        decision = self._decide("src/linked/new.txt")
+        self.assertFalse(decision.allowed)
+        self.assertIn("resolves outside allowed_paths", decision.reason)
 
-        first = self.store.read_changes(proposal.id, limit=10_000)
-        second = self.store.read_changes(proposal.id, offset=first["next_offset"], limit=50_000)
+    def test_file_scope_allows_the_file_but_shell_requires_directories(self):
+        (self.root / "src" / "app.py").write_text("x", encoding="utf-8")
+        policy = PermissionPolicy.for_role("worker", allowed_paths=["src/app.py"])
+        allowed = policy.decide_tool_call(
+            "write_file", {"path": "src/app.py"}, tool_permission="edit", workspace_root=str(self.root)
+        )
+        denied = policy.decide_tool_call(
+            "write_file", {"path": "src/other.py"}, tool_permission="edit", workspace_root=str(self.root)
+        )
+        self.assertTrue(allowed.allowed)
+        self.assertFalse(denied.allowed)
 
-        self.assertGreater(first["total_chars"], 30_000)
-        self.assertIsNotNone(first["next_offset"])
-        self.assertIsNone(second["next_offset"])
-        self.assertTrue(self.store.sandbox_for("agent_worker").workspace.exists())
+        from harness_code_agent.runtime.builtins.shell import _effective_write_paths
+        from harness_code_agent.workspace.native_shell import write_directories
 
-    def test_workspace_root_owner_can_finalize_a_nested_change(self):
-        (self.root / "src").mkdir()
-        (self.root / "src" / "app.py").write_text("one\n", encoding="utf-8")
-        sandbox = self.store.create_sandbox("agent_worker", self.root)
-        (sandbox.workspace / "src" / "app.py").write_text("two\n", encoding="utf-8")
+        context = types.SimpleNamespace(permission_policy=policy)
+        self.assertEqual(_effective_write_paths([], context), ["src/app.py"])
+        # Shell grants are directory-based: a file-only scope fails loudly
+        # instead of silently widening to the parent directory.
+        with self.assertRaisesRegex(ValueError, "directories, not files"):
+            write_directories(self.root, ["src/app.py"])
 
-        proposal = self.store.finalize("agent_worker", ["."])
 
-        self.assertEqual(proposal.status, "ready")
-        self.assertEqual([entry.path for entry in proposal.entries], ["src/app.py"])
+class SharedWorkspaceConcurrencyTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="hca-shared-workspace-"))
+        (self.root / "frontend").mkdir()
+        (self.root / "backend").mkdir()
 
-    def test_registry_exposes_lifecycle_tools_and_removes_legacy_batch_tools(self):
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_distinct_files_written_by_two_services_survive(self):
+        main = WorkspaceService(root=self.root)
+        worker = WorkspaceService(root=self.root)
+        threads = [
+            threading.Thread(target=main.write_text, args=("frontend/app.ts", "frontend")),
+            threading.Thread(target=worker.write_text, args=("backend/app.py", "backend")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual((self.root / "frontend" / "app.ts").read_text(encoding="utf-8"), "frontend")
+        self.assertEqual((self.root / "backend" / "app.py").read_text(encoding="utf-8"), "backend")
+
+    def test_worker_write_after_main_change_conflicts_instead_of_overwriting(self):
+        path = self.root / "frontend" / "app.ts"
+        path.write_text("original", encoding="utf-8")
+        main = WorkspaceService(root=self.root)
+        worker = WorkspaceService(root=self.root)
+        worker.read_text("frontend/app.ts")
+        main.read_text("frontend/app.ts")
+        main.write_text("frontend/app.ts", "main change")
+        with self.assertRaises(WorkspaceConflict):
+            worker.write_text("frontend/app.ts", "worker change")
+        self.assertEqual(path.read_text(encoding="utf-8"), "main change")
+
+
+class AgentToolSurfaceTests(unittest.TestCase):
+    def test_registry_exposes_lifecycle_tools_only(self):
         names = {schema["function"]["name"] for schema in TOOL_SCHEMAS}
-        self.assertIn("spawn_agent", names)
-        self.assertIn("send_agent_message", names)
-        self.assertIn("apply_agent_changes", names)
-        self.assertIn("read_agent_changes", names)
-        # Conflict flow folded into read/apply; status listing folded into
-        # get_runtime_status(section="agents").
-        self.assertNotIn("read_agent_conflicts", names)
-        self.assertNotIn("resolve_agent_conflicts", names)
-        self.assertNotIn("list_agents", names)
-        self.assertNotIn("delegate_agent", names)
-        self.assertNotIn("parallel_agents", names)
-        self.assertNotIn("parallel_commands", names)
+        for name in ("spawn_agent", "send_agent_message", "wait_agents", "close_agent"):
+            self.assertIn(name, names)
+        self.assertNotIn("read_agent_changes", names)
+        self.assertNotIn("apply_agent_changes", names)
 
     def test_coordination_tools_are_deferred_until_search_tools_mounts_them(self):
         from harness_code_agent.runtime.tool_registry import tool_schemas_for_agent
@@ -153,10 +167,9 @@ class ChangeProposalTests(unittest.TestCase):
 
         core = names_of()
         deferred = names_of(disclosure={"deferred"})
-        for name in ("spawn_agent", "apply_agent_changes", "wait_agents", "close_agent"):
+        for name in ("spawn_agent", "wait_agents", "close_agent"):
             self.assertNotIn(name, core, msg=f"{name} must not be mounted by default")
             self.assertIn(name, deferred, msg=f"{name} must stay discoverable")
-        # Children always need their one upward channel, so it stays core for them.
         child_view = {
             schema["function"]["name"]
             for schema in tool_schemas_for_agent(
@@ -164,69 +177,6 @@ class ChangeProposalTests(unittest.TestCase):
             )
         }
         self.assertIn("send_parent_message", child_view)
-
-    def test_merged_change_tools_route_conflict_flow(self):
-        from harness_code_agent.runtime.builtins.agents import (
-            apply_agent_changes,
-            read_agent_changes,
-        )
-
-        proposal = self._proposal("value = 1\n", "value = 2\n")
-        (self.root / "app.py").write_text("value = 3\n", encoding="utf-8")
-        context = types.SimpleNamespace(
-            agent_coordinator=types.SimpleNamespace(changes=self.store),
-            workspace=self.workspace,
-        )
-
-        applied = json.loads(apply_agent_changes(proposal.id, tool_context=context).output)
-        self.assertEqual(applied["status"], "conflict")
-
-        conflict = json.loads(
-            read_agent_changes(
-                proposal.id, conflict_id=applied["conflict_id"], tool_context=context
-            ).output
-        )
-        self.assertIn("value = 2", conflict["content"])
-
-        resolved = json.loads(
-            apply_agent_changes(
-                proposal.id,
-                conflict_id=applied["conflict_id"],
-                resolutions={"app.py": "value = 4\n"},
-                tool_context=context,
-            ).output
-        )
-        self.assertEqual(resolved["status"], "applied")
-        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "value = 4\n")
-
-    def test_conflict_flow_rejects_an_unrelated_proposal_id(self):
-        from harness_code_agent.runtime.builtins.agents import (
-            apply_agent_changes,
-            read_agent_changes,
-        )
-
-        proposal = self._proposal("value = 1\n", "value = 2\n")
-        (self.root / "app.py").write_text("value = 3\n", encoding="utf-8")
-        applied = self.store.apply(proposal.id, self.workspace)
-        context = types.SimpleNamespace(
-            agent_coordinator=types.SimpleNamespace(changes=self.store),
-            workspace=self.workspace,
-        )
-
-        with self.assertRaisesRegex(ValueError, "belongs to proposal"):
-            read_agent_changes(
-                "proposal_unrelated",
-                conflict_id=applied["conflict_id"],
-                tool_context=context,
-            )
-        with self.assertRaisesRegex(ValueError, "belongs to proposal"):
-            apply_agent_changes(
-                "proposal_unrelated",
-                conflict_id=applied["conflict_id"],
-                resolutions={"app.py": "value = 4\n"},
-                tool_context=context,
-            )
-        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "value = 3\n")
 
 
 class ToolDiscoveryTests(unittest.TestCase):
@@ -453,6 +403,73 @@ class AgentCoordinatorTests(unittest.TestCase):
             conversation.release.set()
             self.assertEqual(self._wait_terminal(spawned["agent_id"])["status"], "completed")
 
+    def test_overlapping_worker_scopes_are_rejected(self):
+        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
+            first = self.coordinator.spawn(
+                name="worker-one", role="worker", task="one", allowed_paths=["src"]
+            )
+            with self.assertRaisesRegex(ValueError, "overlap"):
+                self.coordinator.spawn(
+                    name="worker-two", role="worker", task="two", allowed_paths=["src/app.py"]
+                )
+            self._wait_conversation("worker-one").release.set()
+            self.assertEqual(self._wait_terminal(first["agent_id"])["status"], "completed")
+
+    def test_followup_rechecks_worker_scope_overlap(self):
+        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
+            finished = self.coordinator.spawn(
+                name="former", role="worker", task="one", allowed_paths=["src"]
+            )
+            conversation = self._wait_conversation("former")
+            self.assertTrue(conversation.started.wait(1))
+            conversation.release.set()
+            self.assertEqual(self._wait_terminal(finished["agent_id"])["status"], "completed")
+
+            active = self.coordinator.spawn(
+                name="current", role="worker", task="two", allowed_paths=["src"]
+            )
+            self._wait_conversation("current")
+            with self.assertRaisesRegex(ValueError, "overlap"):
+                self.coordinator.followup(finished["agent_id"], "continue")
+
+            state = next(
+                item for item in self.coordinator.list()["agents"]
+                if item["agent_id"] == finished["agent_id"]
+            )
+            self.assertEqual(state["status"], "completed")
+            _ControlledConversation.instances["current"].release.set()
+            self.assertEqual(self._wait_terminal(active["agent_id"])["status"], "completed")
+
+    def test_disjoint_worker_scopes_share_the_workspace_and_run_together(self):
+        (self.temp / "frontend").mkdir()
+        (self.temp / "backend").mkdir()
+        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
+            first = self.coordinator.spawn(
+                name="frontend", role="worker", task="ui", allowed_paths=["frontend"]
+            )
+            second = self.coordinator.spawn(
+                name="backend", role="worker", task="api", allowed_paths=["backend"]
+            )
+            first_conversation = self._wait_conversation("frontend")
+            second_conversation = self._wait_conversation("backend")
+            self.assertTrue(first_conversation.started.wait(1))
+            self.assertTrue(second_conversation.started.wait(1))
+
+            states = {item["name"]: item["status"] for item in self.coordinator.list()["agents"]}
+            self.assertEqual(states, {"frontend": "running", "backend": "running"})
+            frontend = _ControlledAgent.contexts["frontend"]
+            backend = _ControlledAgent.contexts["backend"]
+            self.assertEqual(frontend.workspace.root, self.temp.resolve())
+            self.assertEqual(backend.workspace.root, self.temp.resolve())
+            self.assertIsNot(frontend.workspace, self.context.workspace)
+            self.assertIsNot(frontend.workspace, backend.workspace)
+            self.assertEqual(frontend.permission_policy.allowed_paths, ("frontend",))
+
+            first_conversation.release.set()
+            second_conversation.release.set()
+            self.assertEqual(self._wait_terminal(first["agent_id"])["status"], "completed")
+            self.assertEqual(self._wait_terminal(second["agent_id"])["status"], "completed")
+
     def test_message_reaches_running_agent_without_waiting_for_turn_end(self):
         with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
             spawned = self.coordinator.spawn(name="explore", role="explorer", task="inspect")
@@ -501,6 +518,61 @@ class AgentCoordinatorTests(unittest.TestCase):
         self.assertEqual(terminal["status"], "failed")
         self.assertEqual(terminal["error"], "ValueError: setup exploded")
 
+    def test_spawn_submission_failure_does_not_keep_the_name_or_slot(self):
+        with (
+            patch.object(
+                self.coordinator, "_submit_record", side_effect=RuntimeError("executor closed")
+            ),
+            self.assertRaisesRegex(RuntimeError, "executor closed"),
+        ):
+            self.coordinator.spawn(name="rejected", role="explorer", task="inspect")
+        self.assertEqual(self.coordinator.list()["agents"], [])
+
+        # The name and capacity are free again.
+        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
+            spawned = self.coordinator.spawn(name="rejected", role="explorer", task="inspect")
+            self._wait_conversation("rejected").release.set()
+            self.assertEqual(self._wait_terminal(spawned["agent_id"])["status"], "completed")
+
+    def test_followup_submission_failure_restores_the_terminal_state(self):
+        with patch("harness_code_agent.agent.conversation.Agent", _RunFailingAgent):
+            spawned = self.coordinator.spawn(name="failed", role="explorer", task="inspect")
+            self._wait_terminal(spawned["agent_id"])
+        record = self.coordinator._records[spawned["agent_id"]]
+        messages_before = len(record.conversation.messages)
+        future_before = record.future
+
+        with (
+            patch.object(
+                self.coordinator, "_submit_record", side_effect=RuntimeError("executor closed")
+            ),
+            self.assertRaisesRegex(RuntimeError, "executor closed"),
+        ):
+            self.coordinator.followup(spawned["agent_id"], "try again")
+
+        state = next(
+            item for item in self.coordinator.list()["agents"]
+            if item["agent_id"] == spawned["agent_id"]
+        )
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["error"], "RuntimeError: run exploded")
+        self.assertIs(record.future, future_before)
+        self.assertEqual(len(record.conversation.messages), messages_before)
+
+    def test_child_event_bus_stamps_the_stable_agent_id(self):
+        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
+            spawned = self.coordinator.spawn(name="attributed", role="explorer", task="inspect")
+            self._wait_conversation("attributed")
+            context = _ControlledAgent.contexts["attributed"]
+            event = context.event_bus.emit("tool_call", payload={"tool": "bash", "args": {}})
+            self.assertEqual(event.agent, "attributed")
+            self.assertEqual(event.payload["agent_id"], spawned["agent_id"])
+            # Same shared stream as the main agent; only identity is scoped.
+            self.assertIn(event, self.context.event_bus.events)
+            self.assertIs(context.event_bus.events, self.context.event_bus.events)
+            self._wait_conversation("attributed").release.set()
+            self.assertEqual(self._wait_terminal(spawned["agent_id"])["status"], "completed")
+
     def test_wait_ignores_unrelated_agent_state_changes(self):
         selected = AgentRecord(
             id="agent_selected",
@@ -544,55 +616,6 @@ class AgentCoordinatorTests(unittest.TestCase):
 
         self.assertTrue(payload["timed_out"])
         self.assertEqual(payload["agents"][0]["status"], "running")
-
-    def test_close_agent_cannot_be_revived_by_concurrent_followup(self):
-        closed = threading.Event()
-        cleanup_started = threading.Event()
-        release_cleanup = threading.Event()
-        conversation = types.SimpleNamespace(
-            close=lambda: closed.set(),
-            add_user_turn=lambda _task: self.fail("closed agent was revived"),
-        )
-        record = AgentRecord(
-            id="agent_done",
-            name="done",
-            role="explorer",
-            task="task",
-            expected_output="",
-            allowed_paths=[],
-            fork_turns="none",
-            model_intensity=None,
-            state="completed",
-            conversation=conversation,
-        )
-        with self.coordinator._condition:
-            self.coordinator._records[record.id] = record
-            self.coordinator._names[record.name] = record.id
-
-        def block_cleanup(_agent_id, *, discard_changes=False):
-            cleanup_started.set()
-            release_cleanup.wait(timeout=1)
-
-        errors: list[Exception] = []
-
-        def close_record() -> None:
-            try:
-                self.coordinator.close_agent(record.id)
-            except Exception as exc:  # noqa: BLE001 - surfaced by the assertion below
-                errors.append(exc)
-
-        with patch.object(self.coordinator.changes, "close_agent", side_effect=block_cleanup):
-            worker = threading.Thread(target=close_record)
-            worker.start()
-            self.assertTrue(cleanup_started.wait(timeout=1))
-            with self.assertRaises((KeyError, ValueError)):
-                self.coordinator.followup(record.id, "revive")
-            release_cleanup.set()
-            worker.join(timeout=1)
-
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(errors, [])
-        self.assertTrue(closed.is_set())
 
     def test_agent_runtime_uses_its_tool_context_workspace_for_background_jobs(self):
         from harness_code_agent.agent.conversation import Agent

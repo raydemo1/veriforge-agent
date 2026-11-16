@@ -32,31 +32,19 @@ AGENT_ROLE_DEFINITIONS: tuple[AgentRole, ...] = (
         name="explorer",
         read_only=True,
         can_write=False,
-        instruction="Investigate code and return evidence. Do not modify files.",
-    ),
-    AgentRole(
-        name="test_designer",
-        read_only=True,
-        can_write=False,
-        instruction="Design focused tests and failure cases. Do not modify files.",
-    ),
-    AgentRole(
-        name="reviewer",
-        read_only=True,
-        can_write=False,
-        instruction="Review for correctness, regressions, security, and missing tests. Do not modify files.",
-    ),
-    AgentRole(
-        name="verifier",
-        read_only=True,
-        can_write=False,
-        instruction="Run focused verification and interpret results. Do not modify source files.",
+        instruction=(
+            "Investigate code, search the web, review changes, or design tests, "
+            "and return evidence. Do not modify files."
+        ),
     ),
     AgentRole(
         name="worker",
         read_only=False,
         can_write=True,
-        instruction="Implement the assigned change in your isolated workspace and verify it.",
+        instruction=(
+            "Implement the assigned change in the shared workspace, staying inside "
+            "your writable paths, and verify it."
+        ),
     ),
 )
 

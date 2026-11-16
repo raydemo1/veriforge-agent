@@ -38,10 +38,8 @@ export function workSegments(work: WorkState): StripSegment[] {
   }
 
   const workspaceCount = work.changes.workspace.length;
-  const proposalCount = work.changes.proposals.reduce((sum, item) => sum + item.files.length, 0);
-  const changeCount = workspaceCount + proposalCount;
-  if (changeCount) {
-    segments.push({ key: "changes", label: "", text: `${changeCount} 变更`, tone: "muted" });
+  if (workspaceCount) {
+    segments.push({ key: "changes", label: "", text: `${workspaceCount} 变更`, tone: "muted" });
   }
 
   if (work.checks.length) {

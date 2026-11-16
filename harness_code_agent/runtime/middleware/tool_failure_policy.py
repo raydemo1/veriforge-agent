@@ -32,6 +32,9 @@ Boundary (see ``runtime/tool_failures.py``):
   Runaway protection belongs to the resource layer (tool timeout, LLM
   request timeout, iteration/tool-call budgets, subagent depth, host
   cancellation).
+* Unknown tool names are the exception: three *consecutive* tool failures
+  (reset by any successful tool call) stop the turn, so a repeated typo
+  cannot loop forever while unrelated successful work clears the streak.
 * A non-zero process exit code (a failing test suite, a compiler error, ...)
   is **not** a tool failure: ``run_bash`` started and completed normally, so
   the result stays ``success`` with the raw output and exit code for the
@@ -62,6 +65,9 @@ DEFAULT_SCHEMA_STREAK_STOP = 3
 DEFAULT_POLICY_STREAK_GUIDANCE = 2
 #: First strong nudge for one identical execution failure repeating.
 DEFAULT_EXECUTION_STREAK_GUIDANCE = 3
+#: Stop after this many consecutive tool failures, including unknown tools.
+#: A successful tool call resets this counter.
+DEFAULT_FAILURE_STREAK_STOP = 3
 
 
 def _schema_definition_error(tool_name: str) -> str:
@@ -147,15 +153,18 @@ class ToolFailurePolicyMiddleware(AgentMiddleware):
                 message=_schema_definition_error(failure.tool_name)
             )
         if failure.kind == FailureKind.UNKNOWN_TOOL:
-            if failure.attempt >= 2:
+            failures = getattr(runtime_state, "failures", None)
+            streak = int(getattr(failures, "consecutive_failures", failure.attempt) or failure.attempt)
+            if streak >= DEFAULT_FAILURE_STREAK_STOP:
                 return FailureAction.stop(
                     reason="retry_budget_exhausted",
                     message=(
-                        f"[stop] repeated calls to unknown tool `{failure.tool_name}`. "
-                        "Use only tools from the provided tool list."
+                        f"[stop] {streak} consecutive tool failures. Use only tools "
+                        "from the provided tool list and fix failing calls before "
+                        "continuing."
                     ),
                     limit_type="unknown_tool",
-                    limit=2,
+                    limit=DEFAULT_FAILURE_STREAK_STOP,
                 )
             return FailureAction.return_to_agent()
 

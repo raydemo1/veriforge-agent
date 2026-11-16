@@ -39,7 +39,7 @@ from .llm_channel import (
     LlmStreamTimeoutError,
     llm_call_simple,
 )
-from .observations import FactTracker, ObservationStore
+from .observations import ObservationStore
 from .request_diagnostics import RequestDiagnostics
 from .runtime_state import (
     AgentFallbackState,
@@ -137,11 +137,23 @@ class Agent:
         workspace = self.tool_context.workspace.root if self.tool_context is not None else Path.cwd()
         from ..workspace.paths import observation_dir_for
 
+        # Only the explicit full-access mode may run shell jobs unconfined;
+        # every other mode needs a sandbox backend or fails closed.
+        policy = getattr(self.tool_context, "permission_policy", None)
+        sandbox = "off" if getattr(policy, "mode", "") == "danger-full-access" else "auto"
+
+        context = self.tool_context
         return AgentRuntimeState(
             shell_job_manager=ShellJobManager(workspace, artifact_dir=observation_dir_for(
-                workspace, getattr(self.tool_context, "session_id", None), getattr(self.tool_context, "agent_id", None)),
+                workspace,
+                getattr(context, "session_id", None),
+                getattr(context, "agent_id", None),
+                session_root=getattr(context, "session_root", None),
+            ),
                 environment=getattr(self.tool_context, "environment", "local"),
-                session_id=getattr(self.tool_context, "session_id", None)),
+                session_id=getattr(self.tool_context, "session_id", None),
+                sandbox=sandbox,
+                state_root=getattr(context, "state_root", None)),
             agent_config=self,
         )
 
@@ -150,7 +162,7 @@ class Agent:
         Execute the agent loop until the model stops calling tools.
 
         Returns the final assistant text response.
-        Writes a JSONL trace file to {WORKSPACE}/.harness/traces/trace_{name}.jsonl
+        Writes a JSONL trace file under the workspace state directory.
         """
         conversation = self.start_conversation(task)
         try:
@@ -218,8 +230,7 @@ class AgentConversation:
         self.event_bus = agent.tool_context.event_bus if agent.tool_context is not None else None
         self.runtime_state.event_bus = self.event_bus
         self.emitter.event_bus = self.event_bus
-        self.fact_tracker = FactTracker()
-        self.observation_store = ObservationStore(self._observation_dir(), self._workspace_root())
+        self.observation_store = ObservationStore(self._observation_dir())
         self._cached_prompt_cache_key: str | None = None
         self._log_rewrite_version = 0
         self._last_prompt_cache_shape = None
@@ -231,7 +242,10 @@ class AgentConversation:
         self.journal = None
         if session_id and session_id != "default":
             child_id = getattr(agent.tool_context, "agent_id", None)
-            session_root = agent.tool_context.session_root or self._workspace_root() / ".harness" / "sessions" / session_id
+            from ..workspace.state_paths import ensure_workspace_state
+            session_root = agent.tool_context.session_root or (
+                ensure_workspace_state(self._workspace_root()) / "sessions" / session_id
+            )
             if child_id:
                 session_root = session_root / "agents" / child_id
             self.journal = SessionJournal(
@@ -250,10 +264,12 @@ class AgentConversation:
     def _observation_dir(self) -> Path:
         from ..workspace.paths import observation_dir_for
 
+        context = self.agent.tool_context
         return observation_dir_for(
             self._workspace_root(),
             getattr(self.runtime_state, "session_id", None),
-            getattr(self.agent.tool_context, "agent_id", None),
+            getattr(context, "agent_id", None),
+            session_root=getattr(context, "session_root", None),
         )
 
     def _load_memory_snapshot(self, agent: Agent, *, refresh: bool = False) -> None:
@@ -272,6 +288,14 @@ class AgentConversation:
             self._memory_snapshot = service.startup_block() or None
             self._memory_snapshot_key = key
         self._memory_index = self._memory_snapshot
+
+    def refresh_memory_index(self) -> None:
+        """Re-evaluate the startup memory block, including a disabled switch.
+
+        The next request's contract check replaces the system message, so an
+        index that is no longer allowed cannot survive into the next turn.
+        """
+        self._load_memory_snapshot(self.agent, refresh=True)
 
     def _system_message(self, agent: Agent | None = None) -> dict:
         selected = agent or self.agent
@@ -488,7 +512,7 @@ class AgentConversation:
 
     def record_tool_result(self, tool_call_id: str, result: ToolResult, arguments: dict | None = None):
         observation = self.observation_store.create(
-            tool=result.tool, args=arguments or {}, result=result, fact_tracker=self.fact_tracker,
+            tool=result.tool, args=arguments or {}, result=result,
         )
         if observation.artifact_reference and self.agent.tool_context is not None:
             reference = observation.artifact_reference
@@ -577,7 +601,8 @@ class AgentConversation:
             return None
         safe_session_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(session_id))
         root = self._workspace_root()
-        return root / ".harness" / "sessions" / safe_session_id / "compacted"
+        from ..workspace.state_paths import ensure_workspace_state
+        return ensure_workspace_state(root) / "sessions" / safe_session_id / "compacted"
 
     def _persist_compacted_summary(self, summary: str, *, phase: str) -> None:
         text = (summary or "").strip()
@@ -925,6 +950,7 @@ class AgentConversation:
                 arguments=fn_args,
                 tool_context=self.agent.tool_context,
                 agent_name=self.agent.name,
+                tool_call_id=call.tool_call_id,
             )
             result = tool_result.to_text()
             self.trace.tool_call(fn_name, fn_args, result, tool_call_id=call.tool_call_id,

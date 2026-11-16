@@ -296,6 +296,7 @@ class LlmChannel:
                         ThoughtFinishedEvent(
                             duration_seconds=time.time() - thought_start_time,
                             source=conv.provider.name,
+                            agent=conv.agent.name,
                         ).to_event()
                     )
 
@@ -319,7 +320,7 @@ class LlmChannel:
                 thought_start_time = time.time()
                 if conv.event_bus is not None:
                     from ..sessions.events import ThoughtStartedEvent
-                    conv.event_bus.emit_event(ThoughtStartedEvent().to_event())
+                    conv.event_bus.emit_event(ThoughtStartedEvent(agent=conv.agent.name).to_event())
 
             def on_reasoning_delta(delta: str) -> None:
                 pass  # Reasoning content collected silently, not displayed

@@ -120,6 +120,19 @@ with a.acquire([a.write_claim(Path(sys.argv[1]) / 'a.txt')]):
 
 
 
+def test_recovery_capture_skips_legacy_workspace_state(tmp_path):
+    from harness_code_agent.runtime.recovery import RecoveryStore
+
+    legacy = tmp_path / ".harness"
+    legacy.mkdir()
+    (legacy / "mcp.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "tracked.txt").write_text("work", encoding="utf-8")
+    store = RecoveryStore(tmp_path)
+
+    assert set(store.manifest(store.capture())) == {"tracked.txt"}
+    assert store.manifest(store.capture([legacy / "mcp.json"])) == {}
+
+
 def test_rewind_preserves_another_sessions_changes(runtime_factory, tmp_path):
     create, _ = runtime_factory
     first, second = create(), create()
@@ -169,7 +182,9 @@ def test_worktree_inherits_dirty_local_and_applies_only_task_delta(tmp_path):
     with pytest.raises(WorktreeMergeConflict) as caught:
         service.apply("isolated")
     files = caught.value.files
-    _, approved = prepare_merge_review(tree / ".harness/review", files, files)
+    from harness_code_agent.workspace.state_paths import ensure_workspace_state
+
+    _, approved = prepare_merge_review(ensure_workspace_state(tmp_path) / "review", files, files)
     assert (tmp_path / "tracked").read_text(encoding="utf-8") == "later Local"
     (tmp_path / "tracked").write_text("newer Local", encoding="utf-8")
     with pytest.raises(WorkspaceConflict):
@@ -296,8 +311,8 @@ def test_refused_suspension_leaves_runtime_usable(runtime_factory):
     runtime.submit("第一轮")
     coordinator = runtime.tool_context.agent_coordinator
     with (
-        patch.object(coordinator.changes, "has_pending_changes", return_value=True),
-        pytest.raises(RuntimeError, match="代码提案"),
+        patch.object(coordinator, "has_active_agents", return_value=True),
+        pytest.raises(RuntimeError, match="子代理仍在执行"),
     ):
         runtime.close(suspend=True)
     assert not runtime._closing and not coordinator._closed

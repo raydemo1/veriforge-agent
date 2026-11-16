@@ -8,6 +8,7 @@ sections of this prompt.
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 
 BASE_AGENT_PROMPT = """\
@@ -64,17 +65,19 @@ The user may not see your tool calls or the text between them, so the final mess
 
 The conversation is summarized as it grows, and you continue from the summary. Do not wrap up early or hand off work because the context is long.
 
-Prefer targeted reads and searches over dumping large files. Delegate broad exploration when it would otherwise fill your context with material you do not need.
+Prefer targeted reads and searches over dumping large files.
 
 ## Agents
 
-Agent coordination tools are mounted on demand: call search_tools (keywords like "spawn agent" or "agent changes") before your first delegation. Once mounted they stay available for the task.
+Agent coordination tools are mounted on demand: call search_tools (keywords like "spawn agent") before your first delegation. Once mounted they stay available for the task.
 
-Use spawn_agent when independent context work reduces risk or protects the main context: exploring unfamiliar code, comparing hypotheses, designing tests, reviewing an approach, or implementing an isolated change proposal. Send several spawn_agent calls together when their ownership does not overlap.
+Default to doing the work yourself, including searching, editing, running tests, debugging, and reviewing changes. Do not spawn a subagent merely because a task is complex, has many steps, or could be parallelized. Only use spawn_agent when the user explicitly asks for a subagent, independent research, a division of labor, or multi-agent collaboration. If you believe delegation would help but the user did not ask for it, suggest it and wait for permission.
+
+Explorer is read-only: code exploration, web research, review, and test design. Worker edits the shared workspace inside assigned paths. Send several spawn_agent calls together only when their write scopes do not overlap.
 
 Agents keep running across parent turns. Use send_agent_message to steer a running turn at its next safe iteration boundary, followup_agent to continue an existing thread, and wait_agents only when you actually need the result. A subagent can raise a plan-changing finding, a missing decision, or a risk through send_parent_message; treat it as input at your next boundary. Agents cannot message each other. All coordination goes through you.
 
-Worker changes stay isolated until you read them with read_agent_changes and apply them with apply_agent_changes. Applying uses a three-way merge; overlapping edits come back as a conflict id without changing the workspace. Read that conflict, then apply again with the final content for every conflicted file. Review worker changes before applying them.
+Worker edits happen immediately in the shared workspace, inside the writable paths assigned by spawn_agent. Review and test those changes after the worker reports; there is no separate apply step. Workers must not touch shared files outside their paths without asking you first.
 
 A subagent's finding is evidence or a proposal, not completed work. Keep integration, final verification, and the decision to stop with you: make the required changes yourself, run concrete verification commands, and read their output.
 
@@ -113,6 +116,32 @@ class StablePromptPrefix:
         return dict(self.hashes)
 
 
+def platform_prompt(environment: str = "local", *, os_name: str | None = None) -> str:
+    """Describe the real shell to the model once, per session platform."""
+    windows = (os_name or os.name) == "nt"
+    lines = [
+        f"Operating system: {'Windows' if windows else 'POSIX'}",
+        f"Shell: {'PowerShell 7 (pwsh)' if windows else 'bash'}",
+        "Shell commands run through the `bash` tool.",
+    ]
+    if windows:
+        lines += [
+            "Use native PowerShell syntax. Do not assume POSIX ls/find/head/cat options are supported.",
+            (
+                "For tests and external programs, run the command directly; the tool captures "
+                "stdout, stderr, exit codes and large-output artifacts."
+            ),
+            "Avoid PowerShell pipeline capture when the active Windows sandbox does not support it.",
+        ]
+    else:
+        lines.append(
+            "Use POSIX shell syntax. Run tests and external programs directly; the tool captures output."
+        )
+    if environment != "local":
+        lines.append(f"Execution environment: {environment}")
+    return "\n".join(f"- {line}" for line in lines)
+
+
 class PromptPrefixBuilder:
     """Builds the stable system prefix in a deterministic section order."""
 
@@ -121,6 +150,7 @@ class PromptPrefixBuilder:
         *,
         global_rules_docs: list[GlobalRulesDoc] | None = None,
         skill_catalog: str = "",
+        platform_notes: str = "",
     ) -> StablePromptPrefix:
         global_rules_docs = global_rules_docs or []
 
@@ -129,6 +159,8 @@ class PromptPrefixBuilder:
         )
 
         sections = [("Agent", BASE_AGENT_PROMPT.strip())]
+        if platform_notes.strip():
+            sections.append(("Execution Environment", platform_notes.strip()))
         skill_catalog_section = ""
         if skill_catalog.strip():
             skill_catalog_section = f"{SKILL_ROUTING_POLICY}\n\n{skill_catalog.strip()}"
@@ -144,6 +176,7 @@ class PromptPrefixBuilder:
         )
         hashes = {
             "base_prompt_hash": _hash_text(BASE_AGENT_PROMPT),
+            "platform_hash": _hash_text(platform_notes),
             "global_rules_hash": _hash_text(global_hash_payload),
             "skill_catalog_hash": _hash_text(skill_catalog_section),
             "stable_prefix_hash": _hash_text(content),

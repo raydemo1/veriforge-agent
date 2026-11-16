@@ -162,6 +162,93 @@ describe("OpenTUI app interactions", () => {
     expect(opened).toContain("calculator.html");
   });
 
+  test("subagent rows expand independently and survive live updates", async () => {
+    const stream = eventStream();
+    setup = await testRender(
+      <App
+        events={stream.events}
+        onSubmit={async () => ({ accepted: true } as never)}
+        onAction={async () => ({ ok: true })}
+      />,
+      { width: 110, height: 34 }
+    );
+
+    stream.push({ type: "transcript", item: { id: "g-agent", kind: "assistant", title: "助手", body: "", state: "running", role: "group" } });
+    stream.push({ type: "transcript", item: { id: "agent-alpha", kind: "agent", title: "alpha", body: "运行中", state: "running", role: "group", parentId: "g-agent" } });
+    stream.push({ type: "transcript", item: { id: "agent-beta", kind: "agent", title: "beta", body: "运行中", state: "running", role: "group", parentId: "g-agent" } });
+    stream.push({ type: "transcript", item: { id: "alpha-tool", kind: "tool", title: "命令已执行", body: "alpha-output", state: "success", parentId: "agent-alpha" } });
+    stream.push({ type: "transcript", item: { id: "beta-tool", kind: "tool", title: "命令已执行", body: "beta-output", state: "success", parentId: "agent-beta" } });
+
+    let collapsed = "";
+    for (let i = 0; i < 40; i++) {
+      await sleep(25);
+      await setup.renderOnce();
+      collapsed = setup.captureCharFrame();
+      if (collapsed.includes("alpha") && collapsed.includes("beta")) break;
+    }
+    expect(collapsed).toContain("alpha");
+    expect(collapsed).toContain("beta");
+    // Both subagents start folded: neither timeline leaks into the transcript.
+    expect(collapsed).not.toContain("alpha-output");
+    expect(collapsed).not.toContain("beta-output");
+
+    const headerLine = collapsed.split("\n").find((line) => line.includes("alpha"))!;
+    const headerRow = collapsed.split("\n").indexOf(headerLine);
+    const headerColumn = Math.max(1, headerLine.indexOf("alpha"));
+    await setup.mockMouse.click(headerColumn, headerRow);
+    let opened = "";
+    for (let i = 0; i < 40; i++) {
+      await sleep(25);
+      await setup.renderOnce();
+      opened = setup.captureCharFrame();
+      if (opened.includes("alpha-output")) break;
+    }
+    expect(opened).toContain("alpha-output");
+    // Expanding one agent does not expand its sibling.
+    expect(opened).not.toContain("beta-output");
+
+    // A live header update replaces the summary without collapsing the open
+    // timeline or resetting its per-agent expansion state.
+    stream.push({ type: "transcript", item: { id: "agent-alpha", kind: "agent", title: "alpha", body: "已完成", state: "success", role: "group", parentId: "g-agent" } });
+    let updated = "";
+    for (let i = 0; i < 40; i++) {
+      await sleep(25);
+      await setup.renderOnce();
+      updated = setup.captureCharFrame();
+      if (updated.includes("已完成")) break;
+    }
+    expect(updated).toContain("已完成");
+    expect(updated).toContain("alpha-output");
+    expect(updated).not.toContain("beta-output");
+
+    // Keyboard: Enter expands a focused agent, Space collapses it, and each
+    // agent keeps its own expansion state.
+    const betaNode = setup.renderer.root.findDescendantById("inline-agent-agent-beta")!;
+    betaNode.focus();
+    await sleep(100);
+    setup.mockInput.pressEnter();
+    let betaOpened = "";
+    for (let i = 0; i < 40; i++) {
+      await sleep(25);
+      await setup.renderOnce();
+      betaOpened = setup.captureCharFrame();
+      if (betaOpened.includes("beta-output")) break;
+    }
+    expect(betaOpened).toContain("beta-output");
+    expect(betaOpened).toContain("alpha-output");
+
+    setup.mockInput.pressKey(" ");
+    let betaClosed = "";
+    for (let i = 0; i < 40; i++) {
+      await sleep(25);
+      await setup.renderOnce();
+      betaClosed = setup.captureCharFrame();
+      if (!betaClosed.includes("beta-output")) break;
+    }
+    expect(betaClosed).not.toContain("beta-output");
+    expect(betaClosed).toContain("alpha-output");
+  });
+
   test("Enter is ignored for a panel option while its action is in flight", async () => {
     const stream = eventStream();
     const panelActions: string[] = [];
@@ -244,9 +331,11 @@ describe("OpenTUI app interactions", () => {
       type: "interaction",
       id: "approval-1",
       kind: "approval",
-      payload: { toolName: "run_bash", args: { command: "pytest" }, risk: "高风险", reason: "运行测试", persistAvailable: true },
+      payload: { toolName: "bash", args: { command: "pytest" }, risk: "高风险", reason: "运行测试", persistAvailable: true },
     });
-    await setup.waitForFrame((frame) => frame.includes("[2] 本项目后续允许"));
+    const frame = await setup.waitForFrame((frame) => frame.includes("[2] 本项目后续允许"));
+    expect(frame).toContain("执行命令");
+    expect(frame).toContain("pytest");
 
     setup.mockInput.pressEnter();
     await sleep(50);
@@ -269,7 +358,7 @@ describe("OpenTUI app interactions", () => {
       type: "interaction",
       id: "approval-2",
       kind: "approval",
-      payload: { toolName: "run_bash", args: { command: "pytest" }, risk: "高风险", reason: "运行测试", persistAvailable: false },
+      payload: { toolName: "bash", args: { command: "pytest" }, risk: "高风险", reason: "运行测试", persistAvailable: false },
     });
     const frame = await setup.waitForFrame((frame) => frame.includes("[2] 拒绝"));
     const row = frame.split("\n").find((line) => line.includes("[2] 拒绝"))!;
