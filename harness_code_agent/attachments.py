@@ -233,12 +233,20 @@ class AttachmentManager:
         if external_unapproved:
             raise ExternalPathConfirmationRequired(external_unapproved)
 
+        staged_bytes = sum(self.get(item).size for item in dict.fromkeys(attachment_ids))
         for path, source in path_entries:
+            size = path.stat().st_size
+            if size > self.max_file_bytes or staged_bytes + size > self.max_turn_bytes:
+                # A path mentioned in the task text is an optional hint, not an
+                # explicit upload. Oversize files stay reachable through the
+                # file tools instead of failing the whole turn.
+                continue
             attachment = self.stage_path(
                 path,
                 source=source,
                 copy_to_session=not is_relative_to(path, self.workspace_root),
             )
+            staged_bytes += attachment.size
             attachment_ids.append(attachment.id)
 
         attachments = tuple(self.get(item) for item in dict.fromkeys(attachment_ids))

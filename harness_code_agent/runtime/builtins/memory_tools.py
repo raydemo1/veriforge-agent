@@ -13,8 +13,11 @@ from ..tool_result import ToolResult
 def _service(context, *, write=False):
     if context is None or context.workspace is None:
         raise ValueError("memory requires a workspace context")
-    if not write and not getattr(context, "memory_use_enabled", True):
-        raise ValueError("memory use is disabled")
+    # The switch covers reads and writes for model-facing memory tools.
+    # User-initiated /memory management commands go through MemoryService
+    # directly and remain available.
+    if not getattr(context, "memory_use_enabled", True):
+        raise ValueError("memory is disabled")
     service = getattr(context, "memory_service", None)
     if service is None:
         service = MemoryService(context.workspace.root)

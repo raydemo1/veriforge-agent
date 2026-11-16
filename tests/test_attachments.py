@@ -25,6 +25,16 @@ class AttachmentManagerTests(unittest.TestCase):
         session.mkdir(parents=True)
         return AttachmentManager(root, session, mode)  # type: ignore[arg-type]
 
+    def test_oversize_detected_path_is_skipped_not_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = self._manager(root)
+            manager.max_file_bytes = 1024
+            big = root / "big.sqlite"
+            big.write_bytes(b"x" * 2048)
+            prepared = manager.prepare(TurnSubmission(f"inspect {big}"))
+            self.assertEqual(prepared.attachments, ())
+
     def test_text_model_accepts_documents_and_rejects_images(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

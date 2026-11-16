@@ -17,6 +17,7 @@ from harness_code_agent.core.interactive import InteractiveSession
 from harness_code_agent.headless import run_task
 from harness_code_agent.runtime.approvals import ApprovalRequest
 from harness_code_agent.runtime.questions import QuestionOption, QuestionRequest
+from harness_code_agent.workspace.state_paths import ensure_workspace_state
 
 
 @pytest.fixture(autouse=True)
@@ -27,9 +28,8 @@ def isolate_runner_environment():
 
 @pytest.fixture
 def model(monkeypatch, tmp_path):
-    harness_root = tmp_path / ".harness"
-    harness_root.mkdir()
-    (harness_root / "mcp.json").write_text('{"servers": {}}', encoding="utf-8")
+    state_root = ensure_workspace_state(tmp_path)
+    (state_root / "mcp.json").write_text('{"servers": {}}', encoding="utf-8")
     response = SimpleNamespace(
         choices=[SimpleNamespace(
             message=SimpleNamespace(content="Task response", tool_calls=None),
@@ -98,7 +98,7 @@ def test_empty_task_fails_without_starting_session(tmp_path, model):
     assert result.status == "failed"
     assert result.session_id is None
     assert "No task provided" in result.error
-    assert not (tmp_path / ".harness" / "sessions").exists()
+    assert not (tmp_path / ".harness").exists()
     model.chat.completions.create.assert_not_called()
 
 
@@ -125,7 +125,7 @@ def test_entrypoints_execute_real_session_and_report_failures(tmp_path, model, m
     assert model.chat.completions.create.call_count >= 1
     model.close.assert_called_once()
     session_id = re.search(r"veriforge session: (\S+)", output.out).group(1)
-    assert (tmp_path / ".harness" / "sessions" / session_id / "session.json").is_file()
+    assert (ensure_workspace_state(tmp_path) / "sessions" / session_id / "session.json").is_file()
     if failure:
         assert "model request failed" in output.err
     else:
@@ -268,7 +268,7 @@ def test_initialization_failure_releases_already_registered_resources(tmp_path, 
     assert "initialization failed" in result.error
     model.chat.completions.create.assert_not_called()
     model.close.assert_called_once()
-    metadata_path = next((tmp_path / ".harness" / "sessions").glob("*/session.json"))
+    metadata_path = next((ensure_workspace_state(tmp_path) / "sessions").glob("*/session.json"))
     assert json.loads(metadata_path.read_text(encoding="utf-8"))["status"] == "failed"
 
 
@@ -280,7 +280,7 @@ def test_headless_does_not_read_input_for_approval_or_questions(tmp_path, model,
     original_submit = InteractiveSession.submit
 
     def submit(session, task):
-        approval = session.approval_provider.request(ApprovalRequest("run_bash", {}, "risk", "reason"))
+        approval = session.approval_provider.request(ApprovalRequest("bash", {}, "risk", "reason"))
         question = session.question_provider.ask(QuestionRequest("Continue?", [QuestionOption("Yes")]))
         assert not approval.approved
         assert question.cancelled

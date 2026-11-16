@@ -108,6 +108,82 @@ def test_small_search_page_advances_and_stays_within_budget(tmp_path, scope):
     assert len(seen) == 2
 
 
+def test_memory_service_enabled_is_session_state_not_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("HARNESS_MEMORY_DISABLED", "1")
+    service = MemoryService(tmp_path)
+
+    assert service.enabled is False
+    assert service.search("anything").get("disabled") is True
+
+    service.enabled = True
+    assert service.search("anything").get("disabled") is not True
+
+    service.enabled = False
+    assert service.search("anything").get("disabled") is True
+
+
+def test_memory_tools_are_blocked_by_the_master_switch(tmp_path):
+    context = SimpleNamespace(
+        workspace=SimpleNamespace(root=tmp_path),
+        memory_use_enabled=False,
+    )
+
+    result = memory_read(tool_context=context)
+
+    assert result.status == "failed"
+    assert "memory is disabled" in result.error
+
+
+def test_master_switch_pauses_and_resumes_memory_and_extraction(tmp_path):
+    from unittest.mock import patch
+
+    from harness_code_agent.core.interactive import InteractiveSession
+
+    calls = []
+    service = SimpleNamespace(
+        enabled=True,
+        extraction=SimpleNamespace(
+            resume=lambda session_id: calls.append(("resume", session_id)),
+            cancel=lambda session_id: calls.append(("cancel", session_id)),
+        ),
+    )
+    session = object.__new__(InteractiveSession)
+    session.memory_use_enabled = True
+    session.memory_auto_extract_enabled = True
+    session.memory_service = service
+    session.session = SimpleNamespace(id="session-1", journal_path=tmp_path / "journal.jsonl")
+    session.tool_context = SimpleNamespace(
+        memory_use_enabled=True, memory_auto_extract_enabled=True
+    )
+    session.conversation = SimpleNamespace(
+        refresh_memory_index=lambda: calls.append(("refresh",))
+    )
+    session.cwd = tmp_path
+
+    with patch("harness_code_agent.core.interactive.open_memory_session") as open_session:
+        message = session.set_memory_enabled(False)
+
+        assert service.enabled is False
+        assert session.memory_use_enabled is False
+        assert session.memory_auto_extract_enabled is False
+        assert session.tool_context.memory_use_enabled is False
+        assert session.tool_context.memory_auto_extract_enabled is False
+        assert ("cancel", "session-1") in calls
+        assert "仅作用于当前会话" in message
+        assert open_session.call_count == 0
+
+        session.set_memory_enabled(True)
+
+        assert service.enabled is True
+        assert session.memory_use_enabled is True
+        assert session.memory_auto_extract_enabled is True
+        assert session.tool_context.memory_use_enabled is True
+        assert session.tool_context.memory_auto_extract_enabled is True
+        assert ("resume", "session-1") in calls
+        assert ("refresh",) in calls
+        assert open_session.call_count == 1
+
+
 def test_explicit_memory_operations_work_with_auto_generation_disabled(tmp_path):
     service = MemoryService(tmp_path)
     journal = SessionJournal(tmp_path / "journal.jsonl")

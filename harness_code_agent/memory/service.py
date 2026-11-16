@@ -52,10 +52,12 @@ class MemoryService:
         self.extraction = ExtractionQueue(project)
         self.vectors = {scope: vector_factory(store) for scope, store in self.stores.items()}
         self.views = {scope: CurrentMemoryView(store, vectors=self.vectors[scope]) for scope, store in self.stores.items()}
-
-    @property
-    def enabled(self) -> bool:
-        return os.environ.get("HARNESS_MEMORY_DISABLED", "").lower() not in {"1", "true", "yes", "on"}
+        # The environment variable is the startup default.  The session switch
+        # owns the value after construction, so `/memory on|off` cannot leave
+        # search/startup reading a different decision than the tool surface.
+        self.enabled = os.environ.get("HARNESS_MEMORY_DISABLED", "").lower() not in {
+            "1", "true", "yes", "on",
+        }
 
     def search(self, query: str, scope: str = "both", paths: list[str] | None = None, *, limit: int = 8,
                offset: int = 0, max_tokens: int = 2000, kind: str | None = None) -> dict:
