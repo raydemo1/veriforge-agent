@@ -359,6 +359,82 @@ class EvalSuiteTests(unittest.TestCase):
         self.assertEqual(item["job_dir"], str(self.root / "jobs" / "job-1"))
         self.assertEqual(item["trial_dir"], str(trial_dir))
 
+    def test_harbor_usage_recovers_partial_trace_from_logs_artifacts(self):
+        from eval.benchmarks.usage_metrics import collect_harbor_job_usage
+
+        trial_dir = self.root / "jobs" / "job-1" / "task-a__timeout"
+        session_dir = trial_dir / "artifacts" / "logs" / "artifacts" / "hca" / "session-timeout"
+        session_dir.mkdir(parents=True)
+        (session_dir / "session").mkdir()
+        (session_dir / "session" / "session.json").write_text(
+            json.dumps({"id": "session-timeout", "model": "deepseek-v4-flash"}),
+            encoding="utf-8",
+        )
+        events = [
+            {"type": "turn_started"},
+            {"type": "llm_usage", "payload": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120}},
+            {"type": "tool_call", "payload": {"tool": "bash"}},
+            {"type": "tool_result", "payload": {"tool": "bash", "status": "success"}},
+        ]
+        (session_dir / "session" / "events.jsonl").write_text(
+            "\n".join(json.dumps(event) for event in events) + "\n",
+            encoding="utf-8",
+        )
+        payload = {
+            "task_name": "terminal-bench/task-a",
+            "trial_name": "task-a__timeout",
+            "agent_result": {"metadata": None},
+            "verifier_result": {"rewards": {"reward": 1.0}},
+            "exception_info": {
+                "exception_type": "AgentTimeoutError",
+                "exception_message": "Agent execution timed out after 900.0 seconds",
+            },
+        }
+        (trial_dir / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+
+        usage = collect_harbor_job_usage(self.root / "jobs" / "job-1")
+
+        item = usage["task_results"][0]
+        self.assertTrue(item["has_hca_artifacts"])
+        self.assertEqual(item["artifact_status"], "partial")
+        self.assertTrue(item["agent_timeout"])
+        self.assertEqual(item["session_id"], "session-timeout")
+        self.assertEqual(item["metrics"]["metrics_scope"], "observed")
+        self.assertEqual(item["metrics"]["tokens"]["llm_calls"], 1)
+        self.assertEqual(item["metrics"]["tools"]["tool_calls"], 1)
+        self.assertEqual(usage["token_totals"]["llm_calls"], 1)
+        self.assertEqual(usage["tool_calls"], 1)
+
+    def test_harbor_usage_marks_nested_complete_artifact(self):
+        from eval.benchmarks.usage_metrics import collect_harbor_job_usage
+
+        trial_dir = self.root / "jobs" / "job-1" / "task-a__complete"
+        session_dir = trial_dir / "artifacts" / "logs" / "artifacts" / "hca" / "session-complete"
+        (session_dir / "session").mkdir(parents=True)
+        (session_dir / "session" / "session.json").write_text(
+            json.dumps({"id": "session-complete", "status": "closed"}),
+            encoding="utf-8",
+        )
+        (session_dir / "session" / "events.jsonl").write_text(
+            json.dumps({"type": "session_finished"}) + "\n",
+            encoding="utf-8",
+        )
+        payload = {
+            "task_name": "terminal-bench/task-a",
+            "trial_name": "task-a__complete",
+            "agent_result": {"metadata": None},
+            "verifier_result": {"rewards": {"reward": 1.0}},
+        }
+        (trial_dir / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+
+        usage = collect_harbor_job_usage(self.root / "jobs" / "job-1")
+
+        item = usage["task_results"][0]
+        self.assertTrue(item["has_hca_artifacts"])
+        self.assertEqual(item["artifact_status"], "complete")
+        self.assertFalse(item["agent_timeout"])
+        self.assertEqual(item["session_id"], "session-complete")
+
     def test_basic_metrics_memory_cases_run_with_full_access_permissions(self):
         from eval.scripts.run_basic_metrics_eval import parse_args, run_memory_suite
 
@@ -487,8 +563,36 @@ class EvalSuiteTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(diagnostic["failure_kind"], "infra_or_setup_failure")
+        self.assertEqual(diagnostic["failure_kind"], "infra_failure")
         self.assertTrue(diagnostic["missing_metrics"])
+
+    def test_terminal_bench_task_diagnostics_classifies_agent_start_failure(self):
+        from eval.scripts.run_terminal_bench_eval import _task_diagnostics
+
+        diagnostic = _task_diagnostics(
+            task="example",
+            status="failed",
+            returncode=1,
+            stdout="AttachmentError: 附件超过单文件限制（20 MB）",
+            stderr="",
+            launcher_result={"trial_name": "example__abc", "metrics": {}},
+        )
+
+        self.assertEqual(diagnostic["failure_kind"], "agent_start_failure")
+
+    def test_terminal_bench_task_diagnostics_classifies_bubblewrap_failure(self):
+        from eval.scripts.run_terminal_bench_eval import _task_diagnostics
+
+        diagnostic = _task_diagnostics(
+            task="example",
+            status="failed",
+            returncode=0,
+            stdout="restricted shell execution requires bubblewrap (bwrap) on Linux",
+            stderr="",
+            launcher_result={"trial_name": "example__abc", "metrics": {"tokens": {"llm_calls": 3}}},
+        )
+
+        self.assertEqual(diagnostic["failure_kind"], "infra_failure")
 
     def test_terminal_bench_task_diagnostics_classifies_verifier_failure(self):
         from eval.scripts.run_terminal_bench_eval import _task_diagnostics
@@ -499,10 +603,13 @@ class EvalSuiteTests(unittest.TestCase):
             returncode=0,
             stdout="FAILED ../tests/test_outputs.py::test_x - AssertionError: bad output",
             stderr="",
-            launcher_result={"trial_name": "example__abc", "metrics": {"tokens": {}}},
+            launcher_result={
+                "trial_name": "example__abc",
+                "metrics": {"tokens": {"llm_calls": 3}, "tools": {"tool_calls": 5}},
+            },
         )
 
-        self.assertEqual(diagnostic["failure_kind"], "failed_verifier")
+        self.assertEqual(diagnostic["failure_kind"], "task_failure")
         self.assertFalse(diagnostic["missing_metrics"])
         self.assertIn("FAILED", diagnostic["verifier_failure_headline"])
 

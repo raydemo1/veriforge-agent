@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,14 @@ from harness_code_agent.sessions.observability import build_session_observabilit
 from harness_code_agent.sessions.store import SessionStore
 
 EVAL_METRICS_PREFIX = "HCA_EVAL_METRICS:"
+
+
+@dataclass(frozen=True)
+class ArtifactLocation:
+    session_id: str
+    session_dir: Path
+    partial: bool
+
 
 # Official DeepSeek API prices, per 1M tokens, checked from:
 # https://api-docs.deepseek.com/quick_start/pricing
@@ -116,14 +125,25 @@ def collect_harbor_job_usage(job_dir: Path) -> dict[str, Any]:
         agent_result = payload.get("agent_result") or {}
         metadata = agent_result.get("metadata") or {}
         metrics = metadata.get("hca_eval_metrics") if isinstance(metadata, dict) else None
+        artifact = _artifact_location(result_path.parent)
+        agent_timeout = _agent_timed_out(payload)
         if not isinstance(metrics, dict) or not metrics:
             metrics = _metrics_from_trial_outputs(result_path.parent, result_text, payload)
-        artifact_session_id = _artifact_session_id(result_path.parent)
+        if (not isinstance(metrics, dict) or not metrics) and artifact is not None:
+            metrics = _metrics_from_artifact(artifact)
+            if metrics:
+                metrics["metrics_scope"] = "observed"
+        artifact_status = "missing"
+        if artifact is not None:
+            artifact_status = "partial" if artifact.partial or agent_timeout else "complete"
+        if isinstance(metrics, dict) and metrics:
+            metrics.setdefault("artifact_status", artifact_status)
+            metrics.setdefault("agent_timeout", agent_timeout)
         session_id = (
             (metrics or {}).get("session_id")
             if isinstance(metrics, dict)
             else ""
-        ) or artifact_session_id
+        ) or (artifact.session_id if artifact is not None else "")
         rewards = ((payload.get("verifier_result") or {}).get("rewards") or {})
         exception_info = payload.get("exception_info") if isinstance(payload.get("exception_info"), dict) else {}
         task_results.append({
@@ -134,7 +154,9 @@ def collect_harbor_job_usage(job_dir: Path) -> dict[str, Any]:
             "passed": rewards.get("reward") == 1.0,
             "reward": rewards.get("reward"),
             "session_id": session_id,
-            "has_hca_artifacts": bool(artifact_session_id),
+            "has_hca_artifacts": artifact is not None,
+            "artifact_status": artifact_status,
+            "agent_timeout": agent_timeout,
             "metrics": metrics or {},
             "n_input_tokens": agent_result.get("n_input_tokens"),
             "n_cache_tokens": agent_result.get("n_cache_tokens"),
@@ -169,19 +191,106 @@ def _metrics_from_trial_outputs(trial_dir: Path, result_text: str, payload: dict
     return {}
 
 
-def _artifact_session_id(trial_dir: Path) -> str:
-    hca_root = trial_dir / "artifacts" / "hca"
-    if not hca_root.is_dir():
-        return ""
+def _artifact_location(trial_dir: Path) -> ArtifactLocation | None:
+    candidates = [
+        _pick_artifact_session(trial_dir / "artifacts" / "hca"),
+        # Harbor also mounts the periodic export under logs/artifacts. Both
+        # complete and timed-out sessions can be here, so completeness comes
+        # from the session itself rather than the directory shape.
+        _pick_artifact_session(trial_dir / "artifacts" / "logs" / "artifacts" / "hca"),
+    ]
+    candidates = [path for path in candidates if path is not None]
+    if not candidates:
+        return None
+    complete = [path for path in candidates if _session_closed(path)]
+    chosen = (complete or candidates)[0]
+    return ArtifactLocation(chosen.name, chosen, partial=not _session_closed(chosen))
+
+
+def _pick_artifact_session(root: Path) -> Path | None:
+    if not root.is_dir():
+        return None
     sessions = sorted(
-        (path for path in hca_root.iterdir() if path.is_dir()),
+        (path for path in root.iterdir() if path.is_dir()),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
     for session_dir in sessions:
         if (session_dir / "manifest.json").exists() or (session_dir / "early_manifest.json").exists():
-            return session_dir.name
-    return sessions[0].name if sessions else ""
+            return session_dir
+    return sessions[0] if sessions else None
+
+
+def _session_files(session_dir: Path) -> tuple[Path, Path]:
+    root = session_dir / "session"
+    if not (root / "events.jsonl").is_file():
+        root = session_dir
+    return root / "session.json", root / "events.jsonl"
+
+
+def _session_closed(session_dir: Path) -> bool:
+    """Whether the exported session reached a real termination event.
+
+    A manifest can be written by the periodic exporter while the agent is
+    still running, so neither its presence nor the artifact directory shape
+    proves completeness. Use the recorded session status/finish event.
+    """
+    metadata_path, events_path = _session_files(session_dir)
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        metadata = {}
+    if str(metadata.get("status") or "") in {"closed", "completed", "finished"}:
+        return True
+    try:
+        for line in events_path.read_text(encoding="utf-8").splitlines():
+            if line.strip() and json.loads(line).get("type") == "session_finished":
+                return True
+    except (OSError, json.JSONDecodeError):
+        return False
+    return False
+
+
+def _metrics_from_artifact(location: ArtifactLocation) -> dict[str, Any]:
+    metadata_path, events_path = _session_files(location.session_dir)
+    if not events_path.is_file():
+        return {}
+    metadata: dict[str, Any] = {}
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        metadata = {}
+    events: list[dict[str, Any]] = []
+    try:
+        for line in events_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                events.append(json.loads(line))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    snapshot = build_session_observability(metadata, events)
+    tokens = snapshot.tokens.to_dict()
+    model = str(metadata.get("model") or "")
+    return {
+        "schema_version": 1,
+        "session_id": str(metadata.get("id") or location.session_id),
+        "model": model,
+        "turns": _turn_metrics(events),
+        "tokens": tokens,
+        "tools": snapshot.tools.to_dict(),
+        "performance": snapshot.performance.to_dict(),
+        "audit": snapshot.audit.to_dict(),
+        "usage_cost": estimate_usage_cost(tokens, model=model),
+    }
+
+
+def _agent_timed_out(payload: dict[str, Any]) -> bool:
+    info = payload.get("exception_info")
+    if not isinstance(info, dict):
+        return False
+    return (
+        str(info.get("exception_type") or "") == "AgentTimeoutError"
+        or "timed out" in str(info.get("exception_message") or "").lower()
+    )
 
 
 def _payload_text_fields(payload: dict[str, Any]) -> list[str]:

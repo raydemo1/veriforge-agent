@@ -308,6 +308,13 @@ def main(argv: list[str] | None = None) -> int:
                 model=os.environ.get("HARNESS_MODEL", ""),
             )
             print_eval_metrics(metrics)
+        if result.status == "stopped" and result.turn_result is not None:
+            # The turn finished before the fallback stopped further work (for
+            # example after repeated unknown tool names). The verifier decides
+            # whether the task passed; a nonzero exit would hide the metrics
+            # and turn a solved task into an agent error.
+            print(f"veriforge stopped: {result.stop_reason or 'agent_fallback'}", flush=True)
+            return 0
         return result.exit_code
     except Exception:
         hook_state["runner_error"] = traceback.format_exc()

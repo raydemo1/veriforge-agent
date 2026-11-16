@@ -6,7 +6,7 @@ Harbor has two agent types:
   - Installed (BaseInstalledAgent): agent is installed inside the container
 
 We use Installed agent — a small headless runner executes natively inside the
-container, so run_bash just works as subprocess without any bridging.
+container, so bash just works as subprocess without any bridging.
 
 Usage:
   # Install harbor
@@ -28,6 +28,7 @@ Usage:
 """
 from __future__ import annotations
 
+import logging
 import shlex
 import shutil
 import tempfile
@@ -39,6 +40,8 @@ from harbor.models.agent.context import AgentContext
 
 from eval.benchmarks.harbor_env import runner_env_vars
 from eval.benchmarks.usage_metrics import parse_eval_metrics_from_text
+
+log = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PYTHON_STANDALONE_TARBALL = "python-3.12.13-x86_64-unknown-linux-gnu.tar.gz"
@@ -267,14 +270,10 @@ class HarnessAgent(BaseInstalledAgent):
         await self.exec_as_root(
             environment,
             command=(
-                "command -v git >/dev/null 2>&1 && "
-                "command -v curl >/dev/null 2>&1 && "
-                "command -v unzip >/dev/null 2>&1 && "
-                "command -v g++ >/dev/null 2>&1 || "
                 "( command -v apt-get >/dev/null 2>&1 && "
-                f"  {_apt_get_install_command('ca-certificates git curl unzip build-essential')} ) || "
-                "( command -v apk >/dev/null 2>&1 && apk add --no-cache git ) || "
-                "( command -v yum >/dev/null 2>&1 && yum install -y -q git ) || "
+                f"  {_apt_get_install_command('ca-certificates git curl unzip build-essential bubblewrap sqlite3 vim procps')} ) || "
+                "( command -v apk >/dev/null 2>&1 && apk add --no-cache git bubblewrap sqlite ) || "
+                "( command -v yum >/dev/null 2>&1 && yum install -y -q git bubblewrap sqlite ) || "
                 "{ echo 'FATAL: baseline tooling is missing and no supported package manager was found'; exit 1; }"
             ),
             timeout_sec=900,
@@ -374,6 +373,48 @@ class HarnessAgent(BaseInstalledAgent):
             ),
         )
 
+        # Step 4b: The terminal runtime imports these modules at startup
+        # (tool schemas, memory database, shell parser). Keep the list aligned
+        # with the runtime dependencies in pyproject.toml; eval/UI/browser
+        # extras stay out so task setup remains bounded.
+        await self.exec_as_root(
+            environment,
+            command=(
+                "PYTHON=$(command -v python3); "
+                "$PYTHON -m pip install --break-system-packages -q "
+                "'jsonschema>=4.23,<5' 'sqlite-vec>=0.1.9,<0.2' "
+                "'mcp>=1.0,<2' 'pygls>=2.1,<3' 'watchfiles>=1.1,<2' "
+                "'tree-sitter>=0.25,<0.27' 'tree-sitter-bash>=0.25,<0.26' && "
+                "$PYTHON -c 'import jsonschema, sqlite_vec, mcp, pygls, watchfiles, "
+                "tree_sitter, tree_sitter_bash; print(\"runtime deps ok\")'"
+            ),
+        )
+
+        # Step 5: Provide the verifier's uv bootstrap without GitHub. The
+        # verifier scripts run the official installer, which downloads the uv
+        # tarball from github.com; that host is unreachable from this network.
+        # Installing the same uv version from the configured PyPI mirror and
+        # providing the installer's expected env file keeps the verifier
+        # independent of that download.
+        await self.exec_as_root(
+            environment,
+            command=(
+                "PYTHON=$(command -v python3); "
+                "$PYTHON -m pip install --break-system-packages -q 'uv==0.9.5' && "
+                "SCRIPTS=$($PYTHON -c 'import sysconfig; print(sysconfig.get_path(\"scripts\"))') && "
+                "mkdir -p /root/.local/bin && "
+                "ln -sf \"$SCRIPTS/uv\" /root/.local/bin/uv && "
+                "ln -sf \"$SCRIPTS/uvx\" /root/.local/bin/uvx && "
+                "printf '%s\\n' "
+                "'export PATH=\"$HOME/.local/bin:$PATH\"' "
+                "'export UV_PYTHON_INSTALL_MIRROR=\"https://registry.npmmirror.com/-/binary/python-build-standalone\"' "
+                "'export UV_DEFAULT_INDEX=\"https://pypi.tuna.tsinghua.edu.cn/simple\"' "
+                "'export UV_INDEX_URL=\"https://pypi.tuna.tsinghua.edu.cn/simple\"' "
+                "> /root/.local/bin/env && "
+                "/root/.local/bin/uvx --version"
+            ),
+        )
+
     @with_prompt_template
     async def run(
         self,
@@ -388,7 +429,13 @@ class HarnessAgent(BaseInstalledAgent):
 
         # Pass secrets through Harbor's env channel instead of embedding them
         # in the logged shell command.
+        # Terminal-Bench runs each task in a disposable Harbor container, so the
+        # outer container is the isolation boundary. The nested POSIX sandbox
+        # cannot create namespaces under Docker's default seccomp/capabilities
+        # (bwrap/unshare return EPERM), so evaluations run without it.
         env_vars = runner_env_vars()
+        env_vars["HARNESS_PERMISSION_MODE"] = "danger-full-access"
+        log.info("Terminal-Bench evaluation mode: danger-full-access (outer container boundary)")
 
         # Run VeriForge from the task workspace while importing the cloned agent code.
         result = await self.exec_as_agent(
@@ -427,7 +474,7 @@ def _copy_repo_snapshot(source: Path, dest: Path) -> None:
         for name in names:
             item = current / name
             rel = item.relative_to(source).as_posix()
-            if name in {".git", ".pytest_cache", "__pycache__"} or name == ".harbor" and current == source or name == ".harness" and current == source or name == "jobs" and current == source or name == "workspace" and current == source or rel == "eval/results" or _is_vendored_python_tarball(rel) or name == ".env" or name.startswith(".env.") or name.endswith(".pyc"):
+            if name in {".git", ".pytest_cache", "__pycache__"} or name == ".harbor" and current == source or name == ".veriforge" and current == source or name == "jobs" and current == source or name == "workspace" and current == source or rel == "eval/results" or _is_vendored_python_tarball(rel) or name == ".env" or name.startswith(".env.") or name.endswith(".pyc"):
                 ignored.add(name)
         return ignored
 

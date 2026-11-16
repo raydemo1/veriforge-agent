@@ -278,6 +278,37 @@ def _task_status(returncode: int, launcher_passed: Any) -> str:
     return "passed" if returncode == 0 else "failed"
 
 
+_INFRA_FAILURE_MARKERS = (
+    "bubblewrap",
+    "restricted shell execution requires",
+    "No module named",
+    "FATAL: failed to install",
+    "Docker daemon is not running",
+    "no container found",
+    "Harbor is not usable",
+    "Docker compose command failed",
+)
+
+
+def _hca_failure_text(artifact_info: dict[str, str] | None) -> str:
+    """Runtime error text kept next to the HCA session artifacts."""
+    if not artifact_info:
+        return ""
+    root = Path(str(artifact_info.get("artifact_dir") or ""))
+    if not root.is_dir():
+        return ""
+    chunks: list[str] = []
+    for relative in ("runner_error.txt", "session/events.jsonl"):
+        path = root / relative
+        if not path.is_file():
+            continue
+        try:
+            chunks.append(path.read_text(encoding="utf-8", errors="replace")[-200_000:])
+        except OSError:
+            continue
+    return "\n".join(chunks)
+
+
 def _task_diagnostics(
     *,
     task: str,
@@ -306,24 +337,36 @@ def _task_diagnostics(
         session_id=session_id,
     )
     failure_kind = "passed"
+    artifact_text = _hca_failure_text(artifact_info)
     if status != "passed":
         exception_type = str((launcher_result or {}).get("exception_type") or "")
         exception_message = str((launcher_result or {}).get("exception_message") or "")
-        combined_error_text = "\n".join([exception_type, exception_message, stdout or "", stderr or ""])
+        combined_error_text = "\n".join(
+            [exception_type, exception_message, stdout or "", stderr or "", artifact_text]
+        )
+        tokens = (metrics or {}).get("tokens") or {}
+        tools = (metrics or {}).get("tools") or {}
+        llm_calls = int(tokens.get("llm_calls") or 0)
+        tool_calls = int(tools.get("tool_calls") or 0)
         if "AgentTimeoutError" in combined_error_text:
             failure_kind = "agent_timeout"
         elif returncode == 124 or "Terminal-Bench launcher timed out" in combined_error_text:
             failure_kind = "launcher_timeout"
+        elif any(marker in combined_error_text for marker in _INFRA_FAILURE_MARKERS):
+            failure_kind = "infra_failure"
+        elif (
+            "AttachmentError" in combined_error_text
+            or "附件超过" in combined_error_text
+            or (metrics and llm_calls == 0 and tool_calls == 0)
+        ):
+            failure_kind = "agent_start_failure"
         elif (
             "AgentSetupTimeoutError" in combined_error_text
-            or "NonZeroAgentExitCodeError" in combined_error_text
-            or "FATAL: failed to install harness dependencies" in combined_error_text
-            or "Docker daemon is not running" in combined_error_text
             or (returncode != 0 and not launcher_result)
         ):
-            failure_kind = "infra_or_setup_failure"
+            failure_kind = "infra_failure"
         else:
-            failure_kind = "failed_verifier"
+            failure_kind = "task_failure"
     missing_metrics = status != "passed" and not bool(metrics)
     return {
         "failure_kind": failure_kind,
