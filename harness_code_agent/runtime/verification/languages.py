@@ -102,7 +102,7 @@ def _execution_required(
         "skipped",
         (
             (
-                "Requires project-code execution through run_bash with the session's permissions. "
+                "Requires project-code execution through bash with the session's permissions. "
                 f"cwd: {directory.relative_to(workspace).as_posix()}; argv: {json.dumps(command, ensure_ascii=False)}"
             ),
         ),

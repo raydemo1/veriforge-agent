@@ -25,7 +25,7 @@ _DESCRIPTION_LIMIT = 180
 #: appears in every name), so a keyword search ranks one of them clearly on top
 #: and leaves the rest tied at the noise floor, where a per-tool limit cuts
 #: random siblings. Mounting a group together matches how they are actually
-#: used: spawn -> steer -> wait -> read/apply -> close.
+#: used: spawn -> steer -> wait -> interrupt/close.
 TOOL_GROUPS = (
     frozenset(
         {
@@ -34,8 +34,6 @@ TOOL_GROUPS = (
             "followup_agent",
             "wait_agents",
             "interrupt_agent",
-            "read_agent_changes",
-            "apply_agent_changes",
             "close_agent",
         }
     ),
@@ -45,7 +43,7 @@ TOOL_GROUPS = (
 def discovery_catalog_prompt(registry, mcp_scopes: dict[str, str]) -> str:
     scopes = dict(mcp_scopes)
     if any(spec.discovery_scope == BUILTIN_AGENTS_SCOPE and spec.disclosure == "deferred" for spec in registry.specs()):
-        scopes = {BUILTIN_AGENTS_SCOPE: "Delegate tasks, coordinate agents, inspect and apply proposals.", **scopes}
+        scopes = {BUILTIN_AGENTS_SCOPE: "Optional subagents for explicitly requested delegation. Prefer direct tools for ordinary tasks.", **scopes}
     if not scopes:
         return ""
     lines = ["## Tool discovery scopes", ""]

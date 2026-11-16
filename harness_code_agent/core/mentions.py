@@ -155,7 +155,7 @@ def _resolve_file_mention(mention: Mention, root: Path) -> ResolvedMention:
     is_dir = candidate.is_dir()
     kind = "directory" if is_dir else "file"
     instruction = (
-        "Use list_files to inspect this directory if needed."
+        "Use `rg --files` or `Get-ChildItem` through bash to inspect this directory if needed."
         if is_dir
         else "Use read_file to inspect this file if needed."
     )

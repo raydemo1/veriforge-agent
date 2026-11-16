@@ -269,13 +269,15 @@ class ParallelToolTests(unittest.TestCase):
             for future in futures:
                 future.result()
 
-    def test_coordinator_serializes_subtree_read_and_child_write(self):
+    def test_coordinator_serializes_repository_read_and_child_write(self):
         coordinator = ResourceCoordinator()
         reader_entered = threading.Event()
         release_reader = threading.Event()
         writer_entered = threading.Event()
         subtree_key = BUILTIN_TOOL_REGISTRY.effect_for(
-            "list_files", {"directory": "src"}, self.context
+            "code_intelligence",
+            {"operation": "definition", "path": "src/a.py"},
+            self.context,
         ).resources[0].key
         child_key = BUILTIN_TOOL_REGISTRY.effect_for(
             "write_file", {"path": "src/a.py"}, self.context

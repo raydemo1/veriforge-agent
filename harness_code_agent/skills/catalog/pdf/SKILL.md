@@ -17,7 +17,7 @@ Treat the attachment's `local_path` as the source of truth. The attachment layer
    - Visual inspection, scanned pages, or layout verification: render selected pages with `pypdfium2`; use OCR only when extraction shows the page is image-based.
    - Merge, split, rotate, crop, or metadata edits: use `pypdf`.
    - New PDF generation: use ReportLab, then render and inspect the result.
-4. Use `run_bash` for read-only probes. For a non-trivial transformation, create a short, task-specific Python script in the workspace rather than an unreadable one-liner. Do not install packages or invoke network services without user authorization.
+4. Use `bash` for read-only probes. For a non-trivial transformation, create a short, task-specific Python script in the workspace rather than an unreadable one-liner. Do not install packages or invoke network services without user authorization.
 5. Preserve the original file by default. Write to a clearly named output path, then reopen it and validate page count, extractability, and the requested change.
 6. Report the exact output path and any limits: failed OCR, unsupported encryption, missing fonts, damaged objects, or layout differences.
 

@@ -16,7 +16,7 @@ Treat the attachment's `local_path` as the source of truth. The attachment layer
    - Create or structurally edit a DOCX: use `python-docx`, reusing the source document's styles where possible.
    - Tracked changes, comments, fields, text boxes, or unsupported WordprocessingML: inspect and edit the underlying XML only for the specific structure required.
    - Layout-sensitive verification or PDF delivery: convert a copy with LibreOffice, then render and inspect the PDF.
-4. Use `run_bash` for read-only probes. For non-trivial edits, create a short, task-specific Python script in the workspace. Do not install packages or invoke network services without user authorization.
+4. Use `bash` for read-only probes. For non-trivial edits, create a short, task-specific Python script in the workspace. Do not install packages or invoke network services without user authorization.
 5. Save to a clearly named output, reopen it with `python-docx`, and verify the requested paragraphs, tables, styles, relationships, and section settings.
 6. Report the exact output path and any fidelity limits, especially unsupported Word features or conversion differences.
 

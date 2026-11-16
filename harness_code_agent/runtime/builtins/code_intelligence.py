@@ -19,7 +19,7 @@ def code_intelligence(
     service = tool_context.get_language_service()
     result = service.query(operation, path, line, column)
     if not result["available"]:
-        result["hint"] = "Use repo_search and read_file to continue code inspection."
+        result["hint"] = "Use `rg` through bash and read_file to continue code inspection."
     return ToolResult(
         tool="code_intelligence",
         status="success",

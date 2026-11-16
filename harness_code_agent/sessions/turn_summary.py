@@ -17,7 +17,7 @@ log = logging.getLogger("harness")
 
 LONG_TURN_TOOL_RESULT_THRESHOLD = 3
 LONG_TURN_SECONDS_THRESHOLD = 45.0
-LONG_TURN_TOOLS = {"run_bash"}
+LONG_TURN_TOOLS = {"bash"}
 
 
 @dataclass(frozen=True)
