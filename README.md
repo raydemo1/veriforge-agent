@@ -22,13 +22,23 @@ VeriForge 是一个面向真实代码仓库的可验证 Coding-Agent Runtime。
 
 ## 快速开始
 
-环境要求：Python 3.10+、Bun 1.4+、Git，以及一个 OpenAI-compatible API key。
+环境要求：Python 3.14（Windows 使用 64 位）、Bun 1.4+、Git，以及一个 OpenAI-compatible API key。
 
 ```bash
+python3.14 -m venv .venv
+source .venv/bin/activate
 pip install -e .
 cd frontend/opentui
 bun install
 cd ../..
+```
+
+Windows PowerShell（如果使用 Conda，把 `py -3.14` 换成 Python 3.14 解释器的完整路径）：
+
+```powershell
+py -3.14 -m venv .venv
+.venv\Scripts\python.exe -m pip install -e .
+bun install --frozen-lockfile --cwd frontend/opentui
 ```
 
 复制配置模板并填写 API 信息：
@@ -37,17 +47,29 @@ cd ../..
 cp .env.template .env
 ```
 
-Windows PowerShell：
-
-```powershell
-Copy-Item .env.template .env
-```
+Windows PowerShell 使用 `Copy-Item .env.template .env`。
 
 启动 TUI：
 
 ```bash
 veriforge
 ```
+
+Windows 可直接运行 `.venv\Scripts\veriforge.exe`，或先激活 `.venv` 再运行 `veriforge`。
+
+### 从 wheel 安装
+
+构建 wheel 后，可把文件复制到另一台装有 Python 3.14 和 Bun 的机器，在该机器的项目环境中安装：
+
+```text
+python -m pip wheel --no-deps . -w dist
+python -m pip install dist/veriforge-0.1.0-py3-none-any.whl
+veriforge --setup-tui
+```
+
+wheel 包含 OpenTUI 源码、依赖锁文件和 Windows ACL 补丁。`--setup-tui` 在 `~/.veriforge/opentui/`
+安装 Bun 依赖，也会为 Windows 受限 Shell 准备沙箱依赖。安装新版本后再次执行此命令即可准备相应资源。
+运行 `veriforge` 前，通过环境变量设置 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和所需模型。
 
 也可以直接提交任务：
 
@@ -98,7 +120,7 @@ raise SystemExit(result.exit_code)
 
 新会话加载统一的启动快照：个人默认最多 300 token，项目约定最多 500 token，导航说明及主题目录最多 400 token，头部和引用信息计入预算。正文只选择有效、无条件适用的偏好和规范；条件规则、项目事实、决定、经验和流程默认只提供主题入口。项目同事实键的全局约定覆盖个人默认，不改写原记录；过期、待确认和挂起的内容不会作为确定事实展示。目录优先列出范围和主题名称，在预算允许时补充事实键和适用条件；可用 `memory_read` 按范围和主题名称展开。各范围显示已展示和总主题数，未展示完时提供可直接用于 `memory_read` 的续读参数，不自动生成自由摘要或执行向量检索。
 
-启动快照按稳定事实键排序，在 Agent 重建和压缩时复用，恢复或回撤只在新的上下文边界刷新一次；原始日志保留。子代理沿用父会话的项目记忆身份。后续由模型在需要历史信息时主动调用 `memory_search` 或 `memory_read`，不逐轮自动检索或注入记忆正文。搜索支持分页、路径和类别筛选，读取支持展开主题、单条事实和修订历史。已经在上下文中的事实可直接复用。
+启动快照按稳定事实键排序，在 Agent 重建和压缩时复用，恢复或回撤只在新的上下文边界刷新一次；原始日志保留。子代理沿用父会话的项目记忆身份。后续由模型在需要历史信息时主动调用 `memory_search` 或 `memory_read`，不逐轮自动检索或注入记忆正文。搜索支持分页、路径和类别筛选，同时搜索项目和个人记忆时会共用同一模型生成的查询向量。读取支持展开主题、单条事实和修订历史。已经在上下文中的事实可直接复用。
 
 明确保存通过 `memory_write` 即时完成，必须逐字引用当前原始用户输入作为证据；纠正使用原 ID 和版本，保留旧修订。自动提取只读取单独记录的原始用户输入和原生结构化验证，不读取回忆、模型推断或任意工具输出。每个成功主轮结束后立即安排后台增量提取，前台回答不等待；连续轮次合并尚未处理的范围，下一轮执行期间暂停相关会话的提取和整理。提取候选、跨会话整理和向量更新分别持久化、分阶段处理。关闭进程或会话不等待后台生成，未完成工作在后续启动时恢复；`/memory generate off` 取消当前会话尚未完成的生成任务，并撤销这些候选对旧事实的挂起；重新开启后恢复候选及任务，无需等待空闲期。关闭期间的输入不补做自动抽取。此开关不禁止显式保存、确认和遗忘，这些操作仍需原文证据并经过正常工具权限检查。
 
@@ -112,15 +134,25 @@ raise SystemExit(result.exit_code)
 
 会话默认共享 Local。不同文件可以并行修改，同一文件写入前校验版本；真实冲突最多由 Agent 自动协调两轮；三方合并能安全通过时自动应用，仍有重叠或无法验证时展示最终差异，确认后才覆盖 Local。短命未知命令执行期间互斥写入；长期后台 Shell 允许其他会话继续写入，接受它直接改文件时的并发冲突风险。未知范围操作不扫描整个项目，只记录无法完整回撤的边界，回撤跨过该边界时才警告并拒绝。
 
-需要隔离时选择「隔离工作区」，会 Fork 一个新会话，原会话和任务继续保留；源会话回合执行中不能创建，需等回合结束或先停止，保证文件与分支历史一致。Worktree 继承当前 Local 的未提交内容和非忽略的未跟踪文件，暂不支持从已有 Worktree 再派生；「应用到 Local」只计算创建后的任务改动，并检查 Local 后续修改，发生冲突时不会直接覆盖。
+需要隔离时选择「隔离工作区」，会 Fork 一个新会话，原会话和任务继续保留；源会话回合执行中不能创建，需等回合结束或先停止，保证文件与分支历史一致。Worktree 继承当前 Local 的未提交内容和非忽略的未跟踪文件，暂不支持从已有 Worktree 再派生。创建失败会清理本次新建的 Git 工作树和会话，并报告错误。「应用到 Local」只计算创建后的任务改动，并检查 Local 后续修改，发生冲突时不会直接覆盖。
 
-Windows 默认使用原生 PowerShell 7，使用随项目 Bun 依赖安装的 DSH Windows ACL 独立库限制写入，无需安装 Codex 或 DSH 应用。项目默认只读；Agent 在 `bash(write_paths=["dist", "cache"])` 中声明所需目录，进程只能写这些目录及私有临时目录。目录许可持续到整个进程树退出，期间其他会话写这些目录需等待（「资源」中显示等待原因），同一会话的文件工具可继续写入，其他目录不受影响；后台任务不能申请整个共享 Local。Worktree 仅由用户主动创建，运行时不会因权限不足或写入范围未知而自动创建。此后端提供文件写入限制，不隔离读取和网络，沿用上游声明的 NTFS 硬链接等限制。授权是对目录 ACL 的常驻修改（允许项、拒绝 Everyone 删除子项、Low 完整性标签），不会撤销，也无法用 icacls 清除；每个目录使用由路径派生的固定 SID，任意目录组合复用同一组授权，首次授权某目录时会传播整棵子树。该能力依赖 `frontend/opentui/patches/` 中对上游库的补丁（多目录 SID）。Linux/macOS 使用同一进程托管链路执行 Bash，文件隔离由实际运行环境提供；Linux 评测沿用外层评测容器，不在工具内部再次启动 Docker。
+Windows 使用 PowerShell 7 和随 Bun 依赖安装的 DSH Windows ACL 沙箱。默认的
+`workspace-write` 模式允许写入工作区及私有临时目录。`bash(write_paths=["dist", "cache"])`
+将工作区写入范围收窄到指定目录。`read-only` 模式不给工作区写权限。
+后台任务的写租约只覆盖显式声明的子目录，并持续到进程树退出。其他会话可以继续写未被租约覆盖的目录。
+
+Windows ACL 沙箱限制写入，读取和网络访问由会话策略管理。目录授权会在 NTFS 上留下
+ACL 和完整性标签。各目录使用固定 SID，重复授权可复用已有条目。多目录授权由
+`frontend/opentui/patches/` 中的补丁实现。
+
+Linux 的受限 Shell 使用 Bash 和 bubblewrap，需安装 `bwrap`。macOS 的受限 Shell
+目前无可用后端。评测容器使用外层容器作为隔离边界。
 
 稳定回合结束后保存回撤点，悬停或键盘聚焦该轮即可选择「回撤到此处」。「会话开始」可撤回第一轮。回撤沿用当前会话 ID，只撤销其拥有且仍可安全恢复的文件变化；其他会话或外部程序的后续修改会阻止回撤。原始记录保留，活动对话、计划和任务状态回到目标边界。后台 Shell 不阻止新恢复点；回撤时校验文件版本，并提示仍在运行的 Shell 可能带来的直接写入冲突。替换运行时前需先停止子代理。文件与会话记录通过可恢复事务一起更新。数据库、远端操作等外部副作用不在恢复范围内。
 
 模型循环结束后，运行时同步检查本轮改动，并将结果写入会话记录，供工作台查看。检查前后通过源码指纹和工作区变更序号比对版本，发现变化时将诊断标记为过期。有效的通过或失败证据会写入 Journal，Memory 生成开关只决定是否提取这些证据。检查可发现没有 Git 的目录中的 shell 修改，范围限于本轮实际改动。自动执行 Python AST 和可用的 Ruff、最近 `tsconfig.json` 对应的 `tsc --noEmit`、`gofmt -d`。ESLint 会加载项目配置或插件，`go test` 会执行测试代码，`cargo check` 可能执行构建脚本或过程宏，因此自动验证将它们标为「已跳过」并提供对应目录和参数。需要运行时由 Agent 通过 `bash` 按会话权限执行。
 
-源码验证与 LSP 文件变更扫描固定排除 `.harbor` 评测产物，以及依赖、缓存和构建目录。
+源码验证与 LSP 文件变更扫描固定排除 `.harbor`、`.harness` 和 `.veriforge` 中的运行产物，以及依赖、缓存和构建目录。
 
 `code_intelligence` 按需启动已有的 basedpyright/pyright、typescript-language-server、gopls 或 rust-analyzer，通过 pygls 通信。`definition` / `references` 接收文件路径和从 1 开始的行、列；`symbols` / `diagnostics` 只需文件路径。服务器缺失、崩溃或响应异常时返回 `available: false`，Agent 可继续使用文本搜索和文件读取。它不执行重命名、格式化或 workspace edit；LSP 诊断用于理解代码，不作为退出前验证证据。
 
@@ -150,7 +182,7 @@ Python 通信与文件监听依赖 `pygls` 和 `watchfiles` 随 `pip install -e 
 | `read-only` | 只读检查与代码审查：编辑工具、Shell 写入和风险工具一律拒绝 |
 | `llm-auto` | 与 `workspace-write` 相同的沙箱和审批策略；需要审批的操作交给命令审查模型，不再询问用户；审查器自身失败按拒绝处理 |
 | `danger-full-access` | 评测容器内使用，Windows 与 POSIX 都跳过平台沙箱，不做写范围限制；系统/磁盘级破坏仍然拒绝 |
-| `terminal-eval` | Terminal-Bench / Harbor 任务的评测姿态：Shell 工作区写入和未知副作用放行，外部/系统写入仍拒绝，破坏性 Git 放行，远端操作仍需审批 |
+| `terminal-eval` | Terminal-Bench 独立 runner 的默认审批策略。Harbor 适配器在评测容器内显式选择 `danger-full-access` |
 
 需要先想清楚再动手时用显式计划流，而不是切换到另一个"模式"：
 
@@ -201,7 +233,7 @@ Schema 里不再重复提示词已经写过的行为策略。子代理协作工�
 | --- | --- |
 | `OPENAI_API_KEY` | API key |
 | `OPENAI_BASE_URL` | OpenAI-compatible API 地址 |
-| `HARNESS_MODEL` | 默认模型 |
+| `HARNESS_MODEL` | 通用模型的默认值。DeepSeek 各档位使用内置默认模型，可用 `HARNESS_MODEL_FAST/NORMAL/HARD/MAX` 覆盖 |
 | `HARNESS_MODEL_INTENSITY` | `fast` / `normal` / `hard` / `max` |
 | `HARNESS_PERMISSION_MODE` | `workspace-write` / `read-only` / `llm-auto` / `danger-full-access` / `terminal-eval` |
 | `HARNESS_MODEL_INPUT_MODE` | `text` 或 `multimodal` |

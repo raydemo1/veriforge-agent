@@ -112,7 +112,9 @@ def _conversation_with_registry(root: Path, registry: ToolRegistry, tool_calls, 
 class ToolExecutorTests(unittest.TestCase):
     def test_shell_denials_skip_approval_and_job_start(self):
         from harness_code_agent.runtime.approvals import ApprovalGate
-        from harness_code_agent.runtime.permission_middleware import PermissionMiddleware
+        from harness_code_agent.runtime.permission_middleware import (
+            PermissionMiddleware,
+        )
 
         for mode in ("workspace-write", "llm-auto"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:

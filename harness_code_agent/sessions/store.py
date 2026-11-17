@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import shutil
 import uuid
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
 from .events import EventBus
+from .jsonl import read_records
 
 
 @dataclass
@@ -38,15 +42,14 @@ class SessionStore:
         permission_mode: str,
         session_id: str | None = None,
         environment: str = "local",
+        status: str = "running",
     ) -> Session:
+        from ..runtime.recovery import atomic_json
+
         session_id = session_id or self._new_session_id()
         session_root = self._session_root(session_id)
         snapshots_dir = session_root / "snapshots"
         compacted_dir = session_root / "compacted"
-        session_root.mkdir(parents=True, exist_ok=False)
-        snapshots_dir.mkdir(parents=True, exist_ok=True)
-        compacted_dir.mkdir(parents=True, exist_ok=True)
-        (compacted_dir / "history").mkdir(parents=True, exist_ok=True)
 
         session = Session(
             id=session_id,
@@ -60,20 +63,29 @@ class SessionStore:
         )
         metadata = {
             "id": session.id,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
             "cwd": str(Path(cwd).resolve()),
             "model": model,
             "permission_mode": permission_mode,
-            "status": "running",
+            "status": status,
             "environment": environment,
         }
-        session.metadata_path.write_text(
-            json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        session.events_path.write_text("", encoding="utf-8")
-        session.journal_path.write_text("", encoding="utf-8")
+        session_root.mkdir(parents=True, exist_ok=False)
+        with ExitStack() as cleanup:
+            cleanup.callback(self.remove_created, session)
+            snapshots_dir.mkdir()
+            (compacted_dir / "history").mkdir(parents=True)
+            session.events_path.touch()
+            session.journal_path.touch()
+            atomic_json(session.metadata_path, metadata)
+            cleanup.pop_all()
         return session
+
+    def remove_created(self, session: Session) -> None:
+        root = self._session_root(session.id)
+        if session.root != root or root.resolve() != root:
+            raise ValueError(f"Invalid new session directory: {session.id}")
+        shutil.rmtree(root)
 
     def load(self, session_id: str) -> Session:
         self.read_metadata(session_id)
@@ -81,42 +93,42 @@ class SessionStore:
         return Session(session_id, root, root / "session.json", root / "events.jsonl",
                        root / "snapshots", root / "summary.md", root / "compacted", root / "journal.jsonl")
 
-    def fork(self, source_session_id: str) -> Session:
+    def fork(self, source_session_id: str, *, status: str = "running") -> Session:
         from ..runtime.recovery import atomic_bytes, atomic_json
         source = self.read_metadata(source_session_id)
         boundary = source.get("fork_boundary")
         if boundary is None:
             raise ValueError("会话尚无完整、稳定的回合，暂时无法创建分支")
+        source_root = self._session_root(source_session_id)
+        journal = []
+        sequence = boundary["journal_sequence"]
+        if sequence:
+            for entry in read_records(source_root / "journal.jsonl"):
+                if entry["sequence"] > sequence:
+                    break
+                journal.append(entry)
+                if entry["sequence"] == sequence:
+                    break
+            if not journal or journal[-1]["sequence"] != sequence:
+                raise ValueError("会话记录未到达分支边界")
+        events = list(islice(read_records(source_root / "events.jsonl"), boundary["event_count"]))
+        if len(events) != boundary["event_count"]:
+            raise ValueError("会话事件未到达分支边界")
         fork = self.create(cwd=source["cwd"], model=source["model"],
                            permission_mode=source["permission_mode"],
-                           environment=source.get("environment", "local"))
-        journal = []
-        source_path = self._session_root(source_session_id) / "journal.jsonl"
-        with source_path.open(encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                entry = json.loads(line)
-                if entry["sequence"] > boundary["journal_sequence"]:
-                    break
-                journal.append(line)
-        atomic_bytes(fork.journal_path, "".join(journal).encode("utf-8"))
-        events = []
-        with (self._session_root(source_session_id) / "events.jsonl").open(encoding="utf-8") as handle:
-            for line in handle:
-                if len(events) >= boundary["event_count"]:
-                    break
-                if line.strip():
-                    events.append(line)
-        atomic_bytes(fork.events_path, "".join(events).encode("utf-8"))
-        metadata = self.read_metadata(fork.id)
-        for key in ("model_selection", "environment"):
-            if key in source:
-                metadata[key] = source[key]
-        metadata.update(forked_from=source_session_id,
-                        history_boundary=dict(boundary), fork_boundary=dict(boundary),
-                        title=source.get("title", "新会话"))
-        atomic_json(fork.metadata_path, metadata)
+                           environment=source.get("environment", "local"), status=status)
+        with ExitStack() as cleanup:
+            cleanup.callback(self.remove_created, fork)
+            for path, records in ((fork.journal_path, journal), (fork.events_path, events)):
+                atomic_bytes(path, "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in records).encode("utf-8"))
+            metadata = self.read_metadata(fork.id)
+            if "model_selection" in source:
+                metadata["model_selection"] = source["model_selection"]
+            metadata.update(forked_from=source_session_id,
+                            history_boundary=dict(boundary), fork_boundary=dict(boundary),
+                            title=source.get("title", "新会话"))
+            atomic_json(fork.metadata_path, metadata)
+            cleanup.pop_all()
         return fork
 
     def event_bus(
@@ -158,36 +170,27 @@ class SessionStore:
             raise FileNotFoundError(f"Session not found: {session_id}")
         return json.loads(metadata_path.read_text(encoding="utf-8"))
 
-    def update_status(self, session_id: str, status: str) -> dict[str, Any]:
+    def _update_metadata(self, session_id: str, **fields: Any) -> dict[str, Any]:
         from ..runtime.recovery import atomic_json
 
         metadata = self.read_metadata(session_id)
-        metadata["status"] = status
+        metadata.update(fields)
         metadata_path = self._session_root(session_id) / "session.json"
         atomic_json(metadata_path, metadata)
         return metadata
 
+    def update_status(self, session_id: str, status: str) -> dict[str, Any]:
+        return self._update_metadata(session_id, status=status)
+
     def update_permission_mode(self, session_id: str, permission_mode: str) -> dict[str, Any]:
-        metadata = self.read_metadata(session_id)
-        metadata["permission_mode"] = permission_mode
-        metadata_path = self._session_root(session_id) / "session.json"
-        metadata_path.write_text(
-            json.dumps(metadata, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        return metadata
+        return self._update_metadata(session_id, permission_mode=permission_mode)
 
     def read_events(self, session_id: str) -> list[dict[str, Any]]:
         session_root = self._session_root(session_id)
         events_path = session_root / "events.jsonl"
         if not events_path.exists():
             raise FileNotFoundError(f"Session events not found: {session_id}")
-        events = []
-        for line in events_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            events.append(json.loads(line))
-        return events
+        return list(read_records(events_path))
 
     def read_history_events(self, session_id: str, *, event_count: int | None = None) -> list[dict[str, Any]]:
         events = self.read_events(session_id)
@@ -228,7 +231,7 @@ class SessionStore:
         return lineage
 
     def _session_root(self, session_id: str) -> Path:
-        if "/" in session_id or "\\" in session_id or session_id in {"", ".", ".."}:
+        if not isinstance(session_id, str) or session_id in {"", ".", ".."} or any(char in session_id for char in "/\\:"):
             raise ValueError(f"Invalid session id: {session_id}")
         return self.sessions_dir / session_id
 
@@ -237,5 +240,5 @@ class SessionStore:
 
     @staticmethod
     def _new_session_id() -> str:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         return f"{stamp}-{uuid.uuid4().hex[:8]}"

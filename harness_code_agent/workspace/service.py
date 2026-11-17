@@ -17,23 +17,8 @@ from .state_paths import ensure_workspace_state
 _UNOBSERVED = object()
 
 
-class WorkspaceQuotaError(RuntimeError):
-    """Raised when a write would exceed the workspace write/disk quota."""
-
-    def __init__(
-        self,
-        reason: str,
-        *,
-        charged_bytes: int = 0,
-        limit_bytes: int = 0,
-        resource_kind: str = "workspace_quota",
-    ):
-        super().__init__(reason)
-        self.reason = reason
-        self.charged_bytes = charged_bytes
-        self.limit_bytes = limit_bytes
-        #: "workspace_quota" or "free_disk" — feeds the failure taxonomy.
-        self.resource_kind = resource_kind
+class WorkspaceDiskSpaceError(RuntimeError):
+    """A file write would cross the minimum free disk space."""
 
 
 @dataclass
@@ -76,7 +61,7 @@ class WorkspaceService:
             else ensure_workspace_state(self.root)
         )
         self.access = WorkspaceAccessCoordinator(self.root, state_root=self.state_root)
-        self._versions = {}
+        self._versions: dict[Path, str | None] = {}
         self.snapshots_dir = (
             Path(snapshots_dir).resolve()
             if snapshots_dir
@@ -85,11 +70,7 @@ class WorkspaceService:
         self.change_journal = WorkspaceChangeJournal()
         self._metadata_lock = threading.RLock()
         self._path_locks_lock = threading.Lock()
-        self._path_locks: dict[str, threading.RLock] = {}
-        # Cumulative net-new bytes written through this service; the cheap
-        # backstop against unbounded file generation. run_bash writes bypass
-        # this ledger and are expected to be bounded by ulimit/docker caps.
-        self._charged_bytes = 0
+        self._path_locks: dict[Path, threading.RLock] = {}
 
     def resolve(self, path: str | Path) -> Path:
         raw = Path(path)
@@ -105,24 +86,26 @@ class WorkspaceService:
         resolved = self.resolve(path)
         with self._path_lock(resolved):
             data = resolved.read_bytes()
-            self._versions[str(resolved).casefold()] = fingerprint(data)
+            self.remember_read_version(resolved, fingerprint(data))
             return data.decode("utf-8", errors="replace")
+
+    def remember_read_version(self, resolved: Path, digest: str) -> None:
+        self._versions[resolved] = digest
 
     def write_text(self, path: str | Path, content: str) -> WorkspaceWriteResult:
         resolved = self.resolve(path)
         with self._path_lock(resolved, write=True):
-            if resolved.exists() and str(resolved).casefold() not in self._versions:
+            if resolved.exists() and resolved not in self._versions:
                 raise WorkspaceConflict(f"覆盖已有文件前必须先读取当前版本：{path}")
             self._ensure_writable(resolved)
             old_content = resolved.read_text(encoding="utf-8", errors="replace") if resolved.exists() else None
             old_size = resolved.stat().st_size if resolved.exists() else 0
-            new_size = len(content.encode("utf-8"))
-            self._check_write_quota(new_size - old_size)
+            data = content.encode("utf-8")
+            from ..runtime.recovery import atomic_bytes
+            self._check_free_disk(len(data) - old_size)
             snapshot_path = self._snapshot_unlocked(resolved) if resolved.exists() else None
             resolved.parent.mkdir(parents=True, exist_ok=True)
-            from ..runtime.recovery import atomic_bytes
-            atomic_bytes(resolved, content.encode("utf-8"))
-            self._charge_quota(new_size - old_size)
+            atomic_bytes(resolved, data)
             rel = resolved.relative_to(self.root)
             self._record_changed(rel, operation="write_file", snapshot_path=snapshot_path)
             return WorkspaceWriteResult(path=resolved, snapshot_path=snapshot_path, old_content=old_content)
@@ -145,7 +128,7 @@ class WorkspaceService:
         if not changes:
             return []
         resolved_changes = {self.resolve(path): value for path, value in changes.items()}
-        ordered = sorted(resolved_changes, key=lambda path: str(path).casefold())
+        ordered = sorted(resolved_changes)
         versions = {self.resolve(path): data for path, data in expected.items()} if expected is not None else {}
         with ExitStack() as stack:
             for path in ordered:
@@ -169,9 +152,9 @@ class WorkspaceService:
                 )
                 snapshot_path = self._snapshot_unlocked(path) if existed else None
                 results.append(WorkspaceWriteResult(path=path, snapshot_path=snapshot_path, old_content=old_content))
-            self._check_write_quota(total_net_new)
+            from ..runtime.recovery import atomic_bytes
+            self._check_free_disk(total_net_new)
             try:
-                from ..runtime.recovery import atomic_bytes
                 for path in ordered:
                     new_bytes = resolved_changes[path]
                     if new_bytes is None:
@@ -179,7 +162,7 @@ class WorkspaceService:
                         continue
                     path.parent.mkdir(parents=True, exist_ok=True)
                     atomic_bytes(path, new_bytes)
-            except Exception:
+            except BaseException:
                 for path in reversed(ordered):
                     existed, old_bytes = originals[path]
                     if existed:
@@ -188,7 +171,6 @@ class WorkspaceService:
                     elif path.exists():
                         path.unlink()
                 raise
-            self._charge_quota(total_net_new)
             for result in results:
                 self._record_changed(
                     result.path.relative_to(self.root),
@@ -215,13 +197,13 @@ class WorkspaceService:
             count = original.count(search)
             if count != 1:
                 raise ValueError(f"Patch search text must match exactly once; found {count}")
-            snapshot_path = self._snapshot_unlocked(resolved)
             updated = original.replace(search, replace, 1)
-            net_new_bytes = len(updated.encode("utf-8")) - resolved.stat().st_size
-            self._check_write_quota(net_new_bytes)
+            data = updated.encode("utf-8")
+            net_new_bytes = len(data) - resolved.stat().st_size
             from ..runtime.recovery import atomic_bytes
-            atomic_bytes(resolved, updated.encode("utf-8"))
-            self._charge_quota(net_new_bytes)
+            self._check_free_disk(net_new_bytes)
+            snapshot_path = self._snapshot_unlocked(resolved)
+            atomic_bytes(resolved, data)
             rel = resolved.relative_to(self.root)
             self._record_changed(rel, operation="apply_patch", snapshot_path=snapshot_path)
             return WorkspacePatchResult(
@@ -231,27 +213,6 @@ class WorkspaceService:
                 old_content=original,
                 new_content=updated,
             )
-
-    def rollback_latest_snapshot(self, path: str | Path) -> WorkspaceWriteResult:
-        resolved = self.resolve(path)
-        with self._path_lock(resolved, write=True):
-            self._ensure_writable(resolved)
-            rel = resolved.relative_to(self.root)
-            snapshot_dir = self.snapshots_dir / rel.parent
-            pattern = f"{resolved.name}.*.bak"
-            snapshots = sorted(
-                snapshot_dir.glob(pattern),
-                key=lambda item: item.stat().st_mtime,
-                reverse=True,
-            )
-            if not snapshots:
-                raise FileNotFoundError(f"No snapshot found for: {rel}")
-            old_content = resolved.read_text(encoding="utf-8", errors="replace") if resolved.exists() else None
-            rollback_snapshot = self._snapshot_unlocked(resolved) if resolved.exists() else None
-            resolved.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(snapshots[0], resolved)
-            self._record_changed(rel, operation="rollback", snapshot_path=rollback_snapshot)
-            return WorkspaceWriteResult(path=resolved, snapshot_path=rollback_snapshot, old_content=old_content)
 
     def snapshot(self, path: str | Path) -> Path | None:
         resolved = self.resolve(path)
@@ -274,14 +235,16 @@ class WorkspaceService:
 
     @contextmanager
     def _path_lock(self, resolved: Path, *, write=False, expected=_UNOBSERVED):
-        key = str(resolved).casefold()
         with self._path_locks_lock:
-            lock = self._path_locks.setdefault(key, threading.RLock())
+            lock = self._path_locks.setdefault(resolved, threading.RLock())
         claims = [self.access.write_claim(resolved)] if write else []
         with self.access.acquire(claims, current_token.get()), lock:
+            if not write:
+                yield
+                return
             before = resolved.read_bytes() if resolved.is_file() else None
-            version = self._versions.get(key, _UNOBSERVED) if expected is _UNOBSERVED else fingerprint(expected)
-            if write and version is not _UNOBSERVED and version != fingerprint(before):
+            version = self._versions.get(resolved, _UNOBSERVED) if expected is _UNOBSERVED else fingerprint(expected)
+            if version is not _UNOBSERVED and version != fingerprint(before):
                 raise WorkspaceConflict(f"文件版本已变化，请重新读取并重新计算修改：{resolved.relative_to(self.root)}")
             completed = False
             try:
@@ -289,10 +252,10 @@ class WorkspaceService:
                 completed = True
             finally:
                 after = resolved.read_bytes() if resolved.is_file() else None
-                if write and before != after:
+                if before != after:
                     self.access.record(self.session_id, self.turn_id, resolved, before, after)
-                if write and completed:
-                    self._versions[key] = fingerprint(after)
+                if completed:
+                    self._versions[resolved] = fingerprint(after)
 
     @property
     def changed_files(self) -> list[Path]:
@@ -319,33 +282,15 @@ class WorkspaceService:
         # ordinary workspace content. Snapshot and conflict checks still apply.
         path.relative_to(self.root)
 
-    def _check_write_quota(self, net_new_bytes: int) -> None:
-        """Reject a write that would cross the free-disk floor or write quota."""
-        net_new_bytes = max(0, int(net_new_bytes))
-        if net_new_bytes <= 0:
+    def _check_free_disk(self, net_new_bytes: int) -> None:
+        min_free = config.MIN_FREE_DISK_BYTES
+        if min_free <= 0 or net_new_bytes <= 0:
             return
-        min_free = int(getattr(config, "MIN_FREE_DISK_BYTES", 0) or 0)
-        if min_free > 0:
-            free = shutil.disk_usage(self.root).free
-            if free < min_free + net_new_bytes:
-                raise WorkspaceQuotaError(
-                    f"workspace disk floor reached: only {free} bytes free "
-                    f"(write needs {net_new_bytes}, floor is {min_free})",
-                    charged_bytes=self._charged_bytes,
-                    limit_bytes=min_free,
-                    resource_kind="free_disk",
-                )
-        quota = int(getattr(config, "WORKSPACE_WRITE_QUOTA_BYTES", 0) or 0)
-        if quota > 0 and self._charged_bytes + net_new_bytes > quota:
-            raise WorkspaceQuotaError(
-                f"workspace write quota exceeded: {self._charged_bytes} bytes already written, "
-                f"quota is {quota} bytes (this write needs {net_new_bytes})",
-                charged_bytes=self._charged_bytes,
-                limit_bytes=quota,
+        free = shutil.disk_usage(self.root).free
+        if free < min_free + net_new_bytes:
+            raise WorkspaceDiskSpaceError(
+                f"workspace disk floor reached: only {free} bytes free "
+                f"(write needs {net_new_bytes}, floor is {min_free})"
             )
-
-    def _charge_quota(self, net_new_bytes: int) -> None:
-        with self._metadata_lock:
-            self._charged_bytes += max(0, int(net_new_bytes))
 
     _is_relative_to = staticmethod(is_relative_to)

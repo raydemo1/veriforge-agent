@@ -225,8 +225,14 @@ function createBridgeClient(): BridgeClient {
           newline = buffer.indexOf("\n");
         }
       }
+    } catch (error) {
+      console.error(`读取 Python 桥接失败：${formatUserError(error)}`);
     } finally {
       ended = true;
+      const error = new Error("与 Python 桥接的连接已断开。");
+      for (const waiter of pending.values()) waiter.reject(error);
+      pending.clear();
+      for (const waiter of eventWaiters.splice(0)) waiter(null);
       if (!graceful) console.error("与 Python 桥接的连接已断开。");
       resolveClosed();
     }
@@ -234,12 +240,20 @@ function createBridgeClient(): BridgeClient {
   void readLoop();
 
   const request = (method: BridgeRequest["method"], params?: Record<string, unknown>, sessionId?: string) => {
-    if (ended || !child.stdin) return Promise.reject(new Error("OpenTUI bridge is closed"));
+    const stdin = child.stdin;
+    if (ended || !stdin) return Promise.reject(new Error("与 Python 桥接的连接已断开。"));
     const id = `req-${++requestCounter}`;
     const message: BridgeRequest = { type: "request", id, method, params, sessionId };
-    child.stdin.write(`${JSON.stringify(message)}\n`);
-    child.stdin.flush();
-    return new Promise<unknown>((resolve, reject) => pending.set(id, { resolve, reject }));
+    return new Promise<unknown>((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      try {
+        stdin.write(`${JSON.stringify(message)}\n`);
+        stdin.flush();
+      } catch (error) {
+        pending.delete(id);
+        reject(error);
+      }
+    });
   };
 
   void request("initialize", { protocolVersion: UI_PROTOCOL_VERSION }).catch((error) => {
@@ -405,7 +419,7 @@ async function main() {
       onExit={exitWorkbench}
     />,
   );
-  void client?.closed.then(destroyRenderer);
+  void client?.closed.then(exitWorkbench);
 }
 
 main().catch((error) => {

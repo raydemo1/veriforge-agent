@@ -7,7 +7,7 @@ import os
 import re
 import sys
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -95,7 +95,7 @@ def load_tbench_metadata() -> dict[str, Any]:
 
 
 def make_run_dir(args: argparse.Namespace, suite: str) -> Path:
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H%M%S")
     suffix = f"_{safe_name(args.run_name)}" if args.run_name else ""
     run_dir = Path(args.output_root) / f"{timestamp}_{suite}{suffix}"
     run_dir.mkdir(parents=True, exist_ok=False)

@@ -18,7 +18,10 @@ from harness_code_agent.runtime.permissions import PermissionPolicy
 from harness_code_agent.runtime.tool_context import ToolContext
 from harness_code_agent.sessions.events import EventBus
 from harness_code_agent.support.cancellation import CancellationToken, CancelledError
-from harness_code_agent.workspace.service import WorkspaceQuotaError, WorkspaceService
+from harness_code_agent.workspace.service import (
+    WorkspaceDiskSpaceError,
+    WorkspaceService,
+)
 
 
 class LlmRetryHelperTests(unittest.TestCase):
@@ -76,60 +79,36 @@ class LlmRetryHelperTests(unittest.TestCase):
         self.assertFalse(llm_channel._is_retryable_llm_error(ValueError("nope")))
 
 
-class WorkspaceQuotaTests(unittest.TestCase):
+class WorkspaceDiskSpaceTests(unittest.TestCase):
     def setUp(self):
-        self.temp = Path(tempfile.mkdtemp(prefix="hca-quota-test-"))
+        self.temp = Path(tempfile.mkdtemp(prefix="hca-disk-space-test-"))
         self.workspace = WorkspaceService(root=self.temp)
-        # The 100MB free-disk floor would make these tests machine-dependent;
-        # quota behaviour is exercised with the floor effectively disabled.
-        self._floor = patch.object(config, "MIN_FREE_DISK_BYTES", 0)
-        self._floor.start()
 
     def tearDown(self):
-        self._floor.stop()
         shutil.rmtree(self.temp, ignore_errors=True)
-
-    def test_write_quota_blocks_after_cumulative_limit(self):
-        with patch.object(config, "WORKSPACE_WRITE_QUOTA_BYTES", 20):
-            self.workspace.write_text("a.txt", "x" * 15)
-            with self.assertRaises(WorkspaceQuotaError):
-                self.workspace.write_text("b.txt", "y" * 50)
-
-    def test_overwriting_with_smaller_content_is_not_quota_charged(self):
-        with patch.object(config, "WORKSPACE_WRITE_QUOTA_BYTES", 10):
-            self.workspace.write_text("a.txt", "x" * 10)
-            # Shrinking an existing file adds no net bytes; must stay allowed.
-            result = self.workspace.write_text("a.txt", "x")
-            self.assertEqual(result.old_content, "x" * 10)
-
-    def test_batch_write_is_checked_as_one_unit(self):
-        with patch.object(config, "WORKSPACE_WRITE_QUOTA_BYTES", 10):
-            with self.assertRaises(WorkspaceQuotaError):
-                self.workspace.write_text_batch({"a.txt": "x" * 8, "b.txt": "y" * 8})
-            # Nothing should have been written after the rejection.
-            self.assertFalse((self.temp / "a.txt").exists())
-            self.assertFalse((self.temp / "b.txt").exists())
 
     def test_free_disk_floor_blocks_positive_writes(self):
         usage = SimpleNamespace(total=1000, used=995, free=5)
         with patch.object(config, "MIN_FREE_DISK_BYTES", 100), patch(
             "harness_code_agent.workspace.service.shutil.disk_usage", return_value=usage
-        ), self.assertRaises(WorkspaceQuotaError):
+        ), self.assertRaises(WorkspaceDiskSpaceError):
             self.workspace.write_text("a.txt", "x" * 10)
 
-    def test_write_file_tool_returns_structured_quota_result(self):
+    def test_write_file_tool_returns_structured_disk_space_result(self):
         context = ToolContext(
             workspace=self.workspace,
             permission_policy=PermissionPolicy(mode="danger-full-access"),
             event_bus=EventBus(),
             tool_registry=BUILTIN_TOOL_REGISTRY,
         )
-        with patch.object(config, "WORKSPACE_WRITE_QUOTA_BYTES", 5):
+        with patch.object(config, "MIN_FREE_DISK_BYTES", 100), patch(
+            "harness_code_agent.workspace.service.shutil.disk_usage", return_value=SimpleNamespace(free=50)
+        ):
             result = write_file("big.txt", "z" * 500, tool_context=context)
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.metadata["status_source"], "resource")
-        self.assertEqual(result.metadata["resource_kind"], "workspace_quota")
+        self.assertEqual(result.metadata["resource_kind"], "free_disk")
         self.assertFalse((self.temp / "big.txt").exists())
 
 
@@ -212,7 +191,11 @@ class SubagentControlTests(unittest.TestCase):
             )
 
     def test_parent_cancellation_preserves_registered_subagent(self):
-        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
+        conversation = _ControlledConversation()
+        with (
+            patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent),
+            patch.object(_ControlledAgent, "start_conversation", return_value=conversation),
+        ):
             parent_token = CancellationToken()
             spawned = self.coordinator.spawn(
                 name="child",
@@ -220,13 +203,11 @@ class SubagentControlTests(unittest.TestCase):
                 task="inspect",
                 parent_cancellation_token=parent_token,
             )
-            deadline = threading.Event()
-            deadline.wait(0.5)
-            self.assertEqual(
-                self.coordinator.list()["agents"][0]["status"], "running"
-            )
-
-            parent_token.cancel()
+            try:
+                self.assertTrue(conversation.started.wait(2))
+                parent_token.cancel()
+            finally:
+                conversation.release.set()
             terminal = self.coordinator.wait([spawned["agent_id"]], timeout_seconds=5)
             self.assertFalse(terminal["timed_out"])
             self.assertEqual(terminal["agents"][0]["status"], "completed")

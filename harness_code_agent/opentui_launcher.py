@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+from .workspace.state_paths import veriforge_home
+
+_ASSETS = Path(__file__).resolve().parents[1] / "frontend" / "opentui"
 
 
 def find_bun() -> str | None:
@@ -34,6 +40,64 @@ def _installed_bun() -> str | None:
         if candidate.is_file():
             return str(candidate)
     return None
+
+
+def _installed(directory: Path) -> bool:
+    packages = ["@opentui/core", "@opentui/react"]
+    if os.name == "nt":
+        packages.append("@deepseek-ai/dsh-sandbox-windows-acl")
+    return all((directory / "node_modules" / name / "package.json").is_file() for name in packages)
+
+
+def _asset_files(assets: Path) -> list[Path]:
+    return [assets / name for name in ("package.json", "bun.lock", "tsconfig.json")] + sorted(
+        path for folder in ("src", "patches") for path in (assets / folder).rglob("*")
+        if path.is_file() and not path.name.endswith((".test.ts", ".test.tsx"))
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _asset_hash(assets: Path) -> str:
+    digest = hashlib.sha256()
+    for path in _asset_files(assets):
+        digest.update(path.relative_to(assets).as_posix().encode("utf-8") + b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()[:16]
+
+
+def _frontend_cache() -> Path:
+    return veriforge_home() / "opentui" / _asset_hash(_ASSETS)
+
+
+def frontend_directory() -> Path:
+    # Editable development can reuse the already installed frontend.
+    return _ASSETS if _installed(_ASSETS) else _frontend_cache()
+
+
+def setup_tui() -> int:
+    bun = find_bun()
+    if bun is None:
+        print("Error: Install Bun 1.4 or newer, then run veriforge --setup-tui.", file=sys.stderr)
+        return 1
+    directory = frontend_directory()
+    if not _installed(directory):
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".setup-", dir=directory.parent) as staging:
+            source = Path(staging) / "opentui"
+            for path in _asset_files(_ASSETS):
+                target = source / path.relative_to(_ASSETS)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, target)
+            result = subprocess.run([bun, "install", "--frozen-lockfile", "--production"], cwd=source, check=False)
+            if result.returncode:
+                return result.returncode
+            try:
+                source.rename(directory)
+            except FileExistsError:
+                if not _installed(directory):
+                    raise
+    print(f"OpenTUI ready: {directory}")
+    return 0
 
 
 class OpenTuiApp:
@@ -63,7 +127,10 @@ class OpenTuiApp:
             )
             return 1
 
-        frontend_dir = Path(__file__).resolve().parents[1] / "frontend" / "opentui"
+        frontend_dir = frontend_directory()
+        if not _installed(frontend_dir):
+            print("Error: Run veriforge --setup-tui to install OpenTUI dependencies.", file=sys.stderr)
+            return 1
         command = [
             bun,
             "run",

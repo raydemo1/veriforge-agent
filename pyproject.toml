@@ -7,7 +7,7 @@ name = "veriforge"
 version = "0.1.0"
 description = "VeriForge — verifiable local coding-agent runtime"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.14,<3.15"
 dependencies = [
     "openai>=1.0.0",
     "httpx>=0.27,<1",
@@ -18,8 +18,7 @@ dependencies = [
     "mcp>=1.0.0,<2",
     "pygls>=2.1,<3",
     "watchfiles>=1.1,<2",
-    # Static bash parsing for the shell analyzer. The grammar is abi3, so one
-    # wheel covers 3.10-3.13; this is the combination the test suite runs on.
+    # Static Bash parsing for the shell analyzer.
     "tree-sitter>=0.25,<0.27",
     "tree-sitter-bash>=0.25,<0.26",
 ]
@@ -29,7 +28,7 @@ test = ["pytest>=8,<10", "pytest-timeout>=2.3,<3"]
 eval = [
     "datasets>=5.0.0",
     "pyarrow>=21.0.0",
-    "harbor>=0.13; python_version >= '3.12'",
+    "harbor>=0.13",
 ]
 
 [project.scripts]
@@ -41,6 +40,10 @@ veriforge = "harness_code_agent.cli:main"
 # tests and break collection when pytest recurses the whole repository.
 testpaths = ["tests"]
 addopts = "--strict-markers -m 'not integration and not external'"
+# pygls 2.1.1 uses the deprecated alias while dispatching JSON-RPC handlers.
+filterwarnings = [
+    'ignore:.*asyncio\.iscoroutinefunction.* is deprecated:DeprecationWarning:pygls\.protocol\.json_rpc',
+]
 # Every test finishes in seconds; a hard per-test cap turns a hang or an
 # accidentally long-running task into a fast failure with thread stacks
 # instead of stalling CI until the job limit.
@@ -50,13 +53,16 @@ markers = [
     "session: initializes complete Session, subprocess transport, or multi-session execution",
     "external: explicitly enabled external service acceptance",
 ]
-asyncio_default_fixture_loop_scope = "function"
-
 [tool.setuptools.packages.find]
-include = ["harness_code_agent*"]
+include = ["harness_code_agent*", "frontend.opentui"]
 
 [tool.setuptools.package-data]
+"harness_code_agent.runtime" = ["powershell_parser.ps1"]
 "harness_code_agent.skills" = ["catalog/**/*"]
+"frontend.opentui" = ["package.json", "bun.lock", "tsconfig.json", "src/**/*", "patches/*.patch"]
+
+[tool.setuptools.exclude-package-data]
+"frontend.opentui" = ["src/*.test.ts", "src/*.test.tsx", "src/**/*.test.ts", "src/**/*.test.tsx"]
 
 [tool.ruff.lint.per-file-ignores]
 # These files sit on deliberate failure boundaries: any exception from a tool

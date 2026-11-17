@@ -4,7 +4,9 @@ from __future__ import annotations
 import copy
 import threading
 import time
+import uuid
 import weakref
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -121,10 +123,10 @@ class SessionRuntimeRegistry:
             if session_id in self._records:
                 self.switch(session_id)
                 return session_id
-            self.access.reserve_runtime(session_id)
             record = SessionRuntime(session_id, Path(cwd or self.project), environment)
-            if (self.store.sessions_dir / session_id / "session.json").exists():
+            if (self.store._session_root(session_id) / "session.json").exists():
                 record.title = self.store.read_metadata(session_id).get("title", "新会话")
+            self.access.reserve_runtime(session_id)
             self._records[session_id] = record
             self._views[session_id] = {"sequence": 0, "items": [], "snapshot": {}, "interaction": None,
                                        "work": {}, "turnState": "idle", "queueDepth": 0, "commands": [], "waitingReason": None}
@@ -176,33 +178,35 @@ class SessionRuntimeRegistry:
         return self.create(session_id=session_id, cwd=metadata["cwd"], environment=metadata.get("environment", "local"))
 
     def fork(self, session_id, *, worktree=False):
+        from ..runtime.recovery import RecoveryStore, atomic_json
+        from ..workspace.access import WorkspaceAccessCoordinator
+
         source = self.get(session_id)
         if source.environment == "worktree":
             raise ValueError("暂不支持从 Worktree 派生会话，请从 Local 会话创建分支")
-        if worktree:
-            # The worktree copies current Local files, so they must match the
-            # stable history boundary the fork starts from.
-            with source.host.turns_paused():
-                fork = self.store.fork(source.id)
-                root = WorktreeService(self.project).create(fork.id)
-        else:
-            fork = self.store.fork(source.id)
-            root = source.cwd
-        from ..runtime.recovery import atomic_json
-        metadata = self.store.read_metadata(fork.id)
-        metadata.update(cwd=str(root), environment="worktree" if worktree else source.environment)
-        import uuid
-
-        from ..runtime.recovery import RecoveryStore
-        from ..workspace.access import WorkspaceAccessCoordinator
-        boundary = metadata["history_boundary"]
-        base = dict(boundary, id="rp_" + uuid.uuid4().hex, session_id=fork.id,
-                    change_cursor=WorkspaceAccessCoordinator(root).cursor(),
-                    permission_mode=metadata["permission_mode"], model_selection=metadata.get("model_selection", {"model": None, "reasoning_effort": None}))
-        metadata.update(checkpoint=base, branch_origin=base)
-        atomic_json(RecoveryStore(root).root / "points" / f"{base['id']}.json", base)
-        atomic_json(fork.metadata_path, metadata)
-        return self.create(session_id=fork.id, cwd=root, environment=metadata["environment"])
+        turns = source.host.turns_paused() if worktree else nullcontext()
+        with ExitStack() as cleanup:
+            with turns:
+                fork = self.store.fork(source.id, status="restoring")
+                cleanup.callback(self.store.remove_created, fork)
+                root = source.cwd
+                if worktree:
+                    worktrees = WorktreeService(self.project)
+                    root = worktrees.create(fork.id)
+                    cleanup.callback(worktrees.remove_created, fork.id)
+            metadata = self.store.read_metadata(fork.id)
+            environment = "worktree" if worktree else source.environment
+            base = dict(metadata["history_boundary"], id="rp_" + uuid.uuid4().hex, session_id=fork.id,
+                        change_cursor=WorkspaceAccessCoordinator(root).cursor(),
+                        permission_mode=metadata["permission_mode"], model_selection=metadata.get("model_selection", {"model": None, "reasoning_effort": None}))
+            point = RecoveryStore(root).root / "points" / f"{base['id']}.json"
+            atomic_json(point, base)
+            cleanup.callback(point.unlink, missing_ok=True)
+            metadata.update(cwd=str(root), environment=environment, status="running", checkpoint=base, branch_origin=base)
+            atomic_json(fork.metadata_path, metadata)
+            active_id = self.create(session_id=fork.id, cwd=root, environment=environment)
+            cleanup.pop_all()
+            return active_id
 
     def announce(self):
         with self._lock:

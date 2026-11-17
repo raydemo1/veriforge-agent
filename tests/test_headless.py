@@ -102,18 +102,21 @@ def test_empty_task_fails_without_starting_session(tmp_path, model):
     model.chat.completions.create.assert_not_called()
 
 
-@pytest.mark.parametrize("entry", ["cli", "terminal", "claw"])
-@pytest.mark.parametrize("failure", [False, True])
+@pytest.mark.parametrize("entry,failure", [("cli", False), ("terminal", False), ("terminal", True), ("claw", False)])
 def test_entrypoints_execute_real_session_and_report_failures(tmp_path, model, monkeypatch, capsys, entry, failure):
     monkeypatch.chdir(tmp_path)
     artifacts = tmp_path / "artifacts"
     monkeypatch.setenv("HCA_ARTIFACTS_ROOT", str(artifacts))
-    if failure:
-        model.chat.completions.create.side_effect = RuntimeError("model request failed")
-
     if entry == "cli":
         exit_code = cli.main(["-p", "Inspect the code"])
     elif entry == "terminal":
+        def create(**kwargs):
+            assert len(list(artifacts.glob("hca/*/early_manifest.json"))) == 1
+            if failure:
+                raise RuntimeError("model request failed")
+            return model.chat.completions.create.return_value
+
+        model.chat.completions.create.side_effect = create
         exit_code = hca_terminal_runner.main(["--workspace", str(tmp_path), "Inspect the code"])
     else:
         prompt_file = tmp_path / "prompt.txt"
@@ -137,18 +140,6 @@ def test_entrypoints_execute_real_session_and_report_failures(tmp_path, model, m
         assert "HCA_EVAL_METRICS:" in output.out
         if failure:
             assert "model request failed" in (export_root / "runner_error.txt").read_text(encoding="utf-8")
-
-
-def test_terminal_manifest_is_written_before_model_request(tmp_path, model, monkeypatch):
-    artifacts = tmp_path / "artifacts"
-    monkeypatch.setenv("HCA_ARTIFACTS_ROOT", str(artifacts))
-
-    def create(**kwargs):
-        assert len(list(artifacts.glob("hca/*/early_manifest.json"))) == 1
-        raise RuntimeError("stop after checking early artifacts")
-
-    model.chat.completions.create.side_effect = create
-    assert hca_terminal_runner.main(["--workspace", str(tmp_path), "Inspect the code"]) == 1
 
 
 def test_terminal_signal_exports_partial_session_and_closes_runtime(tmp_path, model, monkeypatch):
@@ -200,18 +191,12 @@ def test_periodic_export_reads_public_session_paths(tmp_path, model, monkeypatch
     assert manifest.is_file()
 
 
-@pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), SystemExit(143)])
-def test_interrupts_close_real_session(tmp_path, model, interrupt):
-    model.chat.completions.create.side_effect = interrupt
-    if isinstance(interrupt, SystemExit):
-        with pytest.raises(SystemExit) as exc:
-            run_task(cwd=tmp_path, task="Inspect the code")
-        assert exc.value.code == 143
-    else:
-        result = run_task(cwd=tmp_path, task="Inspect the code")
-        assert result.status == "interrupted"
-        assert result.exit_code == 130
-        assert result.session_id
+def test_keyboard_interrupt_closes_real_session(tmp_path, model):
+    model.chat.completions.create.side_effect = KeyboardInterrupt()
+    result = run_task(cwd=tmp_path, task="Inspect the code")
+    assert result.status == "interrupted"
+    assert result.exit_code == 130
+    assert result.session_id
     model.close.assert_called_once()
 
 

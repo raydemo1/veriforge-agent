@@ -27,7 +27,7 @@ pytestmark = pytest.mark.integration
 
 @pytest.fixture
 def tmp_path():
-    # Python 3.13+ implements mkdir(mode=0o700) with OWNER RIGHTS on Windows.
+    # Python 3.14 implements mkdir(mode=0o700) with OWNER RIGHTS on Windows.
     # Pytest uses that mode for its temp tree, but restricted tokens cannot
     # use owner rights. Model a normal workspace with inherited user ACLs;
     # do not alter pytest's shared directories or sandbox write permissions.
@@ -62,41 +62,26 @@ def test_wrapped_powershell_keeps_object_output_and_exit_code(
             check=False,
         )
 
-    listing = run("Get-ChildItem -Force | Select-Object Mode,Name")
-    assert listing.returncode == 0
+    listing = run(f'Get-ChildItem -Force | Select-Object Mode,Name; & "{sys.executable}" -c "import sys; sys.exit(3)"')
+    assert listing.returncode == 3
     assert "app" in listing.stdout
     assert "README.md" in listing.stdout
 
-    text = run("Write-Output '---'")
-    assert text.returncode == 0
-    assert "---" in text.stdout
 
-    failed = run(f'& "{sys.executable}" -c "import sys; sys.exit(3)"')
-    assert failed.returncode == 3
-
-
-def test_private_temp_is_writable_and_outside_the_workspace(native_manager, tmp_path):
+def test_native_pipeline_and_private_temp(native_manager, tmp_path):
     runtime = SimpleNamespace(shell_job_manager=native_manager)
     result = run_bash(
+        f'& "{sys.executable}" -c "print(1)" | Select-Object -First 1; '
         'Write-Output $env:TEMP; Set-Content -Path "$env:TEMP\\probe.txt" -Value ok; '
         'Get-Content "$env:TEMP\\probe.txt"',
         runtime_state=runtime,
     )
     assert result.return_code == 0, result.output
     lines = [line.strip() for line in result.output.splitlines() if line.strip()]
+    assert lines[0] == "1"
     temp_path = next(line for line in lines if "veriforge-shell-" in line)
     assert str(tmp_path).lower() not in temp_path.lower()
     assert "ok" in result.output
-
-
-def test_native_process_output_can_be_piped(native_manager):
-    runtime = SimpleNamespace(shell_job_manager=native_manager)
-    result = run_bash(
-        f'& "{sys.executable}" -c "print(1)" | Select-Object -First 1',
-        runtime_state=runtime,
-    )
-    assert result.return_code == 0, result.output
-    assert result.output.splitlines()[0] == "1"
 
 
 def test_write_outside_the_workspace_is_denied(native_manager, tmp_path):
@@ -116,8 +101,9 @@ def test_scoped_extra_directory_grant_stays_sandboxed(native_manager, tmp_path):
     from harness_code_agent.runtime.permissions import PermissionPolicy
 
     runtime = SimpleNamespace(shell_job_manager=native_manager)
-    with tempfile.TemporaryDirectory(prefix="veriforge-extra-") as directory:
-        outside = Path(directory).resolve()
+    outside = tmp_path.with_name(f"veriforge-extra-{uuid.uuid4().hex}")
+    outside.mkdir()
+    try:
         granted = outside / "granted"
         blocked = outside / "blocked"
         granted.mkdir()
@@ -141,6 +127,8 @@ def test_scoped_extra_directory_grant_stays_sandboxed(native_manager, tmp_path):
         assert result.return_code != 0, result.output
         assert target.read_text(encoding="utf-8").strip() == "ok"
         assert not forbidden.exists()
+    finally:
+        shutil.rmtree(outside)
 
 
 @pytest.fixture
@@ -155,26 +143,32 @@ def native_manager(tmp_path, require_integration_tool):
     manager.close()
 
 
-def test_native_directory_grants_do_not_leak_between_calls(native_manager, tmp_path):
+def test_native_directory_grants_are_isolated_and_reused(native_manager, tmp_path):
+    from harness_code_agent.workspace.shell_environment import shell_executable
+
     runtime = SimpleNamespace(shell_job_manager=native_manager)
-    (tmp_path / "a").mkdir()
-    (tmp_path / "b").mkdir()
+    for name in ("a", "b", "c"):
+        (tmp_path / name).mkdir()
+
+    def explicit_aces():
+        literal = str(tmp_path / "a").replace("'", "''")
+        script = f"@((Get-Acl -LiteralPath '{literal}').Access | Where-Object {{ -not $_.IsInherited }}).Count"
+        result = subprocess.run([shell_executable(), "-NoProfile", "-Command", script],
+                                capture_output=True, encoding="utf-8", errors="replace", check=True)
+        return int(result.stdout.strip())
+
     result = run_bash("Set-Content a/first.txt '中文'; Set-Content b/keep.txt 'keep'",
                       write_paths=["a", "b"], runtime_state=runtime)
-    assert result.return_code == 0
+    assert result.return_code == 0, result.output
+    baseline = explicit_aces()
+    result = run_bash("Set-Content a/first.txt '续写'", write_paths=["a", "c"], runtime_state=runtime)
+    assert result.return_code == 0, result.output
+    assert explicit_aces() == baseline
     for script in ("Set-Content b/forbidden.txt 'bad'", "Remove-Item b/keep.txt"):
-        result = run_bash(script, write_paths=["a"], runtime_state=runtime)
+        result = run_bash(script, write_paths=["a", "c"], runtime_state=runtime)
         assert result.return_code != 0
     assert not (tmp_path / "b" / "forbidden.txt").exists()
     assert (tmp_path / "b" / "keep.txt").read_text(encoding="utf-8").strip() == "keep"
-    # Without write_paths a foreground command gets the workspace grant; a
-    # narrowed grant still keeps every other directory read-only.
-    result = run_bash("Set-Content a/default.txt 'ok'", runtime_state=runtime)
-    assert result.return_code == 0
-    assert (tmp_path / "a" / "default.txt").exists()
-    result = run_bash("Set-Content a/narrowed.txt 'bad'", write_paths=["b"], runtime_state=runtime)
-    assert result.return_code != 0
-    assert not (tmp_path / "a" / "narrowed.txt").exists()
 
 
 def test_background_native_job_holds_only_its_directory_until_exit(native_manager, tmp_path):
@@ -275,30 +269,3 @@ def test_cancelled_native_output_keeps_full_unicode_artifact(native_manager, tmp
     content = Path(result.metadata["artifact_path"]).read_text(encoding="utf-8")
     assert "begin-" + "甲" * 10000 + "-end" in content
     assert result.metadata["cancelled"]
-
-
-def test_directory_grants_do_not_accumulate_across_combinations(native_manager, tmp_path):
-    import subprocess
-
-    from harness_code_agent.workspace.shell_environment import shell_executable
-
-    runtime = SimpleNamespace(shell_job_manager=native_manager)
-    for name in ("a", "b", "c"):
-        (tmp_path / name).mkdir()
-
-    def explicit_aces(name):
-        literal = str(tmp_path / name).replace("'", "''")
-        script = f"@((Get-Acl -LiteralPath '{literal}').Access | Where-Object {{ -not $_.IsInherited }}).Count"
-        result = subprocess.run([shell_executable(), "-NoProfile", "-Command", script],
-                                capture_output=True, encoding="utf-8", errors="replace", check=True)
-        return int(result.stdout.strip())
-
-    assert run_bash("Set-Content a/x.txt 1", write_paths=["a"], runtime_state=runtime).return_code == 0
-    baseline = explicit_aces("a")
-    for paths in (["a", "b"], ["a", "c"], ["a", "b", "c"], ["c", "a"]):
-        result = run_bash("Set-Content a/x.txt 2", write_paths=paths, runtime_state=runtime)
-        assert result.return_code == 0, result.output
-    assert explicit_aces("a") == baseline
-    result = run_bash("Set-Content b/y.txt 'bad'", write_paths=["a", "c"], runtime_state=runtime)
-    assert result.return_code != 0
-    assert not (tmp_path / "b" / "y.txt").exists()

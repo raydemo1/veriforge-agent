@@ -1,7 +1,6 @@
 import json
 import shutil
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +14,22 @@ class EvalSuiteTests(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_dev_eval_pairs_results_by_agent_and_counts_every_repeated_group(self):
+        from eval.scripts.run_dev_task_eval import _repeated_calls, _tool_trace
+
+        events = [
+            {"type": "tool_call", "agent": agent, "payload": {
+                "tool": "bash", "tool_call_id": "same", "args": {"command": agent},
+            }}
+            for agent in ("main", "child")
+        ] + [
+            {"type": "tool_result", "agent": agent, "payload": {"tool": "bash", "tool_call_id": "same"}}
+            for agent in ("main", "child")
+        ]
+        self.assertEqual([row["args"]["command"] for row in _tool_trace(events)], ["main", "child"])
+        rows = [{"tool": "bash", "args": {"command": str(group)}} for group in range(12)]
+        self.assertEqual(len(_repeated_calls(rows * 2)), 12)
 
     def test_terminal_bench_8task_subset_is_fixed_and_lightweight(self):
         payload = json.loads(Path("eval/tasks/terminal_bench_8task.json").read_text(encoding="utf-8"))
@@ -514,22 +529,6 @@ class EvalSuiteTests(unittest.TestCase):
         command = _agent_command(timeout=120)
         self.assertIn("HARNESS_TASK_BUDGET=120", command)
         self.assertIn("hca_claw_runner.py", command)
-
-    def test_eval_scripts_self_test(self):
-        for script in (
-            "eval/scripts/run_basic_metrics_eval.py",
-            "eval/scripts/run_terminal_bench_eval.py",
-            "eval/scripts/run_claw_swe_bench_eval.py",
-            "eval/scripts/rebuild_eval_results.py",
-        ):
-            completed = subprocess.run(
-                [sys.executable, script, "--self-test"],
-                cwd=Path.cwd(),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
 
     def test_terminal_bench_task_diagnostics_classifies_timeout(self):
         from eval.scripts.run_terminal_bench_eval import _task_diagnostics

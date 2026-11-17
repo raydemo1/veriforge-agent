@@ -338,12 +338,6 @@ class NormalizationTests(unittest.TestCase):
                 True,
             ),
             (
-                {"status_source": "resource", "resource_kind": "workspace_quota"},
-                FailureKind.QUOTA_EXCEEDED,
-                FailureCategory.RESOURCE,
-                False,
-            ),
-            (
                 {"status_source": "resource", "resource_kind": "free_disk"},
                 FailureKind.QUOTA_EXCEEDED,
                 FailureCategory.RESOURCE,

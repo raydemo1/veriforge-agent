@@ -13,7 +13,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, get_args
 
@@ -581,7 +581,7 @@ def _hash(*values: str) -> str:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _atomic_write(path: Path, text: str) -> None:

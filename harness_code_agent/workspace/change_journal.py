@@ -58,11 +58,10 @@ class WorkspaceChangeJournal:
 
 def _unique_paths(paths) -> tuple[Path, ...]:
     unique: list[Path] = []
-    seen: set[str] = set()
+    seen: set[Path] = set()
     for path in paths:
-        key = str(path).casefold()
-        if key in seen:
+        if path in seen:
             continue
-        seen.add(key)
+        seen.add(path)
         unique.append(path)
     return tuple(unique)

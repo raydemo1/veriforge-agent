@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from ._event_helpers import (
@@ -53,7 +53,7 @@ def build_final_report(
         "tool_counts": dict(_tool_counts(events)),
         "changed_files": _changed_files(events),
         "started_at": str(metadata.get("created_at", "")),
-        "ended_at": datetime.now(timezone.utc).isoformat(),
+        "ended_at": datetime.now(UTC).isoformat(),
     }
 
 

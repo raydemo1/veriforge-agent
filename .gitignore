@@ -42,6 +42,7 @@ pip-wheel-metadata/
 # Local logs and runtime output
 *.log
 logs/
+.harness/
 .veriforge/
 run_logs/
 outputs/

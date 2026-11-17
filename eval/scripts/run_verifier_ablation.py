@@ -13,14 +13,14 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[2]
 TASKS = ROOT / "eval" / "tasks" / "verifier_ablation.json"
-IMAGE = "veriforge-verifier-eval:local"
+IMAGE = "veriforge-verifier-eval:py314"
 PILOT_RUNTIME_REVISION = "b2391f303663549903b8d578f71da2016e0826d6"
 EXPERIMENT_GROUPS = {"verifier": ("A", "B", "C")}
 TEST_COMMAND = re.compile(
@@ -406,7 +406,7 @@ def build_image():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     packages = shlex.join([*project["project"]["dependencies"], "ruff"])
     dockerfile = (
-        f"FROM python:3.12-bookworm\nRUN pip install --no-cache-dir {packages}\n"
+        f"FROM python:3.14-bookworm\nRUN pip install --no-cache-dir {packages}\n"
     )
     subprocess.run(
         ["docker", "build", "-t", IMAGE, "-"], input=dockerfile, text=True, check=True
@@ -484,7 +484,7 @@ def main():
         / "results"
         / (
             args.experiment
-            + datetime.now(timezone.utc).strftime("-ablation-%Y%m%d-%H%M%S-%f")
+            + datetime.now(UTC).strftime("-ablation-%Y%m%d-%H%M%S-%f")
         )
     )
     run_root.mkdir(parents=True)

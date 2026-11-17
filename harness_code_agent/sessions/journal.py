@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .jsonl import append_record, read_records
 
 
 @dataclass(frozen=True)
@@ -72,20 +73,16 @@ class SessionJournal:
     def append(self, kind: str, payload: dict[str, Any]) -> JournalEntry:
         with self._lock:
             entry = JournalEntry(self._sequence + 1, kind, time.time(), copy.deepcopy(payload))
-            with self.path.open("a", encoding="utf-8", newline="\n") as handle:
-                handle.write(json.dumps(entry.__dict__, ensure_ascii=False) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            append_record(self.path, entry.__dict__, durable=True)
             self._sequence = entry.sequence
             return entry
 
     def read(self) -> list[JournalEntry]:
         entries = []
-        for line in self.path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for data in read_records(self.path, skip_invalid=True):
             try:
-                data = json.loads(line)
                 entries.append(JournalEntry(**data))
-            except (json.JSONDecodeError, TypeError):
+            except TypeError:
                 continue
         return entries
 
@@ -139,11 +136,7 @@ class SessionJournal:
         return messages[max(0, len(messages) - count)].sequence
 
     def _last_sequence(self) -> int:
-        try:
-            lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
-            return int(json.loads(lines[-1]).get("sequence", 0)) if lines else 0
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            return 0
+        return max((entry.sequence for entry in self.read()), default=0)
 
 
 def _json_safe(value: Any) -> Any:

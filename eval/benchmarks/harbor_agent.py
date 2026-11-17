@@ -38,13 +38,17 @@ from harbor.agents.installed.base import BaseInstalledAgent, with_prompt_templat
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
+from eval.benchmarks.container_python import (
+    CONTAINER_PYTHON,
+    PYTHON_STANDALONE_TARBALL,
+    bootstrap_python,
+)
 from eval.benchmarks.harbor_env import runner_env_vars
 from eval.benchmarks.usage_metrics import parse_eval_metrics_from_text
 
 log = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PYTHON_STANDALONE_TARBALL = "python-3.12.13-x86_64-unknown-linux-gnu.tar.gz"
 CONTAINER_PYTHON_TARBALL = f"/tmp/{PYTHON_STANDALONE_TARBALL}"
 DEFAULT_DEBIAN_APT_MIRROR = "http://mirrors.tuna.tsinghua.edu.cn"
 DEFAULT_UBUNTU_APT_MIRROR = "http://mirrors.tuna.tsinghua.edu.cn/ubuntu"
@@ -246,11 +250,9 @@ class HarnessAgent(BaseInstalledAgent):
         Strategy: never use apt-get for python (too slow/unreliable on Daytona).
         1. Ensure git exists (apt-get only for git, which is tiny and fast)
         2. Upload a lightweight repo snapshot (wheel deps, no runtime logs)
-        3. If no python3 → install standalone python from an uploaded tarball
-           or download it from GitHub (~34MB)
-        4. Install only the lightweight runtime deps needed by the headless
-           terminal runner. Avoid the full project install because eval/UI deps
-           make per-task container setup slow.
+        3. Install the dedicated Python 3.14 runtime from a vendored archive
+           or the pinned release download.
+        4. Install the project and its runtime dependencies from pyproject.toml.
         """
         # Step 1: Get the current local harness code into the container so evals
         # test this checkout, including uncommitted adapter/runtime changes.
@@ -281,113 +283,22 @@ class HarnessAgent(BaseInstalledAgent):
 
         await self.exec_as_root(environment, command=_pip_config_command())
 
-        # Step 3: Ensure python3 >= 3.11 (openai + pydantic v2 need it)
-        # Old containers ship Python 3.9/3.10 where import openai crashes
-        # on pydantic v2 or anyio incompatibilities. Check the actual version
-        # and install standalone 3.12 if it's too old or missing entirely.
         await self.exec_as_root(
             environment,
-            command=(
-                "NEED_INSTALL=0; "
-                "if command -v python3 >/dev/null 2>&1; then "
-                "  PY_VER=$(python3 -c 'import sys; print(sys.version_info[:2])' 2>/dev/null) && "
-                "  PY_MAJOR=$(python3 -c 'import sys; print(sys.version_info[0])' 2>/dev/null) && "
-                "  PY_MINOR=$(python3 -c 'import sys; print(sys.version_info[1])' 2>/dev/null) && "
-                "  echo \"python3 found: $(python3 --version) (parsed: $PY_MAJOR.$PY_MINOR)\" && "
-                "  if [ \"$PY_MAJOR\" -lt 3 ] 2>/dev/null || [ \"$PY_MINOR\" -lt 11 ] 2>/dev/null; then "
-                "    echo \"Python $PY_MAJOR.$PY_MINOR is too old (need >= 3.11), upgrading...\"; "
-                "    NEED_INSTALL=1; "
-                "  fi; "
-                "else "
-                "  echo 'No python3 found'; "
-                "  NEED_INSTALL=1; "
-                "fi; "
-                "if [ \"$NEED_INSTALL\" = \"1\" ]; then "
-                f"  VENDOR_TGZ={shlex.quote(CONTAINER_PYTHON_TARBALL)} && "
-                "  if [ -f \"$VENDOR_TGZ\" ]; then "
-                "    echo 'Installing standalone Python 3.12 from vendored tarball...' && "
-                "    cp \"$VENDOR_TGZ\" /tmp/python.tar.gz; "
-                "  else "
-                # Fallback: download from npmmirror (China) first, then GitHub.
-                # Stripped build (~34MB) vs full build (~111MB): agent runtime needs no debug symbols.
-                "    echo 'Installing standalone Python 3.12...' && "
-                "    URL_NPM='https://registry.npmmirror.com/-/binary/python-build-standalone/"
-                "20260623/cpython-3.12.13+20260623-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz' && "
-                "    URL_GH='https://github.com/astral-sh/python-build-standalone/releases/"
-                "download/20260623/cpython-3.12.13+20260623-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz' && "
-                "    ( curl -fsSL -o /tmp/python.tar.gz \"$URL_NPM\" 2>/dev/null || "
-                "      wget -q -O /tmp/python.tar.gz \"$URL_NPM\" 2>/dev/null || "
-                "      curl -fsSL -o /tmp/python.tar.gz \"$URL_GH\" 2>/dev/null || "
-                "      wget -q -O /tmp/python.tar.gz \"$URL_GH\" 2>/dev/null || "
-                f"      ( {_apt_get_install_command('curl')} 2>/dev/null && "
-                "        curl -fsSL -o /tmp/python.tar.gz \"$URL_NPM\" ) "
-                "    ); "
-                "  fi && "
-                "  mkdir -p /opt/python && "
-                "  tar -xzf /tmp/python.tar.gz -C /opt/python --strip-components=1 && "
-                # Symlink to /usr/local/bin so it shadows the old system python3
-                "  ln -sf /opt/python/bin/python3 /usr/local/bin/python3 && "
-                "  ln -sf /opt/python/bin/pip3 /usr/local/bin/pip3 && "
-                # Also update the bare 'python' command if it exists
-                "  ln -sf /opt/python/bin/python3 /usr/local/bin/python && "
-                "  rm -f /tmp/python.tar.gz \"$VENDOR_TGZ\" && "
-                # Force hash table refresh so bash picks up the new binary.
-                # IMPORTANT: keep `&&` (not `;`) so a failed download breaks the chain
-                # instead of being masked by the echo below. The trailing
-                # `command -v python3` guard turns a silent skip into a loud failure.
-                "  hash -r 2>/dev/null && "
-                "  echo \"standalone python installed: $(/usr/local/bin/python3 --version)\" && "
-                "  command -v python3 >/dev/null 2>&1 || { echo 'FATAL: python3 still missing after install'; exit 1; }; "
-                "else "
-                "  echo 'Python version OK, no upgrade needed'; "
-                "fi"
-            ),
+            command=bootstrap_python(CONTAINER_PYTHON_TARBALL),
+            timeout_sec=900,
         )
-
-        # Step 4: Install runtime dependencies. Keep this intentionally small:
-        # the agent's terminal profile needs the OpenAI stack plus psutil for
-        # shell job management. Full requirements.txt includes eval/UI/browser
-        # packages and can exceed Harbor's setup timeout inside every task.
         await self.exec_as_root(
             environment,
             command=(
-                "PYTHON=$(command -v python3); "
-                "$PYTHON -m ensurepip --upgrade >/dev/null 2>&1 || true; "
-                "$PYTHON -m pip install --break-system-packages --no-index --force-reinstall -q "
-                "  --find-links=/home/user/harness-agent/vendor_wheels openai && "
-                "( $PYTHON -m pip install --break-system-packages -q 'psutil>=5.9.8,<8' || "
-                "  $PYTHON -m pip install --break-system-packages -q "
-                "    -i https://pypi.org/simple 'psutil>=5.9.8,<8' ) && "
-                "$PYTHON -c 'import openai, psutil' || "
-                "( SITE=$($PYTHON -c 'import site; print(site.getsitepackages()[0])') && "
-                "  mkdir -p \"$SITE\" && "
-                "  for whl in /home/user/harness-agent/vendor_wheels/*.whl; do "
-                "    $PYTHON -m zipfile -e \"$whl\" \"$SITE\" 2>/dev/null; "
-                "  done && "
-                "  $PYTHON -m pip install --break-system-packages -q 'psutil>=5.9.8,<8' && "
-                "  $PYTHON -c 'import openai, psutil; print(\"minimal harness deps installed\")' ) || "
-                "( command -v apt-get >/dev/null 2>&1 && "
-                f"  {_apt_get_install_command('python3-psutil')} && "
-                "  $PYTHON -c 'import openai, psutil' ) || "
-                "( echo 'FATAL: failed to install harness dependencies'; exit 1 )"
+                f"{CONTAINER_PYTHON} -m ensurepip --upgrade && "
+                f"({CONTAINER_PYTHON} -m pip install -q "
+                "--find-links=/home/user/harness-agent/vendor_wheels /home/user/harness-agent || "
+                f"{CONTAINER_PYTHON} -m pip install -q -i https://pypi.org/simple "
+                "--find-links=/home/user/harness-agent/vendor_wheels /home/user/harness-agent) || "
+                "{ echo 'FATAL: failed to install harness dependencies'; exit 1; }"
             ),
-        )
-
-        # Step 4b: The terminal runtime imports these modules at startup
-        # (tool schemas, memory database, shell parser). Keep the list aligned
-        # with the runtime dependencies in pyproject.toml; eval/UI/browser
-        # extras stay out so task setup remains bounded.
-        await self.exec_as_root(
-            environment,
-            command=(
-                "PYTHON=$(command -v python3); "
-                "$PYTHON -m pip install --break-system-packages -q "
-                "'jsonschema>=4.23,<5' 'sqlite-vec>=0.1.9,<0.2' "
-                "'mcp>=1.0,<2' 'pygls>=2.1,<3' 'watchfiles>=1.1,<2' "
-                "'tree-sitter>=0.25,<0.27' 'tree-sitter-bash>=0.25,<0.26' && "
-                "$PYTHON -c 'import jsonschema, sqlite_vec, mcp, pygls, watchfiles, "
-                "tree_sitter, tree_sitter_bash; print(\"runtime deps ok\")'"
-            ),
+            timeout_sec=900,
         )
 
         # Step 5: Provide the verifier's uv bootstrap without GitHub. The
@@ -399,7 +310,7 @@ class HarnessAgent(BaseInstalledAgent):
         await self.exec_as_root(
             environment,
             command=(
-                "PYTHON=$(command -v python3); "
+                f"PYTHON={CONTAINER_PYTHON}; "
                 "$PYTHON -m pip install --break-system-packages -q 'uv==0.9.5' && "
                 "SCRIPTS=$($PYTHON -c 'import sysconfig; print(sysconfig.get_path(\"scripts\"))') && "
                 "mkdir -p /root/.local/bin && "
@@ -452,7 +363,7 @@ class HarnessAgent(BaseInstalledAgent):
                 "  export no_proxy=\"${no_proxy:+$no_proxy,}${HCA_MODEL_API_NO_PROXY_HOSTS}\"; "
                 "fi && "
                 f"PYTHONPATH=/home/user/harness-agent "
-                f"python3 /home/user/harness-agent/eval/benchmarks/hca_terminal_runner.py "
+                f"{CONTAINER_PYTHON} /home/user/harness-agent/eval/benchmarks/hca_terminal_runner.py "
                 f"--workspace \"$WORKSPACE\"{task_name_arg} {escaped}"
             ),
             env=env_vars,
@@ -474,7 +385,15 @@ def _copy_repo_snapshot(source: Path, dest: Path) -> None:
         for name in names:
             item = current / name
             rel = item.relative_to(source).as_posix()
-            if name in {".git", ".pytest_cache", "__pycache__"} or name == ".harbor" and current == source or name == ".veriforge" and current == source or name == "jobs" and current == source or name == "workspace" and current == source or rel == "eval/results" or _is_vendored_python_tarball(rel) or name == ".env" or name.startswith(".env.") or name.endswith(".pyc"):
+            if (
+                name in {".git", ".pytest_cache", "__pycache__", "node_modules"}
+                or current == source and name in {".harbor", ".harness", ".venv", ".veriforge", "jobs", "workspace"}
+                or rel == "eval/results"
+                or _is_vendored_python_tarball(rel)
+                or name == ".env"
+                or name.startswith(".env.")
+                or name.endswith(".pyc")
+            ):
                 ignored.add(name)
         return ignored
 

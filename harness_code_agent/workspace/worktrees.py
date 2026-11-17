@@ -6,6 +6,7 @@ import difflib
 import json
 import shutil
 import subprocess
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -105,25 +106,40 @@ class WorktreeService:
         return result
 
     def create(self, session_id: str):
-        destination = self.state_root / "worktrees" / session_id
-        with self.access.acquire([self.access.write_claim()], current_token.get()):
+        destination = self._destination(session_id)
+        with self.access.acquire([self.access.write_claim()], current_token.get()), ExitStack() as cleanup:
             files = self._files(self.project)
             self._git(self.project, "worktree", "add", "--detach", str(destination), "HEAD")
+            cleanup.callback(self.remove_created, session_id)
             tracked = self._git(destination, "ls-files", "-z").decode("utf-8").split("\0")
             for name in filter(None, tracked):
                 if name not in files:
                     (destination / name).unlink(missing_ok=True)
-            for name in files:
+            for name, data in files.items():
                 path = destination / name
                 if path.is_symlink():
                     path.unlink()
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.resolve().relative_to(destination.resolve())
-                shutil.copy2(self.project / name, path)
+                path.write_bytes(data)
+                shutil.copystat(self.project / name, path)
             baseline = {name: self.blobs._put_blob(data) for name, data in files.items()}
             descriptor = {"root": str(destination), "project": str(self.project), "baseline": baseline}
             atomic_json(self.state_root / "worktrees" / "environments" / f"{session_id}.json", descriptor)
+            cleanup.pop_all()
         return destination
+
+    def _destination(self, session_id: str) -> Path:
+        parent = self.state_root / "worktrees"
+        destination = parent / session_id
+        if destination.name != session_id or destination.parent != parent or destination.resolve() != destination:
+            raise ValueError(f"Invalid worktree id: {session_id}")
+        return destination
+
+    def remove_created(self, session_id: str) -> None:
+        destination = self._destination(session_id)
+        self._git(self.project, "worktree", "remove", "--force", "--", str(destination))
+        (self.state_root / "worktrees" / "environments" / f"{session_id}.json").unlink(missing_ok=True)
 
     def apply(self, session_id, *, turn_id="worktree-apply", approved=None):
         from .merge import git_merge_text

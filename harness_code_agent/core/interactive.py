@@ -191,11 +191,18 @@ class InteractiveSession:
         try:
             self.startup_sink = startup_sink
             self._report_startup("checking workspace")
-            validate_shell_configuration()
             self.stream_sink = stream_sink or stream_callback
             self.event_listener = event_listener
+            self.session_store = SessionStore(self.state_root)
+            saved = None
+            if session_id and (self.session_store._session_root(session_id) / "session.json").exists():
+                saved = self.session_store.read_metadata(session_id)
             self.permission_mode = os.environ.get("HARNESS_PERMISSION_MODE", "workspace-write")
+            if saved:
+                self.permission_mode = saved.get("permission_mode", self.permission_mode)
+                self.model_selection.select(**saved.get("model_selection", {}))
             PermissionPolicy(mode=self.permission_mode)
+            validate_shell_configuration(sandboxed=self.permission_mode != PermissionPolicy.DANGER_FULL_ACCESS)
             self._manual_approval_provider = approval_provider or ConsoleApprovalProvider()
             self.approval_provider = self._approval_provider_for_mode(self.permission_mode)
             self.question_provider = question_provider or ConsoleQuestionProvider()
@@ -213,17 +220,6 @@ class InteractiveSession:
             self.skill_registry = SkillRegistry()
             self._slash_registry = None
             self.last_command_result = None
-            self.session_store = SessionStore(self.state_root)
-            self.session_store.root.mkdir(parents=True, exist_ok=True)
-            saved = None
-            if session_id and (self.session_store.sessions_dir / session_id / "session.json").exists():
-                saved = self.session_store.read_metadata(session_id)
-                # Older sessions recorded a task profile and routing mode.
-                # They are still readable history; they no longer drive
-                # behaviour, so nothing here restores or validates them.
-                self.permission_mode = saved.get("permission_mode", self.permission_mode)
-                self.approval_provider = self._approval_provider_for_mode(self.permission_mode)
-                self.model_selection.select(**saved.get("model_selection", {}))
             self.session: Session | None = None
             self.attachment_manager: AttachmentManager | None = None
             self.event_bus = None
@@ -488,7 +484,7 @@ class InteractiveSession:
                 self.recovery.begin_turn(
                     session_id=self.session.id, turn=self.turn_count - 1,
                     journal_sequence=self.conversation.journal.sequence,
-                    event_count=len(self.session_store.read_events(self.session.id)),
+                    event_count=self.event_bus.event_count,
                     permission_mode=self.permission_mode,
                     model_selection={"model": self.model_selection.model, "reasoning_effort": self.model_selection.reasoning_effort},
                 )
@@ -514,7 +510,7 @@ class InteractiveSession:
                 metadata["title"] = metadata.get("title") or (self.last_user_task.splitlines()[0][:48] if self.last_user_task else "新会话")
                 metadata["history_boundary"] = {
                     "turn": self.turn_count, "journal_sequence": self.conversation.journal.sequence,
-                    "event_count": len(self.session_store.read_events(self.session.id)),
+                    "event_count": self.event_bus.event_count,
                     "change_cursor": self.tool_context.workspace.access.cursor(),
                 }
                 if status == "completed" and not self.tool_context.tool_tasks.pending_foreground_count:
@@ -868,7 +864,7 @@ class InteractiveSession:
             session_id=self.session.id,
             turn=self.turn_count,
             journal_sequence=self.conversation.journal.sequence,
-            event_count=len(self.session_store.read_events(self.session.id)),
+            event_count=self.event_bus.event_count,
         )
         metadata = self.session_store.read_metadata(self.session.id)
         point.update(permission_mode=self.permission_mode,
@@ -1237,15 +1233,16 @@ class InteractiveSession:
         previous = self.permission_mode
         if previous == permission_mode:
             return f"permission mode already active: {permission_mode}"
+        approval_provider = self._approval_provider_for_mode(permission_mode)
+        if self.session is not None:
+            self.session_store.update_permission_mode(self.session.id, permission_mode)
         self.permission_mode = permission_mode
-        self.approval_provider = self._approval_provider_for_mode(permission_mode)
+        self.approval_provider = approval_provider
         if self.tool_context is not None:
             self._apply_permission_policy()
             self.tool_context.approval_provider = self.approval_provider
         if self.conversation is not None and getattr(self.conversation, "runtime_state", None) is not None:
             self.conversation.runtime_state.permission_mode = permission_mode
-        if self.session is not None:
-            self.session_store.update_permission_mode(self.session.id, permission_mode)
         if self.event_bus is not None:
             self.event_bus.emit(
                 "permission_mode_switched",
@@ -1608,7 +1605,7 @@ class InteractiveSession:
                 metadata.update(checkpoint=point,
                                 permission_mode=point["permission_mode"], model_selection=point["model_selection"],
                                 history_boundary={"turn": point["turn"], "journal_sequence": replacement.journal.sequence,
-                                                      "event_count": len(self.session_store.read_events(self.session.id)),
+                                                      "event_count": self.event_bus.event_count,
                                                       "change_cursor": point["change_cursor"]})
                 metadata["fork_boundary"] = dict(metadata["history_boundary"])
                 atomic_json(self.session.metadata_path, metadata)
@@ -1652,8 +1649,10 @@ class InteractiveSession:
         limit = _env_int("HARNESS_TURN_INLINE_CHAR_LIMIT", TURN_INLINE_CHAR_LIMIT)
         if limit <= 0 or len(text) <= limit:
             return text
-        path = self._write_turn_input_file(label, text)
-        digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+        data = text.encode("utf-8")
+        path = self._write_turn_input_file(label, data)
+        digest = hashlib.sha256(data).hexdigest()
+        self.tool_context.register_output_artifact({"path": path.as_posix(), "sha256": digest})
         head, tail = _head_tail(text, TURN_EXCERPT_CHARS)
         return (
             "[EXTERNALIZED TURN CONTENT]\n"
@@ -1693,7 +1692,7 @@ class InteractiveSession:
             updated.append(replace(item, content=replacement, metadata=metadata))
         return updated
 
-    def _write_turn_input_file(self, label: str, text: str) -> Path:
+    def _write_turn_input_file(self, label: str, data: bytes) -> Path:
         if self.session is None:
             raise RuntimeError("Cannot externalize turn input before the session is bound.")
         safe_label = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in label) or "input"
@@ -1704,11 +1703,8 @@ class InteractiveSession:
         while path.exists():
             path = inputs_dir / f"turn-{self.turn_count + 1:04d}-{safe_label}-{suffix}.txt"
             suffix += 1
-        path.write_text(text, encoding="utf-8")
+        path.write_bytes(data)
         return path
-
-    def _append_conversation_message(self, message: dict) -> None:
-        self.conversation._append_message(message)
 
     def _suspend_blocker(self) -> str | None:
         coordinator = self.tool_context.agent_coordinator

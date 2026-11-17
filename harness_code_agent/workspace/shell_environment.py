@@ -20,8 +20,9 @@ def shell_executable():
     return path
 
 
-def validate_shell_configuration():
-    shell_executable()
-    if os.name == "nt":
+def validate_shell_configuration(*, sandboxed: bool):
+    if os.name == "nt" and sandboxed:
         from .native_shell import validate_native_shell
         validate_native_shell()
+    else:
+        shell_executable()

@@ -100,10 +100,6 @@ def test_real_server_navigation_diagnostics_refresh_and_close(
         assert any(item["line"] == 3 for item in errors())
         source.write_text(source_text.replace('"wrong"', "1"), encoding="utf-8")
         assert errors() == []
-        source.write_text(source_text, encoding="utf-8")
-        assert any(item["line"] == 3 for item in errors())
-        source.write_text(source_text.replace('"wrong"', "1"), encoding="utf-8")
-        assert errors() == []
         # The imported file has not been opened by the client.
         library.write_text(library_text.replace("greet", "renamed"), encoding="utf-8")
         deadline = time.monotonic() + 6

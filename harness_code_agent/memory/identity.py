@@ -16,7 +16,7 @@ def resolve_repo_key(workspace: Path) -> str:
     try:
         proc = subprocess.run(
             ["git", "rev-parse", "--git-common-dir"], cwd=workspace,
-            capture_output=True, text=True, check=True,
+            capture_output=True, encoding="utf-8", check=True,
             timeout=GIT_IDENTITY_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL,
             env=_noninteractive_git_env(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )

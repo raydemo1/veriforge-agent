@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import posixpath
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from ..runtime.approvals import ApprovalRequest
@@ -66,7 +66,7 @@ class ApprovalAllowlist:
                 "write_paths": list(scope),
                 "permissions": permissions,
                 "command": command,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now(UTC).isoformat(),
             }
         )
         self._write(data)

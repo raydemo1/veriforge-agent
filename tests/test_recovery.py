@@ -11,6 +11,14 @@ import pytest
 from harness_code_agent.runtime.questions import QuestionResult
 from harness_code_agent.runtime.recovery import (
     RecoveryStore,
+    atomic_bytes,
+    atomic_json,
+)
+from harness_code_agent.sessions.journal import SessionJournal
+from harness_code_agent.sessions.store import SessionStore
+from harness_code_agent.workspace.access import (
+    WorkspaceAccessCoordinator,
+    WorkspaceConflict,
 )
 
 
@@ -39,11 +47,51 @@ class RecoveryStoreTests(unittest.TestCase):
                 store.blob(digest)
 
 
-from harness_code_agent.runtime.recovery import atomic_bytes
-from harness_code_agent.workspace.access import (
-    WorkspaceAccessCoordinator,
-    WorkspaceConflict,
-)
+@pytest.mark.parametrize("torn_tail", [False, True])
+def test_session_logs_reopen_and_append_with_unicode_and_an_unterminated_tail(tmp_path, torn_tail):
+    store = SessionStore(tmp_path / "state")
+    session = store.create(cwd=tmp_path, model="test", permission_mode="read-only")
+    journal = SessionJournal(session.journal_path)
+    bus = store.event_bus(session)
+    text = "one\u2028two\u2029three\x85four"
+    journal.append("entry", {"text": text})
+    bus.emit("entry", payload={"text": text})
+    for path in (session.journal_path, session.events_path):
+        previous = path.read_bytes()
+        path.write_bytes(previous + b'{"sequence": 2, "text":"\xe4\xb8' if torn_tail else previous.rstrip(b"\n"))
+
+    assert store.read_events(session.id)[0]["payload"]["text"] == text
+    bus = store.event_bus(session)
+    journal = SessionJournal(session.journal_path)
+    assert bus.event_count == journal.sequence == 1
+    assert bus.emit("next").sequence == journal.append("next", {}).sequence == 2
+    assert [entry.kind for entry in journal.read()] == ["entry", "next"]
+    assert [entry["type"] for entry in store.read_events(session.id)] == ["entry", "next"]
+    assert bus.event_count == 2
+
+
+def test_fork_validates_the_stable_prefix_before_creating_a_branch(tmp_path):
+    store = SessionStore(tmp_path / "state")
+    session = store.create(cwd=tmp_path, model="test", permission_mode="read-only")
+    journal = SessionJournal(session.journal_path)
+    journal.append("user_input", {"text": "stable"})
+    bus = store.event_bus(session)
+    bus.emit("stable")
+    metadata = store.read_metadata(session.id)
+    metadata["fork_boundary"] = {"journal_sequence": 2, "event_count": 1}
+    atomic_json(session.metadata_path, metadata)
+
+    with pytest.raises(ValueError, match="分支边界"):
+        store.fork(session.id)
+    assert len(store.list_sessions()) == 1
+
+    metadata["fork_boundary"]["journal_sequence"] = 1
+    atomic_json(session.metadata_path, metadata)
+    with session.journal_path.open("ab") as handle:
+        handle.write(b'{"sequence": 2, ')
+    branch = store.fork(session.id)
+    assert SessionJournal(branch.journal_path).read() == journal.read()
+    assert store.read_events(branch.id) == store.read_events(session.id)
 
 
 @pytest.mark.session

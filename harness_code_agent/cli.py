@@ -52,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("task", nargs="*", help="Optional first task to submit after startup")
     parser.add_argument("-p", "--print", dest="print_mode", action="store_true",
         help="Execute one task headlessly and print results")
+    parser.add_argument("--setup-tui", action="store_true", help="Install OpenTUI's Bun dependencies")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     parser.add_argument("--no-alt-screen", action="store_true",
         help="Keep the OpenTUI frontend in the main terminal screen")
@@ -60,6 +61,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--icons", choices=("auto", "nerd", "unicode"),
         default=os.environ.get("VERIFORGE_ICONS", "auto"), help="OpenTUI icon set")
     args = parser.parse_args(argv)
+    if args.setup_tui:
+        from .opentui_launcher import setup_tui
+
+        return setup_tui()
     is_tty = _is_interactive_tty()
 
     from .core.logging_config import setup_logging

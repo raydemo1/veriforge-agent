@@ -17,6 +17,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from eval.benchmarks.container_python import (
+    CONTAINER_PYTHON,
+    PYTHON_STANDALONE_TARBALL,
+    bootstrap_python,
+)
+
 try:
     from claw_swebench.claws.base import BaseClawAdapter
     from claw_swebench.types import AgentResult
@@ -44,10 +50,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONTAINER_REPO = "/opt/harness-code-agent"
 CONTAINER_PROMPT = "/tmp/hca_claw_prompt.txt"
 RUNNER = f"{CONTAINER_REPO}/eval/benchmarks/hca_claw_runner.py"
-DEFAULT_PYTHON_URL = (
-    "https://github.com/astral-sh/python-build-standalone/releases/download/"
-    "20250604/cpython-3.12.11+20250604-x86_64-unknown-linux-gnu-install_only.tar.gz"
-)
 
 FORWARDED_ENV_PREFIXES = (
     "HARNESS_",
@@ -75,6 +77,7 @@ class HarnessCodeAgentAdapter(BaseClawAdapter):
         super().__init__(model=model, timeout=timeout, max_turns=max_turns)
         self.repo_root = Path(repo_root or os.environ.get("HARNESS_CLAW_AGENT_REPO") or PROJECT_ROOT).resolve()
         self.install_deps = install_deps
+        self.python = CONTAINER_PYTHON if install_deps else "python3.14"
 
     def container_run_args(self, instance_id: str) -> list[str]:
         args = ["-v", f"{_docker_path(self.repo_root)}:{CONTAINER_REPO}:ro"]
@@ -154,7 +157,7 @@ class HarnessCodeAgentAdapter(BaseClawAdapter):
                 stderr_path=stderr_path,
             )
 
-        command = _agent_command(timeout=self.timeout)
+        command = _agent_command(timeout=self.timeout, python=self.python)
         started = time.perf_counter()
         timed_out = False
         try:
@@ -190,7 +193,7 @@ class HarnessCodeAgentAdapter(BaseClawAdapter):
         )
 
     def collect_usage(self, workspace, artifact_dir: Path) -> dict:
-        usage_result = workspace.run_in_container(_usage_command(), timeout=120)
+        usage_result = workspace.run_in_container(_usage_command(python=self.python), timeout=120)
         usage: dict[str, Any] = {}
         if usage_result.exit_code == 0 and usage_result.stdout.strip():
             try:
@@ -217,7 +220,7 @@ class HarnessCodeAgentAdapter(BaseClawAdapter):
         return usage
 
 
-def _agent_command(*, timeout: int) -> str:
+def _agent_command(*, timeout: int, python: str = CONTAINER_PYTHON) -> str:
     env = {
         "PYTHONPATH": CONTAINER_REPO,
         "HARNESS_WORKSPACE": "/testbed",
@@ -229,52 +232,31 @@ def _agent_command(*, timeout: int) -> str:
         "HARNESS_TASK_BUDGET": str(timeout),
     }
     prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
-    return f"cd /testbed && {prefix} python3 {shlex.quote(RUNNER)} {shlex.quote(CONTAINER_PROMPT)}"
+    return f"cd /testbed && {prefix} {shlex.quote(python)} {shlex.quote(RUNNER)} {shlex.quote(CONTAINER_PROMPT)}"
 
 
 def _bootstrap_command() -> str:
-    python_url = os.environ.get("HARNESS_CLAW_PYTHON_URL", DEFAULT_PYTHON_URL)
+    provision = bootstrap_python(
+        f"{CONTAINER_REPO}/vendor_wheels/{PYTHON_STANDALONE_TARBALL}",
+        download_url=os.environ.get("HARNESS_CLAW_PYTHON_URL"),
+    )
     return f"""
 set -e
-need_python=0
-if command -v python3 >/dev/null 2>&1; then
-  python3 - <<'PY' || need_python=1
-import sys
-raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
-PY
-else
-  need_python=1
-fi
-if [ "$need_python" = "1" ]; then
-  (command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq curl)) >/dev/null 2>&1 || true
-  (curl -fsSL -o /tmp/hca-python.tar.gz {shlex.quote(python_url)} || wget -q -O /tmp/hca-python.tar.gz {shlex.quote(python_url)})
-  mkdir -p /opt/hca-python
-  tar -xzf /tmp/hca-python.tar.gz -C /opt/hca-python --strip-components=1
-  ln -sf /opt/hca-python/bin/python3 /usr/local/bin/python3
-  ln -sf /opt/hca-python/bin/pip3 /usr/local/bin/pip3
-  ln -sf /opt/hca-python/bin/python3 /usr/local/bin/python
-fi
-python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
-# Dependency versions live in pyproject.toml.  The repo is mounted read-only and
-# a build may still write metadata next to the sources, so the tree is copied to
-# a writable directory first; --no-build-isolation keeps the container's own
-# setuptools instead of downloading one.
-rm -rf /tmp/hca-src && mkdir -p /tmp/hca-src && cp -a {CONTAINER_REPO}/. /tmp/hca-src/
-if python3 -m pip install --break-system-packages -q --no-build-isolation /tmp/hca-src; then
-  python3 -c 'import harness_code_agent, openai, psutil'
-else
-  echo "full install failed; installing the minimal dependency set" >&2
-  python3 -m pip install --break-system-packages --no-index --find-links={CONTAINER_REPO}/vendor_wheels -q openai &&
-  python3 -m pip install --break-system-packages -q psutil
-  python3 -c 'import openai, psutil'
-fi
+command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq curl)
+{provision}
+{CONTAINER_PYTHON} -m ensurepip --upgrade
+# Build from a writable snapshot of the package files because the repo mount is read-only.
+source_dir=$(mktemp -d)
+trap 'rm -rf "$source_dir"' EXIT
+cp -a {CONTAINER_REPO}/pyproject.toml {CONTAINER_REPO}/README.md {CONTAINER_REPO}/harness_code_agent "$source_dir/"
+{CONTAINER_PYTHON} -m pip install -q --find-links={CONTAINER_REPO}/vendor_wheels "$source_dir"
 """.strip()
 
 
-def _usage_command() -> str:
+def _usage_command(*, python: str = CONTAINER_PYTHON) -> str:
     return f"""
 cd /testbed
-PYTHONPATH={shlex.quote(CONTAINER_REPO)} python3 - <<'PY'
+PYTHONPATH={shlex.quote(CONTAINER_REPO)} {shlex.quote(python)} - <<'PY'
 import json
 from pathlib import Path
 from harness_code_agent.sessions.observability import build_session_observability

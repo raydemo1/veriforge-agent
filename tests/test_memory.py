@@ -9,7 +9,7 @@ from harness_code_agent.memory import (
     MemoryService,
     MemoryWriteCommand,
 )
-from harness_code_agent.memory.reconciliation import CurrentMemoryView
+from harness_code_agent.memory.vectors import DIMENSIONS, SiliconFlowEmbeddings
 from harness_code_agent.runtime.builtins.memory_tools import (
     memory_forget,
     memory_read,
@@ -58,19 +58,15 @@ def test_tool_requires_original_user_quote_and_preserves_version_history(tmp_pat
     assert record.evidence[0]["content_hash"] == hashlib.sha256(text.encode()).hexdigest()
 
 
-class UnavailableVectors:
-    def __init__(self, database):
-        pass
-
-    def search(self, query, *, limit):
+@pytest.fixture
+def unavailable_embeddings(monkeypatch):
+    def embed(self, texts):
         raise OSError("offline")
-
-    def pending(self):
-        return 0
+    monkeypatch.setattr(SiliconFlowEmbeddings, "embed", embed)
 
 
-def test_expired_matches_do_not_crowd_out_active_lexical_result(tmp_path):
-    service = MemoryService(tmp_path, vector_factory=UnavailableVectors)
+def test_expired_matches_do_not_crowd_out_active_lexical_result(tmp_path, unavailable_embeddings):
+    service = MemoryService(tmp_path)
     store = service.stores["project"]
     ref = EvidenceReference("manual", 1, "manual", "a" * 64)
     with store.connect(write=True) as db:
@@ -82,14 +78,14 @@ def test_expired_matches_do_not_crowd_out_active_lexical_result(tmp_path):
         # Make the valid item rank after every expired match, independent of random IDs.
         db.execute("UPDATE memory_search SET terms='needle'")
         db.execute("UPDATE memory_search SET terms=? WHERE memory_id=?", ("needle " + "extra " * 100, record.id))
-    page = CurrentMemoryView(store, vectors=UnavailableVectors(store)).search("needle")
+    page = service.views["project"].search("needle")
     assert [item["id"] for item in page["items"]] == [record.id]
     assert page["semantic_status"] == "OSError"
 
 
 @pytest.mark.parametrize("scope", ["project", "both"])
-def test_small_search_page_advances_and_stays_within_budget(tmp_path, scope):
-    service = MemoryService(tmp_path, vector_factory=UnavailableVectors)
+def test_small_search_page_advances_and_stays_within_budget(tmp_path, scope, unavailable_embeddings):
+    service = MemoryService(tmp_path)
     ref = EvidenceReference("manual", 1, "manual", "a" * 64)
     for index in range(2):
         service.write(MemoryWriteCommand(topic="build", fact_key=str(index), kind="convention",
@@ -106,6 +102,38 @@ def test_small_search_page_advances_and_stays_within_budget(tmp_path, scope):
             break
         offset = project_page["next_offset"]
     assert len(seen) == 2
+
+
+@pytest.mark.parametrize("offline", [False, True])
+def test_both_memory_scopes_share_one_embedding_request(tmp_path, monkeypatch, offline):
+    requests = []
+
+    def embed(self, texts):
+        requests.append(texts)
+        vector = [1.0, *([0.0] * (DIMENSIONS - 1))]
+        return [vector for _ in texts], {"usage": {"total_tokens": 1}}
+
+    monkeypatch.setattr(SiliconFlowEmbeddings, "embed", embed)
+    service = MemoryService(tmp_path)
+    ref = EvidenceReference("manual", 1, "manual", "a" * 64)
+    for store in service.stores.values():
+        with store.connect(write=True) as db:
+            store._write(db, topic="build", fact_key="command", kind="preference", body="needle", evidence=[ref])
+    for vectors in service.vectors.values():
+        assert vectors.sync()["indexed"] == 1
+    requests.clear()
+
+    if offline:
+        def fail(self, texts):
+            requests.append(texts)
+            raise OSError("offline")
+        monkeypatch.setattr(SiliconFlowEmbeddings, "embed", fail)
+    result = service.search("needle")
+    assert requests == [["needle"]]
+    assert {item["scope"] for item in result["items"]} == {"project", "user"}
+    assert {page["semantic_status"] for page in result["pages"]} == {"OSError" if offline else "ready"}
+    with service.stores["project"].connect() as db:
+        assert db.execute("SELECT COUNT(*) FROM embedding_calls WHERE purpose='query'").fetchone()[0] == 1
 
 
 def test_memory_service_enabled_is_session_state_not_environment(tmp_path, monkeypatch):

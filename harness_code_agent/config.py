@@ -256,13 +256,7 @@ SHELL_JOB_EXIT_DRAIN_SECONDS = _finite_seconds("HARNESS_SHELL_JOB_EXIT_DRAIN_SEC
 SHELL_JOB_TERMINATION_CONFIRM_SECONDS = _finite_seconds("HARNESS_SHELL_JOB_TERMINATION_CONFIRM_SECONDS", 3.0)
 SHELL_JOB_READER_JOIN_SECONDS = _finite_seconds("HARNESS_SHELL_JOB_READER_JOIN_SECONDS", 5.0)
 
-# --- Workspace write quota ---
-# Cumulative structured writes (write_file/apply_patch) allowed per session;
-# 0 disables the quota.  Writes also fail when free disk space drops below
-# HARNESS_MIN_FREE_DISK_MB.
-WORKSPACE_WRITE_QUOTA_BYTES = (
-    int(os.environ.get("HARNESS_WORKSPACE_WRITE_QUOTA_MB", "0")) * 1024 * 1024
-)
+# --- Minimum free disk space for structured writes ---
 MIN_FREE_DISK_BYTES = int(os.environ.get("HARNESS_MIN_FREE_DISK_MB", "100")) * 1024 * 1024
 
 # --- Shell process resource limits ---

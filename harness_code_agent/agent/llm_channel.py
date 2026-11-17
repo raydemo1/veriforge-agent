@@ -79,7 +79,7 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
         return None
     if target.tzinfo is None:
         return None
-    delta = (target - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    delta = (target - datetime.datetime.now(datetime.UTC)).total_seconds()
     return min(max(0.0, delta), _RETRY_AFTER_CAP_SECONDS)
 
 

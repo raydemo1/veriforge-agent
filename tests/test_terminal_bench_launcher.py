@@ -182,7 +182,8 @@ class TerminalBenchLauncherTests(unittest.TestCase):
             (repo_root / "harness_code_agent" / "__init__.py").write_text("", encoding="utf-8")
             (repo_root / "vendor_wheels").mkdir()
             (repo_root / "vendor_wheels" / "openai-1.0.0-py3-none-any.whl").write_text("wheel", encoding="utf-8")
-            (repo_root / "vendor_wheels" / "python-3.12.13-x86_64-unknown-linux-gnu.tar.gz").write_text(
+            python_archive = Path("vendor_wheels") / harbor_agent.PYTHON_STANDALONE_TARBALL
+            (repo_root / python_archive).write_text(
                 "large runtime archive",
                 encoding="utf-8",
             )
@@ -193,16 +194,20 @@ class TerminalBenchLauncherTests(unittest.TestCase):
             (repo_root / "eval" / "results" / "old-run").mkdir(parents=True)
             (repo_root / "eval" / "results" / "old-run" / "summary.json").write_text("{}", encoding="utf-8")
             (repo_root / ".env").write_text("SECRET=1\n", encoding="utf-8")
+            (repo_root / ".venv").mkdir()
+            (repo_root / "frontend" / "node_modules").mkdir(parents=True)
 
             harbor_agent._copy_repo_snapshot(repo_root, snapshot)
 
             self.assertTrue((snapshot / "harness_code_agent" / "__init__.py").exists())
             self.assertTrue((snapshot / "vendor_wheels" / "openai-1.0.0-py3-none-any.whl").exists())
-            self.assertFalse((snapshot / "vendor_wheels" / "python-3.12.13-x86_64-unknown-linux-gnu.tar.gz").exists())
+            self.assertFalse((snapshot / python_archive).exists())
             self.assertFalse((snapshot / ".veriforge").exists())
             self.assertFalse((snapshot / ".harbor").exists())
             self.assertFalse((snapshot / "eval" / "results").exists())
             self.assertFalse((snapshot / ".env").exists())
+            self.assertFalse((snapshot / ".venv").exists())
+            self.assertFalse((snapshot / "frontend" / "node_modules").exists())
         finally:
             shutil.rmtree(repo_root, ignore_errors=True)
             shutil.rmtree(dest_parent, ignore_errors=True)

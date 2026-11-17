@@ -37,14 +37,15 @@ class CurrentMemoryView:
         self.vectors = vectors or VectorIndex(database)
 
     def search(self, query: str, *, limit: int = 10, offset: int = 0, max_tokens: int = 2000,
-               applicability: str | None = None, paths: list[str] | None = None, kind: str | None = None) -> dict:
+               applicability: str | None = None, paths: list[str] | None = None, kind: str | None = None,
+               embedding_errors: dict[tuple[str, str], Exception] | None = None) -> dict:
         if not 1 <= limit <= 50 or not 0 <= offset < 400 or not 512 <= max_tokens <= 8000:
             raise ValueError("invalid memory page or token budget")
         if not query.strip() or len(query) > 4096 or contains_secret(query):
             raise ValueError("invalid memory query")
         status, semantic = "ready", []
         try:
-            semantic = self.vectors.search(query, limit=200)
+            semantic = self.vectors.search(query, limit=200, embedding_errors=embedding_errors)
         except Exception as exc:  # noqa: BLE001 - lexical results are explicitly labelled as degraded
             status = type(exc).__name__
         terms = search_terms(query).split()[:128]
@@ -89,7 +90,7 @@ class CurrentMemoryView:
                 state = "pending_update" if holds else record.status
                 item = {"id": record.id, "version": record.version, "topic": record.topic,
                         "fact_key": record.fact_key, "applicability": record.applicability, "status": state}
-                similarity = dict(semantic).get(record.id)
+                similarity = similarities.get(record.id)
                 if similarity is not None:
                     item["semantic_similarity"] = round(similarity, 4)
                 if state == "active":

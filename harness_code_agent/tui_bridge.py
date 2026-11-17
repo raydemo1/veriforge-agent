@@ -21,7 +21,7 @@ import traceback
 import uuid
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -81,10 +81,10 @@ _EFFORT_COPY = {
 
 def _relative_age(value: Any) -> str:
     try:
-        created = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        created = datetime.fromisoformat(str(value))
         if created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-        seconds = max(0, int((datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds()))
+            created = created.replace(tzinfo=UTC)
+        seconds = max(0, int((datetime.now(UTC) - created.astimezone(UTC)).total_seconds()))
     except (TypeError, ValueError):
         return "时间未知"
     if seconds < 60:

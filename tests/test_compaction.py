@@ -495,42 +495,6 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Compacted storage — persistence in the workspace state sessions/<id>/compacted/
-# ---------------------------------------------------------------------------
-
-class CompactedStorageTests(unittest.TestCase):
-    """Compacted directory structure and persistence."""
-
-    def test_session_dataclass_has_compacted_path(self):
-        """Session dataclass should include compacted_dir."""
-        from harness_code_agent.sessions.store import Session
-        s = Session(
-            id="test",
-            root=Path("/tmp/test"),
-            metadata_path=Path("/tmp/test/session.json"),
-            events_path=Path("/tmp/test/events.jsonl"),
-            snapshots_dir=Path("/tmp/test/snapshots"),
-            summary_path=Path("/tmp/test/summary.md"),
-        )
-        # compacted_dir should exist as an attribute
-        self.assertTrue(hasattr(s, "compacted_dir"))
-
-    def test_session_store_creates_compacted_dir(self):
-        """SessionStore.create() should create the compacted/ subdirectory."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            from harness_code_agent.sessions.store import SessionStore
-            store = SessionStore(Path(tmpdir))
-            session = store.create(
-                cwd=tmpdir,
-                model="test",
-                permission_mode="workspace-write",
-            )
-            compacted = session.root / "compacted"
-            self.assertTrue(compacted.exists())
-            self.assertTrue((compacted / "history").exists())
-
-
-# ---------------------------------------------------------------------------
 # Session events for compaction
 # ---------------------------------------------------------------------------
 

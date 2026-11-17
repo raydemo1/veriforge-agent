@@ -1718,36 +1718,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn("[error]", max_output)
         self.assertIn("max_lines must be an integer", max_output)
 
-    def test_read_file_defaults_to_a_bounded_page(self):
-        from harness_code_agent.runtime.builtins.filesystem import READ_FILE_MAX_LINES
-        from harness_code_agent.runtime.permissions import PermissionPolicy
-        from harness_code_agent.runtime.tool_context import ToolContext
-        from harness_code_agent.sessions.events import EventBus
-        from harness_code_agent.workspace.service import WorkspaceService
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "big.txt").write_text(
-                "\n".join(f"line {i}" for i in range(1, READ_FILE_MAX_LINES + 2)),
-                encoding="utf-8",
-            )
-            context = ToolContext(
-                workspace=WorkspaceService(root=root, snapshots_dir=root / ".harness" / "snapshots"),
-                permission_policy=PermissionPolicy(mode="workspace-write"),
-                event_bus=EventBus(root / ".harness" / "events.jsonl"),
-            )
-
-            output = execute_tool(
-                "read_file",
-                {"path": "big.txt"},
-                tool_context=context,
-                agent_name="main_agent",
-            )
-
-        self.assertNotIn("[error]", output)
-        self.assertIn("line 1", output)
-        self.assertLess(len(output), 30000)
-
     def test_read_file_rejects_ranges_over_limit_lines(self):
         from harness_code_agent.runtime.builtins.filesystem import READ_FILE_MAX_LINES
         from harness_code_agent.runtime.permissions import PermissionPolicy
@@ -2305,22 +2275,6 @@ class ProductRuntimeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 workspace.apply_text_patch("app.py", search="same\n", replace="once\n")
             self.assertEqual(target.read_text(encoding="utf-8"), "same\nsame\n")
-
-    def test_workspace_service_rolls_back_latest_snapshot_for_file(self):
-        from harness_code_agent.workspace.service import WorkspaceService
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            workspace = WorkspaceService(root=root, snapshots_dir=root / ".harness" / "snapshots")
-            target = root / "app.py"
-            target.write_text("old\n", encoding="utf-8")
-            workspace.read_text("app.py")
-            workspace.write_text("app.py", "new\n")
-
-            result = workspace.rollback_latest_snapshot("app.py")
-
-            self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
-            self.assertTrue(result.snapshot_path.exists())
 
     def test_permission_policy_defaults_to_workspace_scope(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy

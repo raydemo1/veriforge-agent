@@ -6,7 +6,7 @@ import os
 import stat
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 from ..workspace.state_paths import LEGACY_STATE_DIR_NAME
@@ -22,9 +22,9 @@ def atomic_bytes(path: Path, data: bytes) -> None:
     fd, name = tempfile.mkstemp(prefix=".recovery-", dir=path.parent)
     temporary = Path(name)
     try:
-        if path.exists():
-            os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
         with os.fdopen(fd, "wb") as handle:
+            if path.exists():
+                os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -77,7 +77,7 @@ class RecoveryStore:
             if any(part in EXCLUDED_NAMES for part in Path(rel).parts):
                 return
             info = path.lstat()
-            if getattr(path, "is_junction", lambda: False)():
+            if path.is_junction():
                 raise ValueError(f"无法为目录联接创建恢复快照：{rel}")
             mode = stat.S_IMODE(info.st_mode)
             if stat.S_ISLNK(info.st_mode):
@@ -143,7 +143,7 @@ class RecoveryService:
 
     def _publish(self, **location):
         point = dict(location, id="rp_" + uuid.uuid4().hex,
-                     created_at=datetime.now(timezone.utc).isoformat(), change_cursor=self.access.cursor())
+                     created_at=datetime.now(UTC).isoformat(), change_cursor=self.access.cursor())
         atomic_json(self.store.root / "points" / f"{point['id']}.json", point)
         return point
 

@@ -383,16 +383,7 @@ def _document(spec: ToolSpec) -> SearchDocument:
         ]
         if part
     )
-    return SearchDocument(
-        key=spec.name,
-        text=text,
-        metadata={
-            "description": description,
-            "server": spec.origin_server,
-            "tool": _tool_of(spec),
-            "permission": spec.permission,
-        },
-    )
+    return SearchDocument(key=spec.name, text=text)
 
 
 def _description_of(spec: ToolSpec) -> str:

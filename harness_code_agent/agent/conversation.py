@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 import weakref
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .. import config
@@ -201,7 +201,7 @@ class AgentConversation:
         self._resource_owner = weakref.finalize(self, self.project_resources.hold())
         self.trace = TraceWriter(
             agent.name,
-            workspace=(agent.tool_context.workspace.root if agent.tool_context is not None else Path.cwd()),
+            state_root=agent.tool_context.workspace.state_root if agent.tool_context is not None else None,
             session_id=getattr(agent.tool_context, "session_id", None),
             turn_id=lambda: self.runtime_state.turn_id or None,
             request_id=lambda: getattr(agent.tool_context, "ui_request_id", None),
@@ -614,9 +614,9 @@ class AgentConversation:
         try:
             history_dir = compacted_dir / "history"
             history_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+            stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
             safe_phase = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in phase) or "compact"
-            body = f"# Compacted Context\n\nphase: {phase}\ncreated_at: {datetime.now(timezone.utc).isoformat()}\n\n{text}\n"
+            body = f"# Compacted Context\n\nphase: {phase}\ncreated_at: {datetime.now(UTC).isoformat()}\n\n{text}\n"
             history_path = history_dir / f"{stamp}-{safe_phase}.md"
             history_path.write_text(body, encoding="utf-8")
             (compacted_dir / "latest.md").write_text(body, encoding="utf-8")

@@ -2,6 +2,12 @@
 
 `eval/` is the single home for evaluation code, benchmark adapters, fixed task sets, and generated results.
 
+Run the launchers with Python 3.14. The Terminal-Bench and Claw-SWE-Bench
+adapters provision a separate Python 3.14 inside the Linux agent container;
+task-provided Python commands keep using the interpreter from the task image.
+If you use `--no-install-deps` with Claw-SWE-Bench, provide `python3.14` and
+the VeriForge runtime dependencies in the task image.
+
 ## Directory Map
 
 ```text
@@ -15,6 +21,7 @@ eval/
 ## File Relationships
 
 - `scripts/run_basic_metrics_eval.py` runs local basic metrics suites: memory and latency by default; cache is available when explicitly selected.
+- `scripts/run_dev_task_eval.py` runs local development regression cases. `--validate` checks the fixtures offline; `--run` calls the configured model.
 - `scripts/run_terminal_bench_eval.py` runs the fixed Terminal-Bench subsets and delegates each task to `benchmarks/run_terminal_bench.py`.
 - `scripts/run_claw_swe_bench_eval.py` runs Claw-SWE-Bench through the local harness adapter.
 - `scripts/deepseek_context_eval.py` runs the DeepSeek context/cache scenarios and writes timestamped outputs under `results/`.
@@ -61,6 +68,7 @@ marginal billing by default. `--tool-cost` can assign a flat USD rate per call.
 Both pilot commands reproduce the historical comparisons using the runtime
 archived from `b2391f3`. The checkout must include that commit. Each result
 records the full runtime revision alongside the model and container image.
+Rebuild the pilot image with `--build-image` to run with Python 3.14.
 
 Each block pairs A (verifier disabled), B (evidence only), and C (current
 exit behavior) on a clean copy of the same fixture. All three run the same agent with the same budgets and permissions inside Docker.
@@ -80,20 +88,24 @@ These fixtures are a pilot for the measurement path and cover Python only.
 
 ### Model configuration
 
-The default `.env` remains the final-evaluation configuration. To run a local
-evaluation or tuning script with the separate `.env.ab` model profile, use:
+The default `.env` remains the final-evaluation configuration. Set
+`HARNESS_EVAL_PROFILE=ab` for the evaluation process to load the separate
+`.env.ab` model profile:
 
 ```powershell
-python eval/scripts/run_with_ab_model.py eval/scripts/run_memory_candidate_eval.py
-python eval/scripts/run_with_ab_model.py eval/scripts/run_memory_candidate_eval.py --run
+$env:HARNESS_EVAL_PROFILE = 'ab'
+try {
+    python eval/scripts/run_memory_candidate_eval.py
+} finally {
+    Remove-Item Env:HARNESS_EVAL_PROFILE
+}
 ```
 
-The first command prints the evaluation protocol without making model calls;
-`--run` executes it. The wrapper selects the A/B profile for its child process
-and its subprocesses; other commands keep the default configuration. Set
+The command prints the evaluation protocol. Add `--run` to execute it.
+The development-task runner selects its overlay with `--model-profile ab`. Set
 `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `HARNESS_PROVIDER`, `HARNESS_MODEL`, and
 `HARNESS_MODEL_FAST/NORMAL/HARD/MAX` in the ignored `.env.ab` file. The base
-URL ends at `/v1`; the client adds `/chat/completions`. A missing A/B file is an
+URL uses the provider's API base URL. The client adds `/chat/completions`. A missing A/B file is an
 error rather than a fallback to the final model. Record the model and evaluation
 conditions with results; A/B tuning outcomes are not final-model measurements.
 

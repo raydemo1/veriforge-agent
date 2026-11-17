@@ -80,22 +80,19 @@ def test_file_pages_reconstruct_long_unicode_line(tmp_path):
     assert ''.join(pages) == source
 
 
-def test_file_pages_continue_across_line_windows_and_keep_final_newlines(tmp_path):
-    source = ''.join(f'row {index}\n' for index in range(4100)) + '\n\n'
+def test_file_pages_continue_across_line_windows_and_keep_final_newlines(tmp_path, monkeypatch):
+    monkeypatch.setattr("harness_code_agent.runtime.builtins.filesystem.READ_FILE_MAX_LINES", 4)
+    source = ''.join(f'row {index}\n' for index in range(9)) + '\n\n'
     (tmp_path / 'rows.txt').write_text(source, encoding='utf-8')
     context = SimpleNamespace(workspace=WorkspaceService(root=tmp_path))
-    arguments = {'path': 'rows.txt', 'max_lines': 2000}
+    arguments = {'path': 'rows.txt'}
     pages = []
-    for _ in range(100):
+    for next_line in (5, 9, None):
         result = read_file(**arguments, tool_context=context)
         assert result.status == 'success'
         pages.append(result.output)
-        if not result.metadata.get('next_read'):
-            break
-        assert result.metadata['next_read'] != arguments
-        arguments = result.metadata['next_read']
-    else:
-        raise AssertionError('pagination did not finish')
+        arguments = result.metadata.get('next_read')
+        assert (arguments and arguments['start_line']) == next_line
     assert ''.join(pages) == source
 
 

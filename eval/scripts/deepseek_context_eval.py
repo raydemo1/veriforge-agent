@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from typing_extensions import Self
+from typing import Self
 
 from harness_code_agent import config
 from harness_code_agent.agent import context
@@ -445,7 +445,7 @@ class DeepSeekContextEvaluator:
             turn=turn,
             kind=kind,
             label=label,
-            timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            timestamp=datetime.now(UTC).isoformat(timespec="seconds"),
             latency_ms=latency_ms,
             model=config.MODEL,
             provider=self.adapter.name,
@@ -630,7 +630,7 @@ def scenario_names(value: str) -> list[str]:
 
 
 def make_run_dir(args: argparse.Namespace) -> Path:
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%d_%H%M%S")
     suffix = f"_{safe_name(args.run_name)}" if args.run_name else ""
     run_dir = Path(args.output_root) / f"{timestamp}_deepseek_context_eval{suffix}"
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -639,7 +639,7 @@ def make_run_dir(args: argparse.Namespace) -> Path:
 
 def write_run_config(run_dir: Path, args: argparse.Namespace) -> None:
     payload = {
-        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "project_root": str(PROJECT_ROOT),
         "provider": current_adapter().name,
         "base_url": config.BASE_URL,
@@ -703,7 +703,7 @@ def summarize_calls(calls: list[EvalCall]) -> dict[str, Any]:
             "estimated_request_tokens": [item.estimated_request_tokens for item in items],
         }
     return {
-        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "scenarios": scenarios,
         "all_calls": [call_payload(call) for call in calls],
     }

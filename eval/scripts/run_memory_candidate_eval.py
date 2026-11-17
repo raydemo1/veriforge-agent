@@ -6,7 +6,7 @@ import hashlib
 import json
 import sys
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -49,7 +49,7 @@ def main(argv=None):
     if not args.run:
         print(json.dumps(protocol, ensure_ascii=False, indent=2))
         return
-    root = PROJECT_ROOT / "eval/results" / ("memory-candidates-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
+    root = PROJECT_ROOT / "eval/results" / ("memory-candidates-" + datetime.now(UTC).strftime("%Y%m%d-%H%M%S"))
     root.mkdir(parents=True)
     (root / "protocol.json").write_text(json.dumps(protocol, ensure_ascii=False, indent=2), encoding="utf-8")
     recorder = RequestRecorder(root / "requests.jsonl", 2)

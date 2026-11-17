@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 import time
 from pathlib import Path
 from typing import TypedDict
@@ -49,19 +50,21 @@ def snapshot(root: str | Path) -> FileSnapshot:
     started = time.perf_counter()
     files: dict[str, tuple[int, int, str]] = {}
     for directory, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(name for name in dirnames if name not in IGNORED_DIRS)
+        parent = Path(directory)
+        dirnames[:] = [name for name in dirnames if name not in IGNORED_DIRS and not (parent / name).is_junction()]
         for name in filenames:
-            path = Path(directory) / name
-            if path.is_symlink():
-                continue
+            path = parent / name
             try:
-                stat = path.stat()
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                with path.open("rb") as stream:
+                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
             except OSError:
                 continue
             files[path.relative_to(root).as_posix()] = (
-                stat.st_size,
-                stat.st_mtime_ns,
+                info.st_size,
+                info.st_mtime_ns,
                 digest,
             )
     return {"files": files, "scan_ms": round((time.perf_counter() - started) * 1000, 2)}

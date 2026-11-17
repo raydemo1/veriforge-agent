@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
@@ -8,6 +7,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .jsonl import append_record, read_records
 
 log = logging.getLogger("harness")
 
@@ -539,14 +540,19 @@ class EventBus:
         self.listener = listener
         self.events: list[SessionEvent] = []
         self._sequence = 0
+        self._event_count_at_start = 0
         self._lock = threading.RLock()
         if self.events_path is not None:
             self.events_path.parent.mkdir(parents=True, exist_ok=True)
             if self.events_path.exists():
-                with self.events_path.open(encoding="utf-8") as handle:
-                    for line in handle:
-                        if line.strip():
-                            self._sequence = max(self._sequence, int(json.loads(line)["sequence"]))
+                for record in read_records(self.events_path):
+                    self._sequence = max(self._sequence, int(record["sequence"]))
+                    self._event_count_at_start += 1
+
+    @property
+    def event_count(self) -> int:
+        with self._lock:
+            return self._event_count_at_start + len(self.events)
 
     def emit(
         self,
@@ -556,18 +562,17 @@ class EventBus:
         payload: dict[str, Any] | None = None,
     ) -> SessionEvent:
         with self._lock:
-            self._sequence += 1
             event = SessionEvent(
-                sequence=self._sequence,
+                sequence=self._sequence + 1,
                 timestamp=time.time(),
                 type=event_type,
                 agent=agent,
                 payload=payload or {},
             )
-            self.events.append(event)
             if self.events_path is not None:
-                with self.events_path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(event.to_dict(), ensure_ascii=False) + "\n")
+                append_record(self.events_path, event.to_dict())
+            self._sequence = event.sequence
+            self.events.append(event)
             if self.listener is not None:
                 try:
                     self.listener(event)

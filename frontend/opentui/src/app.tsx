@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { stringWidth } from "bun";
 import { CliRenderEvents, SyntaxStyle, CodeRenderable } from "@opentui/core";
@@ -11,7 +11,7 @@ import { clipboardFilePaths, formatBytes } from "./attachment-utils.ts";
 import type { ActionName, ActionResult, AttachmentItem, CommandItem, IconPreference, Interaction, PanelOption, PanelSpec, SubmitResult, ThemePreference, TranscriptItem, TurnSubmission, UiEvent, SessionEvent } from "./protocol.ts";
 import { initialState as initialAppState, initialSessionState as initialState, reduceEvent } from "./state.ts";
 import { resolveTheme } from "./theme.ts";
-import type { Theme, ThemeMode } from "./theme.ts";
+import type { Theme } from "./theme.ts";
 import { WorkStrip } from "./workbench/WorkStrip.tsx";
 import { Workbench } from "./workbench/Workbench.tsx";
 import type { SessionUI, SessionViewState } from "./state.ts";
@@ -1357,7 +1357,6 @@ const SessionPane = React.memo(function SessionPane({ resolvedTheme: theme, stat
   const setDraft = (value: React.SetStateAction<string>) => updateUI("draft", value);
   const attachments = ui.attachments;
   const setAttachments = (value: React.SetStateAction<AttachmentItem[]>) => updateUI("attachments", value);
-  const [composerVersion, setComposerVersion] = useState(0);
   const panel = ui.panel;
   const setPanel = (value: PanelSpec | null) => updateUI("panel", value);
   const [panelBusyId, setPanelBusyId] = useState<string | null>(null);
@@ -1520,7 +1519,7 @@ const SessionPane = React.memo(function SessionPane({ resolvedTheme: theme, stat
     <box style={{ flexDirection: "column", width: "100%", height: 1, flexGrow: 1, flexShrink: 1, minHeight: 0, backgroundColor: theme.background }}>
       <Transcript scrollTop={ui.scrollTop} onSaveScroll={(position) => updateUI("scrollTop", position)} items={state.items} theme={theme} icons={icons} narrow={narrow} onRewind={!running && !state.interaction && !workbenchOpen && !panel && onAction ? (pointId) => void invoke("rewind", { pointId }) : undefined} />
       <WorkStrip work={state.work} width={width} theme={theme} onOpen={openWorkbench} />
-      {state.interaction ? <InteractionView key={state.interaction.id} interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : <Composer key={composerVersion} value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} waitingReason={state.waitingReason} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping || workbenchOpen} sessionReady={Boolean(state.snapshot.sessionId) && state.snapshot.status !== "failed"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
+      {state.interaction ? <InteractionView key={state.interaction.id} interaction={state.interaction} theme={theme} icons={icons} narrow={narrow} onResolve={resolveInteraction} /> : <Composer value={draft} onChange={setDraft} onSubmit={submit} onCancel={onCancel ?? (() => undefined)} running={running} stopping={stopping} queueDepth={state.queueDepth} waitingReason={state.waitingReason} commands={state.commands} theme={theme} icons={icons} compact={compact} narrow={narrow} terminalWidth={width} terminalHeight={height} disabled={stopping || workbenchOpen} sessionReady={Boolean(state.snapshot.sessionId) && state.snapshot.status !== "failed"} onAction={onAction} attachments={attachments} onAddFiles={addFiles} onStagePaths={stagePaths} onPaste={paste} onRemoveAttachment={removeAttachment} snapshot={state.snapshot} onOpenPanel={(panel) => void invoke("open_panel", { panel }, panel)} />}
       {panel && !state.interaction ? <PanelOverlay panel={panel} anchor={panelAnchor} theme={theme} icons={icons} terminalWidth={width} terminalHeight={height} onClose={() => setPanel(null)} onSelect={selectPanel} busyId={panelBusyId} /> : null}
       {workbenchOpen && !state.interaction ? (
         <Workbench
@@ -1551,19 +1550,18 @@ export function App(props: WorkbenchAppProps) {
   const { width, height } = useTerminalDimensions();
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const renderer = useRenderer();
-  const [detected, setDetected] = useState<ThemeMode | null>(null);
+  const subscribeToTheme = useCallback((notify: () => void) => {
+    renderer.on(CliRenderEvents.THEME_MODE, notify);
+    return () => { renderer.off(CliRenderEvents.THEME_MODE, notify); };
+  }, [renderer]);
+  const detected = useSyncExternalStore(subscribeToTheme, () => renderer.themeMode);
   const theme = resolveTheme(props.themePreference ?? "auto", detected);
   const appRef = useRef(app);
   appRef.current = app;
   const actionRef = useRef(props.onAction);
   actionRef.current = props.onAction;
   const initialSent = useRef(false);
-  useEffect(() => {
-    void renderer.waitForThemeMode(120).then(setDetected);
-    const onTheme = (mode: ThemeMode) => setDetected(mode);
-    renderer.on(CliRenderEvents.THEME_MODE, onTheme);
-    return () => { renderer.off(CliRenderEvents.THEME_MODE, onTheme); };
-  }, [renderer]);
+  const pendingSubmissions = useRef(new Set<string>());
   useEffect(() => {
     let mounted = true;
     if (!props.events) return;
@@ -1576,10 +1574,12 @@ export function App(props: WorkbenchAppProps) {
           const id = event.sessionId;
           const previous = seen.get(id) ?? appRef.current.sessions[id]?.sequence ?? 0;
           if (waiting.has(id)) { waiting.get(id)!.push(event); continue; }
-          if (event.sequence > previous + 1) {
+          const action = actionRef.current;
+          if (event.sequence > previous + 1 && action) {
             waiting.set(id, [event]);
-            void actionRef.current?.(id, "sync_session").then((result) => {
-              if (!mounted || !result.view) return;
+            void action(id, "sync_session").then((result) => {
+              if (!mounted) return;
+              if (!result.view) throw new Error("会话同步未返回状态。");
               dispatch({ type: "session_view", sessionId: id, view: result.view });
               seen.set(id, result.view.sequence);
               for (const queued of waiting.get(id) ?? []) {
@@ -1587,10 +1587,10 @@ export function App(props: WorkbenchAppProps) {
                   dispatch(queued); seen.set(id, queued.sequence);
                 }
               }
-              waiting.delete(id);
             }).catch((error) => {
+              if (mounted) dispatch({ type: "local_event", sessionId: id, event: { type: "notice", level: "error", text: formatUserError(error) } });
+            }).finally(() => {
               waiting.delete(id);
-              dispatch({ type: "local_event", sessionId: id, event: { type: "notice", level: "error", text: formatUserError(error) } });
             });
             continue;
           }
@@ -1606,8 +1606,10 @@ export function App(props: WorkbenchAppProps) {
   useEffect(() => {
     if (initialSent.current || !activeId || !active?.view.snapshot.sessionId || !props.initialTask?.trim()) return;
     initialSent.current = true;
-    void props.onSubmit?.(activeId, { text: props.initialTask, attachmentIds: [] });
-  }, [activeId, active?.view.snapshot.sessionId, props.initialTask]);
+    void props.onSubmit?.(activeId, { text: props.initialTask, attachmentIds: [] }).catch((error) => {
+      dispatch({ type: "local_event", sessionId: activeId, event: { type: "notice", level: "error", text: formatUserError(error) } });
+    });
+  }, [activeId, active?.view.snapshot.sessionId, props.initialTask, props.onSubmit]);
   const invoke = useCallback(async (name: ActionName, params?: Record<string, unknown>) => {
     const id = appRef.current.activeSessionId;
     if (!id) return;
@@ -1636,7 +1638,16 @@ export function App(props: WorkbenchAppProps) {
   }, [activeId]);
   const scoped = useMemo(() => ({
     dispatch: (event: SessionEvent) => { if (activeId) dispatch({ type: "local_event", sessionId: activeId, event }); },
-    onSubmit: props.onSubmit && activeId ? (submission: TurnSubmission) => props.onSubmit!(activeId, submission) : undefined,
+    onSubmit: props.onSubmit && activeId ? async (submission: TurnSubmission) => {
+      const pending = pendingSubmissions.current;
+      if (pending.has(activeId)) return { accepted: false };
+      pending.add(activeId);
+      try {
+        return await props.onSubmit!(activeId, submission);
+      } finally {
+        pending.delete(activeId);
+      }
+    } : undefined,
     onCancel: () => { if (activeId) props.onCancel?.(activeId); },
     onAction: props.onAction && activeId ? (name: ActionName, params?: Record<string, unknown>) => props.onAction!(activeId, name, params) : undefined,
     onResolveInteraction: props.onResolveInteraction && activeId ? (id: string, result: Record<string, unknown>) => props.onResolveInteraction!(activeId, id, result) : undefined,

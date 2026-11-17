@@ -21,7 +21,9 @@ _SOURCE_SUFFIXES = {
 }
 _EXCLUDE = {
     ".git",
+    ".harness",
     ".harbor",
+    ".veriforge",
     "node_modules",
     ".venv",
     "venv",
@@ -91,9 +93,8 @@ def source_fingerprints(root: Path) -> dict[str, str]:
     files = {}
     for path in iter_source_files(root):
         try:
-            files[path.relative_to(root).as_posix()] = hashlib.sha256(
-                path.read_bytes()
-            ).hexdigest()
+            with path.open("rb") as stream:
+                files[path.relative_to(root).as_posix()] = hashlib.file_digest(stream, "sha256").hexdigest()
         except OSError:
             continue
     return files

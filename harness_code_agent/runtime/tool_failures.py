@@ -65,7 +65,7 @@ class FailureKind:
     USER_ATTENTION_REQUIRED = "user_attention_required"
     # resource
     BUDGET_EXCEEDED = "budget_exceeded"
-    #: Workspace write quota or free-disk floor reached.
+    #: External quota exhausted or the local free-disk floor reached.
     QUOTA_EXCEEDED = "quota_exceeded"
     #: Subagent concurrency/open-agent capacity is full.
     SUBAGENT_CAPACITY = "subagent_capacity"
@@ -185,7 +185,6 @@ _SOURCE_DEFAULT_KIND = {
 #: metadata.resource_kind values for status_source="resource"/"quota".
 _RESOURCE_KIND_MAP = {
     "subagent_capacity": FailureKind.SUBAGENT_CAPACITY,
-    "workspace_quota": FailureKind.QUOTA_EXCEEDED,
     "free_disk": FailureKind.QUOTA_EXCEEDED,
     "quota": FailureKind.QUOTA_EXCEEDED,
 }

@@ -45,12 +45,13 @@ class MemoryWriteCommand:
 
 
 class MemoryService:
-    def __init__(self, workspace: str | Path, *, vector_factory=VectorIndex):
+    def __init__(self, workspace: str | Path):
         self.workspace = Path(workspace).resolve()
         project = MemoryDatabase(default_memory_root(), "project:" + resolve_repo_key(self.workspace))
         self.stores = {"project": project, "user": project.scoped("user")}
         self.extraction = ExtractionQueue(project)
-        self.vectors = {scope: vector_factory(store) for scope, store in self.stores.items()}
+        query_cache = {}
+        self.vectors = {scope: VectorIndex(store, query_cache=query_cache) for scope, store in self.stores.items()}
         self.views = {scope: CurrentMemoryView(store, vectors=self.vectors[scope]) for scope, store in self.stores.items()}
         # The environment variable is the startup default.  The session switch
         # owns the value after construction, so `/memory on|off` cannot leave
@@ -75,9 +76,10 @@ class MemoryService:
                 continue
         paths = normalized_paths
         pages = []
+        embedding_errors = {}
         for selected in scopes:
             page = self.views[selected].search(query, limit=limit, offset=offset, max_tokens=max_tokens,
-                                               paths=paths, kind=kind)
+                                               paths=paths, kind=kind, embedding_errors=embedding_errors)
             for item in page["items"]:
                 item["scope"] = selected
                 if item["status"] == "active":
@@ -113,11 +115,10 @@ class MemoryService:
         return result
 
     def read(self, memory_id: str, scope: str = "project", *, history: bool = False, offset: int = 0, limit: int = 10) -> dict:
-        self._store(scope)
+        store = self._store(scope)
         if history:
             if offset < 0 or not 1 <= limit <= 20:
                 raise ValueError("invalid history page")
-            store = self._store(scope)
             with store.connect() as db:
                 store._read(db, memory_id)
                 rows = db.execute("SELECT snapshot FROM revisions WHERE memory_id=? ORDER BY version DESC LIMIT ? OFFSET ?",
@@ -131,10 +132,9 @@ class MemoryService:
                 items.append(value)
                 used += cost
             return {"history": items, "has_more": len(rows) > len(items), "next_offset": offset + len(items)}
-        if not history:
-            self._refresh(scope, memory_id)
-            self.flush_exports()
-        return _public_record(self.views[scope].read(memory_id, history=history))
+        self._refresh(scope, memory_id)
+        self.flush_exports()
+        return _public_record(self.views[scope].read(memory_id))
 
     def topics(self, scope: str = "project", *, offset: int = 0, limit: int = 20) -> dict:
         store = self._store(scope)

@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
+from functools import lru_cache
 from pathlib import Path
 
-from ..opentui_launcher import find_bun
+from ..opentui_launcher import find_bun, frontend_directory
 from ..runtime.execution_planner import workspace_claim
 
 
 def helper_path():
-    return Path(__file__).resolve().parents[2] / "frontend" / "opentui" / "src" / "native-shell.ts"
+    return frontend_directory() / "src" / "native-shell.ts"
 
 
 def validate_native_shell():
@@ -23,7 +26,36 @@ def validate_native_shell():
         raise RuntimeError("The native sandbox requires the VeriForge Bun runtime and PowerShell 7")
     package = helper_path().parents[1] / "node_modules" / "@deepseek-ai" / "dsh-sandbox-windows-acl" / "package.json"
     if not package.is_file():
-        raise RuntimeError("Native sandbox dependencies are missing; run bun install in frontend/opentui")
+        raise RuntimeError("Native sandbox dependencies are missing; run veriforge --setup-tui")
+
+
+@lru_cache(maxsize=1)
+def _current_user_sid(system32: Path) -> str:
+    output = subprocess.check_output(
+        [system32 / "whoami.exe", "/user", "/fo", "csv", "/nh"],
+        timeout=10,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    match = re.search(rb'"(S-1-\d+(?:-\d+)+)"\s*$', output)
+    if match is None:
+        raise RuntimeError("Could not identify the Windows account for the private shell directory")
+    return match[1].decode("ascii")
+
+
+def prepare_private_temp_dir(path: str) -> None:
+    """Give the restricted job token a matching user ACE on its private temp directory."""
+    system32 = Path(os.environ["SystemRoot"]) / "System32"
+    sid = _current_user_sid(system32)
+    # tempfile's OWNER RIGHTS ACE protects this directory but cannot satisfy
+    # the restricted token's normal access check. Add only the current user;
+    # AclSandbox still supplies a distinct, per-job SID for its second check.
+    subprocess.run(
+        [system32 / "icacls.exe", path, "/grant", f"*{sid}:(OI)(CI)F"],
+        check=True,
+        timeout=10,
+        capture_output=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
 
 
 def write_directories(root, values):

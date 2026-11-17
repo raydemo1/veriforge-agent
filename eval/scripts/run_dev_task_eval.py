@@ -30,12 +30,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-os.environ.pop("HARNESS_EVAL_PROFILE", None)
-
-from eval.scripts.eval_common import session_id_from_stdout
+from eval.scripts.eval_common import base_env, session_id_from_stdout
 from eval.tasks.dev_tasks_v1 import TASKS as DEV_TASKS
 from eval.tasks.windows_native_tasks_v1 import TASKS as WINDOWS_NATIVE_TASKS
-from harness_code_agent import config
 from harness_code_agent.sessions.observability import build_session_observability
 from harness_code_agent.sessions.store import SessionStore
 from harness_code_agent.workspace.state_paths import ensure_workspace_state
@@ -45,8 +42,35 @@ TASK_PACKS = {
     "windows-native": ("windows_native_tasks_v1", WINDOWS_NATIVE_TASKS),
 }
 
-IGNORED_DIRS = {"__pycache__", ".pytest_cache", ".git", ".harness"}
+IGNORED_DIRS = {"__pycache__", ".pytest_cache", ".git", ".harness", ".veriforge"}
 IGNORED_SUFFIXES = {".pyc", ".pyo"}
+
+
+def _model_env(profile: str) -> dict[str, str]:
+    env = base_env()
+    env["HARNESS_MODEL_INTENSITY"] = "normal"
+    env["HARNESS_EVAL_PROFILE"] = "ab" if profile == "ab" else ""
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _configured_model(profile: str) -> dict:
+    # Resolve dotenv in a clean child, just as the actual agent does. Importing
+    # config here would populate the runner's environment from the default .env.
+    completed = subprocess.run(
+        [sys.executable, "-c", (
+            "import json; from harness_code_agent import config; "
+            "print(json.dumps(dict(provider=config.MODEL_PROFILE.provider, "
+            "model=config.MODEL_PROFILE.model, base_url=config.BASE_URL, "
+            "input_mode=config.MODEL_INPUT_MODE)))"
+        )],
+        cwd=PROJECT_ROOT,
+        env=_model_env(profile),
+        capture_output=True,
+        encoding="utf-8",
+        check=True,
+    )
+    return json.loads(completed.stdout)
 
 
 def _selected_tasks(args) -> list[dict]:
@@ -74,21 +98,32 @@ def _apply_golden(task: dict, root: Path) -> None:
 
 
 def _file_hashes(root: Path, paths: list[str]) -> dict[str, str]:
-    return {
-        relative: hashlib.sha256((root / relative).read_bytes()).hexdigest()
-        for relative in paths
-    }
+    hashes = {}
+    for relative in paths:
+        path = root / relative
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+    return hashes
 
 
 def _run_hidden(root: Path, task: dict, *, timeout: int = 180) -> tuple[bool, str]:
-    path = root / "eval_hidden_test.py"
-    path.write_text(task["hidden_test"], encoding="utf-8", newline="\n")
+    with tempfile.NamedTemporaryFile(
+        mode="w", prefix="eval_hidden_", suffix="_test.py", dir=root,
+        encoding="utf-8", newline="\n", delete=False,
+    ) as handle:
+        path = Path(handle.name)
+        handle.write(task["hidden_test"])
     try:
         completed = subprocess.run(
-            [sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", path.name],
+            [sys.executable, "-X", "utf8", "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", path.name],
             cwd=root,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
         )
@@ -101,14 +136,17 @@ def _run_hidden(root: Path, task: dict, *, timeout: int = 180) -> tuple[bool, st
 
 def _snapshot(root: Path) -> dict[str, bytes]:
     snapshot = {}
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if any(part in IGNORED_DIRS for part in path.relative_to(root).parts):
-            continue
-        if path.suffix in IGNORED_SUFFIXES:
-            continue
-        snapshot[path.relative_to(root).as_posix()] = path.read_bytes()
+    root = root.resolve()
+    for directory, children, files in os.walk(root):
+        parent = Path(directory)
+        children[:] = [
+            name for name in children
+            if name not in IGNORED_DIRS and (parent / name).resolve() == parent / name
+        ]
+        for name in files:
+            path = parent / name
+            if path.suffix not in IGNORED_SUFFIXES and not path.is_symlink() and path.is_file():
+                snapshot[path.relative_to(root).as_posix()] = path.read_bytes()
     return snapshot
 
 
@@ -228,55 +266,28 @@ def _copy_session_artifacts(
 
 
 def _tool_trace(events: list[dict]) -> list[dict]:
-    """Pair tool_call and tool_result events, preferring the runtime call id."""
-    pending_by_id: dict[str, dict] = {}
-    pending_by_tool: dict[str, list[dict]] = {}
+    """Pair each result with its call in the same agent."""
+    calls = {}
     rows: list[dict] = []
-
-    def take(entry_id: str, tool: str) -> dict | None:
-        if entry_id and entry_id in pending_by_id:
-            entry = pending_by_id.pop(entry_id)
-            queue = pending_by_tool.get(tool) or []
-            for index, item in enumerate(queue):
-                if item is entry:
-                    queue.pop(index)
-                    break
-            return entry
-        queue = pending_by_tool.get(tool) or []
-        if not queue:
-            return None
-        entry = queue.pop(0)
-        if entry.get("id"):
-            pending_by_id.pop(entry["id"], None)
-        return entry
-
     for event in events:
         payload = event.get("payload") or {}
         event_type = event.get("type")
         metadata = payload.get("metadata") or {}
-        if event_type == "tool_call":
-            entry = {
-                "id": str(payload.get("tool_call_id") or ""),
-                "args": payload.get("args"),
-            }
-            pending_by_tool.setdefault(str(payload.get("tool")), []).append(entry)
-            if entry["id"]:
-                pending_by_id[entry["id"]] = entry
+        agent = payload.get("agent_id") or event.get("agent")
+        call_id = payload.get("tool_call_id") or metadata.get("tool_call_id")
+        if event_type == "tool_call" and call_id:
+            calls[agent, call_id] = payload.get("args")
         elif event_type == "tool_result":
-            tool = str(payload.get("tool"))
-            entry_id = str(
-                payload.get("tool_call_id") or metadata.get("tool_call_id") or ""
-            )
-            entry = take(entry_id, tool)
             rows.append({
                 "timestamp": event.get("timestamp"),
-                "tool": tool,
-                "tool_call_id": entry_id or (entry or {}).get("id"),
+                "agent": agent,
+                "tool": payload.get("tool"),
+                "tool_call_id": call_id,
                 "status": payload.get("status"),
                 "error": payload.get("error"),
                 "return_code": payload.get("return_code"),
                 "output_tail": str(payload.get("output") or "")[-400:],
-                "args": (entry or {}).get("args"),
+                "args": calls.pop((agent, call_id), None),
                 "file_changes": metadata.get("file_changes"),
                 "file_change_summary": metadata.get("file_change_summary"),
                 "stage_timings": metadata.get("stage_timings"),
@@ -291,7 +302,7 @@ def _has_file_changes(payload) -> bool:
     return any(int(counts.get(key) or 0) > 0 for key in ("created", "modified", "deleted"))
 
 
-def _repeated_calls(rows: list[dict], limit: int = 10) -> list[dict]:
+def _repeated_calls(rows: list[dict]) -> list[dict]:
     counts: Counter[str] = Counter()
     examples: dict[str, dict] = {}
     for row in rows:
@@ -302,7 +313,7 @@ def _repeated_calls(rows: list[dict], limit: int = 10) -> list[dict]:
         examples[key] = {"tool": row.get("tool"), "args": row["args"]}
     return [
         {**examples[key], "count": count}
-        for key, count in counts.most_common(limit)
+        for key, count in counts.most_common()
         if count > 1
     ]
 
@@ -424,11 +435,10 @@ def _stop_concurrent_edit(handle) -> dict:
     return dict(handle["state"])
 
 
-def _run_case(task: dict, rep: int, run_dir: Path, args) -> dict:
-    workspace_root = Path(args.workspace_root)
-    workspace = workspace_root / f"{task['id']}-r{rep}"
-    case_home = workspace_root / "state" / f"{task['id']}-r{rep}"
-    case_memory = workspace_root / "memory" / f"{task['id']}-r{rep}"
+def _run_case(task: dict, rep: int, run_dir: Path, args, workspace_root: Path) -> dict:
+    workspace = workspace_root / "workspace"
+    case_home = workspace_root / "state"
+    case_memory = workspace_root / "memory"
     case_home.mkdir(parents=True, exist_ok=True)
     case_memory.mkdir(parents=True, exist_ok=True)
     _materialize(task, workspace)
@@ -436,11 +446,8 @@ def _run_case(task: dict, rep: int, run_dir: Path, args) -> dict:
     protected_before = _file_hashes(workspace, protected)
     snapshot = _snapshot(workspace)
 
-    env = os.environ.copy()
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = str(PROJECT_ROOT) if not existing else str(PROJECT_ROOT) + os.pathsep + existing
+    env = _model_env(args.model_profile)
     env["HARNESS_PERMISSION_MODE"] = "workspace-write"
-    env["HARNESS_MODEL_INTENSITY"] = "normal"
     env["VERIFORGE_HOME"] = str(case_home)
     env["VERIFORGE_MEMORY_ROOT"] = str(case_memory)
     # Evaluation must not depend on history from another task or from the host.
@@ -453,11 +460,6 @@ def _run_case(task: dict, rep: int, run_dir: Path, args) -> dict:
         env["HARNESS_TRACE_FILE_CHANGES"] = "1"
     if getattr(args, "trace_stages", False):
         env["HARNESS_TRACE_STAGES"] = "1"
-    if args.model_profile == "ab":
-        env["HARNESS_EVAL_PROFILE"] = "ab"
-    else:
-        env.pop("HARNESS_EVAL_PROFILE", None)
-
     case_dir = run_dir / "cases" / f"{task['id']}-r{rep}"
     case_dir.mkdir(parents=True, exist_ok=True)
     timed_out = False
@@ -469,7 +471,8 @@ def _run_case(task: dict, rep: int, run_dir: Path, args) -> dict:
             cwd=workspace,
             env=env,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=args.task_timeout,
             check=False,
         )
@@ -478,12 +481,13 @@ def _run_case(task: dict, rep: int, run_dir: Path, args) -> dict:
         returncode = completed.returncode
     except subprocess.TimeoutExpired as exc:
         timed_out = True
-        stdout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-        stderr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
+        stdout = (exc.stdout or b"").decode("utf-8", errors="replace")
+        stderr = (exc.stderr or b"").decode("utf-8", errors="replace")
         stderr += f"\n[timeout] case exceeded {args.task_timeout}s"
         returncode = 124
-    elapsed = time.perf_counter() - started
-    concurrent_edit = _stop_concurrent_edit(controller)
+    finally:
+        elapsed = time.perf_counter() - started
+        concurrent_edit = _stop_concurrent_edit(controller)
 
     (case_dir / "stdout.txt").write_text(stdout, encoding="utf-8", newline="\n")
     (case_dir / "stderr.txt").write_text(stderr, encoding="utf-8", newline="\n")
@@ -491,7 +495,7 @@ def _run_case(task: dict, rep: int, run_dir: Path, args) -> dict:
     hidden_ok, hidden_log = _run_hidden(workspace, task)
     (case_dir / "hidden.txt").write_text(hidden_log, encoding="utf-8", newline="\n")
     protected_after = _file_hashes(workspace, protected)
-    protected_ok = protected_after == protected_before
+    protected_ok = len(protected_before) == len(protected) and protected_after == protected_before
     changed = _snapshot(workspace)
     diff = _diff(snapshot, changed)
     (case_dir / "diff.patch").write_text(diff, encoding="utf-8", newline="\n")
@@ -531,7 +535,7 @@ def _run_case(task: dict, rep: int, run_dir: Path, args) -> dict:
         for event in events
         if event.get("type") == "agent_fallback"
     ]
-    stop_reason = cli_stop or (fallback_reasons[-1] if fallback_reasons else "")
+    stop_reason = cli_stop
     tokens = metrics.get("tokens") or {}
     performance = metrics.get("performance") or {}
     failed_tool_details = [
@@ -547,7 +551,7 @@ def _run_case(task: dict, rep: int, run_dir: Path, args) -> dict:
         }
         for row in tool_rows
         if row.get("tool") == "bash" and row.get("return_code") not in (None, 0)
-    ][:8]
+    ]
 
     success = (
         returncode == 0
@@ -563,10 +567,10 @@ def _run_case(task: dict, rep: int, run_dir: Path, args) -> dict:
         failure_kind = f"stopped:{stop_reason}"
     elif not protected_ok:
         failure_kind = "protected_test_modified"
-    elif not hidden_ok:
-        failure_kind = "hidden_test_failed"
     elif returncode != 0:
         failure_kind = "runtime_exit_nonzero"
+    elif not hidden_ok:
+        failure_kind = "hidden_test_failed"
 
     return {
         "task_id": task["id"],
@@ -593,10 +597,7 @@ def _run_case(task: dict, rep: int, run_dir: Path, args) -> dict:
         "background_jobs": counts["background_jobs"],
         "failed_tools": counts["failed_tools"],
         "failed_tool_details": failed_tool_details,
-        "nonzero_shell": len([
-            row for row in tool_rows
-            if row.get("tool") == "bash" and row.get("return_code") not in (None, 0)
-        ]),
+        "nonzero_shell": len(shell_errors),
         "shell_errors": shell_errors,
         "repeated_calls": repeated,
         "commands_with_changes": commands_with_changes,
@@ -611,19 +612,28 @@ def _run_case(task: dict, rep: int, run_dir: Path, args) -> dict:
     }
 
 
-def run(tasks: list[dict], args, output_root: Path) -> int:
+def run(tasks: list[dict], args, output_root: Path, model: dict) -> int:
     stamp = datetime.now().astimezone()
     prefix = "dev-task-eval" if args.task_pack == "dev" else f"{args.task_pack}-eval"
-    run_dir = output_root / f"{prefix}-{stamp:%Y%m%d-%H%M%S}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    if not args.workspace_root:
-        args.workspace_root = tempfile.mkdtemp(prefix="vf-dev-eval-workspaces-")
-    workspace_root = Path(args.workspace_root)
+    run_dir = output_root / f"{prefix}-{stamp:%Y%m%d-%H%M%S-%f}"
+    run_dir.mkdir(parents=True)
+    workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else None
+    if workspace_root is not None:
+        workspace_root.mkdir(parents=True, exist_ok=True)
     results: list[dict] = []
     raw = run_dir / "results.jsonl"
     for task in tasks:
         for rep in range(1, args.repetitions + 1):
-            result = _run_case(task, rep, run_dir, args)
+            with tempfile.TemporaryDirectory(
+                dir=workspace_root, prefix="vf-dev-eval-", ignore_cleanup_errors=True,
+            ) as tmp:
+                if os.name == "nt":
+                    from harness_code_agent.workspace.native_shell import (
+                        prepare_private_temp_dir,
+                    )
+
+                    prepare_private_temp_dir(tmp)
+                result = _run_case(task, rep, run_dir, args, Path(tmp))
             results.append(result)
             with raw.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(json.dumps(result, ensure_ascii=False) + "\n")
@@ -632,12 +642,6 @@ def run(tasks: list[dict], args, output_root: Path) -> int:
                 f"{result['elapsed_seconds']}s llm={result['llm_calls']} "
                 f"tools={result['tool_calls']} shell={result['shell_calls']}"
             )
-            for directory in (
-                workspace_root / f"{task['id']}-r{rep}",
-                workspace_root / "state" / f"{task['id']}-r{rep}",
-                workspace_root / "memory" / f"{task['id']}-r{rep}",
-            ):
-                shutil.rmtree(directory, ignore_errors=True)
 
     per_task = []
     for task in tasks:
@@ -660,12 +664,9 @@ def run(tasks: list[dict], args, output_root: Path) -> int:
         "suite": TASK_PACKS[args.task_pack][0],
         "generated_at": stamp.isoformat(timespec="seconds"),
         "model": {
+            **model,
             "profile": args.model_profile,
-            "provider": config.MODEL_PROFILE.provider,
-            "model": config.MODEL_PROFILE.model,
-            "base_url": config.BASE_URL,
             "permission_mode": "workspace-write",
-            "input_mode": config.MODEL_INPUT_MODE,
         },
         "repetitions": args.repetitions,
         "task_count": len(tasks),
@@ -735,7 +736,7 @@ def run(tasks: list[dict], args, output_root: Path) -> int:
         _report(summary, per_task, summary["failures"]), encoding="utf-8", newline="\n"
     )
     print(f"\nWrote {run_dir / 'summary.json'}")
-    return 0 if summary["overall"]["success_rate"] == 1.0 else 1
+    return 0 if all(item["success"] for item in results) else 1
 
 
 def _report(summary: dict, per_task: list[dict], failures: list[dict]) -> str:
@@ -868,7 +869,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Record preparation, lease, launch, spawn, wait and result timings.",
     )
     parser.add_argument("--output-root", default=str(PROJECT_ROOT / "eval" / "results"))
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.repetitions < 1 or args.task_timeout < 1 or args.limit < 0:
+        parser.error("--repetitions and --task-timeout must be positive; --limit cannot be negative")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -885,13 +889,17 @@ def main(argv: list[str] | None = None) -> int:
             else f"{args.task_pack}-validation"
         )
         return validate(tasks, output_root, prefix=prefix)
+    try:
+        model = _configured_model(args.model_profile)
+    except subprocess.CalledProcessError as exc:
+        print(exc.stderr.strip() or "Could not load the evaluation model configuration.", file=sys.stderr)
+        return 2
     if not args.run:
         print(json.dumps({"tasks": [task["id"] for task in tasks],
                           "repetitions": args.repetitions,
-                          "model": config.MODEL_PROFILE.model,
-                          "base_url": config.BASE_URL}, ensure_ascii=False, indent=2))
+                          **model}, ensure_ascii=False, indent=2))
         return 0
-    return run(tasks, args, output_root)
+    return run(tasks, args, output_root, model)
 
 
 if __name__ == "__main__":

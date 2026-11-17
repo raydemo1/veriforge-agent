@@ -3,13 +3,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import type { TestRendererSetup } from "@opentui/core/testing";
 import type { Renderable } from "@opentui/core";
-import { App as RealApp } from "./app.tsx";
+import { App } from "./app.tsx";
 import type { ActionName, UiEvent, SessionEvent } from "./protocol.ts";
 import { initialSessionState as initialState } from "./state.ts";
 
-function App(props: React.ComponentProps<typeof RealApp>) {
-  const stream = eventStream();
-  return <RealApp {...props} events={props.events ?? stream.events} />;
+async function update(action: () => unknown) {
+  await act(async () => { await action(); });
 }
 
 type AnyNode = Renderable & { _childrenInLayoutOrder?: AnyNode[] };
@@ -44,79 +43,71 @@ function eventStream() {
       },
     },
     push(event: SessionEvent) {
-      queued.push({ ...event, sessionId: "test-session", sequence: ++sequence });
-      const current = waiters;
-      waiters = [];
-      current.forEach((resolve) => resolve());
+      return update(() => {
+        queued.push({ ...event, sessionId: "test-session", sequence: ++sequence });
+        const current = waiters;
+        waiters = [];
+        current.forEach((resolve) => resolve());
+      });
     },
   };
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
 describe("OpenTUI app interactions", () => {
   let setup: TestRendererSetup;
 
-  afterEach(() => {
-    setup?.renderer.destroy();
-  });
+  function renderApp(...args: Parameters<typeof testRender>) {
+    return update(async () => { setup = await testRender(...args); });
+  }
+
+  afterEach(() => update(() => setup?.renderer.destroy()));
 
   test.each([50, 100])("rewind appears only on hover and keeps layout stable at W=%d", async (width) => {
     const stream = eventStream();
     const actions: Array<{ name: ActionName; params?: Record<string, unknown> }> = [];
-    setup = await testRender(<App events={stream.events} onAction={async (_sessionId, name, params) => { actions.push({ name, params }); return { ok: true }; }} />, { width, height: 30 });
-    stream.push({ type: "transcript", item: { id: "user-one", kind: "user", title: "你", body: "调整认证逻辑" } });
-    stream.push({ type: "transcript", item: { id: "group-one", kind: "assistant", title: "助手", body: "", role: "group", state: "success", turn: 1 } });
-    stream.push({ type: "transcript", item: { id: "answer-one", kind: "assistant", title: "助手", body: "认证逻辑已调整", parentId: "group-one", state: "success" } });
-    stream.push({ type: "recovery_available", turn: 1, pointId: "point-one" });
-    await sleep(300);
+    await renderApp(<App events={stream.events} onAction={async (_sessionId, name, params) => { actions.push({ name, params }); return { ok: true }; }} />, { width, height: 30 });
+    await stream.push({ type: "transcript", item: { id: "user-one", kind: "user", title: "你", body: "调整认证逻辑" } });
+    await stream.push({ type: "transcript", item: { id: "group-one", kind: "assistant", title: "助手", body: "", role: "group", state: "success", turn: 1 } });
+    await stream.push({ type: "transcript", item: { id: "answer-one", kind: "assistant", title: "助手", body: "认证逻辑已调整", parentId: "group-one", state: "success" } });
+    await stream.push({ type: "recovery_available", turn: 1, pointId: "point-one" });
     const initial = await setup.waitForFrame((frame) => frame.includes("认证逻辑已调整"));
     expect(initial).not.toContain("回撤到此处");
     expect(initial.split("\n")[0]).not.toContain("回撤");
     const answerRow = initial.split("\n").findIndex((row) => row.includes("认证逻辑已调整"));
     const userRow = initial.split("\n").findIndex((row) => row.includes("调整认证逻辑"));
-    await setup.mockMouse.moveTo(5, userRow);
-    await sleep(50);
+    await update(() => setup.mockMouse.moveTo(5, userRow));
     const hovered = await setup.waitForFrame((frame) => frame.includes("回撤到此处"));
     expect(hovered.split("\n").findIndex((row) => row.includes("认证逻辑已调整"))).toBe(answerRow);
     const buttonRow = hovered.split("\n").findIndex((row) => row.includes("回撤到此处"));
     const buttonColumn = hovered.split("\n")[buttonRow].indexOf("回撤到此处");
-    await setup.mockMouse.moveTo(buttonColumn + 1, buttonRow);
-    await sleep(30);
-    expect(setup.captureCharFrame()).toContain("回撤到此处");
-    await setup.mockMouse.click(buttonColumn + 1, buttonRow);
-    await sleep(30);
+    await update(() => setup.mockMouse.moveTo(buttonColumn + 1, buttonRow));
+    await setup.waitForFrame((frame) => frame.includes("回撤到此处"));
+    await update(() => setup.mockMouse.click(buttonColumn + 1, buttonRow));
     expect(actions).toEqual([{ name: "rewind", params: { pointId: "point-one" } }]);
-    await setup.mockMouse.moveTo(0, 0);
-    await sleep(100);
+    await update(() => setup.mockMouse.moveTo(0, 0));
     await setup.waitForFrame((frame) => !frame.includes("回撤到此处"));
   });
 
   test("keyboard focus exposes rewind and running turns disable it", async () => {
     const stream = eventStream();
     const actions: ActionName[] = [];
-    setup = await testRender(<App events={stream.events} onAction={async (_sessionId, name) => { actions.push(name); return { ok: true }; }} />, { width: 100, height: 30 });
-    stream.push({ type: "transcript", item: { id: "group-keyboard", kind: "assistant", title: "助手", body: "", role: "group", state: "success", turn: 1, recoveryPointId: "point-keyboard" } });
-    await setup.renderOnce();
-    await sleep(50);
+    await renderApp(<App events={stream.events} onAction={async (_sessionId, name) => { actions.push(name); return { ok: true }; }} />, { width: 100, height: 30 });
+    await stream.push({ type: "transcript", item: { id: "group-keyboard", kind: "assistant", title: "助手", body: "", role: "group", state: "success", turn: 1, recoveryPointId: "point-keyboard" } });
+    await update(() => setup.renderOnce());
     const node = setup.renderer.root.findDescendantById("recovery-turn-group-keyboard")!;
-    node.focus();
-    await sleep(100);
+    await update(() => node.focus());
     await setup.waitForFrame((frame) => frame.includes("回撤到此处"));
-    setup.mockInput.pressEnter();
-    await sleep(30);
+    await update(() => setup.mockInput.pressEnter());
     expect(actions).toEqual(["rewind"]);
-    stream.push({ type: "turn_state", state: "running" });
-    await sleep(50);
+    await stream.push({ type: "turn_state", state: "running" });
     await setup.waitForFrame((frame) => !frame.includes("回撤到此处"));
-    setup.mockInput.pressEnter();
-    await sleep(30);
+    await update(() => setup.mockInput.pressEnter());
     expect(actions).toEqual(["rewind"]);
   });
 
   test("finished tool calls collapse into a per-kind summary that expands", async () => {
     const stream = eventStream();
-    setup = await testRender(
+    await renderApp(
       <App
         events={stream.events}
         onSubmit={async () => ({ accepted: true } as never)}
@@ -125,23 +116,17 @@ describe("OpenTUI app interactions", () => {
       { width: 100, height: 30 }
     );
 
-    stream.push({ type: "transcript", item: { id: "g1", kind: "assistant", title: "助手", body: "", state: "running", role: "group" } });
+    await stream.push({ type: "transcript", item: { id: "g1", kind: "assistant", title: "助手", body: "", state: "running", role: "group" } });
     await setup.waitForFrame((frame) => frame.includes("思考中"));
-    stream.push({ type: "transcript", item: { id: "t1", kind: "tool", title: "文件已阅读", body: "calculator.html", state: "success", parentId: "g1" } });
+    await stream.push({ type: "transcript", item: { id: "t1", kind: "tool", title: "文件已阅读", body: "calculator.html", state: "success", parentId: "g1" } });
     await setup.waitForFrame((frame) => frame.includes("已阅读 1 个文件"));
-    stream.push({ type: "transcript", item: { id: "t2", kind: "thought", title: "思考", body: "740ms", state: "success", parentId: "g1" } });
-    stream.push({ type: "transcript", item: { id: "t3", kind: "tool", title: "文件已阅读", body: "readme.md", state: "success", parentId: "g1" } });
-    stream.push({ type: "transcript", item: { id: "t5", kind: "tool", title: "记忆已搜索", body: "notes", state: "success", parentId: "g1" } });
-    stream.push({ type: "transcript", item: { id: "t4", kind: "tool", title: "命令已执行", body: "git status", state: "failed", parentId: "g1" } });
+    await stream.push({ type: "transcript", item: { id: "t2", kind: "thought", title: "思考", body: "740ms", state: "success", parentId: "g1" } });
+    await stream.push({ type: "transcript", item: { id: "t3", kind: "tool", title: "文件已阅读", body: "readme.md", state: "success", parentId: "g1" } });
+    await stream.push({ type: "transcript", item: { id: "t5", kind: "tool", title: "记忆已搜索", body: "notes", state: "success", parentId: "g1" } });
+    await stream.push({ type: "transcript", item: { id: "t4", kind: "tool", title: "命令已执行", body: "git status", state: "failed", parentId: "g1" } });
     // waitForFrame bails out early when the scheduler looks idle, which can
     // happen while act still holds queued updates; poll with forced renders.
-    let collapsed = "";
-    for (let i = 0; i < 40; i++) {
-      await sleep(25);
-      await setup.renderOnce();
-      collapsed = setup.captureCharFrame();
-      if (collapsed.includes("已阅读 2 个文件") && collapsed.includes("执行了工具 1 次") && collapsed.includes("git status")) break;
-    }
+    const collapsed = await setup.waitForFrame((frame) => frame.includes("已阅读 2 个文件") && frame.includes("执行了工具 1 次") && frame.includes("git status"));
     expect(collapsed).toContain("▸ 已阅读 2 个文件，执行了工具 1 次");
     // Collapsed: hidden rows stay out of the frame, failures stay visible.
     expect(collapsed).toContain("命令已执行");
@@ -151,20 +136,14 @@ describe("OpenTUI app interactions", () => {
     const summaryLine = collapsed.split("\n").find((line) => line.includes("已阅读 2 个文件"))!;
     const mx = Math.max(1, summaryLine.indexOf("已阅读"));
     const my = collapsed.split("\n").indexOf(summaryLine);
-    await setup.mockMouse.click(mx, my);
-    let opened = "";
-    for (let i = 0; i < 40; i++) {
-      await sleep(25);
-      await setup.renderOnce();
-      opened = setup.captureCharFrame();
-      if (opened.includes("calculator.html") && opened.includes("▾ 已阅读 2 个文件")) break;
-    }
+    await update(() => setup.mockMouse.click(mx, my));
+    const opened = await setup.waitForFrame((frame) => frame.includes("calculator.html") && frame.includes("▾ 已阅读 2 个文件"));
     expect(opened).toContain("calculator.html");
   });
 
   test("subagent rows expand independently and survive live updates", async () => {
     const stream = eventStream();
-    setup = await testRender(
+    await renderApp(
       <App
         events={stream.events}
         onSubmit={async () => ({ accepted: true } as never)}
@@ -173,19 +152,13 @@ describe("OpenTUI app interactions", () => {
       { width: 110, height: 34 }
     );
 
-    stream.push({ type: "transcript", item: { id: "g-agent", kind: "assistant", title: "助手", body: "", state: "running", role: "group" } });
-    stream.push({ type: "transcript", item: { id: "agent-alpha", kind: "agent", title: "alpha", body: "运行中", state: "running", role: "group", parentId: "g-agent" } });
-    stream.push({ type: "transcript", item: { id: "agent-beta", kind: "agent", title: "beta", body: "运行中", state: "running", role: "group", parentId: "g-agent" } });
-    stream.push({ type: "transcript", item: { id: "alpha-tool", kind: "tool", title: "命令已执行", body: "alpha-output", state: "success", parentId: "agent-alpha" } });
-    stream.push({ type: "transcript", item: { id: "beta-tool", kind: "tool", title: "命令已执行", body: "beta-output", state: "success", parentId: "agent-beta" } });
+    await stream.push({ type: "transcript", item: { id: "g-agent", kind: "assistant", title: "助手", body: "", state: "running", role: "group" } });
+    await stream.push({ type: "transcript", item: { id: "agent-alpha", kind: "agent", title: "alpha", body: "运行中", state: "running", role: "group", parentId: "g-agent" } });
+    await stream.push({ type: "transcript", item: { id: "agent-beta", kind: "agent", title: "beta", body: "运行中", state: "running", role: "group", parentId: "g-agent" } });
+    await stream.push({ type: "transcript", item: { id: "alpha-tool", kind: "tool", title: "命令已执行", body: "alpha-output", state: "success", parentId: "agent-alpha" } });
+    await stream.push({ type: "transcript", item: { id: "beta-tool", kind: "tool", title: "命令已执行", body: "beta-output", state: "success", parentId: "agent-beta" } });
 
-    let collapsed = "";
-    for (let i = 0; i < 40; i++) {
-      await sleep(25);
-      await setup.renderOnce();
-      collapsed = setup.captureCharFrame();
-      if (collapsed.includes("alpha") && collapsed.includes("beta")) break;
-    }
+    const collapsed = await setup.waitForFrame((frame) => frame.includes("alpha") && frame.includes("beta"));
     expect(collapsed).toContain("alpha");
     expect(collapsed).toContain("beta");
     // Both subagents start folded: neither timeline leaks into the transcript.
@@ -195,28 +168,16 @@ describe("OpenTUI app interactions", () => {
     const headerLine = collapsed.split("\n").find((line) => line.includes("alpha"))!;
     const headerRow = collapsed.split("\n").indexOf(headerLine);
     const headerColumn = Math.max(1, headerLine.indexOf("alpha"));
-    await setup.mockMouse.click(headerColumn, headerRow);
-    let opened = "";
-    for (let i = 0; i < 40; i++) {
-      await sleep(25);
-      await setup.renderOnce();
-      opened = setup.captureCharFrame();
-      if (opened.includes("alpha-output")) break;
-    }
+    await update(() => setup.mockMouse.click(headerColumn, headerRow));
+    const opened = await setup.waitForFrame((frame) => frame.includes("alpha-output"));
     expect(opened).toContain("alpha-output");
     // Expanding one agent does not expand its sibling.
     expect(opened).not.toContain("beta-output");
 
     // A live header update replaces the summary without collapsing the open
     // timeline or resetting its per-agent expansion state.
-    stream.push({ type: "transcript", item: { id: "agent-alpha", kind: "agent", title: "alpha", body: "已完成", state: "success", role: "group", parentId: "g-agent" } });
-    let updated = "";
-    for (let i = 0; i < 40; i++) {
-      await sleep(25);
-      await setup.renderOnce();
-      updated = setup.captureCharFrame();
-      if (updated.includes("已完成")) break;
-    }
+    await stream.push({ type: "transcript", item: { id: "agent-alpha", kind: "agent", title: "alpha", body: "已完成", state: "success", role: "group", parentId: "g-agent" } });
+    const updated = await setup.waitForFrame((frame) => frame.includes("已完成"));
     expect(updated).toContain("已完成");
     expect(updated).toContain("alpha-output");
     expect(updated).not.toContain("beta-output");
@@ -224,27 +185,14 @@ describe("OpenTUI app interactions", () => {
     // Keyboard: Enter expands a focused agent, Space collapses it, and each
     // agent keeps its own expansion state.
     const betaNode = setup.renderer.root.findDescendantById("inline-agent-agent-beta")!;
-    betaNode.focus();
-    await sleep(100);
-    setup.mockInput.pressEnter();
-    let betaOpened = "";
-    for (let i = 0; i < 40; i++) {
-      await sleep(25);
-      await setup.renderOnce();
-      betaOpened = setup.captureCharFrame();
-      if (betaOpened.includes("beta-output")) break;
-    }
+    await update(() => betaNode.focus());
+    await update(() => setup.mockInput.pressEnter());
+    const betaOpened = await setup.waitForFrame((frame) => frame.includes("beta-output"));
     expect(betaOpened).toContain("beta-output");
     expect(betaOpened).toContain("alpha-output");
 
-    setup.mockInput.pressKey(" ");
-    let betaClosed = "";
-    for (let i = 0; i < 40; i++) {
-      await sleep(25);
-      await setup.renderOnce();
-      betaClosed = setup.captureCharFrame();
-      if (!betaClosed.includes("beta-output")) break;
-    }
+    await update(() => setup.mockInput.pressKey(" "));
+    const betaClosed = await setup.waitForFrame((frame) => !frame.includes("beta-output"));
     expect(betaClosed).not.toContain("beta-output");
     expect(betaClosed).toContain("alpha-output");
   });
@@ -253,7 +201,7 @@ describe("OpenTUI app interactions", () => {
     const stream = eventStream();
     const panelActions: string[] = [];
     const releaseHolder: { release?: () => void } = {};
-    setup = await testRender(
+    await renderApp(
       <App
         events={stream.events}
         onSubmit={async () => ({ accepted: true } as never)}
@@ -269,27 +217,24 @@ describe("OpenTUI app interactions", () => {
     );
 
     // Commit the incoming event and keyboard effects before sending input.
-    await act(async () => {
-      stream.push({
-        type: "panel",
-        panel: { kind: "observe", title: "运行观察", options: [{ id: "go", label: "切换到项目概览" }] },
-      });
+    await stream.push({
+      type: "panel",
+      panel: { kind: "observe", title: "运行观察", options: [{ id: "go", label: "切换到项目概览" }] },
     });
     await setup.waitForFrame((frame) => frame.includes("切换到项目概览"));
 
-    await act(async () => { setup.mockInput.pressEnter(); });
+    await update(() => setup.mockInput.pressEnter());
     await setup.waitForFrame((frame) => frame.includes("处理中"));
-    await act(async () => { setup.mockInput.pressEnter(); });
-    await act(async () => { await sleep(50); });
+    await update(() => setup.mockInput.pressEnter());
 
     expect(panelActions).toEqual(["panel_action"]);
-    await act(async () => { releaseHolder.release?.(); });
+    await update(() => releaseHolder.release?.());
   });
 
   test("mention completion fires once after rapid typing", async () => {
     const stream = eventStream();
     const actions: ActionName[] = [];
-    setup = await testRender(
+    await renderApp(
       <App
         events={stream.events}
         onSubmit={async () => ({ accepted: true } as never)}
@@ -301,24 +246,41 @@ describe("OpenTUI app interactions", () => {
       { width: 100, height: 30 }
     );
 
-    await act(async () => {
-      stream.push({
-        type: "snapshot",
-        snapshot: { ...initialState.snapshot, sessionId: "test-session", status: "ready" },
-      });
+    await stream.push({
+      type: "snapshot",
+      snapshot: { ...initialState.snapshot, sessionId: "test-session", status: "ready" },
     });
     await setup.waitForFrame((frame) => frame.includes("从这里开始"));
 
-    await act(async () => { await setup.mockInput.typeText("@readme", 8); });
-    await act(async () => { await sleep(300); });
+    await update(() => setup.mockInput.typeText("@readme", 8));
+    await update(() => Bun.sleep(300));
 
     expect(actions.filter((name) => name === "complete_mention").length).toBe(1);
   });
 
-  test("approval resolves through keyboard and two-stage mouse click", async () => {
+  test("repeated Enter sends a pending draft only once", async () => {
+    const stream = eventStream();
+    const submissions: string[] = [];
+    const pending = Promise.withResolvers<{ accepted: boolean }>();
+    await renderApp(
+      <App events={stream.events} onSubmit={async (_id, submission) => {
+        submissions.push(submission.text);
+        return pending.promise;
+      }} />,
+      { width: 100, height: 30 },
+    );
+    await setup.waitForFrame((frame) => frame.includes("从这里开始"));
+    await update(() => setup.mockInput.typeText("一次提交"));
+    await update(() => setup.mockInput.pressEnter());
+    await update(() => setup.mockInput.pressEnter());
+    expect(submissions).toEqual(["一次提交"]);
+    await update(() => pending.resolve({ accepted: true }));
+  });
+
+  test("approval resolves through the keyboard", async () => {
     const stream = eventStream();
     const resolutions: Record<string, unknown>[] = [];
-    setup = await testRender(
+    await renderApp(
       <App
         events={stream.events}
         onSubmit={async () => ({ accepted: true } as never)}
@@ -327,7 +289,7 @@ describe("OpenTUI app interactions", () => {
       />,
       { width: 100, height: 30 }
     );
-    stream.push({
+    await stream.push({
       type: "interaction",
       id: "approval-1",
       kind: "approval",
@@ -337,15 +299,14 @@ describe("OpenTUI app interactions", () => {
     expect(frame).toContain("执行命令");
     expect(frame).toContain("pytest");
 
-    setup.mockInput.pressEnter();
-    await sleep(50);
+    await update(() => setup.mockInput.pressEnter());
     expect(resolutions).toEqual([{ decision: "approve" }]);
   });
 
   test("approval option can be selected and confirmed with the mouse", async () => {
     const stream = eventStream();
     const resolutions: Record<string, unknown>[] = [];
-    setup = await testRender(
+    await renderApp(
       <App
         events={stream.events}
         onSubmit={async () => ({ accepted: true } as never)}
@@ -354,7 +315,7 @@ describe("OpenTUI app interactions", () => {
       />,
       { width: 100, height: 30 }
     );
-    stream.push({
+    await stream.push({
       type: "interaction",
       id: "approval-2",
       kind: "approval",
@@ -365,18 +326,17 @@ describe("OpenTUI app interactions", () => {
     const x = Math.max(1, row.indexOf("[2]"));
     const y = frame.split("\n").indexOf(row);
 
-    await setup.mockMouse.click(x + 1, y);
+    await update(() => setup.mockMouse.click(x + 1, y));
     await setup.waitForFrame((next) => next.includes("› [2] 拒绝"));
     expect(resolutions).toEqual([]);
-    await setup.mockMouse.click(x + 1, y);
-    await sleep(50);
+    await update(() => setup.mockMouse.click(x + 1, y));
     expect(resolutions).toEqual([{ decision: "deny" }]);
   });
 
   test("question other branch is escapable via arrow keys and submits custom text", async () => {
     const stream = eventStream();
     const resolutions: Record<string, unknown>[] = [];
-    setup = await testRender(
+    await renderApp(
       <App
         events={stream.events}
         onSubmit={async () => ({ accepted: true } as never)}
@@ -385,7 +345,7 @@ describe("OpenTUI app interactions", () => {
       />,
       { width: 100, height: 30 }
     );
-    stream.push({
+    await stream.push({
       type: "interaction",
       id: "question-1",
       kind: "question",
@@ -399,23 +359,22 @@ describe("OpenTUI app interactions", () => {
     });
     await setup.waitForFrame((frame) => frame.includes("[2] 其他"));
 
-    setup.mockInput.pressArrow("down");
+    await update(() => setup.mockInput.pressArrow("down"));
     await setup.waitForFrame((frame) => frame.includes("其他说明"));
-    setup.mockInput.pressArrow("up");
+    await update(() => setup.mockInput.pressArrow("up"));
     await setup.waitForFrame((frame) => frame.includes("› [1] 直接修复") && !frame.includes("其他说明"));
 
-    setup.mockInput.pressArrow("down");
+    await update(() => setup.mockInput.pressArrow("down"));
     await setup.waitForFrame((frame) => frame.includes("其他说明"));
-    await setup.mockInput.typeText("用方案B");
-    setup.mockInput.pressEnter();
-    await sleep(50);
+    await update(() => setup.mockInput.typeText("用方案B"));
+    await update(() => setup.mockInput.pressEnter());
     expect(resolutions).toEqual([{ selectedIndex: 1, customText: "用方案B" }]);
   });
 
   test("failed startup keeps the draft but blocks submission", async () => {
     const stream = eventStream();
     let submitCalls = 0;
-    setup = await testRender(
+    await renderApp(
       <App
         events={stream.events}
         onSubmit={async () => { submitCalls += 1; return { accepted: true } as never; }}
@@ -423,18 +382,16 @@ describe("OpenTUI app interactions", () => {
       />,
       { width: 100, height: 30 }
     );
-    stream.push({ type: "progress", status: "failed", detail: "缺少运行依赖" });
+    await stream.push({ type: "progress", status: "failed", detail: "缺少运行依赖" });
     await setup.waitForFrame((frame) => frame.includes("会话启动失败"));
-    await setup.mockInput.typeText("修复这个 bug");
-    await sleep(200);
-    setup.mockInput.pressEnter();
-    await sleep(300);
-    expect(setup.captureCharFrame()).toContain("会话未就绪");
+    await update(() => setup.mockInput.typeText("修复这个 bug"));
+    await update(() => setup.mockInput.pressEnter());
+    await setup.waitForFrame((frame) => frame.includes("会话未就绪"));
     expect(submitCalls).toBe(0);
   });
 
   test("mouse click on a header button does not leave focus on it", async () => {
-    setup = await testRender(
+    await renderApp(
       <App
         events={eventStream().events}
         onSubmit={async () => ({ accepted: true } as never)}
@@ -442,14 +399,13 @@ describe("OpenTUI app interactions", () => {
       />,
       { width: 100, height: 30 }
     );
-    await sleep(300);
-    const headerLines = setup.captureCharFrame().split("\n");
+    const header = await setup.waitForFrame((frame) => frame.includes("＋ 新建"));
+    const headerLines = header.split("\n");
     const labelY = headerLines.findIndex((line) => line.includes("＋ 新建"));
     const labelX = headerLines[labelY]?.indexOf("新建") ?? -1;
     expect(labelX).toBeGreaterThan(-1);
 
-    await setup.mockMouse.click(labelX + 1, labelY);
-    await sleep(150);
+    await update(() => setup.mockMouse.click(labelX + 1, labelY));
 
     const focused = findFocused((setup.renderer as unknown as { root: AnyNode }).root);
     const focusedKind = focused?.constructor?.name ?? "none";
@@ -459,7 +415,7 @@ describe("OpenTUI app interactions", () => {
   });
 
   test.each([50, 70, 100])("right-side controls stay right-aligned at W=%d", async (terminalWidth) => {
-    setup = await testRender(
+    await renderApp(
       <App
         events={eventStream().events}
         onSubmit={async () => ({ accepted: true } as never)}
@@ -467,8 +423,7 @@ describe("OpenTUI app interactions", () => {
       />,
       { width: terminalWidth, height: 30 }
     );
-    // Default snapshot already renders both toolbar groups.
-    await sleep(300);
+    await update(() => setup.renderOnce());
     const events = (() => {
       const root = (setup.renderer as unknown as { root: AnyNode }).root;
       return [root, ...(function collect(node: AnyNode): AnyNode[] {
@@ -483,7 +438,7 @@ describe("OpenTUI app interactions", () => {
   });
 
   test.each([50, 100])("context gauge popover shows full details at W=%d", async (terminalWidth) => {
-    setup = await testRender(
+    await renderApp(
       <App
         events={eventStream().events}
         onSubmit={async () => ({ accepted: true } as never)}
@@ -491,15 +446,13 @@ describe("OpenTUI app interactions", () => {
       />,
       { width: terminalWidth, height: 30 }
     );
-    await sleep(300);
+    await update(() => setup.renderOnce());
     const all = (function collect(node: AnyNode): AnyNode[] {
       return [node, ...(node._childrenInLayoutOrder ?? []).flatMap((child) => collect(child as AnyNode))];
     })((setup.renderer as unknown as { root: AnyNode }).root);
     const groups = all.filter((node) => (node._childrenInLayoutOrder?.length ?? 0) >= 3 && node.width >= 10);
     const gauge = groups.at(-1)!._childrenInLayoutOrder?.[0]!;
-    gauge.focus();
-    await sleep(200);
-    const frame = setup.captureCharFrame();
-    expect(frame).toContain("已使用");
+    await update(() => gauge.focus());
+    await setup.waitForFrame((frame) => frame.includes("已使用"));
   });
 });

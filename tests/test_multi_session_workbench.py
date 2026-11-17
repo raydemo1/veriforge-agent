@@ -4,11 +4,17 @@ import json
 import subprocess
 import sys
 import threading
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from harness_code_agent import config
+from harness_code_agent.core.session_runtime_registry import SessionRuntimeRegistry
+from harness_code_agent.memory.identity import resolve_repo_key
+from harness_code_agent.runtime.builtins.filesystem import read_file
+from harness_code_agent.runtime.recovery import atomic_json
 from harness_code_agent.support.cancellation import CancellationToken, CancelledError
 from harness_code_agent.workspace.access import (
     WorkspaceAccessCoordinator,
@@ -34,6 +40,47 @@ def test_models_and_histories_are_session_owned(runtime_factory):
     assert "分析 A" not in str(second.conversation.messages)
 
 
+def test_externalized_prompt_is_readable_before_and_after_resume(runtime_factory, tmp_path_factory, monkeypatch):
+    create, _ = runtime_factory
+    state = tmp_path_factory.mktemp("externalized-input")
+    monkeypatch.setenv("HARNESS_TURN_INLINE_CHAR_LIMIT", "32")
+    session = create(state_root=state)
+    text = "测试长输入\n" * 18 + "结尾"
+    session.submit(text)
+    path, = (session.session.root / "inputs").glob("*.txt")
+    assert path.read_bytes() == text.encode("utf-8")
+    assert read_file(str(path), tool_context=session.tool_context).output == text
+    assert list((state / "traces" / session.session.id).glob("*.jsonl"))
+
+    identity = session.session.id
+    session.close()
+    resumed = create(state_root=state, session_id=identity)
+    assert read_file(str(path), tool_context=resumed.tool_context).output == text
+
+
+def test_worktree_shares_memory_identity_with_a_unicode_repository(tmp_path):
+    project = tmp_path / "中文-é"
+    project.mkdir()
+    tree = tmp_path / "worktree"
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    subprocess.run([
+        "git", "-C", str(project), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+        "commit", "--allow-empty", "-qm", "initial",
+    ], check=True)
+    subprocess.run(["git", "-C", str(project), "worktree", "add", "--detach", str(tree)], check=True)
+    assert resolve_repo_key(tree) == resolve_repo_key(project)
+
+
+def test_failed_permission_save_keeps_the_active_mode(runtime_factory):
+    session = runtime_factory[0]()
+    with (
+        patch.object(session.session_store, "update_permission_mode", side_effect=OSError("disk unavailable")),
+        pytest.raises(OSError, match="disk unavailable"),
+    ):
+        session.set_permission_mode("read-only")
+    assert session.permission_mode == session.tool_context.permission_policy.mode == "workspace-write"
+
+
 def test_resume_preserves_id_and_fork_uses_stable_boundary(runtime_factory):
     create, _ = runtime_factory
     original = create()
@@ -56,10 +103,6 @@ def test_resume_preserves_id_and_fork_uses_stable_boundary(runtime_factory):
 
 
 def test_registry_creation_failure_preserves_active_session_and_rejects_worktree_forks(tmp_path):
-    from types import SimpleNamespace
-
-    from harness_code_agent.core.session_runtime_registry import SessionRuntimeRegistry
-
     events = []
     registry = SessionRuntimeRegistry(tmp_path, lambda _: SimpleNamespace(), events.append)
     first = registry.create(environment="worktree")
@@ -75,6 +118,37 @@ def test_registry_creation_failure_preserves_active_session_and_rejects_worktree
     assert events[-1]["activeSessionId"] == first
     assert [record["id"] for record in events[-1]["sessions"]] == [first]
     registry.access.release_runtime(first)
+
+
+@pytest.mark.parametrize("stage", ["copy", "startup"])
+def test_failed_worktree_fork_cleans_up_the_new_tree_and_session(tmp_path, stage):
+    def git(*args):
+        return subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True).stdout
+
+    git("init", "-q")
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    git("add", "app.py")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "initial")
+
+    registry = SessionRuntimeRegistry(tmp_path, lambda _: SimpleNamespace(turns_paused=nullcontext, close=lambda: None), lambda _: None)
+    source = registry.store.create(cwd=tmp_path, model="test", permission_mode="read-only")
+    metadata = registry.store.read_metadata(source.id)
+    metadata["fork_boundary"] = {"turn": 0, "journal_sequence": 0, "event_count": 0}
+    atomic_json(source.metadata_path, metadata)
+    registry.create(session_id=source.id)
+    before = git("worktree", "list", "--porcelain")
+    entry = ("harness_code_agent.workspace.worktrees.shutil.copystat" if stage == "copy"
+             else "harness_code_agent.core.session_runtime_registry.SessionRuntimeRegistry.create")
+    try:
+        with patch(entry, side_effect=OSError(f"{stage} failed")), pytest.raises(OSError, match=f"{stage} failed"):
+            registry.fork(source.id, worktree=True)
+        assert git("worktree", "list", "--porcelain") == before
+        assert list(registry.store.sessions_dir.iterdir()) == [source.root]
+        assert list((registry.store.root / "worktrees" / "environments").glob("*.json")) == []
+        assert registry.active_id == source.id
+        assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 1\n"
+    finally:
+        registry.close()
 
 
 def test_file_versions_prevent_stale_writes(tmp_path):

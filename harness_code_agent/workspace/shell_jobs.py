@@ -373,6 +373,7 @@ class ShellJobManager:
                 from .native_shell import (
                     direct_arguments,
                     launch_arguments,
+                    prepare_private_temp_dir,
                     write_directories,
                 )
 
@@ -423,6 +424,8 @@ class ShellJobManager:
                         Path(extra).mkdir(parents=True, exist_ok=True)
                     temporary = tempfile.TemporaryDirectory(prefix="veriforge-shell-")
                     launch_started = time.perf_counter()
+                    if not read_only:
+                        prepare_private_temp_dir(temporary.name)
                     args = launch_arguments(
                         root, granted, temporary.name, command,
                         extra_dirs=extra_dirs, read_only=read_only,

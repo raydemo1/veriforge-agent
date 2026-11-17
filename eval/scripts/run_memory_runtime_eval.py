@@ -8,7 +8,7 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -69,7 +69,7 @@ def main():
     if not args.run:
         print(json.dumps(protocol, indent=2))
         return
-    root = ROOT / "eval/results" / ("memory-runtime-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
+    root = ROOT / "eval/results" / ("memory-runtime-" + datetime.now(UTC).strftime("%Y%m%d-%H%M%S"))
     root.mkdir(parents=True)
     (root / "protocol.json").write_text(json.dumps(protocol, indent=2), encoding="utf-8")
     workspace = root / "workspace"

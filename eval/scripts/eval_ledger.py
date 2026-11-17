@@ -10,7 +10,7 @@ import json
 import re
 import shutil
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from hashlib import sha1
 from pathlib import Path
 from typing import Any
@@ -116,7 +116,7 @@ def rebuild_eval_ledger(
     )
     return {
         "schema_version": 1,
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "results_root": str(results_root),
         "jobs_root": str(jobs_root_path) if jobs_root_path else "",
         "summary": summary,
@@ -792,7 +792,7 @@ def _run_timestamp(run_name: str, summary_path: Path) -> str:
     if match:
         return f"{match.group(1)}_{match.group(2)}"
     try:
-        return datetime.fromtimestamp(summary_path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+        return datetime.fromtimestamp(summary_path.stat().st_mtime, tz=UTC).strftime("%Y-%m-%d_%H%M%S")
     except OSError:
         return "0000-00-00_000000"
 

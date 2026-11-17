@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import difflib
+from itertools import islice
 from pathlib import Path
 
 from ... import config
 from ...support.tokens import count_text_tokens
-from ...workspace.service import WorkspaceQuotaError
+from ...workspace.service import WorkspaceDiskSpaceError
+from ..output_artifacts import file_digest
 from ..tool_context import ToolContext
 from ..tool_output import fitting_prefix, output_limit
 from ..tool_result import ToolResult
@@ -32,40 +34,27 @@ def _is_secret_env_file(path: Path) -> bool:
     return not name.endswith((".example", ".template", ".sample", ".default", ".dist"))
 
 
-def _change_diff(old: str | None, new: str) -> str:
-    """Compact unified diff between two file versions (old=None means new file)."""
+def _change_details(path: Path, old: str | None, new: str) -> tuple[str, int, int]:
+    """Return a bounded diff and counts for the entire change."""
+    if _is_secret_env_file(path):
+        return "[redacted .env diff]", 0, 0
+    new_lines = new.splitlines()
     if old is None:
-        lines = new.splitlines()
-        body = ["+" + line for line in lines]
+        lines = ("+" + line for line in new_lines)
     else:
-        body = [
-            line
-            for line in difflib.unified_diff(
-                old.splitlines(), new.splitlines(), lineterm="", n=1
-            )
-            if not line.startswith(("--- ", "+++ "))
-        ]
-    if len(body) > _DIFF_MAX_LINES:
-        omitted = len(body) - _DIFF_MAX_LINES
-        kept = "\n".join(body[:_DIFF_MAX_LINES])
-        return kept + "\n… " + str(omitted) + " more diff lines"
-    return "\n".join(body)
-
-
-def _change_stats(old: str | None, new: str) -> tuple[int, int]:
-    """Return actual added/deleted line counts before the display diff is capped."""
-    if old is None:
-        return len(new.splitlines()), 0
-    body = [
-        line
-        for line in difflib.unified_diff(
-            old.splitlines(), new.splitlines(), lineterm="", n=1
-        )
-        if not line.startswith(("--- ", "+++ "))
-    ]
-    additions = sum(1 for line in body if line.startswith("+"))
-    deletions = sum(1 for line in body if line.startswith("-"))
-    return additions, deletions
+        lines = islice(difflib.unified_diff(old.splitlines(), new_lines, lineterm="", n=1), 2, None)
+    preview = []
+    additions = deletions = omitted = 0
+    for line in lines:
+        additions += line.startswith("+")
+        deletions += line.startswith("-")
+        if len(preview) < _DIFF_MAX_LINES:
+            preview.append(line)
+        else:
+            omitted += 1
+    if omitted:
+        preview.append(f"… {omitted} more diff lines")
+    return "\n".join(preview), additions, deletions
 
 
 def _resolve(path: str) -> Path:
@@ -116,11 +105,6 @@ def read_file(
                           error=f"File not found: {path}", metadata={"path": path, "status_source": "native"})
     references = getattr(tool_context, "tool_output_artifacts", {})
     reference = references.get(p.as_posix())
-    if reference and reference.get("sha256") and not reference.get("append_only"):
-        from ..output_artifacts import file_digest
-        if file_digest(p) != reference["sha256"]:
-            return ToolResult(tool="read_file", status="failed", output="[error] Tool output artifact is damaged.",
-                              error="Tool output artifact is damaged", metadata={"path": path})
     for name, value, maximum in (("start_line", start_line if start_line is not None else 1, None),
                                  ("start_column", start_column, None),
                                  ("max_lines", max_lines if max_lines is not None else READ_FILE_MAX_LINES, READ_FILE_MAX_LINES)):
@@ -142,9 +126,13 @@ def read_file(
     next_read = None
     budget = max(1, output_limit() - 800)
     before = p.stat()
-    if tool_context is not None:
-        from ..output_artifacts import file_digest
-        tool_context.workspace._versions[str(p).casefold()] = file_digest(p)
+    version = None
+    if reference and reference.get("sha256") and not reference.get("append_only"):
+        if file_digest(p) != reference["sha256"]:
+            return ToolResult(tool="read_file", status="failed", output="[error] Tool output artifact is damaged.",
+                              error="Tool output artifact is damaged", metadata={"path": path})
+    elif tool_context is not None and reference is None:
+        version = file_digest(p)
     with p.open("r", encoding="utf-8", errors="replace", newline=None) as stream:
         while fragment := stream.readline(4096):
             fragment_line, fragment_col = line, col
@@ -181,6 +169,8 @@ def read_file(
     if (before.st_ino, before.st_mtime_ns, before.st_size) != (after.st_ino, after.st_mtime_ns, after.st_size):
         from ...workspace.access import WorkspaceConflict
         raise WorkspaceConflict(f"读取期间文件发生变化，请重新读取：{path}")
+    if version is not None and tool_context is not None:
+        tool_context.workspace.remember_read_version(p, version)
     metadata = {"path": path, "start_line": start, "start_column": column, "max_lines": limit,
                 "status_source": "native"}
     if next_read:
@@ -224,22 +214,16 @@ def read_skill_file(path: str) -> ToolResult:
     )
 
 
-def _quota_result(tool: str, path: str, exc: WorkspaceQuotaError) -> ToolResult:
+def _disk_space_result(tool: str, path: str, exc: WorkspaceDiskSpaceError) -> ToolResult:
     return ToolResult(
         tool=tool,
         status="failed",
-        output=(
-            f"[blocked] {exc.reason}. Stop generating new files, clean up existing "
-            "workspace files, or ask the user to raise HARNESS_WORKSPACE_WRITE_QUOTA_MB / "
-            "HARNESS_MIN_FREE_DISK_MB."
-        ),
-        error=exc.reason,
+        output=f"[blocked] {exc}. Free disk space before retrying.",
+        error=str(exc),
         metadata={
             "path": path,
             "status_source": "resource",
-            "resource_kind": getattr(exc, "resource_kind", "workspace_quota"),
-            "charged_bytes": exc.charged_bytes,
-            "limit_bytes": exc.limit_bytes,
+            "resource_kind": "free_disk",
         },
     )
 
@@ -262,18 +246,18 @@ def write_file(
         workspace = tool_context.workspace
         try:
             write_result = workspace.write_text(path, content)
-        except WorkspaceQuotaError as exc:
-            return _quota_result("write_file", path, exc)
+        except WorkspaceDiskSpaceError as exc:
+            return _disk_space_result("write_file", path, exc)
         old = write_result.old_content
         rel = write_result.path.relative_to(workspace.root)
         redacted = _is_secret_env_file(write_result.path)
-        additions, deletions = (0, 0) if redacted else _change_stats(old, content)
+        diff, additions, deletions = _change_details(write_result.path, old, content)
         metadata["file_changes"] = [
             {
                 "path": str(rel),
                 "operation": "write_file",
                 "snapshot_path": str(write_result.snapshot_path) if write_result.snapshot_path else None,
-                "diff": "[redacted .env diff]" if redacted else _change_diff(old, content),
+                "diff": diff,
                 "additions": additions,
                 "deletions": deletions,
             }
@@ -282,7 +266,6 @@ def write_file(
             metadata["diff_redacted"] = True
     else:
         p = _resolve(path)
-        old = p.read_text(encoding="utf-8", errors="replace") if p.exists() else None
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
     return ToolResult(
@@ -315,13 +298,13 @@ def apply_patch(
                 search=search,
                 replace=replace,
             )
-        except WorkspaceQuotaError as exc:
-            return _quota_result("apply_patch", path, exc)
+        except WorkspaceDiskSpaceError as exc:
+            return _disk_space_result("apply_patch", path, exc)
         rel = patch_result.path.relative_to(workspace.root)
         old = patch_result.old_content
         new = patch_result.new_content
         redacted = _is_secret_env_file(patch_result.path)
-        additions, deletions = (0, 0) if redacted else _change_stats(old, new)
+        diff, additions, deletions = _change_details(patch_result.path, old, new)
         return ToolResult(
             tool="apply_patch",
             status="success",
@@ -335,7 +318,7 @@ def apply_patch(
                         "path": str(rel),
                         "operation": "apply_patch",
                         "snapshot_path": str(patch_result.snapshot_path) if patch_result.snapshot_path else None,
-                        "diff": "[redacted .env diff]" if redacted else _change_diff(old, new),
+                        "diff": diff,
                         "additions": additions,
                         "deletions": deletions,
                     }

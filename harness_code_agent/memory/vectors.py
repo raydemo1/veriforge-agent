@@ -81,10 +81,10 @@ def _text(record):
 
 
 class VectorIndex:
-    def __init__(self, database: MemoryDatabase, *, embeddings=None):
+    def __init__(self, database: MemoryDatabase, *, embeddings=None, query_cache=None):
         self.database = database
         self.embeddings = embeddings or SiliconFlowEmbeddings()
-        self._query_cache = {}
+        self._query_cache = {} if query_cache is None else query_cache
 
     def _embed(self, texts, purpose):
         with self.database.connect(write=True) as db:
@@ -159,25 +159,34 @@ class VectorIndex:
                     indexed += 1
         return {"calls": calls, "indexed": indexed, "obsolete": obsolete}
 
-    def search(self, text: str, *, limit: int = 30) -> list[tuple[str, float]]:
+    def search(self, text: str, *, limit: int = 30,
+               embedding_errors: dict[tuple[str, str], Exception] | None = None) -> list[tuple[str, float]]:
         if not 1 <= limit <= 200:
             raise ValueError("Invalid vector candidate count")
         with self.database.connect() as db:
             if not db.execute("SELECT 1 FROM memories WHERE namespace=? AND status<>'expired' LIMIT 1",
                               (self.database.namespace,)).fetchone():
                 return []
-        digest = hashlib.sha256(text.encode()).hexdigest()
-        if digest not in self._query_cache:
-            vector = self._embed([text], "query")[0]
+        key = (self.embeddings.contract, hashlib.sha256(text.encode()).hexdigest())
+        vector = self._query_cache.get(key)
+        if vector is None:
+            if embedding_errors is not None and key in embedding_errors:
+                raise embedding_errors[key]
+            try:
+                vector = self._embed([text], "query")[0]
+            except Exception as exc:
+                if embedding_errors is not None:
+                    embedding_errors[key] = exc
+                raise
             if len(self._query_cache) >= 128:
                 self._query_cache.clear()
-            self._query_cache[digest] = vector
+            self._query_cache[key] = vector
         with self.database.connect() as db:
             rows = db.execute(
                 "SELECT v.memory_id,n.distance FROM memory_vectors n JOIN vector_entries v ON v.id=n.rowid "
                 "JOIN memories m ON m.id=v.memory_id WHERE n.embedding MATCH ? AND k=? AND n.namespace=? "
                 "AND v.contract=? AND v.version=m.version ORDER BY n.distance",
-                (self._query_cache[digest], limit, self.database.namespace, self.embeddings.contract),
+                (vector, limit, self.database.namespace, self.embeddings.contract),
             ).fetchall()
             return [(row[0], 1 - row[1]) for row in rows]
 

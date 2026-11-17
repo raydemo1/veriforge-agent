@@ -7,7 +7,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -158,7 +158,7 @@ def main():
         return
     if not os.environ.get("SILICONFLOW_API_KEY", "").strip():
         raise SystemExit("Configure SILICONFLOW_API_KEY in local .env before running.")
-    root = ROOT / "eval/results" / ("memory-consolidation-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S"))
+    root = ROOT / "eval/results" / ("memory-consolidation-" + datetime.now(UTC).strftime("%Y%m%d-%H%M%S"))
     root.mkdir(parents=True)
     (root / "protocol.json").write_text(json.dumps(protocol, ensure_ascii=False, indent=2), encoding="utf-8")
     recorder = RequestRecorder(root / "model-requests.jsonl", 28)

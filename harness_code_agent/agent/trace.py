@@ -7,7 +7,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .. import config
@@ -24,7 +24,7 @@ class TraceWriter:
     """
 
     def __init__(self, agent_name: str, *, workspace: str | Path | None = None,
-                 session_id: str | None = None, turn_id=None, request_id=None):
+                 state_root: Path | None = None, session_id: str | None = None, turn_id=None, request_id=None):
         self.agent_name = agent_name
         self.session_id = session_id or "standalone_" + uuid.uuid4().hex
         self._turn_id = turn_id or (lambda: None)
@@ -34,7 +34,8 @@ class TraceWriter:
         self._path = None
         safe = lambda value: re.sub(r"[^a-zA-Z0-9_-]", "_", value)
         from ..workspace.state_paths import ensure_workspace_state
-        trace_dir = ensure_workspace_state(Path(workspace or Path.cwd())) / "traces" / safe(self.session_id)
+        state_root = state_root or ensure_workspace_state(Path(workspace or Path.cwd()))
+        trace_dir = state_root / "traces" / safe(self.session_id)
         try:
             trace_dir.mkdir(parents=True, exist_ok=True)
             self._path = trace_dir / f"{safe(agent_name)}_{uuid.uuid4().hex}.jsonl"
@@ -44,7 +45,7 @@ class TraceWriter:
     def _write(self, event_type: str, data: dict):
         with self._lock:
             entry = {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
                 "t": round(time.monotonic() - self._start_time, 3),
                 "agent": self.agent_name,
                 "event": event_type,

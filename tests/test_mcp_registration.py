@@ -79,7 +79,7 @@ def test_discover_isolates_unreachable_servers_and_reports_them(tmp_path):
         manager.close()
 
 
-def test_reregister_server_keeps_existing_metadata(tmp_path):
+def test_reregister_server_keeps_existing_metadata(tmp_path, monkeypatch):
     _write_config(
         tmp_path,
         {
@@ -93,7 +93,7 @@ def test_reregister_server_keeps_existing_metadata(tmp_path):
         },
     )
     manager = McpClientManager.from_workspace(tmp_path)
-    manager.timeout_seconds = 5
+    monkeypatch.setattr(manager, "ensure_connected", lambda _: None)
     server = build_server_config(name="docs", url="http://127.0.0.1:1/mcp", permission="network_read")
     registration = manager.register_server(server)
     assert registration.replaced is True
@@ -253,7 +253,7 @@ def test_concurrent_connects_share_a_handshake_and_isolate_timeout(tmp_path, mon
         name: {"transport": "stdio", "command": name} for name in ("slow", "fast")
     })
     manager = McpClientManager.from_workspace(tmp_path)
-    manager.timeout_seconds = 3
+    manager.timeout_seconds = 1
     started = threading.Event()
     calls = []
 
