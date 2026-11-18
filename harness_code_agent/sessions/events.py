@@ -236,25 +236,6 @@ class SessionFinishedEvent:
 
 
 @dataclass(frozen=True)
-class TaskOutcomeEvent:
-    status: str
-    evidence: list[str]
-    summary: str
-    agent: str | None = "main_agent"
-
-    def to_event(self) -> StructuredEvent:
-        return StructuredEvent(
-            "task_outcome",
-            {
-                "status": self.status,
-                "evidence": self.evidence,
-                "summary": self.summary,
-            },
-            self.agent,
-        )
-
-
-@dataclass(frozen=True)
 class TurnSummaryEvent:
     turn: int
     summary: str

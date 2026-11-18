@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 ToolStatus = Literal["success", "failed", "unknown"]
@@ -44,12 +44,6 @@ class ToolResult:
         if self.error:
             return f"[error] {self.error}"
         return ""
-
-    def with_output_prefix(self, prefix: str) -> ToolResult:
-        metadata = dict(self.metadata)
-        metadata["output_prefix"] = prefix
-        output = f"{prefix}\n\n{self.to_text()}"
-        return replace(self, output=output, metadata=metadata)
 
 
 def unstructured_tool_result_from_text(

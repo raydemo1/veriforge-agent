@@ -13,8 +13,17 @@ asks for it.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from pathlib import Path
+
+
+def is_same_or_child(value: str, parent: str) -> bool:
+    """Whether normalized absolute path ``value`` is ``parent`` or below it."""
+    try:
+        return os.path.commonpath((value, parent)) == parent
+    except ValueError:
+        return False
 
 
 def normalize_rel_path(value: str) -> str:

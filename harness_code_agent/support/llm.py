@@ -1,10 +1,12 @@
 """Provider adapters for OpenAI-compatible chat completions."""
 from __future__ import annotations
 
+import atexit
 import functools
 import os
 import re
 import ssl
+import threading
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -146,15 +148,40 @@ def get_client() -> OpenAI:
     )
 
 
+_shared_lock = threading.Lock()
+_shared: tuple[tuple, OpenAI] | None = None
+
+
 @contextmanager
 def client_scope():
-    """Yield one independently owned client and always release its transport."""
-    client = get_client()
-    try:
-        yield client
-    finally:
-        with suppress(Exception):
-            client.close()
+    """Yield the process-wide client used by helper calls (summaries, reviews, memory).
+
+    One client keeps its connection pool across calls, so a helper request does
+    not pay a fresh TLS handshake.  It is rebuilt when the endpoint settings or
+    the ``get_client`` factory change (tests patch the factory).  The main agent
+    loop keeps its own client so a stream timeout can reset it independently.
+    """
+    global _shared
+    key = (*_current_client_config(), get_client)
+    with _shared_lock:
+        if _shared is None or _shared[0] != key:
+            previous = _shared
+            _shared = (key, get_client())
+            if previous is not None:
+                with suppress(Exception):
+                    previous[1].close()
+        client = _shared[1]
+    yield client
+
+
+@atexit.register
+def _close_shared_client() -> None:
+    global _shared
+    with _shared_lock:
+        if _shared is not None:
+            with suppress(Exception):
+                _shared[1].close()
+            _shared = None
 
 
 def _current_client_config() -> tuple[str | None, str | None, float, int]:
@@ -194,7 +221,6 @@ class ProviderAdapter:
         model: str | None = None,
         profile: config.ModelProfile | None = None,
         messages: list[dict],
-        max_tokens: int,
         tools: list[dict] | None = None,
         tool_choice: str | None = None,
         stream: bool = False,
@@ -208,7 +234,6 @@ class ProviderAdapter:
         kwargs = {
             "model": model,
             "messages": _strip_response_only_message_fields(messages, provider_name=self.name),
-            "max_tokens": max_tokens,
         }
         if tools is not None:
             kwargs["tools"] = tools

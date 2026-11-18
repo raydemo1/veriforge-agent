@@ -92,6 +92,10 @@ class ShellResultClassificationTests(unittest.TestCase):
 
 class ShellJobManagerTests(unittest.TestCase):
 
+    @unittest.skipIf(
+        os.name != "nt" and Path(os.path.abspath(sys.executable)).is_relative_to(Path(tempfile.gettempdir()).resolve()),
+        "the POSIX sandbox mounts a private /tmp, hiding an interpreter that lives there",
+    )
     def test_natural_exit_records_status_and_exit_code(self):
         from harness_code_agent.workspace.shell_jobs import ShellJobManager
 

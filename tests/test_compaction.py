@@ -202,7 +202,7 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
 
         compact.assert_called_once()
         request.assert_called_once()
-        self.assertEqual(request.call_args.args[0]["max_tokens"], 32768)
+        self.assertNotIn("max_tokens", request.call_args.args[0])
         self.assertEqual(conv.history.epoch.reason, "compaction")
 
     def test_failed_compaction_preserves_history_and_stops_an_oversize_request(self):
@@ -245,15 +245,15 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
             middlewares=[RefreshMiddleware()],
         ).start_conversation("task")
 
-        conv._refresh_dynamic_context_after_compaction(phase="summarizing_history")
+        messages = conv._refreshed_context(conv.messages, phase="summarizing_history")
 
         dynamic = [
-            message for message in conv.messages
+            message for message in messages
             if str(message.get("content") or "").startswith("[HARNESS_DYNAMIC_CONTEXT:test]")
         ]
         self.assertEqual(len(dynamic), 1)
         self.assertIn("new:summarizing_history", dynamic[0]["content"])
-        self.assertEqual(conv.messages[1], dynamic[0])
+        self.assertEqual(messages[1], dynamic[0])
 
     def test_auto_compaction_summarizes_and_returns_below_threshold_after_summary(self):
         from harness_code_agent.agent.compaction import get_thresholds

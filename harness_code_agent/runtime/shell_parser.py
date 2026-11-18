@@ -71,11 +71,6 @@ class ParsedCommand:
     #: readability; the flags are the authority, not markers inside the string.
     arg_literals: tuple[bool, ...] = ()
 
-    def is_literal(self, index: int) -> bool:
-        if index < len(self.arg_literals):
-            return self.arg_literals[index]
-        return True
-
 
 @dataclass(frozen=True)
 class ParsedRedirection:

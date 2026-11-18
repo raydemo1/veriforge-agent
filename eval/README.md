@@ -1,96 +1,62 @@
-# Eval
+# 评测
 
-`eval/` is the single home for evaluation code, benchmark adapters, fixed task sets, and generated results.
+`eval/` 存放所有评测代码、基准适配器、固定任务集和历史评测报告。运行产物写入 `eval/results/`，不进入 Git。
 
-Run the launchers with Python 3.14. The Terminal-Bench and Claw-SWE-Bench
-adapters provision a separate Python 3.14 inside the Linux agent container;
-task-provided Python commands keep using the interpreter from the task image.
-If you use `--no-install-deps` with Claw-SWE-Bench, provide `python3.14` and
-the VeriForge runtime dependencies in the task image.
+所有 runner 都需要 Python 3.14，并先安装评测依赖：
 
-## Directory Map
+```bash
+pip install -e ".[eval]"
+```
+
+大部分 runner 默认只打印计划（`--dry-run` 或缺省 `--run`），需要显式参数才会发出计费的真实请求。
+
+## 目录
 
 ```text
 eval/
-├── scripts/       # Evaluation runners and ledger rebuild tools
-├── tasks/         # Fixed lightweight task definitions used by scripts
-├── benchmarks/    # External benchmark adapters: Terminal-Bench 2.1 via Harbor, Claw-SWE-Bench
-└── results/       # Timestamped raw outputs plus ledger.json/results.json/SUMMARY.md
+├── scripts/      评测入口和结果账本工具
+├── tasks/        固定的轻量任务集
+├── benchmarks/   外部基准的适配器：Terminal-Bench 2.1（通过 Harbor）、Claw-SWE-Bench
+├── reports/      历史评测报告（按日期命名）
+└── results/      运行产物和汇总（不进入 Git）
 ```
 
-## File Relationships
+## 本地评测
 
-- `scripts/run_basic_metrics_eval.py` runs local basic metrics suites: memory and latency by default; cache is available when explicitly selected.
-- `scripts/run_dev_task_eval.py` runs local development regression cases. `--validate` checks the fixtures offline; `--run` calls the configured model.
-- `scripts/run_terminal_bench_eval.py` runs the fixed Terminal-Bench subsets and delegates each task to `benchmarks/run_terminal_bench.py`.
-- `scripts/run_claw_swe_bench_eval.py` runs Claw-SWE-Bench through the local harness adapter.
-- `scripts/deepseek_context_eval.py` runs the DeepSeek context/cache scenarios and writes timestamped outputs under `results/`.
-- `scripts/rebuild_eval_results.py` scans raw `summary.json`, Harbor `result.json`, VeriForge artifacts, stdout, and stderr to regenerate `results/ledger.json`, `results/results.json`, `results/retention_plan.json`, and `results/SUMMARY.md`.
-- `tasks/memory_ab.json`, `tasks/latency_smoke.json`, `tasks/terminal_bench_8task.json`, and `tasks/terminal_bench_24task.json` define the lightweight interview-project eval workload.
-- `benchmarks/run_terminal_bench.py` launches the fixed Terminal-Bench subset through Harbor.
-- `benchmarks/run_claw_swe_bench.py` launches Claw-SWE-Bench through the upstream orchestrator with the local harness adapter.
-- `benchmarks/harbor_agent.py` is Harbor's installed-agent adapter for running VeriForge inside Terminal-Bench task containers.
-- `benchmarks/harness_claw_adapter.py` runs VeriForge inside each Claw-SWE-Bench container and lets the upstream runner collect patches. Claw remains an external evaluation scenario, not a product mode.
-- `benchmarks/data/tb2_tasks.json` stores Terminal-Bench task metadata consumed by `benchmarks/tb2_metadata.py` and the launcher.
-
-## Common Commands
+| 脚本 | 作用 |
+| --- | --- |
+| `scripts/run_basic_metrics_eval.py` | 本地指标套件：`memory`、`latency`（默认），`cache` 需要显式选择 |
+| `scripts/run_dev_task_eval.py` | 本地开发任务回归。`--validate` 离线检查夹具，`--run` 调用模型 |
+| `scripts/run_verifier_ablation.py` | 改动验证器的消融实验（见下文） |
+| `scripts/run_memory_candidate_eval.py` | 记忆候选提取评测 |
+| `scripts/check_memory_consolidation.py`、`scripts/check_memory_runtime.py` | 记忆整理与运行时的离线检查 |
+| `scripts/deepseek_context_eval.py` | DeepSeek 上下文 / 缓存场景测量 |
 
 ```bash
 python eval/scripts/run_basic_metrics_eval.py --dry-run
 python eval/scripts/run_basic_metrics_eval.py --suites memory,latency
 python eval/scripts/run_basic_metrics_eval.py --suites cache
-python eval/scripts/run_basic_metrics_eval.py --suites latency
-python eval/scripts/run_terminal_bench_eval.py --dry-run
-python eval/scripts/run_terminal_bench_eval.py --tbench-task-set 24task
-python eval/scripts/run_claw_swe_bench_eval.py --dry-run --claw-limit 5
-python eval/scripts/run_claw_swe_bench_eval.py --claw-limit 5
-python eval/scripts/rebuild_eval_results.py --results-root eval/results --jobs-root jobs
-python eval/benchmarks/run_terminal_bench.py --task fix-git
-python eval/benchmarks/run_claw_swe_bench.py --limit 5
 ```
 
-## A/B tests and final evaluation
+### 验证器消融实验
 
-### Static verifier pilot
-
-```powershell
-python eval/scripts/run_verifier_ablation.py --repeats 2
-python eval/scripts/run_verifier_ablation.py --build-image
+```bash
+python eval/scripts/run_verifier_ablation.py --repeats 2                 # 打印计划
+python eval/scripts/run_verifier_ablation.py --build-image               # 构建评测镜像
 python eval/scripts/run_verifier_ablation.py --run --repeats 2 --rates 0.006 0.30 1.20
 ```
 
-The first command prints the plan. The last command uses the configured model
-and makes billable requests. Set `--rates` to the cache-hit input, cache-miss
-input, and output prices in USD per million tokens. The example applies one
-DeepSeek Flash price schedule to every trial. Local tool calls have zero
-marginal billing by default. `--tool-cost` can assign a flat USD rate per call.
+每组在同一夹具的干净副本上对比三种配置：A 关闭验证器，B 只记录证据，C 使用当前的退出行为。三组在 Docker 中使用相同的 Agent、预算和权限运行；Agent 退出后，隐藏测试在另一个无网络的容器中执行。
 
-Both pilot commands reproduce the historical comparisons using the runtime
-archived from `b2391f3`. The checkout must include that commit. Each result
-records the full runtime revision alongside the model and container image.
-Rebuild the pilot image with `--build-image` to run with Python 3.14.
+- `--rates` 依次是缓存命中输入、缓存未命中输入、输出的价格（美元 / 百万 token）；`--tool-cost` 可以为每次工具调用设一个固定成本。
+- 实验复现的是 `b2391f3` 归档的运行时，检出时必须包含该提交。
+- runner 限制工具调用次数和单次实验的墙钟时间，不限制累计 token。
+- 结果写入 `ablation.json`：每次成功的成本包含失败的实验，任何用量或判定缺失时留空；延迟只计 Agent 执行时间。
+- 夹具只覆盖 Python，目前是测量流程的试点。
 
-Each block pairs A (verifier disabled), B (evidence only), and C (current
-exit behavior) on a clean copy of the same fixture. All three run the same agent with the same budgets and permissions inside Docker.
-The runner caps tool calls and trial wall time. There is no cumulative token cap.
-The agent container receives the fixture and prompt. The hidden tests run
-after it exits in a separate container with no network access.
+### A/B 模型配置
 
-`ablation.json` contains the plan, group metrics, and per-trial evidence.
-Cost per success includes failed trials and is left blank if any usage or
-judge result is missing. Latency measures agent execution and excludes setup
-and hidden tests. Timed-out runs are counted separately. Repeated tests count
-exact command repeats among recognizable test commands. Requests after a C
-intervention are observed overhead. The paired B/C comparison estimates the
-effect on total requests. In C, the first interrupted candidate is graded
-separately to flag already-passing code and possible rescues or regressions.
-These fixtures are a pilot for the measurement path and cover Python only.
-
-### Model configuration
-
-The default `.env` remains the final-evaluation configuration. Set
-`HARNESS_EVAL_PROFILE=ab` for the evaluation process to load the separate
-`.env.ab` model profile:
+默认的 `.env` 是最终评测使用的配置。设置 `HARNESS_EVAL_PROFILE=ab` 后，评测进程会额外加载被 Git 忽略的 `.env.ab`：
 
 ```powershell
 $env:HARNESS_EVAL_PROFILE = 'ab'
@@ -101,21 +67,61 @@ try {
 }
 ```
 
-The command prints the evaluation protocol. Add `--run` to execute it.
-The development-task runner selects its overlay with `--model-profile ab`. Set
-`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `HARNESS_PROVIDER`, `HARNESS_MODEL`, and
-`HARNESS_MODEL_FAST/NORMAL/HARD/MAX` in the ignored `.env.ab` file. The base
-URL uses the provider's API base URL. The client adds `/chat/completions`. A missing A/B file is an
-error rather than a fallback to the final model. Record the model and evaluation
-conditions with results; A/B tuning outcomes are not final-model measurements.
+`.env.ab` 必须提供 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`HARNESS_PROVIDER`、`HARNESS_MODEL` 以及 `HARNESS_MODEL_FAST/NORMAL/HARD/MAX`，缺失时直接报错，不会回退到最终评测的模型。开发任务 runner 用 `--model-profile ab` 选择这份配置。A/B 调优的结果不能当作最终模型的测量结果。
 
-Claw-SWE-Bench uses the Hugging Face dataset `TokenRhythm/Claw-SWE-Bench`
-with the `lite` config by default. It requires Docker SWE-bench images and the
-optional host dependency `datasets`; the launcher will clone the upstream
-`opensquilla/claw-swe-bench` orchestrator into `.harbor/datasets/` on first use.
+## Terminal-Bench 2.1
 
-Use `eval/results/SUMMARY.md` as the human-facing summary. It should only contain metrics produced from real runs.
-The current Terminal-Bench 2.1 ledger reports `56/89` passed (`62.9%`)
-with `DeepSeek-V4-Flash-Preview` through VeriForge.
-The official reference is `61.8%` for the same model on Terminal-Bench 2.1 at
-Max reasoning intensity with the official DeepSeek Harness.
+通过 Harbor 运行，需要 Docker（或使用 `--env daytona`）。
+
+```bash
+python eval/scripts/run_terminal_bench_eval.py --dry-run
+python eval/scripts/run_terminal_bench_eval.py --tbench-task-set 24task      # 固定子集：8task / 24task / full
+
+python eval/benchmarks/run_terminal_bench.py --task fix-git                   # 单个任务
+python eval/benchmarks/run_terminal_bench.py --task fix-git --task query-optimize
+python eval/benchmarks/run_terminal_bench.py --full                           # 完整数据集
+python eval/benchmarks/run_terminal_bench.py --task fix-git --env daytona
+python eval/benchmarks/run_terminal_bench.py --task fix-git --force-build     # 强制构建环境镜像
+```
+
+运行流程：
+
+1. 需要时下载仓库本地的 `terminal-bench-2-1` 数据集；
+2. 保留可拉取的任务镜像，只把失效的 `docker_image` 修复为已知的 Docker Hub 备用镜像；
+3. Harbor 通过 `--path` 使用本地数据集，避免任务元数据漂移；
+4. `benchmarks/harbor_agent.py` 中的 `HarnessAgent` 在任务容器内安装独立的 Python 3.14 和 VeriForge，任务自带的 Python 命令仍使用镜像中的解释器；
+5. 在容器内以 headless 方式运行 Agent，权限模式为 `danger-full-access`（容器本身是隔离边界）；
+6. Harbor 用任务的 `tests/test.sh` 判定结果。
+
+任务元数据在 `benchmarks/data/tb2_tasks.json`，由 `benchmarks/tb2_metadata.py` 读取。
+
+当前账本记录：VeriForge + `DeepSeek-V4-Flash-Preview` 在 Terminal-Bench 2.1 上通过 `56/89`（62.9%）。作为参照，官方 DeepSeek Harness 在 Max 推理强度下的同模型成绩为 61.8%。
+
+## Claw-SWE-Bench
+
+```bash
+python eval/scripts/run_claw_swe_bench_eval.py --dry-run --claw-limit 5
+python eval/scripts/run_claw_swe_bench_eval.py --claw-limit 5
+python eval/benchmarks/run_claw_swe_bench.py --limit 5
+```
+
+默认使用 Hugging Face 数据集 `TokenRhythm/Claw-SWE-Bench` 的 `lite` 配置，需要 SWE-bench 的 Docker 镜像。首次运行时会把上游编排器 `opensquilla/claw-swe-bench` 克隆到 `.harbor/datasets/`。`benchmarks/harness_claw_adapter.py` 在每个容器内运行 VeriForge，由上游 runner 收集补丁。使用 `--no-install-deps` 时，任务镜像需要自带 `python3.14` 和 VeriForge 的运行依赖。
+
+## 结果账本
+
+```bash
+python eval/scripts/rebuild_eval_results.py --results-root eval/results --jobs-root jobs
+```
+
+它扫描各次运行的 `summary.json`、Harbor 的 `result.json`、VeriForge 产物和标准输出，重新生成 `results/ledger.json`、`results/results.json`、`results/retention_plan.json` 和面向人阅读的 `results/SUMMARY.md`。`SUMMARY.md` 只能包含真实运行产生的指标；被中断的评测要标记为 interrupted / incomplete，不能当作最终结果。
+
+## 历史报告
+
+| 报告 | 内容 |
+| --- | --- |
+| [2026-10-23-memory-lifecycle](reports/2026-10-23-memory-lifecycle.md) | 记忆分类、主题聚合与更新的问题定位 |
+| [2026-10-23-tool-disclosure](reports/2026-10-23-tool-disclosure.md) | 工具披露方式与缓存命中的对比 |
+| [2026-10-24-memory-consolidation](reports/2026-10-24-memory-consolidation.md) | 记忆整理与混合检索评测 |
+| [2026-10-24-memory-v3-upgrade](reports/2026-10-24-memory-v3-upgrade.md) | 记忆 v3 升级的阶段记录 |
+| [2026-10-24-memory-v3-acceptance](reports/2026-10-24-memory-v3-acceptance.md) | 记忆 v3 最终验收 |
+| [2026-11-03-multi-session-resources](reports/2026-11-03-multi-session-resources.md) | 多会话资源管理的测量与验收 |

@@ -22,7 +22,7 @@ from enum import Enum
 from pathlib import Path
 from typing import ClassVar
 
-from ..workspace.paths import normalize_rel_path, path_within
+from ..workspace.paths import is_same_or_child, normalize_rel_path, path_within
 from .agent_roles import role_definition
 from .shell_classification import (
     ShellEffect,
@@ -699,7 +699,7 @@ class PermissionPolicy:
             if not candidate.is_absolute():
                 candidate = Path(workspace_root) / candidate
             normalized = _normalized(str(candidate))
-            if not _is_same_or_child(normalized, root):
+            if not is_same_or_child(normalized, root):
                 return f"write path is outside the workspace: {value}"
             resolved.append(normalized)
         return tuple(resolved)
@@ -954,7 +954,7 @@ def _covered_by_extra(target, extra_dirs, workspace_root: str | None) -> bool:
         candidate = Path(workspace_root) / candidate
     normalized = _normalized(str(candidate))
     return any(
-        _is_same_or_child(normalized, _normalized(directory))
+        is_same_or_child(normalized, _normalized(directory))
         for directory in extra_dirs
     )
 
@@ -971,14 +971,14 @@ def _resolved_write_block(
     except OSError as exc:
         return f"cannot resolve write path: {raw} ({exc})"
     resolved_key = _normalized(str(resolved))
-    if not _is_same_or_child(resolved_key, _normalized(str(root))):
+    if not is_same_or_child(resolved_key, _normalized(str(root))):
         return f"write path escapes the workspace: {raw}"
     for allowed in allowed_paths:
         try:
             allowed_root = (root / allowed).resolve()
         except OSError:
             continue
-        if _is_same_or_child(resolved_key, _normalized(str(allowed_root))):
+        if is_same_or_child(resolved_key, _normalized(str(allowed_root))):
             return None
     return f"write path resolves outside allowed_paths: {raw}"
 
@@ -989,7 +989,7 @@ def _workspace_relative(raw: str, normalized_root: str) -> str | None:
     if not candidate.is_absolute():
         candidate = Path(normalized_root) / candidate
     normalized = _normalized(str(candidate))
-    if not _is_same_or_child(normalized, normalized_root):
+    if not is_same_or_child(normalized, normalized_root):
         return None
     relative = os.path.relpath(normalized, normalized_root).replace("\\", "/")
     return "." if relative == "." else relative
@@ -1006,18 +1006,11 @@ def _covered_by(target: ShellTarget, directories: tuple[str, ...], workspace_roo
     if not candidate.is_absolute():
         candidate = Path(workspace_root) / candidate
     normalized = _normalized(str(candidate))
-    return any(_is_same_or_child(normalized, directory) for directory in directories)
+    return any(is_same_or_child(normalized, directory) for directory in directories)
 
 
 def _normalized(value: str) -> str:
     return os.path.normcase(os.path.normpath(os.path.abspath(str(value))))
-
-
-def _is_same_or_child(value: str, parent: str) -> bool:
-    try:
-        return os.path.commonpath((value, parent)) == parent
-    except ValueError:
-        return False
 
 
 def _builtin_permission(tool_name: str) -> str | None:

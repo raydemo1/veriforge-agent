@@ -59,17 +59,6 @@ class NoApprovalProvider:
         )
 
 
-class StaticApprovalProvider:
-    """Deterministic provider for tests and scripted runs."""
-
-    def __init__(self, *, approved: bool, reason: str = ""):
-        self.approved = approved
-        self.reason = reason or ("approved" if approved else "denied")
-
-    def request(self, request: ApprovalRequest) -> ApprovalResult:
-        return ApprovalResult(self.approved, self.reason)
-
-
 class ApprovalFormatError(ValueError):
     """The reviewer's answer cannot be trusted as an approval."""
 
@@ -133,7 +122,6 @@ class LlmAutoApprovalProvider:
                 response = client.chat.completions.create(**adapter.chat_kwargs(
                     profile=profile,
                     messages=_approval_messages(request),
-                    max_tokens=300,
                 ))
             raw = response.choices[0].message.content or ""
         except Exception as exc:

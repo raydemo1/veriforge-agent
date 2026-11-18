@@ -157,10 +157,6 @@ class ToolRegistry:
             else CallEffect.global_exclusive()
         )
 
-    def effect_resolver_for(self, name: str) -> EffectResolver | None:
-        spec = self._specs.get(name)
-        return spec.effect_resolver if spec is not None else None
-
     def disclosure_for(self, name: str) -> str | None:
         spec = self._specs.get(name)
         return spec.disclosure if spec is not None else None
@@ -170,9 +166,6 @@ class ToolRegistry:
 
     def schemas(self) -> list[dict]:
         return [spec.schema for spec in self.specs()]
-
-    def dispatch(self) -> dict[str, Callable]:
-        return {name: spec.handler for name, spec in self._specs.items()}
 
     def copy(self) -> ToolRegistry:
         clone = ToolRegistry()

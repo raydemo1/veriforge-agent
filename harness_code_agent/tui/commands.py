@@ -72,13 +72,6 @@ class SlashCommandRegistry:
     def candidates(self) -> list[CommandSpec]:
         return list(self.specs)
 
-    def format_help(self) -> str:
-        lines = ["VeriForge 命令：", ""]
-        width = max((len(spec.usage) for spec in self.specs), default=0)
-        for spec in self.specs:
-            lines.append(f"{spec.usage:<{width}}  {spec.description}")
-        return "\n".join(lines)
-
 
 def default_command_registry(skill_registry=None) -> SlashCommandRegistry:
     specs = [

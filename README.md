@@ -1,39 +1,45 @@
 # VeriForge
 
-VeriForge 是一个面向真实代码仓库的可验证 Coding-Agent Runtime。
+VeriForge 是一个在本地代码仓库里工作的 Coding Agent。它把模型调用、工具执行、权限审批、会话记录和改动验证串在同一条可追踪的链路上，适合修 Bug、补测试、做代码审查和规划实现。
 
-它把模型、工具、权限、会话和验收放在同一条可追踪链路里，支持修复代码、补测试、代码审查、计划设计和应用构建。
-
-基于 OpenAI-compatible Chat Completions API，可接入 DeepSeek、OpenAI 等服务。
+它通过 OpenAI 兼容的 Chat Completions API 调用模型，默认按 DeepSeek 调优，也可以接入 OpenAI 或其他兼容网关。
 
 ![VeriForge OpenTUI](https://raw.githubusercontent.com/raydemo1/veriforge-agent/main/docs/images/veriforge-tui.png)
 
 ## 特性
 
-- 单一通用 Agent：没有按任务类型切换的 profile，行为差异只来自权限模式和 `/plan` 显式计划流
-- 工具治理：文件、Shell、Web、MCP 和 Agent 统一经过 registry、权限和 middleware
-- 资源感知调度：无冲突调用可并行，冲突资源按顺序执行，结果按模型顺序回写
-- 安全修改：工作区路径保护、快照、审批、危险命令拦截和退出前验证
-- 代码理解：单一只读 `code_intelligence` 工具，支持定义、引用、文件符号和诊断
-- 多语言验证：本轮修改触发 Python AST/Ruff、TypeScript 静态检查和 Go 格式检查；项目代码执行经过 Shell 权限体系
-- 子代理协作：只读 Explorer 按需调查，Worker 在共享工作区按分配路径直接修改
-- 上下文与记忆：可恢复的 JSONL 会话手账、结构化压缩、Markdown 长期记忆和可重建索引
-- OpenTUI：命令与 `@` 补全、审批、会话、运行观察和模型设置
+- **单一通用 Agent**：没有按任务类型切换的 profile。行为差异只来自权限模式和显式的 `/plan` 计划流。
+- **统一的工具治理**：文件、Shell、Web、MCP 和子 Agent 都经过同一套注册表、参数校验、权限策略和中间件。
+- **安全的 Shell**：先静态解析命令、再按事实做权限决定，最后放进平台沙箱（Windows ACL / Linux bubblewrap）执行。
+- **并行调度**：无资源冲突的工具调用并行执行，冲突的按顺序执行，结果按模型给出的顺序回写。
+- **自动验证**：每轮结束后检查本轮改动的文件（Python AST / Ruff、TypeScript `tsc`、`gofmt`），结果写入会话记录。
+- **代码理解**：只读的 `code_intelligence` 工具按需启动语言服务器，提供定义、引用、符号和诊断。
+- **可恢复的会话**：JSONL 会话日志、上下文压缩、回撤到任意稳定回合、分支会话和隔离 Worktree。
+- **长期记忆**：SQLite 存储的事实与修订历史，全文 + 向量混合检索，后台增量提取与整理。
+- **终端界面**：基于 Bun + React 的 OpenTUI，支持多会话标签、`/` 命令与 `@` 补全、审批面板和运行观察。
 
 ## 快速开始
 
-环境要求：Python 3.14（Windows 使用 64 位）、Bun 1.4+、Git，以及一个 OpenAI-compatible API key。
+### 环境要求
+
+- Python 3.14（Windows 需要 64 位）
+- [Bun](https://bun.sh) 1.4+（终端界面和 Windows 沙箱需要）
+- Git
+- 一个 OpenAI 兼容的 API key
+- Linux 上的受限 Shell 需要安装 `bwrap`（bubblewrap）；Windows 需要 PowerShell 7
+
+### 安装
+
+Linux / macOS：
 
 ```bash
 python3.14 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-cd frontend/opentui
-bun install
-cd ../..
+bun install --frozen-lockfile --cwd frontend/opentui
 ```
 
-Windows PowerShell（如果使用 Conda，把 `py -3.14` 换成 Python 3.14 解释器的完整路径）：
+Windows PowerShell：
 
 ```powershell
 py -3.14 -m venv .venv
@@ -41,272 +47,157 @@ py -3.14 -m venv .venv
 bun install --frozen-lockfile --cwd frontend/opentui
 ```
 
-复制配置模板并填写 API 信息：
+### 配置
 
 ```bash
 cp .env.template .env
 ```
 
-Windows PowerShell 使用 `Copy-Item .env.template .env`。
+至少填写 `OPENAI_API_KEY` 和 `OPENAI_BASE_URL`。所有可用变量及说明都在 [.env.template](.env.template) 里，常用项见下文 [配置](#配置)。
 
-启动 TUI：
+### 运行
 
-```bash
-veriforge
-```
-
-Windows 可直接运行 `.venv\Scripts\veriforge.exe`，或先激活 `.venv` 再运行 `veriforge`。
-
-### 从 wheel 安装
-
-构建 wheel 后，可把文件复制到另一台装有 Python 3.14 和 Bun 的机器，在该机器的项目环境中安装：
-
-```text
-python -m pip wheel --no-deps . -w dist
-python -m pip install dist/veriforge-0.1.0-py3-none-any.whl
-veriforge --setup-tui
-```
-
-wheel 包含 OpenTUI 源码、依赖锁文件和 Windows ACL 补丁。`--setup-tui` 在 `~/.veriforge/opentui/`
-安装 Bun 依赖，也会为 Windows 受限 Shell 准备沙箱依赖。安装新版本后再次执行此命令即可准备相应资源。
-运行 `veriforge` 前，通过环境变量设置 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和所需模型。
-
-也可以直接提交任务：
+在你要处理的项目目录里启动：
 
 ```bash
-veriforge "Fix the failing tests"
-veriforge -p "Review this repository"
+veriforge                              # 打开终端界面
+veriforge "修复失败的测试"               # 打开终端界面并立即提交第一个任务
+veriforge -p "审查这个仓库"              # 无界面执行一个任务，输出结果后退出
 ```
 
-CLI `-p`、无 TTY 的批处理，以及 Terminal-Bench / Claw-SWE-Bench runner 都通过同一个 Headless API 执行单轮任务：
+没有 TTY 时（例如管道输入），`veriforge` 会自动以无界面模式运行，并从 stdin 读取任务。
+
+其他子命令：
+
+```bash
+veriforge session show latest          # 查看最近一次会话的摘要
+veriforge session observe latest       # 查看会话的运行观察（加 --export 导出）
+veriforge mcp list                     # 管理 MCP 服务：add / list / remove / describe
+veriforge --setup-tui                  # 从 wheel 安装时，准备终端界面的 Bun 依赖
+```
+
+### 在代码中调用
+
+命令行的 `-p` 模式和评测 runner 都使用同一个 Headless API：
 
 ```python
 from harness_code_agent.headless import run_task
 
 result = run_task(cwd="/path/to/project", task="Fix the failing tests")
-print(result.session_id, result.status)
-if result.turn_result is not None:
-    print(result.turn_result.text)
-raise SystemExit(result.exit_code)
+print(result.session_id, result.status)       # completed / failed / interrupted
+raise SystemExit(result.exit_code)            # 0 / 1 / 130
 ```
 
-`RunResult` 返回工作区、会话 ID、记录目录 `harness_root`、`TurnResult`、运行状态和错误信息。`completed` 表示本轮正常结束，任务是否通过仍由测试或评测器判断；`failed` 表示初始化、执行或关闭抛出异常；`interrupted` 表示键盘中断，对应退出码分别为 `0`、`1`、`130`。执行失败后仍返回已启动会话的 ID 和记录目录。系统终止信号引发的 `SystemExit` 在资源关闭后继续传播，保留原退出码。
+`completed` 只表示本轮正常结束，任务是否真正完成仍由测试或评测器判断。无界面运行不会从 stdin 请求审批：需要人工审批的操作直接拒绝，向用户提问按取消处理。
 
-`on_session_started` 回调在提交任务前接收 `SessionInfo(session_id, cwd, harness_root)`，可立即写入 manifest 或在运行期间导出日志。接口统一负责关闭会话，保留正常的 Recovery 与权限检查；无界面运行不从 stdin 请求审批或问题答案，需要人工审批的操作拒绝执行，问题按取消处理。评测 runner 的权限模式仍由各自运行环境配置。
+## 使用
 
-常用入口：
+### 命令
 
-```text
-/mcp          管理 MCP 服务
-/compact      压缩上下文
-/context      查看上下文预算
-/plan         先规划，`/plan execute` 执行待审批的计划
-/memory       搜索、验证与管理长期记忆
-/fork         创建会话分支
-/observe      查看运行状态
-```
-
-输入 `/` 或 `@` 会打开遮罩补全面板。Enter/Tab 接受候选，点击外层关闭；修改或清空指令后会重新匹配。普通状态面板可点击外层或按 Esc 关闭。
-
-上下文默认达到窗口的 80% 时压缩，同时预留模型输出空间。压缩只更新当前上下文视图，原始会话日志保留。
-
-工具结果默认最多内联 5,000 token。超限结果完整落盘，返回状态、大小、文件引用及前后各最多 500 token 的预览，整条消息仍受 5K 上限约束；用 `read_file` 按 `next_read` 连续回读，长单行可通过 `start_column` 续读。短结果不额外生成文件。
-
-长期记忆以 `~/.veriforge/memory-v3/memory.db` 为唯一数据源，用户偏好与各仓库分区隔离，同仓库的 worktree 共用项目记忆。`views/` 中的 Markdown 是按主题生成的只读视图，直接修改不会写回数据库。六类记忆为：偏好、项目事实、规范、决定、经验和工作流程。
-
-在本机 `.env` 中配置 `SILICONFLOW_API_KEY` 后，检索使用硅基流动 `BAAI/bge-m3`（1024 维）与 SQLite 全文检索，两路独立召回再合并排序。查询不额外调用聊天模型，但会产生 embedding 请求；重复查询在会话内缓存。语义服务失败或索引未齐全会明确标记，不把检索失败解释为没有记忆。可用 `VERIFORGE_MEMORY_ROOT` 指定独立存储根目录。
-
-记忆按三个独立维度组织：`scope` 区分个人与项目，`topic` 聚合同一知识领域，`kind` 标记偏好、事实、规范、决定、经验或流程。同一主题可包含不同 `kind`；已登记的主题别名复用原主题。个人空间仅保存来自用户的跨项目偏好，不接受项目文件依赖或验证结果。
-
-新会话加载统一的启动快照：个人默认最多 300 token，项目约定最多 500 token，导航说明及主题目录最多 400 token，头部和引用信息计入预算。正文只选择有效、无条件适用的偏好和规范；条件规则、项目事实、决定、经验和流程默认只提供主题入口。项目同事实键的全局约定覆盖个人默认，不改写原记录；过期、待确认和挂起的内容不会作为确定事实展示。目录优先列出范围和主题名称，在预算允许时补充事实键和适用条件；可用 `memory_read` 按范围和主题名称展开。各范围显示已展示和总主题数，未展示完时提供可直接用于 `memory_read` 的续读参数，不自动生成自由摘要或执行向量检索。
-
-启动快照按稳定事实键排序，在 Agent 重建和压缩时复用，恢复或回撤只在新的上下文边界刷新一次；原始日志保留。子代理沿用父会话的项目记忆身份。后续由模型在需要历史信息时主动调用 `memory_search` 或 `memory_read`，不逐轮自动检索或注入记忆正文。搜索支持分页、路径和类别筛选，同时搜索项目和个人记忆时会共用同一模型生成的查询向量。读取支持展开主题、单条事实和修订历史。已经在上下文中的事实可直接复用。
-
-明确保存通过 `memory_write` 即时完成，必须逐字引用当前原始用户输入作为证据；纠正使用原 ID 和版本，保留旧修订。自动提取只读取单独记录的原始用户输入和原生结构化验证，不读取回忆、模型推断或任意工具输出。每个成功主轮结束后立即安排后台增量提取，前台回答不等待；连续轮次合并尚未处理的范围，下一轮执行期间暂停相关会话的提取和整理。提取候选、跨会话整理和向量更新分别持久化、分阶段处理。关闭进程或会话不等待后台生成，未完成工作在后续启动时恢复；`/memory generate off` 取消当前会话尚未完成的生成任务，并撤销这些候选对旧事实的挂起；重新开启后恢复候选及任务，无需等待空闲期。关闭期间的输入不补做自动抽取。此开关不禁止显式保存、确认和遗忘，这些操作仍需原文证据并经过正常工具权限检查。
-
-整理按事实身份和全文索引寻找已有记录，只对当前有效视图做逻辑更新，原始候选与修订历史保留。历史事件不反复成为当前事实，未决冲突只返回不确定提示。文件证据变化会使相关事实过期；较旧的后台结果不能覆盖较新的已确认状态。向量更新在事实整理之后异步处理，索引失败独立重试，不阻塞事实生效；旧向量随事实更新立即失效。
-
-管理命令包括 `/memory status`、`search <query>`、`topics [scope]`、`show <id>`、`history <id>`、`edit <id> <version> <body>`、`validate <id> <version>`、`restore <id> <revision> <version>`、`forget <id> <version>`、`retry`，以及 `use on|off`、`generate on|off`。ID 可带 `project:` 或 `user:` 前缀。遗忘删除长期记忆及其修订并抑制旧来源再次提取，原始会话日志保留；用户明确要求重新记住时，`memory_write(restore_forgotten=true)` 使用新证据重新保存。
-
-独立验证脚本：`eval/scripts/check_memory_consolidation.py`、`check_memory_runtime.py`；真实模型评测必须显式带 `--run`，场景与请求上限写入各次评测产物，不纳入默认测试集。
-
-一个工作台可以同时运行多个会话，每个会话独立保存对话、队列、审批、模型设置、草稿和后台任务。切换标签不会中断执行，关闭标签只隐藏会话，历史会话恢复后沿用原 ID；「分支」从最近完整稳定的历史边界创建新会话。输入区的停止只取消当前回合，保留排队消息和后台任务；Ctrl+C 或关闭工作台会清理所有会话及其托管进程。
-
-会话默认共享 Local。不同文件可以并行修改，同一文件写入前校验版本；真实冲突最多由 Agent 自动协调两轮；三方合并能安全通过时自动应用，仍有重叠或无法验证时展示最终差异，确认后才覆盖 Local。短命未知命令执行期间互斥写入；长期后台 Shell 允许其他会话继续写入，接受它直接改文件时的并发冲突风险。未知范围操作不扫描整个项目，只记录无法完整回撤的边界，回撤跨过该边界时才警告并拒绝。
-
-需要隔离时选择「隔离工作区」，会 Fork 一个新会话，原会话和任务继续保留；源会话回合执行中不能创建，需等回合结束或先停止，保证文件与分支历史一致。Worktree 继承当前 Local 的未提交内容和非忽略的未跟踪文件，暂不支持从已有 Worktree 再派生。创建失败会清理本次新建的 Git 工作树和会话，并报告错误。「应用到 Local」只计算创建后的任务改动，并检查 Local 后续修改，发生冲突时不会直接覆盖。
-
-Windows 使用 PowerShell 7 和随 Bun 依赖安装的 DSH Windows ACL 沙箱。默认的
-`workspace-write` 模式允许写入工作区及私有临时目录。`bash(write_paths=["dist", "cache"])`
-将工作区写入范围收窄到指定目录。`read-only` 模式不给工作区写权限。
-后台任务的写租约只覆盖显式声明的子目录，并持续到进程树退出。其他会话可以继续写未被租约覆盖的目录。
-
-Windows ACL 沙箱限制写入，读取和网络访问由会话策略管理。目录授权会在 NTFS 上留下
-ACL 和完整性标签。各目录使用固定 SID，重复授权可复用已有条目。多目录授权由
-`frontend/opentui/patches/` 中的补丁实现。
-
-Linux 的受限 Shell 使用 Bash 和 bubblewrap，需安装 `bwrap`。macOS 的受限 Shell
-目前无可用后端。评测容器使用外层容器作为隔离边界。
-
-稳定回合结束后保存回撤点，悬停或键盘聚焦该轮即可选择「回撤到此处」。「会话开始」可撤回第一轮。回撤沿用当前会话 ID，只撤销其拥有且仍可安全恢复的文件变化；其他会话或外部程序的后续修改会阻止回撤。原始记录保留，活动对话、计划和任务状态回到目标边界。后台 Shell 不阻止新恢复点；回撤时校验文件版本，并提示仍在运行的 Shell 可能带来的直接写入冲突。替换运行时前需先停止子代理。文件与会话记录通过可恢复事务一起更新。数据库、远端操作等外部副作用不在恢复范围内。
-
-模型循环结束后，运行时同步检查本轮改动，并将结果写入会话记录，供工作台查看。检查前后通过源码指纹和工作区变更序号比对版本，发现变化时将诊断标记为过期。有效的通过或失败证据会写入 Journal，Memory 生成开关只决定是否提取这些证据。检查可发现没有 Git 的目录中的 shell 修改，范围限于本轮实际改动。自动执行 Python AST 和可用的 Ruff、最近 `tsconfig.json` 对应的 `tsc --noEmit`、`gofmt -d`。ESLint 会加载项目配置或插件，`go test` 会执行测试代码，`cargo check` 可能执行构建脚本或过程宏，因此自动验证将它们标为「已跳过」并提供对应目录和参数。需要运行时由 Agent 通过 `bash` 按会话权限执行。
-
-源码验证与 LSP 文件变更扫描固定排除 `.harbor`、`.harness` 和 `.veriforge` 中的运行产物，以及依赖、缓存和构建目录。
-
-`code_intelligence` 按需启动已有的 basedpyright/pyright、typescript-language-server、gopls 或 rust-analyzer，通过 pygls 通信。`definition` / `references` 接收文件路径和从 1 开始的行、列；`symbols` / `diagnostics` 只需文件路径。服务器缺失、崩溃或响应异常时返回 `available: false`，Agent 可继续使用文本搜索和文件读取。它不执行重命名、格式化或 workspace edit；LSP 诊断用于理解代码，不作为退出前验证证据。
-
-安装 Python 与 TypeScript 语言服务器（Node.js 22.22.2+）：
-
-```bash
-npm install --global --ignore-scripts pyright typescript-language-server typescript@6
-```
-
-Windows 可将工具和下载缓存放到 D 盘，并将 `D:\Tools\lsp` 加入用户 PATH 后重新打开终端：
-
-```powershell
-npm install --global --prefix D:\Tools\lsp --cache D:\Tools\npm-cache --ignore-scripts pyright typescript-language-server typescript@6
-```
-
-Python 通信与文件监听依赖 `pygls` 和 `watchfiles` 随 `pip install -e .` 安装。只自动启动 PATH 中位于工作区之外的语言服务器；工作区 `.venv`、`node_modules`、工作区内的 PATH 入口及链接回工作区的程序均不自动执行。Windows 下支持全局 npm 的 `.cmd` 入口，并检查实际 Node 和 JS 文件的位置。TypeScript 固定使用工作区之外安装的 `tsserver`，不注册项目插件；因此语义结果可能与项目本地 TypeScript 版本或插件提供的结果不同。服务器启动时建立源码文件列表，后续查询通过原生文件监听发送增量变更，不再逐次读取并 hash 全仓源码。会话关闭时释放监听器和服务器进程。
-
-语言服务器关闭自动类型包下载、Rust 构建脚本/过程宏执行和保存时编译检查；Go 使用只读模块设置。Rust 导航可能因此缺少构建生成代码或过程宏展开信息。项目的编译和测试按需通过 `bash` 执行。
-
-## 工作模式
-
-只有一个通用 Agent，没有按任务类型切换的 profile：system prompt、工具面、中间件和预算在整个会话内保持一致，不会因为"换个模式"而重建。行为差异只来自两处显式开关：
-
-| 权限模式（`HARNESS_PERMISSION_MODE`） | 用途 |
+| 命令 | 作用 |
 | --- | --- |
-| `workspace-write` | 默认。可证明的工作区写入和未知程序在沙箱内直接执行；不填 `write_paths` 时可写整个工作区，填写后只收窄到指定目录；网络访问、破坏性 Git（如 `reset --hard`）、大范围删除和一次性额外权限会请求审批；工作区外写入默认拒绝，只有同一次调用通过 `additional_permissions.file_system.write` 申请并获批后才放行；系统/磁盘级破坏永远拒绝 |
-| `read-only` | 只读检查与代码审查：编辑工具、Shell 写入和风险工具一律拒绝 |
-| `llm-auto` | 与 `workspace-write` 相同的沙箱和审批策略；需要审批的操作交给命令审查模型，不再询问用户；审查器自身失败按拒绝处理 |
-| `danger-full-access` | 评测容器内使用，Windows 与 POSIX 都跳过平台沙箱，不做写范围限制；系统/磁盘级破坏仍然拒绝 |
-| `terminal-eval` | Terminal-Bench 独立 runner 的默认审批策略。Harbor 适配器在评测容器内显式选择 `danger-full-access` |
+| `/plan` | 只调查、产出计划，不修改代码 |
+| `/plan execute` | 执行已批准的计划 |
+| `/compact` | 压缩当前对话上下文 |
+| `/context` | 查看上下文预算的组成 |
+| `/memory` | 查看和管理长期记忆，见 [docs/memory.md](docs/memory.md) |
+| `/mcp` | 管理 MCP 服务和工具 |
+| `/fork` | 从当前会话创建分支 |
+| `/observe` | 打开当前项目的运行观察 |
+| `/<skill>` | 直接加载一个内置 Skill，例如 `/tdd`、`/code-review` |
 
-需要先想清楚再动手时用显式计划流，而不是切换到另一个"模式"：
+输入 `/` 或 `@` 会弹出补全。`@file:路径` 把文件作为附件，`@session:ID` 引用历史会话。
 
-```text
-/plan            # 只调查并产出计划，不修改代码
-/plan execute    # 执行已经批准的计划
-```
+### 权限模式
 
-计划就绪后继续输入文字会被当作对计划的修改意见，不会隐式开始执行——执行只认 `/plan execute` 或计划面板上的确认。执行如果没能真正开始（模型不可用、被取消、启动失败），计划会原样留在待审批状态，可以再次 `/plan execute`，不会静默丢失。
+通过 `HARNESS_PERMISSION_MODE` 设置，也可以在界面里切换：
 
-规划期间权限由 Runtime 收紧到 `read-only`，不是靠提示词约定：写文件、打补丁、会写入的 Shell 命令和 `dangerous` 类 MCP 工具都会在执行期被拒绝，委派出去的 worker 子代理也不会因为换了沙箱而获得写权限。执行计划时 `plan_mode` 关闭，会话原本的权限模式立即生效。进入规划本身受与其他运行时修改相同的互斥保护；已经在跑的后台 Shell 任务不会因此停下，命令行会明确提示这一点。
-
-## Runtime 设计
-
-| 模块 | 职责 |
+| 模式 | 行为 |
 | --- | --- |
-| `support/` | 叶子层原语：取消令牌、token 计数、LLM 客户端适配，不依赖任何其他包 |
-| `agent/` | 对话循环、统一上下文生命周期和子代理 |
-| `runtime/` | 工具 registry、权限、调度、middleware 和 MCP |
-| `workspace/` | 文件保护、快照、Shell、后台任务和路径规则 |
-| `sessions/` | session metadata、事件、逻辑消息手账和报告 |
-| `memory/` | SQLite 事实与修订、主题视图、向量＋全文检索、分阶段后台整理 |
-| `frontend/opentui/` | Bun + React + TypeScript 终端界面 |
-| `eval/` | 基准任务、运行器和结果账本 |
+| `workspace-write`（默认） | 工作区内的写入和未知程序在沙箱内直接执行；网络访问、破坏性 Git、大范围删除和额外权限需要你审批；工作区外写入默认拒绝 |
+| `read-only` | 只允许读取。编辑工具和会写入的 Shell 命令一律拒绝 |
+| `llm-auto` | 沙箱和策略与 `workspace-write` 相同，但需要审批的操作交给一个审查模型决定；审查失败按拒绝处理 |
+| `danger-full-access` | 不使用沙箱，只拦截系统 / 磁盘级破坏。仅用于评测容器 |
+| `terminal-eval` | Terminal-Bench 独立 runner 使用的预设 |
 
-依赖方向是单向的：`support` ← `runtime`/`workspace`/`memory`/`sessions` ← `agent` ← `core`/`tui`/`cli`。
-`tests/test_layering.py` 用 AST 检查这条规则，防止"顺手 import"重新造出环。
+无论哪种模式，系统级破坏（如 `rm -rf /`、格式化磁盘）都会被拒绝。细节见 [docs/permissions-and-sandbox.md](docs/permissions-and-sandbox.md)。
 
-职责分层同样适用于模型可见面：**System Prompt 只放少量全局原则，Tool Schema 只描述精确的接口契约
-（参数语义、返回值语义、分页规则、隔离与权限参数），运行时保障由 Runtime 实际执行，复杂知识按需加载**。
-Schema 里不再重复提示词已经写过的行为策略。子代理协作工具（`spawn_agent` 等 8 个）默认不挂载，
-由 `search_tools` 按需发现并长期挂载；memory 与常规编码工具常驻。
+### 计划流
 
-### 执行边界
+需要先想清楚再动手时使用 `/plan`。规划期间运行时把权限收紧到 `read-only`，这是强制约束而不是提示词约定。计划就绪后：
 
-- `bash` 每次从 workspace 根目录启动新的 Shell，不继承上次调用的 cwd、环境变量或函数。
-- 文件、目录和全局资源使用统一 effect 声明；未声明 effect 的扩展工具默认独占。
-- 同一文件读写、目录读写和验证输出按资源顺序执行；不同资源的安全调用可并行。
-- `workspace-write` 默认需要批准 risky Shell 和未知工具；危险删除、覆盖和系统命令直接拒绝。
-- worker 在共享工作区按 `allowed_paths` 直接修改，Shell 的可写目录同样收窄到该范围；并发 worker 的写入范围重叠会在派发时被拒绝，主 Agent 负责复查和验证。
-- Docker 模式用于隔离 Shell，默认关闭网络；它不是绝对安全边界。
+- 继续输入文字会被当作修改意见，计划随之更新，不会开始执行；
+- `/plan execute` 或计划面板上的确认才会开始执行，并恢复原来的权限模式；
+- 如果执行没能真正开始（模型不可用、被取消等），计划保持待审批状态，可以再次执行。
+
+### 多会话与工作区
+
+一个工作台可以同时运行多个会话，每个会话有自己的对话、队列、审批和后台任务。切换标签不会中断执行；会话空闲两分钟后自动释放运行时，下次使用时恢复。
+
+- **共享工作区（默认）**：所有会话改同一个目录。不同文件可以并行修改；同一文件写入前会校验版本，冲突时先尝试自动三方合并，无法安全合并时展示差异等你确认。
+- **隔离工作区**：从当前会话 Fork 出一个 Git Worktree 会话，继承未提交的改动；完成后用「应用到 Local」把改动合回主工作区。
+- **回撤**：每个稳定回合结束后保存回撤点，可以回到之前任意回合。回撤只撤销本会话自己的文件改动；如果文件之后又被其他会话或外部程序修改，回撤会被拒绝。数据库、远端请求等外部副作用不在回撤范围内。
+
+更多细节见 [docs/context-and-sessions.md](docs/context-and-sessions.md)。
 
 ## 配置
 
-常用环境变量：
-
 | 变量 | 说明 |
 | --- | --- |
-| `OPENAI_API_KEY` | API key |
-| `OPENAI_BASE_URL` | OpenAI-compatible API 地址 |
-| `HARNESS_MODEL` | 通用模型的默认值。DeepSeek 各档位使用内置默认模型，可用 `HARNESS_MODEL_FAST/NORMAL/HARD/MAX` 覆盖 |
-| `HARNESS_MODEL_INTENSITY` | `fast` / `normal` / `hard` / `max` |
-| `HARNESS_PERMISSION_MODE` | `workspace-write` / `read-only` / `llm-auto` / `danger-full-access` / `terminal-eval` |
-| `HARNESS_MODEL_INPUT_MODE` | `text` 或 `multimodal` |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` | 模型服务的凭据和地址 |
+| `HARNESS_PROVIDER` | `auto`（默认，按域名识别）、`openai`、`deepseek` 或 `openai-compatible` |
+| `HARNESS_MODEL` | 非 DeepSeek provider 使用的模型名 |
+| `HARNESS_MODEL_INTENSITY` | 模型档位：`fast` / `normal` / `hard`（默认）/ `max` |
+| `HARNESS_MODEL_FAST` … `HARNESS_MODEL_MAX` | 覆盖各档位使用的模型 |
+| `HARNESS_AVAILABLE_MODELS` | 界面模型选择器中可选的模型，逗号分隔 |
+| `HARNESS_PERMISSION_MODE` | 权限模式，见上文 |
+| `HARNESS_MODEL_INPUT_MODE` | `text`（默认）或 `multimodal`（允许发送图片） |
+| `HARNESS_CONTEXT_WINDOW_TOKENS` | 上下文窗口大小，默认 200000；达到 80% 时自动压缩 |
+| `SILICONFLOW_API_KEY` | 长期记忆向量检索使用的 embedding 凭据（独立于模型 key）|
+| `VERIFORGE_HOME` | 用户级状态目录，默认 `~/.veriforge` |
 
-完整配置见 `.env.template`。
+完整列表（超时、Shell 资源限制、预算等）见 [.env.template](.env.template)。
 
-会话只在首次执行时初始化，切换标签只读取已保留的界面与历史。连续空闲两分钟后自动释放运行时，下次执行自动恢复；排队消息、审批、后台进程、子代理、未退出工具、未应用的代码提案和待解决冲突都会阻止休眠；已结束的子代理及其对话、已结束的 Shell 任务及输出在恢复后保留，可继续跟进或读取。项目内共享模型与工具执行额度，任务等待额度时可正常取消。MCP 目录缓存可复用，连接按会话隔离、按需建立。顶部「资源」可查看运行会话、等待原因、后台进程的内存与 CPU 累计时间及最近失败；关闭面板后停止进程资源采样。
+运行时状态不写进你的项目目录，而是放在 `~/.veriforge/workspaces/<项目名>-<路径哈希>/` 下：会话日志、Trace、大输出文件和 MCP 配置都在这里。长期记忆在 `~/.veriforge/memory-v3/`。
 
-Trace 位于 `~/.veriforge/workspaces/<项目名>-<路径哈希>/traces/<Session ID>/`，每个 Agent 实例单独写入文件，通过 `ui_request_id`、`turn_id`、`llm_call_id`、`tool_call_id`、`shell_job_id` 关联请求与执行。
+## 项目结构
 
-## 测试
-
-安装 Python 测试依赖并运行日常测试：
-
-```bash
-python -m pip install -e ".[test]"
-python -m pytest -q
+```text
+harness_code_agent/      Python 运行时
+├── support/             叶子层原语：取消令牌、token 计数、LLM 客户端适配
+├── workspace/           路径规则、文件保护、Shell 与后台任务、沙箱、Worktree
+├── sessions/            会话元数据、事件、JSONL 日志、观测与报告
+├── memory/              长期记忆：SQLite、检索、后台提取与整理
+├── runtime/             工具注册与执行、权限、调度、中间件、MCP、LSP、验证
+├── agent/               对话循环、上下文管理、压缩、子 Agent
+├── core/ · tui/         交互会话与终端界面的 Python 侧逻辑
+├── skills/catalog/      内置 Skill（Markdown）
+├── cli.py · headless.py · tui_bridge.py    入口
+frontend/opentui/        终端界面（Bun + React + TypeScript）
+eval/                    评测脚本、基准适配器与报告
+tests/                   测试
+docs/                    设计文档
 ```
 
-默认执行完整非外部测试，排除标记为 `integration` 的原生工具测试和 `external` 的外部服务验收；单元测试和使用仓库内假服务器的 LSP 协议测试不要求安装真实语言服务器。测试统一使用假模型凭据，不依赖开发机的 API key；搜索参数与过滤规则通过 mock 验证，不要求安装 `rg`。
-
-日常可只跑快速回归；本轮涉及的 Session 集成测试按需追加，提交前仍跑完整非外部测试：
+## 开发
 
 ```bash
-python -m pytest -q -m "not integration and not session and not external"
-python -m pytest -q tests/test_multi_session_workbench.py tests/test_project_resources.py
-python -m pytest -q --durations=30
+pip install -e ".[test]"
+python -m pytest -q                          # Python 测试
+cd frontend/opentui && bun run check && bun test   # 前端类型检查与测试
 ```
 
-真实 Windows ACL、LSP 与 Node.js 执行边界测试单独运行：
+测试分层、集成测试、CI 和代码约定见 [docs/development.md](docs/development.md)。
 
-```bash
-python -m pytest -q -m integration -rs
-```
+## 文档
 
-本地缺少 Node.js、Python/TypeScript 语言服务器或外部 TypeScript 编译器时，对应测试明确跳过并显示原因。工具安装方法见上文；Windows 可继续使用 `D:\Tools\lsp`，安装目录需要加入当前终端的 `PATH`。跳过不代表验证通过。
+- [架构](docs/architecture.md)：模块分层、一轮对话和一次工具调用的完整路径、资源生命周期
+- [权限与沙箱](docs/permissions-and-sandbox.md)：Shell 的四层安全边界、权限模式、额外权限与持久授权
+- [上下文与会话](docs/context-and-sessions.md)：上下文版本、压缩、会话日志、多会话、回撤与 Worktree
+- [长期记忆](docs/memory.md)：数据模型、检索、自动提取与管理命令
+- [开发指南](docs/development.md)：环境、测试、CI 与约定
+- [评测](eval/README.md)：本地指标、Terminal-Bench、Claw-SWE-Bench 与历史评测报告
 
-`.github/workflows/python-tests.yml` 在 Linux 和 Windows 分别运行日常测试与真实 LSP 测试。LSP 任务固定 Node.js `24.18.0`、Pyright `1.1.414`、typescript-language-server `6.0.1` 和 TypeScript `6.0.3`，在 runner 临时目录中安装，位于工作区之外。安装和版本检查在测试前完成；测试不自动下载工具。CI 使用严格命令，缺少工具直接失败：
+## 许可证
 
-```bash
-python -m pytest tests/test_code_intelligence.py tests/test_language_service_integration.py -q -m integration --require-integration-tools -rs
-# Windows
-python -m pytest tests/test_native_shell.py -q -m integration --require-integration-tools -rs
-```
-
-OpenTUI：
-
-```bash
-cd frontend/opentui
-bun test
-bun run check
-```
-
-## 评测
-
-```bash
-python eval/scripts/run_basic_metrics_eval.py --dry-run
-python eval/scripts/run_terminal_bench_eval.py --dry-run
-python eval/scripts/rebuild_eval_results.py --results-root eval/results --jobs-root jobs
-```
-
-评测结果和运行说明：
-
-- [eval/README.md](eval/README.md)
-- [eval/benchmarks/README.md](eval/benchmarks/README.md)
-
-## 相关文档
-
-- [架构与资源生命周期](docs/architecture.md)
-- [上下文版本与运行时状态](docs/deepseek-context-runtime.md)
-- [环境变量模板](.env.template)
-
-## 注意
-
-- 不要提交 `.env` 或 API key。
-- 被中断的评测应标记为 interrupted/incomplete，不要当作最终结果。
+[MIT](LICENSE)

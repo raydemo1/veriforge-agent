@@ -126,18 +126,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Approximate token budget for real project context included in prompts.",
     )
     parser.add_argument(
-        "--max-output-tokens",
-        type=int,
-        default=160,
-        help="Maximum completion tokens for measured calls.",
-    )
-    parser.add_argument(
-        "--summary-output-tokens",
-        type=int,
-        default=800,
-        help="Maximum completion tokens for the compaction summarizer call.",
-    )
-    parser.add_argument(
         "--post-rewrite-turns",
         type=int,
         default=3,
@@ -220,7 +208,6 @@ class DeepSeekContextEvaluator:
             assistant, usage, finish_reason, latency_ms = self.call_model(
                 messages,
                 schemas,
-                max_tokens=self.args.max_output_tokens,
             )
             call, previous_shape = self.record_call(
                 scenario="stable_warmup",
@@ -257,7 +244,6 @@ class DeepSeekContextEvaluator:
             assistant, usage, finish_reason, latency_ms = self.call_model(
                 messages,
                 schemas,
-                max_tokens=self.args.max_output_tokens,
             )
             call, previous_shape = self.record_call(
                 scenario="schema_reorder",
@@ -291,7 +277,6 @@ class DeepSeekContextEvaluator:
         assistant, usage, finish_reason, latency_ms = self.call_model(
             messages,
             schemas,
-            max_tokens=self.args.max_output_tokens,
         )
         call, previous_shape = self.record_call(
             scenario="compaction_rewrite",
@@ -316,7 +301,6 @@ class DeepSeekContextEvaluator:
             summary_assistant, summary_usage, summary_finish, summary_latency = self.call_model(
                 summary_messages,
                 tools=None,
-                max_tokens=self.args.summary_output_tokens,
             )
             summary_usage_box.append(summary_usage)
             summary_call, _ = self.record_call(
@@ -356,7 +340,6 @@ class DeepSeekContextEvaluator:
             assistant, usage, finish_reason, latency_ms = self.call_model(
                 messages,
                 schemas,
-                max_tokens=self.args.max_output_tokens,
             )
             call, previous_shape = self.record_call(
                 scenario="compaction_rewrite",
@@ -392,12 +375,9 @@ class DeepSeekContextEvaluator:
         self,
         messages: list[dict],
         tools: list[dict] | None,
-        *,
-        max_tokens: int,
     ) -> tuple[dict, dict[str, Any], str | None, int]:
         chat_args: dict[str, Any] = {
             "messages": messages,
-            "max_tokens": max_tokens,
         }
         if self.args.no_profile_extra:
             chat_args["model"] = config.MODEL

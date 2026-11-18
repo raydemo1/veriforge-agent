@@ -17,6 +17,9 @@ from .search_index import search_terms
 from .security import contains_secret, redact_secrets
 from .vectors import VectorIndex
 
+# Context-window space kept free for the model's JSON answer.
+_OUTPUT_RESERVE = 4096
+
 
 def hold_matching_facts(db, namespace: str, candidate_id: str, value: dict) -> None:
     rows = db.execute(
@@ -287,7 +290,7 @@ class ConsolidationQueue:
             if should_continue is not None and not should_continue():
                 raise ObsoleteConsolidation("Memory worker stopped")
             kwargs, provider = _request(candidates, records, sources)
-            if count_request_tokens(kwargs["messages"]) + kwargs["max_tokens"] > min(max_tokens, config.CONTEXT_WINDOW_TOKENS):
+            if count_request_tokens(kwargs["messages"]) + _OUTPUT_RESERVE > min(max_tokens, config.CONTEXT_WINDOW_TOKENS):
                 raise IncompleteConsolidation("Consolidation exceeds request budget")
             with self.database.connect(write=True) as db:
                 self._ready(db, task)
@@ -494,7 +497,7 @@ def _request(candidates, records, sources):
         profile=profile, messages=[
             {"role": "system", "content": "Consolidate evidence-backed memories. Return JSON only."},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ], max_tokens=4096,
+        ],
     )
     return kwargs, profile.provider
 

@@ -257,16 +257,6 @@ def pre_pull_task_images(
     return pulled
 
 
-def rewrite_task_images_to_ghcr(dataset_path: Path) -> int:
-    """Backward-compatible name for older tests/integrations.
-
-    The old implementation rewrote every task to a guessed GHCR image. Some
-    Some Terminal-Bench tasks do not have a public GHCR package, so the safe
-    behavior is now to repair only broken image references.
-    """
-    return repair_task_images(dataset_path)
-
-
 def _task_files(dataset_path: Path, tasks: list[str] | None) -> list[Path]:
     tasks_root = dataset_path / "tasks"
     if tasks:

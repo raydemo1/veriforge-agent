@@ -9,7 +9,6 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import wraps
@@ -576,17 +575,6 @@ class InteractiveSession:
         self._slash_registry = None
         if self.is_bound:
             self._activate_agent()
-
-    def _wait_session_future(self, future):
-        token = current_token.get()
-        while True:
-            if token is not None:
-                token.check()
-            try:
-                return future.result(timeout=.05)
-            except FutureTimeout:
-                if future.done():
-                    return future.result()
 
     def _bind_session(self) -> None:
         if self.is_bound:
@@ -1309,10 +1297,6 @@ class InteractiveSession:
     def mcp_status(self) -> str:
         self._ensure_mcp_tools_loaded()
         return self.mcp_manager.status_report()
-
-    def mcp_list(self) -> str:
-        self._ensure_mcp_tools_loaded()
-        return self.mcp_manager.tools_report()
 
     @runtime_change
     def reload_mcp(self) -> str:

@@ -16,7 +16,6 @@ class SessionStatusSnapshot:
     session_id: str | None
     cwd: Path
     turn: int = 0
-    pending_plan: bool = False
     running_tool: str = ""
     status: str = "idle"
     dirty_count: int = 0
@@ -98,7 +97,7 @@ class TuiState:
             body = str(payload.get("text", ""))
             attachments = payload.get("attachments") or []
             summaries = [
-                f"[{item.get('kind', 'file')}] {item.get('name', '附件')} ({_format_attachment_size(item.get('size', 0))})"
+                f"[{item.get('kind', 'file')}] {item.get('name', '附件')} ({format_attachment_size(item.get('size', 0))})"
                 for item in attachments if isinstance(item, dict)
             ]
             if summaries:
@@ -166,13 +165,11 @@ class TuiState:
         if event_type == "approval_decided":
             return None
         if event_type == "plan_executed":
-            self.snapshot.pending_plan = False
             return None
         if event_type == "permission_mode_switched":
             self.snapshot.permission_mode = str(payload.get("permission_mode") or self.snapshot.permission_mode)
             return None
         if event_type == "plan_ready":
-            self.snapshot.pending_plan = True
             self.snapshot.status = "plan ready"
             path = str(payload.get("plan_path") or "global_plan/current/plan.md")
             revision = payload.get("plan_revision")
@@ -646,7 +643,8 @@ def _is_protocol_failure(payload: dict[str, Any]) -> bool:
     return isinstance(metadata, dict) and metadata.get("failure_visibility") == FailureVisibility.PROTOCOL
 
 
-def _format_attachment_size(value: Any) -> str:
+def format_attachment_size(value: Any) -> str:
+    """Human-readable size, matching the frontend formatBytes helper."""
     try:
         size = max(0, int(value))
     except (TypeError, ValueError):

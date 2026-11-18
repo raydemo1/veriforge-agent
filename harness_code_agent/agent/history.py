@@ -37,9 +37,6 @@ class ContextHistory:
     def snapshot(self) -> list[dict]:
         return copy.deepcopy(list(self._decoded))
 
-    def raw_snapshot(self) -> list[dict]:
-        return [json.loads(message) for message in self._raw_messages]
-
     @property
     def sequences(self) -> tuple[int, ...]:
         return self._sequences

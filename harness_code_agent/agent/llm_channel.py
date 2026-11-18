@@ -186,6 +186,10 @@ def _reset_client_after_stream_timeout(conv) -> None:
     conv._client_needs_refresh = True
 
 
+# Context-window space kept free for the summary the model writes back.
+_SUMMARY_OUTPUT_RESERVE = 10_000
+
+
 def llm_call_simple(messages: list[dict], *, diagnostics=None, trace=None, epoch=None, project_resources=None) -> str:
     """Simple LLM call without tools — used for summarization.
 
@@ -197,8 +201,8 @@ def llm_call_simple(messages: list[dict], *, diagnostics=None, trace=None, epoch
     attempts = max(1, int(config.LLM_MAX_RETRIES) + 1)
 
     def _invoke() -> str:
-        kwargs = adapter.chat_kwargs(profile=profile, messages=messages, max_tokens=10000)
-        if tokens.count_request_tokens(kwargs["messages"]) + kwargs["max_tokens"] > config.CONTEXT_WINDOW_TOKENS:
+        kwargs = adapter.chat_kwargs(profile=profile, messages=messages)
+        if tokens.count_request_tokens(kwargs["messages"]) + _SUMMARY_OUTPUT_RESERVE > config.CONTEXT_WINDOW_TOKENS:
             log.warning("Skipping compaction: summary request exceeds context budget")
             return ""
         record = diagnostics.begin(kwargs, provider=profile.provider, epoch=epoch,

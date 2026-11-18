@@ -1,7 +1,7 @@
 export type ThemePreference = "auto" | "dark" | "light";
 export type IconPreference = "auto" | "nerd" | "unicode";
 
-export const UI_PROTOCOL_VERSION = 10;
+export const UI_PROTOCOL_VERSION = 11;
 
 export type Snapshot = {
   permissionMode: string;
@@ -202,7 +202,6 @@ export type ProjectResourcesSnapshot = {
 };
 
 export type SessionEvent =
-  | { type: "runtime_state"; state: string }
   | { type: "resource_wait"; reason: string | null }
   | { type: "snapshot"; snapshot: Snapshot }
   | { type: "session_reset"; snapshot: Snapshot; items?: TranscriptItem[] }

@@ -128,9 +128,6 @@ class WorkStateProjection:
             return list(self._artifacts.values())
         raise KeyError(f"unknown work state section: {key}")
 
-    def changed_sections(self) -> dict[str, Any]:
-        return {key: self.section(key) for key in SECTION_EVENTS}
-
     # ------------------------------------------------------------------
     # Plan / Tasks
     # ------------------------------------------------------------------

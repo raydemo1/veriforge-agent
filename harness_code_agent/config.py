@@ -7,7 +7,7 @@ Setup:
 """
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .provider_resolution import resolve_provider_name as _resolve_provider_name
@@ -87,9 +87,13 @@ MODEL_OVERRIDES = {
     for intensity in MODEL_INTENSITIES
 }
 
-# Models and reasoning efforts selectable from the TUI.  Values follow the
-# DeepSeek API: reasoning_effort accepts low/high/max (default high).
-AVAILABLE_MODELS = ("deepseek-flash", "deepseek-v4-pro")
+# Models selectable from the TUI (comma-separated).  Reasoning efforts follow
+# the DeepSeek API: low/high/max (default high).
+AVAILABLE_MODELS = tuple(
+    name.strip()
+    for name in os.environ.get("HARNESS_AVAILABLE_MODELS", "deepseek-flash,deepseek-v4-pro").split(",")
+    if name.strip()
+)
 REASONING_EFFORTS = ("low", "high", "max")
 
 @dataclass
@@ -125,10 +129,6 @@ def _normalize_model_intensity(value: str | None) -> str:
     return intensity
 
 
-def _model_override_for_intensity(intensity: str) -> str | None:
-    return MODEL_OVERRIDES.get(intensity)
-
-
 def _default_model_profile(provider: str, intensity: str) -> ModelProfile:
     if provider == "deepseek":
         defaults = {
@@ -157,37 +157,19 @@ def _default_model_profile(provider: str, intensity: str) -> ModelProfile:
 
 
 def resolve_model_profile(intensity: str, selection: ModelSelection | None = None) -> ModelProfile:
+    """Model profile for one request: intensity defaults, env overrides, then the TUI selection."""
     normalized = _normalize_model_intensity(intensity)
-    override_model = _model_override_for_intensity(normalized)
     provider = _resolve_provider_name(provider=PROVIDER, base_url=BASE_URL)
-    profile = _default_model_profile(provider, normalized)
-    if override_model:
-        profile = ModelProfile(
-            provider=profile.provider,
-            model=override_model,
-            thinking=profile.thinking,
-            reasoning_effort=profile.reasoning_effort,
-            input_mode=MODEL_INPUT_MODE,
-        )
-    elif profile.input_mode != MODEL_INPUT_MODE:
-        profile = ModelProfile(
-            provider=profile.provider,
-            model=profile.model,
-            thinking=profile.thinking,
-            reasoning_effort=profile.reasoning_effort,
-            input_mode=MODEL_INPUT_MODE,
-        )
-    selection = selection or ModelSelection()
-    runtime_override = {"model": selection.model, "reasoning_effort": selection.reasoning_effort}
-    if normalized != "fast" and (runtime_override["model"] or runtime_override["reasoning_effort"]):
-        model = runtime_override["model"] or profile.model
-        provider = _resolve_provider_name(provider=PROVIDER, base_url=BASE_URL)
-        profile = ModelProfile(
-            provider=provider,
-            model=model,
-            thinking=True if runtime_override["reasoning_effort"] else profile.thinking,
-            reasoning_effort=runtime_override["reasoning_effort"] or profile.reasoning_effort or "high",
-            input_mode=MODEL_INPUT_MODE,
+    profile = replace(_default_model_profile(provider, normalized), input_mode=MODEL_INPUT_MODE)
+    if MODEL_OVERRIDES.get(normalized):
+        profile = replace(profile, model=MODEL_OVERRIDES[normalized])
+    # The "fast" tier serves internal helper calls and ignores the TUI selection.
+    if selection is not None and normalized != "fast" and (selection.model or selection.reasoning_effort):
+        profile = replace(
+            profile,
+            model=selection.model or profile.model,
+            thinking=True if selection.reasoning_effort else profile.thinking,
+            reasoning_effort=selection.reasoning_effort or profile.reasoning_effort or "high",
         )
     return profile
 
@@ -270,4 +252,6 @@ SHELL_FSIZE_BLOCKS = int(os.environ.get("HARNESS_SHELL_FSIZE_BLOCKS", "0"))
 TRACE_STDERR = os.environ.get("HARNESS_TRACE_STDERR", "").lower() in {"1", "true", "yes", "on"}
 
 # --- Paths ---
-WORKSPACE = os.path.abspath(os.environ.get("HARNESS_WORKSPACE", "./workspace"))
+# Workspace used by tool calls that run without a session ToolContext
+# (eval runners set it explicitly); defaults to the process working directory.
+WORKSPACE = os.path.abspath(os.environ.get("HARNESS_WORKSPACE", "."))

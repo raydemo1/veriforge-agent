@@ -124,9 +124,7 @@ class ProductRuntimeTests(unittest.TestCase):
             importlib.reload(config)
 
     def test_deepseek_reasoning_content_round_trips(self):
-        from harness_code_agent.agent.conversation import (
-            _assistant_message_from_response,
-        )
+        from harness_code_agent.support.llm import ProviderAdapter
 
         cases = [
             ("direct_attr", SimpleNamespace(
@@ -148,28 +146,17 @@ class ProductRuntimeTests(unittest.TestCase):
 
         for label, msg, expected in cases:
             with self.subTest(source=label):
-                with (
-                    patch("harness_code_agent.agent.conversation.config.BASE_URL", "https://api.deepseek.com"),
-                    patch("harness_code_agent.agent.conversation.config.MODEL", "deepseek-v4-flash"),
-                ):
-                    assistant_msg = _assistant_message_from_response(msg)
+                assistant_msg = ProviderAdapter("deepseek").assistant_message_from_response(msg)
 
                 self.assertEqual(assistant_msg["reasoning_content"], expected)
                 if label == "direct_attr":
                     self.assertEqual(assistant_msg["tool_calls"][0]["function"]["name"], "read_file")
 
     def test_non_deepseek_assistant_message_omits_reasoning_content(self):
-        from harness_code_agent.agent.conversation import (
-            _assistant_message_from_response,
-        )
+        from harness_code_agent.support.llm import ProviderAdapter
 
         msg = SimpleNamespace(content="ok", reasoning_content="hidden", tool_calls=None)
-
-        with (
-            patch("harness_code_agent.agent.conversation.config.BASE_URL", "https://api.openai.com/v1"),
-            patch("harness_code_agent.agent.conversation.config.MODEL", "gpt-4o"),
-        ):
-            assistant_msg = _assistant_message_from_response(msg)
+        assistant_msg = ProviderAdapter("openai").assistant_message_from_response(msg)
 
         self.assertNotIn("reasoning_content", assistant_msg)
 
@@ -295,7 +282,6 @@ class ProductRuntimeTests(unittest.TestCase):
         kwargs = ProviderAdapter("deepseek").chat_kwargs(
             model="deepseek-v4-pro",
             messages=messages,
-            max_tokens=10,
         )
 
         self.assertEqual(kwargs["messages"][0]["reasoning_content"], "provider-only thinking")
@@ -369,7 +355,7 @@ class ProductRuntimeTests(unittest.TestCase):
         def request():
             try:
                 conversation.llm.request_assistant_message(
-                    conversation.provider.chat_kwargs(model="m", messages=[], max_tokens=10),
+                    conversation.provider.chat_kwargs(model="m", messages=[]),
                     cancellation_token=token,
                 )
             except CancelledError as exc:
@@ -419,7 +405,7 @@ class ProductRuntimeTests(unittest.TestCase):
 
         with patch.object(conversation.trace, "error") as trace_error:
             completion = conversation.llm.request_assistant_message(
-                conversation.provider.chat_kwargs(model="m", messages=[], max_tokens=10)
+                conversation.provider.chat_kwargs(model="m", messages=[])
             )
 
         self.assertEqual(completion[0]["content"], "fallback")
@@ -459,7 +445,7 @@ class ProductRuntimeTests(unittest.TestCase):
         with patch("harness_code_agent.agent.conversation.get_client", return_value=fake_client):
             conversation = AgentConversation(Agent("test", "system", use_tools=False, stream_callback=deltas.append))
             completion = conversation.llm.request_assistant_message(
-                conversation.provider.chat_kwargs(model="m", messages=[], max_tokens=10)
+                conversation.provider.chat_kwargs(model="m", messages=[])
             )
 
         self.assertEqual(completion[0]["content"], "hello")
@@ -711,7 +697,6 @@ class ProductRuntimeTests(unittest.TestCase):
         kwargs = ProviderAdapter("openai").chat_kwargs(
             model="m",
             messages=[],
-            max_tokens=10,
             prompt_cache_key="cache-key",
             stream_options={"include_usage": True},
         )
@@ -731,7 +716,6 @@ class ProductRuntimeTests(unittest.TestCase):
                 reasoning_effort="high",
             ),
             messages=[],
-            max_tokens=10,
         )
         openai = ProviderAdapter("openai").chat_kwargs(
             profile=config.ModelProfile(
@@ -741,7 +725,6 @@ class ProductRuntimeTests(unittest.TestCase):
                 reasoning_effort="high",
             ),
             messages=[],
-            max_tokens=10,
         )
 
         self.assertEqual(deepseek["model"], "deepseek-v4-pro")
@@ -1492,10 +1475,10 @@ class ProductRuntimeTests(unittest.TestCase):
 
     def test_ask_user_tool_appends_other_and_returns_structured_choice(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy
-        from harness_code_agent.runtime.questions import StaticQuestionProvider
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
         from harness_code_agent.workspace.service import WorkspaceService
+        from tests.fakes import StaticQuestionProvider
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1528,7 +1511,6 @@ class ProductRuntimeTests(unittest.TestCase):
             FileChangeEvent,
             FinalReportEvent,
             SessionFinishedEvent,
-            TaskOutcomeEvent,
             ToolCallEvent,
             ToolResultEvent,
             UserInputEvent,
@@ -1545,7 +1527,6 @@ class ProductRuntimeTests(unittest.TestCase):
             FailureEvent(category="tool_error", message="boom").to_event().type,
             FinalReportEvent(status="success", reason="completed", summary="done").to_event().type,
             SessionFinishedEvent(reason="user_exit", status="closed").to_event().type,
-            TaskOutcomeEvent(status="success", evidence=["tests_passed"], summary="done").to_event().type,
         }
 
         self.assertEqual(event_types, {
@@ -1559,7 +1540,6 @@ class ProductRuntimeTests(unittest.TestCase):
             "failure",
             "final_report",
             "session_finished",
-            "task_outcome",
         })
 
     def test_assistant_message_event_records_streamed_flag_when_present(self):
@@ -1783,11 +1763,11 @@ class ProductRuntimeTests(unittest.TestCase):
     def test_tool_result_does_not_infer_status_from_raw_tool_text(self):
         from unittest.mock import patch
 
-        from harness_code_agent.runtime.approvals import StaticApprovalProvider
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
         from harness_code_agent.workspace.service import WorkspaceService
+        from tests.fakes import StaticApprovalProvider
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2010,9 +1990,7 @@ class ProductRuntimeTests(unittest.TestCase):
             metadata["fork_boundary"] = {"turn": 0, "journal_sequence": 0, "event_count": 0, "change_cursor": 0}
             atomic_json(source.metadata_path, metadata)
             fork = store.fork(source.id)
-            lineage = store.read_lineage(fork.id)
-
-            self.assertEqual([item["id"] for item in lineage], [source.id, fork.id])
+            self.assertEqual(store.read_metadata(fork.id)["forked_from"], source.id)
 
     def test_session_store_reads_latest_session_and_persisted_summary(self):
         from harness_code_agent.sessions.store import SessionStore
@@ -2065,7 +2043,6 @@ class ProductRuntimeTests(unittest.TestCase):
                 "payload": {"previous_profile": "coding-agent", "profile": "plan", "reason": "slash command"},
             },
             {"sequence": 8, "type": "plan_ready", "agent": "main_agent", "payload": {"profile": "plan"}},
-            {"sequence": 9, "type": "task_outcome", "agent": "main_agent", "payload": {"status": "success", "summary": "done"}},
             {"sequence": 10, "type": "agent_fallback", "agent": "main_agent", "payload": {"reason": "loop_detected"}},
             {"sequence": 11, "type": "session_finished", "agent": "main_agent", "payload": {"status": "closed", "reason": "user_exit"}},
         ]
@@ -2083,7 +2060,6 @@ class ProductRuntimeTests(unittest.TestCase):
 
         self.assertIn("plans_ready: 1", summary)
         self.assertIn("fallbacks: 1 (latest: loop_detected)", summary)
-        self.assertIn("task_outcome: success - done", summary)
         self.assertIn("recent_events:", summary)
 
     def test_session_summary_uses_final_report_for_phase_two_status_and_categories(self):
@@ -2136,7 +2112,6 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn("events: 1", summary)
         self.assertIn("tools: 1 call(s): unknown=1", summary)
         self.assertIn("changed_files: unknown", summary)
-        self.assertIn("task_outcome: unknown", summary)
 
     def test_final_report_payload_is_statistics_ready_for_replay_and_evaluation(self):
         from harness_code_agent.sessions.events import FinalReportEvent
@@ -2309,10 +2284,13 @@ class ProductRuntimeTests(unittest.TestCase):
         blocked_commands = [
             "rm -rf /",
             "rm -rf ~",
-            "Remove-Item C:\\ -Recurse",
             "mkfs.ext4 /dev/sda",
             "dd if=/dev/zero of=/dev/sda",
         ]
+        if os.name == "nt":
+            # Commands are parsed as PowerShell only on Windows; elsewhere the
+            # runtime shell is bash.
+            blocked_commands.append("Remove-Item C:\\ -Recurse")
         destructive_git_decisions = [
             workspace_policy.decide_tool_call("bash", {"command": command})
             for command in (
@@ -3201,7 +3179,6 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertFalse(any(event["type"] == "file_changed" for event in events))
 
     def test_permission_middleware_allows_approved_tool_call(self):
-        from harness_code_agent.runtime.approvals import StaticApprovalProvider
         from harness_code_agent.runtime.permission_middleware import (
             PermissionMiddleware,
         )
@@ -3209,6 +3186,7 @@ class ProductRuntimeTests(unittest.TestCase):
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
         from harness_code_agent.workspace.service import WorkspaceService
+        from tests.fakes import StaticApprovalProvider
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3244,7 +3222,6 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertTrue(decided["payload"]["approved"])
 
     def test_permission_middleware_records_llm_auto_approval_metadata(self):
-        from harness_code_agent.runtime.approvals import StaticApprovalProvider
         from harness_code_agent.runtime.permission_middleware import (
             PermissionMiddleware,
         )
@@ -3252,6 +3229,7 @@ class ProductRuntimeTests(unittest.TestCase):
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.sessions.events import EventBus
         from harness_code_agent.workspace.service import WorkspaceService
+        from tests.fakes import StaticApprovalProvider
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

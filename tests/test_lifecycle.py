@@ -143,25 +143,6 @@ class ExecutionBoundaryTests(unittest.TestCase):
         self.assertEqual(calls, [True])
 
 
-    def test_cancelled_startup_wait_retains_session_future(self):
-        from concurrent.futures import Future
-
-        from harness_code_agent.core.interactive import InteractiveSession
-        from harness_code_agent.support.cancellation import (
-            CancellationToken,
-            CancelledError,
-            cancellation_scope,
-        )
-        future, token = Future(), CancellationToken()
-        future.set_running_or_notify_cancel()
-        token.cancel()
-        session = InteractiveSession.__new__(InteractiveSession)
-        with cancellation_scope(token), self.assertRaises(CancelledError):
-            session._wait_session_future(future)
-        self.assertFalse(future.cancelled())
-        future.set_result("initialized")
-        self.assertEqual(future.result(), "initialized")
-
     def test_session_close_retains_resources_while_foreground_tool_is_alive(self):
         import threading
         from types import SimpleNamespace

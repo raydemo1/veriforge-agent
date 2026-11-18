@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,12 +13,7 @@ from harness_code_agent.tui.approval import (
     _persistent_prefix_for_request,
 )
 from harness_code_agent.tui.commands import default_command_registry
-from harness_code_agent.tui.completion import (
-    MentionIndex,
-    current_mention_query,
-    mention_candidates,
-    replace_mention_fragment,
-)
+from harness_code_agent.tui.completion import MentionIndex
 from harness_code_agent.tui.state import (
     SessionStatusSnapshot,
     TranscriptBlock,
@@ -32,18 +28,16 @@ class TerminalUiTests(unittest.TestCase):
         self.assertNotIn("/checkpoint", registry.command_names())
         self.assertNotIn("/profile", registry.command_names())
 
-    def test_mentions_search_files_and_replace_only_active_fragment(self):
+    def test_mentions_quote_file_paths_with_spaces(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "README file.md").write_text("demo", encoding="utf-8")
             store = SimpleNamespace(list_sessions=list)
-            candidates = mention_candidates(root, "read", store)
+            candidates = MentionIndex(root, store).candidates("read")
         self.assertEqual(candidates[0].insert_text, 'file:"README file.md"')
-        self.assertEqual(current_mention_query("inspect @rea"), ("rea", -4))
-        self.assertEqual(replace_mention_fragment("inspect @rea", candidates[0].insert_text), 'inspect @file:"README file.md" ')
 
     def test_transcript_state_tracks_tool_and_file_events(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         call = state.apply_event(SessionEvent(1, 0, "tool_call", "main", {"tool": "read_file", "args": {"path": "README.md"}}))
         change = state.apply_event(SessionEvent(2, 0, "file_change", "main", {"operation": "edit", "path": "README.md", "diff": "+new"}))
         self.assertEqual(call.kind, "tool")
@@ -52,7 +46,7 @@ class TerminalUiTests(unittest.TestCase):
         self.assertEqual(state.snapshot.dirty_count, 1)
 
     def test_transcript_shows_child_parent_report(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         block = state.apply_event(SessionEvent(
             1, 0, "agent_parent_message", "reviewer",
             {"name": "reviewer", "message": "evidence contradicts the plan"},
@@ -67,7 +61,7 @@ class TerminalUiTests(unittest.TestCase):
         self.assertEqual(block.body, "evidence contradicts the plan")
 
     def test_child_internal_events_stay_inside_the_agent_timeline(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         state.apply_event(SessionEvent(1, 0, "llm_usage", "main_agent", {"prompt_tokens": 1200}))
         state.apply_event(SessionEvent(2, 0, "turn_started", "main_agent", {"turn": 1}))
 
@@ -125,7 +119,7 @@ class TerminalUiTests(unittest.TestCase):
         self.assertEqual(list(state.agent_blocks), ["agent_1"])
 
     def test_parallel_subagents_pair_same_named_tools_by_call_id(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         agents = {}
         for index, name in enumerate(("alpha", "beta", "gamma"), 1):
             agents[name] = state.apply_event(SessionEvent(index, 0, "agent_spawned", name, {
@@ -152,7 +146,7 @@ class TerminalUiTests(unittest.TestCase):
         self.assertEqual(state.active_tool_blocks, {})
 
     def test_child_tool_results_never_consume_the_main_agents_call(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         main_call = state.apply_event(SessionEvent(1, 0, "tool_call", "main_agent", {
             "tool": "bash", "args": {"command": "pytest -q"}, "tool_call_id": "main-call",
         }))
@@ -179,7 +173,7 @@ class TerminalUiTests(unittest.TestCase):
         self.assertIsNone(main_result.parent_id)
 
     def test_agent_followup_reuses_the_same_inline_record(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         spawned = state.apply_event(SessionEvent(1, 0, "agent_spawned", "worker", {
             "agent_id": "agent_1", "name": "worker", "task": "first", "status": "queued",
         }))
@@ -230,7 +224,7 @@ class TerminalUiTests(unittest.TestCase):
         ]
 
         def snapshot():
-            state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+            state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
             for event in events:
                 block = state.apply_event(event)
                 state.add_block(block)
@@ -314,7 +308,7 @@ class TerminalUiTests(unittest.TestCase):
         self.assertIn("命令已执行", children[0]["title"])
 
     def test_child_activity_does_not_reorder_main_output(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
 
         def apply(sequence, event_type, agent, payload):
             block = state.apply_event(SessionEvent(sequence, 0, event_type, agent, payload))
@@ -347,7 +341,7 @@ class TerminalUiTests(unittest.TestCase):
         self.assertEqual(state.snapshot.status, "idle")
 
     def test_late_spawn_event_does_not_reopen_a_finished_agent(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         completed = state.apply_event(SessionEvent(1, 0, "agent_status", "fast", {
             "agent_id": "agent_f", "name": "fast", "status": "completed", "summary": "done",
         }))
@@ -361,7 +355,7 @@ class TerminalUiTests(unittest.TestCase):
         self.assertEqual(len(state.agent_blocks), 1)
 
     def test_agent_status_dedup_and_completed_wording(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         spawned = state.apply_event(SessionEvent(1, 0, "agent_spawned", "worker", {
             "agent_id": "agent_w", "name": "worker", "task": "run", "status": "queued",
         }))
@@ -408,6 +402,7 @@ class TerminalUiTests(unittest.TestCase):
             self.assertTrue(allowlist.matches("pytest --all"))
             self.assertFalse(allowlist.matches("ruff check ."))
 
+    @unittest.skipUnless(os.name == "nt", "PowerShell commands are parsed as PowerShell only on Windows")
     def test_project_allowlist_supports_pipeline_commands(self):
         with tempfile.TemporaryDirectory() as tmp:
             allowlist = ApprovalAllowlist(tmp)
@@ -442,7 +437,7 @@ class TerminalUiTests(unittest.TestCase):
 
     def test_fallback_block_ids_are_unique_and_replay_stable(self):
         def build_ids() -> list[str]:
-            state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+            state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
             state.add_block(TranscriptBlock("notice", "same", "first", turn=2))
             state.add_block(TranscriptBlock("notice", "same", "second", turn=2))
             return [block.id for block in state.blocks]
@@ -456,7 +451,7 @@ class TerminalUiTests(unittest.TestCase):
     def test_llm_usage_updates_context_tokens(self):
         from harness_code_agent.config import CONTEXT_WINDOW_TOKENS
 
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         result = state.apply_event(SessionEvent(1, 0, "llm_usage", "main", {"prompt_tokens": 16000}))
 
         self.assertIsNone(result)
@@ -464,7 +459,7 @@ class TerminalUiTests(unittest.TestCase):
         self.assertEqual(state.snapshot.context_window_tokens, int(CONTEXT_WINDOW_TOKENS))
 
     def test_run_bash_failure_keeps_raw_output(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         call = state.apply_event(SessionEvent(1, 0, "tool_call", "main", {
             "tool": "bash",
             "args": {"command": "pytest tests/test_thing.py"},
@@ -483,7 +478,7 @@ class TerminalUiTests(unittest.TestCase):
         self.assertIn("退出码 1", result.body)
 
     def test_model_protocol_errors_stay_out_of_the_transcript(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         state.snapshot.status = "thinking"
         events = [
             ("tool_call", {"tool": "write_file", "args": {}, "failure_visibility": "protocol"}),
@@ -501,7 +496,7 @@ class TerminalUiTests(unittest.TestCase):
         })))
 
     def test_approval_and_policy_rejections_collapse_to_a_short_line(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         state.apply_event(SessionEvent(1, 0, "tool_call", "main", {
             "tool": "bash",
             "args": {"command": "Remove-Item x"},
@@ -530,7 +525,7 @@ class TerminalUiTests(unittest.TestCase):
         self.assertIsNone(blocked)
 
     def test_tool_failures_render_once_and_denial_stop_stays_quiet(self):
-        state = TuiState(SessionStatusSnapshot("general", "model", "provider", "workspace-write", "session", Path.cwd()))
+        state = TuiState(SessionStatusSnapshot("model", "provider", "workspace-write", "session", Path.cwd()))
         state.apply_event(SessionEvent(1, 0, "tool_call", "main", {
             "tool": "bash",
             "args": {"command": "pytest"},

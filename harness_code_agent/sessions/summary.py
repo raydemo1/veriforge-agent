@@ -57,7 +57,6 @@ def format_session_summary(
     latest_fallback = _latest_fallback_reason(events)
     final_report = _latest_final_report(events)
     plans_ready = _count_events(events, "plan_ready")
-    task_outcome = _latest_task_outcome(events)
 
     lines = [
         "Session summary",
@@ -91,10 +90,7 @@ def format_session_summary(
     ])
     if final_report:
         lines.append(f"final_report: {_format_final_report(final_report)}")
-    lines.extend([
-        f"task_outcome: {task_outcome}",
-        "recent_events:",
-    ])
+    lines.append("recent_events:")
 
     recent = events[-recent_limit:] if recent_limit > 0 else []
     if recent:
@@ -135,24 +131,6 @@ def _failure_categories(events: list[dict[str, Any]]) -> Counter[str]:
         return Counter({str(key): int(value) for key, value in report_categories.items()})
 
     return _event_failure_categories(events)
-
-
-def _latest_task_outcome(events: list[dict[str, Any]]) -> str:
-    payload = _latest_task_outcome_payload(events)
-    status = str(payload.get("status", "")).strip()
-    summary = str(payload.get("summary", "")).strip()
-    if status and summary:
-        return f"{status} - {summary}"
-    if status:
-        return status
-    return "unknown"
-
-
-def _latest_task_outcome_payload(events: list[dict[str, Any]]) -> dict[str, Any]:
-    for event in reversed(events):
-        if _event_type(event) == "task_outcome":
-            return _payload(event)
-    return {}
 
 
 def _latest_final_report(events: list[dict[str, Any]]) -> dict[str, Any]:

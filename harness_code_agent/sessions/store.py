@@ -216,20 +216,6 @@ class SessionStore:
         summary_path.write_text(summary + "\n", encoding="utf-8")
         return summary
 
-    def read_lineage(self, session_id: str) -> list[dict[str, Any]]:
-        lineage = []
-        seen = set()
-        current_id = session_id
-        while current_id:
-            if current_id in seen:
-                raise ValueError(f"Session lineage cycle detected: {current_id}")
-            seen.add(current_id)
-            metadata = self.read_metadata(current_id)
-            lineage.append(metadata)
-            current_id = metadata.get("forked_from")
-        lineage.reverse()
-        return lineage
-
     def _session_root(self, session_id: str) -> Path:
         if not isinstance(session_id, str) or session_id in {"", ".", ".."} or any(char in session_id for char in "/\\:"):
             raise ValueError(f"Invalid session id: {session_id}")

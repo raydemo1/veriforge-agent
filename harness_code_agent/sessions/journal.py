@@ -52,24 +52,6 @@ class SessionJournal:
             "auto_extract": auto_extract,
         })
 
-    def append_compaction(
-        self,
-        *,
-        summary: str,
-        first_kept_sequence: int,
-        phase: str,
-        state: dict | None = None,
-    ) -> JournalEntry:
-        return self.append(
-            "compaction",
-            {
-                "summary": summary,
-                "first_kept_sequence": first_kept_sequence,
-                "phase": phase,
-                "state": _json_safe(state or {}),
-            },
-        )
-
     def append(self, kind: str, payload: dict[str, Any]) -> JournalEntry:
         with self._lock:
             entry = JournalEntry(self._sequence + 1, kind, time.time(), copy.deepcopy(payload))
@@ -97,23 +79,6 @@ class SessionJournal:
             messages.extend(copy.deepcopy(entry.payload["message"]) for entry in entries
                             if entry.kind == "message" and entry.sequence > latest.sequence)
             return messages
-        compactions = [entry for entry in entries if entry.kind == "compaction"]
-        if compactions:
-            latest = compactions[-1]
-            boundary = int(latest.payload.get("first_kept_sequence") or latest.sequence + 1)
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": "[COMPACTED CONTEXT]\n" + str(latest.payload.get("summary") or "")},
-            ]
-            messages.extend(
-                entry.payload["message"]
-                for entry in entries
-                if entry.kind == "message"
-                and entry.sequence >= boundary
-                and (entry.payload.get("message", {}).get("role") != "system"
-                     or entry.payload.get("metadata", {}).get("kind") == "runtime_event")
-            )
-            return messages
         return [
             {"role": "system", "content": system_prompt},
             *[
@@ -128,12 +93,6 @@ class SessionJournal:
     @property
     def sequence(self) -> int:
         return self._sequence
-
-    def first_sequence_of_recent_messages(self, count: int) -> int:
-        messages = [entry for entry in self.read() if entry.kind == "message"]
-        if count <= 0 or not messages:
-            return self._sequence + 1
-        return messages[max(0, len(messages) - count)].sequence
 
     def _last_sequence(self) -> int:
         return max((entry.sequence for entry in self.read()), default=0)

@@ -466,7 +466,6 @@ class AgentConversation:
         self.runtime_state.current_turn_start_index = len(previous_messages)
         self.runtime_state.todo = None
         self.runtime_state.fallback = AgentFallbackState()
-        self.runtime_state.auto_compaction_turn_start_index = -1
         self.runtime_state.auto_compaction_suspended = False
         self.runtime_state.context_anxiety_turn_start_index = -1
         for mw in self.agent.middlewares:
@@ -578,11 +577,6 @@ class AgentConversation:
                     for line in message["content"].splitlines() if line.startswith("limit_type: ")
                 }
 
-    def _refresh_dynamic_context_after_compaction(self, *, phase: str) -> None:
-        messages = self._refreshed_context(self.messages, phase=phase)
-        if messages != self.messages:
-            self.start_epoch("context_refreshed", messages)
-
     def _refreshed_context(self, messages: list[dict], *, phase: str) -> list[dict]:
         messages = [message for message in messages
                     if not _safe_message_content(message).startswith(DYNAMIC_CONTEXT_MARKER)]
@@ -651,7 +645,6 @@ class AgentConversation:
             return
 
         self._last_compaction_boundary = boundary
-        state.auto_compaction_turn_start_index = state.current_turn_start_index
         messages_before = len(self.messages)
         token_count_before = token_count
 
@@ -766,7 +759,6 @@ class AgentConversation:
 
     def record_llm_usage(self, usage: dict | None, prompt_cache_key: str | None) -> None:
         fallback = self.runtime_state.fallback
-        fallback.llm_call_count += 1
         if usage:
             total_tokens = usage.get("total_tokens")
             if total_tokens is not None:
@@ -1041,7 +1033,6 @@ class AgentConversation:
             chat_args = {
                 "profile": profile,
                 "messages": prompt_messages,
-                "max_tokens": max_output_tokens,
             }
             if agent.use_tools:
                 chat_args["tools"] = tool_schemas
@@ -1063,7 +1054,7 @@ class AgentConversation:
                 chat_args["prompt_cache_key"] = self._cached_prompt_cache_key
             kwargs = self.provider.chat_kwargs(**chat_args)
             input_tokens = tokens.count_request_tokens(kwargs["messages"], tool_schemas=tool_schemas)
-            if input_tokens + chat_args["max_tokens"] > config.CONTEXT_WINDOW_TOKENS:
+            if input_tokens + max_output_tokens > config.CONTEXT_WINDOW_TOKENS:
                 self.runtime_state.fallback.request_stop(reason="context_budget_exceeded")
                 self.emitter.emit_agent_fallback(self.runtime_state.fallback)
                 self.last_text = self._fallback_text()
@@ -1199,6 +1190,3 @@ def _tool_names_from_schemas(tool_schemas: list[dict] | None) -> set[str]:
             names.add(str(function["name"]))
     return names
 
-
-def _assistant_message_from_response(msg) -> dict:
-    return current_adapter().assistant_message_from_response(msg)

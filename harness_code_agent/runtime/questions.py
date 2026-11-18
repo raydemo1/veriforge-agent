@@ -68,26 +68,6 @@ class NoQuestionProvider:
         return QuestionResult(cancelled=True, reason="no question provider configured")
 
 
-class StaticQuestionProvider:
-    """Deterministic provider for tests and scripted runs."""
-
-    def __init__(self, *, index: int = 0, custom_text: str = "", reason: str = "selected by static provider"):
-        self.index = index
-        self.custom_text = custom_text
-        self.reason = reason
-
-    def ask(self, request: QuestionRequest) -> QuestionResult:
-        if self.index < 0 or self.index >= len(request.options):
-            return QuestionResult(cancelled=True, reason=f"invalid static question option index: {self.index}")
-        return question_result_from_option(
-            request,
-            self.index,
-            custom_text=self.custom_text,
-            metadata={"ui": "static"},
-            reason=self.reason,
-        )
-
-
 class ConsoleQuestionProvider:
     """Ask a question on stdin/stdout when an interactive terminal is available."""
 

@@ -12,7 +12,6 @@ from ..workspace.shell_jobs import ShellJobManager
 @dataclass
 class AgentFallbackState:
     total_tokens: int = 0
-    llm_call_count: int = 0
     tool_call_count: int = 0
     budget_warnings: set[str] = field(default_factory=set)
     stop_requested: bool = False
@@ -67,7 +66,6 @@ class AgentRuntimeState:
     current_turn_start_index: int = 0
     session_id: str = "default"
     permission_mode: str = ""
-    auto_compaction_turn_start_index: int = -1
     auto_compaction_suspended: bool = False
     context_anxiety_turn_start_index: int = -1
     event_bus: Any = None

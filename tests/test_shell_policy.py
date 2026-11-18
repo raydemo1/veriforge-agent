@@ -4,6 +4,7 @@ Facts come from the analyzer; allow/ask/deny comes only from the policy.
 """
 from __future__ import annotations
 
+import os
 import unittest
 
 from harness_code_agent.runtime.permissions import PermissionPolicy
@@ -137,6 +138,7 @@ class ShellPermissionPolicyTests(unittest.TestCase):
                 self.assertIn(TargetScope.TEMP, analysis.scopes)
                 self.assertTrue(self._decide(self.workspace, command).allowed)
 
+    @unittest.skipUnless(os.name == "nt", "PowerShell commands are parsed as PowerShell only on Windows")
     def test_temp_variable_reassignment_or_dynamic_suffix_is_not_proven(self):
         commands = [
             '$tmp = Join-Path $env:TEMP $name; Set-Content -Path $tmp -Value x',
@@ -210,12 +212,17 @@ class ShellPermissionPolicyTests(unittest.TestCase):
             "rm -rf ~",
             'rm -rf "$HOME"',
             "rm -rf C:\\",
-            "Remove-Item -Force -Recurse C:\\",
-            "Remove-Item -LiteralPath C:\\ -Recurse -Force",
             "sudo rm -rf /etc",
             "mkfs.ext4 /dev/sda",
             "dd if=/dev/zero of=/dev/sda",
         ]
+        if os.name == "nt":
+            # Commands are parsed as PowerShell only on Windows; elsewhere the
+            # runtime shell is bash.
+            commands += [
+                "Remove-Item -Force -Recurse C:\\",
+                "Remove-Item -LiteralPath C:\\ -Recurse -Force",
+            ]
         for policy in (self.workspace, self.eval, self.full):
             for command in commands:
                 with self.subTest(mode=policy.mode, command=command):

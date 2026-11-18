@@ -919,15 +919,20 @@ class ToolExecutorTests(unittest.TestCase):
         registry = ToolRegistry()
         token = CancellationToken()
         seen = []
+        slow_started = threading.Event()
 
         def slow_tool(cancellation_token=None):
             seen.append(cancellation_token)
+            slow_started.set()
             while not cancellation_token.is_cancelled:
                 time.sleep(0.01)
             seen.append("slow_observed_cancel")
             return ToolResult(tool="slow_read", status="failed", output="slow cancelled")
 
         def cancel_tool(cancellation_token=None):
+            # Cancel only once the slow handler is running; otherwise the turn
+            # may be cancelled before the parallel group ever starts it.
+            slow_started.wait(5)
             token.cancel()
             return ToolResult(tool="cancel_read", status="success", output="cancelled")
 

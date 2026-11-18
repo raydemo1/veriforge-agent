@@ -64,6 +64,11 @@ include = ["harness_code_agent*", "frontend.opentui"]
 [tool.setuptools.exclude-package-data]
 "frontend.opentui" = ["src/*.test.ts", "src/*.test.tsx", "src/**/*.test.ts", "src/**/*.test.tsx"]
 
+[tool.ruff.lint]
+# Broad `except Exception` is only allowed on the failure boundaries listed
+# below (or with an inline noqa explaining why).
+extend-select = ["BLE001"]
+
 [tool.ruff.lint.per-file-ignores]
 # These files sit on deliberate failure boundaries: any exception from a tool
 # handler, LLM/network call, plugin resolver, worker thread or UI bridge is

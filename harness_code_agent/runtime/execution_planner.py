@@ -8,6 +8,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..workspace.paths import is_same_or_child
+
 
 @dataclass(frozen=True, order=True)
 class ResourceClaim:
@@ -87,9 +89,9 @@ def claims_conflict(left: ResourceClaim, right: ResourceClaim) -> bool:
     if left.scope == right.scope == "exact":
         return left.key == right.key
     if left.scope == "subtree" and right.scope == "subtree":
-        return _is_same_or_child(left.key, right.key) or _is_same_or_child(right.key, left.key)
+        return is_same_or_child(left.key, right.key) or is_same_or_child(right.key, left.key)
     subtree, exact = (left, right) if left.scope == "subtree" else (right, left)
-    return _is_same_or_child(exact.key, subtree.key)
+    return is_same_or_child(exact.key, subtree.key)
 
 
 def normalize_workspace_key(root: str | Path, value: str | Path = ".") -> str:
@@ -134,13 +136,6 @@ def analyzed_shell_write_claims(
 def _looks_like_directory_target(raw: str) -> bool:
     tail = raw.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
     return "." not in tail
-
-
-def _is_same_or_child(value: str, parent: str) -> bool:
-    try:
-        return os.path.commonpath((value, parent)) == parent
-    except ValueError:
-        return False
 
 
 class ResourceCoordinator:

@@ -411,9 +411,6 @@ class McpClientManager:
                     self._connecting.pop(server_name)
                 flight.task.cancel()
 
-    def connect_all(self) -> None:
-        self.discover()
-
     async def _discover_connected(self, names: list[str]) -> dict[str, str]:
         results = await asyncio.gather(*(self._ensure_connected(name) for name in names), return_exceptions=True)
         return {
@@ -1080,17 +1077,6 @@ class McpClientManager:
         except OSError as exc:
             raise McpConfigError(f"无法写入 MCP 配置（{path}）：{exc}") from exc
 
-    def doctor_status(self) -> tuple[bool, str]:
-        if self.config_error:
-            return False, self.config_error
-        if not self.config.path.exists():
-            return True, "not configured"
-        failed = [status for status in self.discovery_statuses().values() if status.state in {"failed", "invalid"}]
-        if failed:
-            details = "; ".join(f"{item.name}: {item.error}" for item in failed)
-            return False, details
-        return True, f"{len(self.config.servers)} server(s), {len(self.tool_bindings)} tool(s)"
-
     def close(self) -> None:
         with self._state_lock:
             if self._closed:
@@ -1481,7 +1467,7 @@ def describe_mcp_servers(
 
             profile = config.resolve_model_profile("fast")
             adapter = ProviderAdapter(profile.provider)
-            kwargs = adapter.chat_kwargs(profile=profile, messages=messages, max_tokens=400)
+            kwargs = adapter.chat_kwargs(profile=profile, messages=messages)
             with client_scope() as client:
                 response = client.chat.completions.create(**kwargs)
         content = str(response.choices[0].message.content or "")

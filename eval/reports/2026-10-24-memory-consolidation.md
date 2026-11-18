@@ -1,6 +1,6 @@
 # Memory consolidation and hybrid retrieval evaluation
 
-Historical checkpoint: the runtime integration and later acceptance results are now recorded in `MEMORY_V3_ACCEPTANCE.md`. The original failures and request accounting below are retained as evidence.
+Historical checkpoint: the runtime integration and later acceptance results are now recorded in [2026-10-24-memory-v3-acceptance.md](2026-10-24-memory-v3-acceptance.md). The original failures and request accounting below are retained as evidence.
 
 Date: 2026-10-24 (Hong Kong). Isolated synthetic stores only; the production memory path remains unchanged.
 

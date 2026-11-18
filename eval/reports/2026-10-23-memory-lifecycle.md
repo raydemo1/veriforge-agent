@@ -101,12 +101,14 @@ scope: project
 
 ## 复现与证据
 
-```powershell
-& D:\miniconda\miniconda\python.exe eval/scripts/run_memory_lifecycle_eval.py
-& D:\miniconda\miniconda\python.exe eval/scripts/run_memory_lifecycle_eval.py --run
+当时使用的独立脚本 `run_memory_lifecycle_eval.py` 已移除，该场景现在由本地指标评测的 memory 套件覆盖：
+
+```bash
+python eval/scripts/run_basic_metrics_eval.py --dry-run --suites memory
+python eval/scripts/run_basic_metrics_eval.py --suites memory
 ```
 
-第一条只显示协议；第二条发出有上限的真实请求。数据位于 `eval/tasks/memory_lifecycle.json`，固定夹具 SHA-256：`12f87643288dfac632eee1253ba861a5a3a3ee207314753625f8dc2fd00d1986`。
+第一条只显示计划；第二条发出有上限的真实请求。数据位于 `eval/tasks/memory_lifecycle.json`，固定夹具 SHA-256：`12f87643288dfac632eee1253ba861a5a3a3ee207314753625f8dc2fd00d1986`。
 
 本次本地证据：`eval/results/memory-lifecycle-20261023-131211/`，包含 `protocol.json`、`requests.jsonl`、`summary.json`、`audit.json`、逐会话结果、原始合成日志及隔离记忆目录。该 results 目录沿用仓库忽略规则，不进入 Git。请求记录包含模型输出和用量，不记录密钥；输入以哈希及长度记录，可由固定夹具和隔离记忆快照核对。
 

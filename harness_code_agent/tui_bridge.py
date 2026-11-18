@@ -56,7 +56,13 @@ from .tui.commands import default_command_registry
 from .tui.completion import MentionIndex
 from .tui.projection import SECTION_EVENTS, WorkStateProjection
 from .tui.protocol import UI_PROTOCOL_VERSION, validate_ui_event
-from .tui.state import SessionStatusSnapshot, TranscriptBlock, TuiState, _localize_error
+from .tui.state import (
+    SessionStatusSnapshot,
+    TranscriptBlock,
+    TuiState,
+    _localize_error,
+    format_attachment_size,
+)
 
 log = logging.getLogger("harness.opentui")
 
@@ -123,21 +129,12 @@ def _localize_observability(text: str) -> str:
     return text
 
 
-def _format_attachment_size(size: int) -> str:
-    """Mirror the frontend formatBytes helper for transcript summaries."""
-    if size < 1024:
-        return f"{size} B"
-    if size < 1024 * 1024:
-        return f"{size / 1024:.1f} KB"
-    return f"{size / (1024 * 1024):.1f} MB"
-
-
 def _user_transcript_body(text: str, attachments: tuple) -> str:
     """Build the user transcript row body, matching the optimistic client row."""
     lines = [text.strip()]
     for item in attachments:
         data = item.public_dict()
-        lines.append(f"[{data['kind']}] {data['name']} ({_format_attachment_size(int(data['size']))})")
+        lines.append(f"[{data['kind']}] {data['name']} ({format_attachment_size(data['size'])})")
     return "\n".join(line for line in lines if line)
 
 
@@ -379,7 +376,6 @@ class SessionBridge:
         items = self._history_items(self.runtime_id)
         self._emit_commands()
         self._send_event({"type": "session_reset", "snapshot": self._snapshot_payload(), "items": items})
-        self._send_event({"type": "runtime_state", "state": "dormant"})
         self._send_event({"type": "progress", "status": "ready", "detail": ""})
 
     def _start_session_construction(self) -> None:
@@ -436,7 +432,6 @@ class SessionBridge:
             self._send_snapshot()
             self._send_work_state()
             self._send_event({"type": "progress", "status": "ready", "detail": "Python 会话已就绪。"})
-            self._send_event({"type": "runtime_state", "state": "warm"})
         except Exception as exc:  # pragma: no cover - exercised by real startup failures
             error = _localize_error(exc, "会话启动失败，请稍后重试")
             with self._session_lock:
@@ -1208,7 +1203,6 @@ class SessionBridge:
                 self._mention_index = None
         finally:
             self._not_suspending.set()
-        self._send_event({"type": "runtime_state", "state": "dormant"})
         return True
 
     @contextmanager

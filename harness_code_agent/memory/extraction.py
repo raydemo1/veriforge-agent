@@ -16,6 +16,9 @@ from .database import KINDS, MemoryDatabase
 from .reconciliation import hold_matching_facts
 from .security import contains_secret, redact_secrets
 
+# Context-window space kept free for the model's JSON answer.
+_OUTPUT_RESERVE = 4096
+
 _OUTPUT = Draft202012Validator({
     "type": "object", "required": ["complete", "candidates", "episode"], "additionalProperties": False,
     "properties": {
@@ -235,7 +238,7 @@ class ExtractionQueue:
                     self._commit(task, start, None, [], "")
                     return {"state": "done", "calls": calls}
                 kwargs, provider = _request(chunk)
-                reservation = count_request_tokens(kwargs["messages"]) + kwargs["max_tokens"]
+                reservation = count_request_tokens(kwargs["messages"]) + _OUTPUT_RESERVE
                 if calls >= max_calls or used + reservation > max_tokens:
                     self._release(task, delay=30)
                     return {"state": "pending", "calls": calls}
@@ -450,9 +453,9 @@ def _request(chunk: SourceChunk) -> tuple[dict, str]:
         profile=profile, messages=[
             {"role": "system", "content": "Extract evidence-backed memory candidates. Return one JSON object only."},
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
-        ], max_tokens=4096,
+        ],
     )
-    if count_request_tokens(kwargs["messages"]) + kwargs["max_tokens"] > config.CONTEXT_WINDOW_TOKENS:
+    if count_request_tokens(kwargs["messages"]) + _OUTPUT_RESERVE > config.CONTEXT_WINDOW_TOKENS:
         raise ValueError("Extraction request exceeds context budget")
     return kwargs, profile.provider
 

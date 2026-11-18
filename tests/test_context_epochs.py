@@ -97,14 +97,13 @@ def test_reasoning_survives_multiple_user_turns(stream):
                 provider="deepseek", model="deepseek-v4-flash", thinking=thinking
             ),
             messages=history,
-            max_tokens=100,
             tools=[],
         )
         assert kwargs["messages"][1]["reasoning_content"] == "first thought"
     assert (
         "reasoning_content"
         not in ProviderAdapter("openai").chat_kwargs(
-            model="example", messages=history, max_tokens=100
+            model="example", messages=history
         )["messages"][1]
     )
 
@@ -292,7 +291,6 @@ def test_epoch_failure_preserves_active_view_and_original_log(tmp_path):
             journal=journal,
         )
     assert history.epoch == original
-    assert history.raw_snapshot() == history.snapshot()
 
 
 def test_pending_tools_defer_warning_and_compaction(runtime_conversation):

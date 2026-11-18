@@ -321,7 +321,8 @@ class WorkStateProjectionTests(unittest.TestCase):
         replay = WorkStateProjection(self.cwd)
         for item in events:
             replay.apply_event(item)
-        self.assertEqual(replay.changed_sections(), self.projection.changed_sections())
+        for key in ("plan", "tasks", "agents", "changes", "checks", "artifacts"):
+            self.assertEqual(replay.section(key), self.projection.section(key))
 
 
 if __name__ == "__main__":

@@ -40,7 +40,26 @@ jobs:
           bun install --frozen-lockfile --cwd frontend/opentui
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run runtime and protocol tests
-        run: python -m pytest -q -m "not integration and not external" --durations=30 -rs
+        run: python -m pytest -q --durations=30 -rs
+
+  frontend:
+    name: OpenTUI frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend/opentui
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.0'
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Type check
+        run: bun run check
+      - name: Unit tests
+        run: bun test
 
   lsp:
     name: LSP integration (${{ matrix.os }})

@@ -4,9 +4,9 @@
 
 Production integration is complete. The service, native tools, interactive session lifecycle, idle worker, topic navigation and context references now use the SQLite memory system. The old Markdown store implementation has been removed; no legacy import or parallel production path remains. The stage notes below describe earlier checkpoints, not the current activation state.
 
-Final validation: 774 passed and 3 deselected in the full suite; 91 relevant tests passed after the final recovery/session-lifecycle changes. Standalone consolidation and runtime checks passed 17 and 5 checks respectively. Real-provider acceptance and its limitations are recorded in `MEMORY_V3_ACCEPTANCE.md`.
+Final validation: 774 passed and 3 deselected in the full suite; 91 relevant tests passed after the final recovery/session-lifecycle changes. Standalone consolidation and runtime checks passed 17 and 5 checks respectively. Real-provider acceptance and its limitations are recorded in [2026-10-24-memory-v3-acceptance.md](2026-10-24-memory-v3-acceptance.md).
 
-The user completed legacy cleanup with `eval/scripts/cleanup_legacy_memory.ps1`. The saved manifest reports completion, and a fresh preview finds no remaining legacy directories. Original session journals and Codex memories remain present. The default memory-v3 directory is created on production initialization.
+The user completed legacy cleanup with `eval/scripts/cleanup_legacy_memory.ps1` (since removed). The saved manifest reports completion, and a fresh preview finds no remaining legacy directories. Original session journals and Codex memories remain present. The default memory-v3 directory is created on production initialization.
 
 ## Accepted design
 
@@ -68,7 +68,7 @@ Validation:
 - Existing storage/extraction checks: 60 passed.
 - Standalone robustness script: 14 checks passed, including 2,000 synthetic facts. Its fixture vectors validate index mechanics, not semantic quality.
 - New consolidation scenarios live under eval/scripts, outside default pytest collection.
-- Bounded real-provider protocol: at most 28 LLM requests and 48 embedding requests, zero automatic retries; six fixed synthetic cases. Completed: 28 model and 41 embedding requests in isolated synthetic stores. Scope normalization and lexical stop-word defects were fixed; the frozen strict compactness rubric still passes only 1/6 on final stored fixtures. See eval/MEMORY_CONSOLIDATION_REPORT.md. Do not treat this as final production acceptance.
+- Bounded real-provider protocol: at most 28 LLM requests and 48 embedding requests, zero automatic retries; six fixed synthetic cases. Completed: 28 model and 41 embedding requests in isolated synthetic stores. Scope normalization and lexical stop-word defects were fixed; the frozen strict compactness rubric still passes only 1/6 on final stored fixtures. See [2026-10-24-memory-consolidation.md](2026-10-24-memory-consolidation.md). Do not treat this as final production acceptance.
 
 Current-stage release gate remains open: extraction compactness/topic normalization changes still need complete semantic and compactness validation.
 

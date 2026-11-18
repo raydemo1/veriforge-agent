@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from ..workspace.paths import is_same_or_child
 from .shell_parser import (
     ParsedCommand,
     ShellParseResult,
@@ -109,16 +110,6 @@ class ShellAnalysis:
     @property
     def write_targets(self) -> tuple[ShellTarget, ...]:
         return tuple(target for target in self.targets if target.write)
-
-    @property
-    def delete_targets(self) -> tuple[ShellTarget, ...]:
-        return tuple(target for target in self.targets if target.delete)
-
-    @property
-    def read_targets(self) -> tuple[ShellTarget, ...]:
-        return tuple(
-            target for target in self.targets if target.access is TargetAccess.READ
-        )
 
     @property
     def uncertainty(self) -> str | None:
@@ -1508,23 +1499,16 @@ def _scope_against_root(token: str, root: str) -> TargetScope:
         if not candidate.is_absolute():
             candidate = Path(root) / candidate
         normalized = os.path.normcase(os.path.normpath(str(candidate)))
-        if not _is_same_or_child(normalized, root):
+        if not is_same_or_child(normalized, root):
             return TargetScope.EXTERNAL
         if candidate.exists():
             # A symlink inside the workspace can still point outside it.
             resolved = os.path.normcase(os.path.normpath(str(candidate.resolve())))
-            if not _is_same_or_child(resolved, root):
+            if not is_same_or_child(resolved, root):
                 return TargetScope.EXTERNAL
         return TargetScope.WORKSPACE
     except (OSError, ValueError):
         return TargetScope.UNKNOWN
-
-
-def _is_same_or_child(value: str, parent: str) -> bool:
-    try:
-        return os.path.commonpath((value, parent)) == parent
-    except ValueError:
-        return False
 
 
 def _normalize_root(root: str | None) -> str | None:

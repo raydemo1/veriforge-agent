@@ -81,7 +81,6 @@ def generate_turn_summary(
         kwargs = adapter.chat_kwargs(
             profile=profile,
             messages=messages,
-            max_tokens=800,
         )
         if llm_create is not None:
             response = llm_create(**kwargs)
