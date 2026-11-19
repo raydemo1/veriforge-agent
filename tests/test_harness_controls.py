@@ -217,76 +217,41 @@ class SubagentControlTests(unittest.TestCase):
 
 
 class CancellationTokenTreeTests(unittest.TestCase):
-    def test_parent_cancel_propagates_to_child_and_grandchild(self):
+    def test_cancellation_propagates_down_never_up_and_is_inherited(self):
         root = CancellationToken()
         child = root.create_child()
         grandchild = CancellationToken(parent=child)
-        root.cancel()
-        self.assertTrue(child.is_cancelled)
-        self.assertTrue(grandchild.is_cancelled)
-
-    def test_child_cancel_does_not_propagate_upward(self):
-        root = CancellationToken()
-        child = root.create_child()
-        child.cancel()
-        self.assertTrue(child.is_cancelled)
+        sibling = root.create_child()
+        sibling.cancel()
         self.assertFalse(root.is_cancelled)
-
-    def test_child_is_born_cancelled(self):
-        root = CancellationToken()
         root.cancel()
-        child = CancellationToken(parent=root)
-        self.assertTrue(child.is_cancelled)
+        self.assertTrue(child.is_cancelled and grandchild.is_cancelled)
+        self.assertTrue(CancellationToken(parent=root).is_cancelled)
 
-    def test_close_detaches_child_from_parent(self):
-        root = CancellationToken()
-        child = root.create_child()
-        self.assertEqual(len(root._callbacks), 1)
-        child.close()
-        self.assertEqual(len(root._callbacks), 0)
-        root.cancel()
-        self.assertFalse(child.is_cancelled)
-
-    def test_close_is_idempotent_and_safe_for_root_token(self):
+    def test_close_detaches_child_and_is_idempotent(self):
         root = CancellationToken()
         root.close()
         root.close()
-        child = root.create_child()
-        child.close()
-        child.close()
-        root.cancel()
-        self.assertFalse(child.is_cancelled)
-
-    def test_new_children_after_close_are_independent_of_old_one(self):
-        root = CancellationToken()
         old = root.create_child()
+        self.assertEqual(len(root._callbacks), 1)
         old.close()
+        old.close()
+        self.assertEqual(len(root._callbacks), 0)
         new = root.create_child()
         root.cancel()
         self.assertFalse(old.is_cancelled)
         self.assertTrue(new.is_cancelled)
 
-    def test_wait_returns_true_on_cancel_and_false_on_timeout(self):
-        token = CancellationToken()
-        self.assertFalse(token.wait(0.02))
-        token.cancel()
-        self.assertTrue(token.wait(1.0))
-
-    def test_wait_unblocks_immediately_when_cancelled_from_another_thread(self):
+    def test_wait_times_out_or_returns_as_soon_as_cancelled(self):
         import threading
         import time as _time
 
         token = CancellationToken()
-
-        def cancel_later():
-            _time.sleep(0.1)
-            token.cancel()
-
-        threading.Thread(target=cancel_later, daemon=True).start()
+        self.assertFalse(token.wait(0.02))
+        threading.Timer(0.05, token.cancel).start()
         start = _time.monotonic()
         self.assertTrue(token.wait(30.0))
         self.assertLess(_time.monotonic() - start, 1.0)
-
 
 # --- Retry-After handling --------------------------------------------------
 
@@ -296,28 +261,14 @@ class RetryAfterTests(unittest.TestCase):
         headers = {"retry-after": header} if header is not None else None
         return SimpleNamespace(status_code=429, response=SimpleNamespace(headers=headers))
 
-    def test_delta_seconds_header(self):
+    def test_retry_after_header_parsing_and_backoff_fallback(self):
         with patch.object(llm_channel.random, "uniform", return_value=0.0):
             self.assertEqual(llm_channel._retry_delay(0, self._exc("3")), 3.0)
-
-    def test_missing_header_uses_exponential_backoff(self):
-        no_header = SimpleNamespace(
-            status_code=500, response=SimpleNamespace(headers=None)
-        )
-        with patch.object(llm_channel.random, "uniform", return_value=0.0):
+            no_header = SimpleNamespace(status_code=500, response=SimpleNamespace(headers=None))
             self.assertEqual(llm_channel._retry_delay(0, no_header), 2.0)
-
-    def test_header_is_capped(self):
-        self.assertEqual(
-            llm_channel._retry_after_seconds(self._exc("9999")),
-            llm_channel._RETRY_AFTER_CAP_SECONDS,
-        )
-
-    def test_malformed_header_falls_back_to_backoff(self):
+        self.assertEqual(llm_channel._retry_after_seconds(self._exc("9999")), llm_channel._RETRY_AFTER_CAP_SECONDS)
         self.assertIsNone(llm_channel._retry_after_seconds(self._exc("soon")))
-        self.assertIsNone(
-            llm_channel._retry_after_seconds(SimpleNamespace(status_code=503))
-        )
+        self.assertIsNone(llm_channel._retry_after_seconds(SimpleNamespace(status_code=503)))
 
     def test_retry_loop_honours_retry_after(self):
         class RateLimit(Exception):

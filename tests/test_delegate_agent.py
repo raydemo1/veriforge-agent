@@ -25,21 +25,17 @@ from harness_code_agent.workspace.service import WorkspaceService
 
 
 class AgentPathOwnershipTests(unittest.TestCase):
-    def test_only_workspace_relative_owned_paths_are_allowed(self):
-        self.assertTrue(path_within("src/app.py", ["src"]))
-        self.assertTrue(path_within("docs", ["docs"]))
-        self.assertFalse(path_within("docs2/x.md", ["docs"]))
+    def test_owned_paths_match_whole_segments_and_dot_owns_everything(self):
+        from harness_code_agent.agent.coordinator import _normalize_rel
+
+        for path, roots, expected in [
+            ("src/app.py", ["src"], True), ("docs", ["docs"], True), ("docs2/x.md", ["docs"], False),
+            ("src/app.py", ["."], True), (".", ["."], True), (".", ["src"], False), ("src2/app.py", ["src"], False),
+        ]:
+            with self.subTest(path=path, roots=roots):
+                self.assertEqual(path_within(path, roots), expected)
         with self.assertRaises(ValueError):
-            from harness_code_agent.agent.coordinator import _normalize_rel
-
             _normalize_rel("src/../../secret")
-
-    def test_dot_root_owns_the_whole_workspace(self):
-        self.assertTrue(path_within("src/app.py", ["."]))
-        self.assertTrue(path_within(".", ["."]))
-        self.assertFalse(path_within(".", ["src"]))
-        self.assertFalse(path_within("src2/app.py", ["src"]))
-
 
 def _make_directory_link(link: Path, target: Path) -> bool:
     try:
@@ -73,10 +69,8 @@ class WorkerScopePathTests(unittest.TestCase):
             "write_file", {"path": path}, tool_permission="edit", workspace_root=str(self.root)
         )
 
-    def test_inside_scope_is_allowed(self):
+    def test_inside_scope_is_allowed_and_dotdot_escape_is_denied(self):
         self.assertTrue(self._decide("src/nested/new.txt").allowed)
-
-    def test_dotdot_escape_is_denied(self):
         decision = self._decide("src/../other.txt")
         self.assertFalse(decision.allowed)
         self.assertIn("resolves outside allowed_paths", decision.reason)
@@ -664,38 +658,20 @@ class AgentCoordinatorTests(unittest.TestCase):
         self.assertIsNone(explorer.get("send_agent_message"))
         self.assertIsNone(worker.get("send_agent_message"))
 
-    def test_send_to_parent_queues_tagged_message_for_main(self):
-        queued = []
-        self.coordinator._parent_message_sink = lambda text, tag: queued.append((text, tag))
+    def test_send_to_parent_queues_a_tagged_message_and_validates_input(self):
         with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
             spawned = self.coordinator.spawn(name="reporter", role="explorer", task="inspect")
             self._wait_conversation("reporter")
 
-        snapshot = self.coordinator.send_to_parent(
-            spawned["agent_id"], "evidence contradicts the current plan"
-        )
-
-        self.assertEqual(
-            queued,
-            [("evidence contradicts the current plan", "SUBAGENT MESSAGE from reporter")],
-        )
-        self.assertEqual(snapshot["status"], "running")
-
-    def test_send_to_parent_without_sink_raises(self):
-        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
-            spawned = self.coordinator.spawn(name="adrift", role="explorer", task="inspect")
-            self._wait_conversation("adrift")
-
         with self.assertRaisesRegex(ValueError, "no parent agent is available"):
             self.coordinator.send_to_parent(spawned["agent_id"], "hello")
-
-    def test_send_to_parent_rejects_empty_message(self):
-        with patch("harness_code_agent.agent.conversation.Agent", _ControlledAgent):
-            spawned = self.coordinator.spawn(name="quiet", role="explorer", task="inspect")
-            self._wait_conversation("quiet")
-
+        queued = []
+        self.coordinator._parent_message_sink = lambda text, tag: queued.append((text, tag))
         with self.assertRaisesRegex(ValueError, "message is required"):
             self.coordinator.send_to_parent(spawned["agent_id"], "   ")
+        snapshot = self.coordinator.send_to_parent(spawned["agent_id"], "evidence contradicts the current plan")
+        self.assertEqual(queued, [("evidence contradicts the current plan", "SUBAGENT MESSAGE from reporter")])
+        self.assertEqual(snapshot["status"], "running")
 
     def test_send_parent_message_tool_blocks_without_child_identity(self):
         from harness_code_agent.runtime.builtins.agents import send_parent_message

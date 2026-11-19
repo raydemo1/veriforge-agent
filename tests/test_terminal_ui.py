@@ -392,15 +392,18 @@ class TerminalUiTests(unittest.TestCase):
         self.assertEqual(interrupted.body, "cancelled")
         self.assertEqual(len(state.agent_blocks), 3)
 
-    def test_project_allowlist_reuses_persisted_command_prefix(self):
+    def test_project_allowlist_matches_persisted_prefixes_across_arguments_and_redirections(self):
         with tempfile.TemporaryDirectory() as tmp:
             allowlist = ApprovalAllowlist(tmp)
-            request = ApprovalRequest("bash", {"command": "pytest -q"}, "shell_risky", "confirm")
-            prefix = _persistent_prefix_for_request(request)
-            self.assertIsNotNone(prefix)
-            allowlist.add_prefix_rule(prefix, command=request.args["command"])
+            for command in ("pytest -q", "git log --oneline -5 2>$null; git status --short 2>&1"):
+                request = ApprovalRequest("bash", {"command": command}, "shell_risky", "confirm")
+                prefix = _persistent_prefix_for_request(request)
+                self.assertIsNotNone(prefix)
+                allowlist.add_prefix_rule(prefix, command=command)
             self.assertTrue(allowlist.matches("pytest --all"))
+            self.assertTrue(allowlist.matches("git log --oneline -3 2>$null; git status --short 2>&1"))
             self.assertFalse(allowlist.matches("ruff check ."))
+            self.assertFalse(allowlist.matches("git push origin main 2>$null"))
 
     @unittest.skipUnless(os.name == "nt", "PowerShell commands are parsed as PowerShell only on Windows")
     def test_project_allowlist_supports_pipeline_commands(self):
@@ -423,17 +426,6 @@ class TerminalUiTests(unittest.TestCase):
             self.assertFalse(allowlist.matches(
                 "Remove-Item calc.html | Select-Object Name; (Get-Content calc.html | Measure-Object -Line).Lines"
             ))
-
-    def test_pipeline_allowlist_survives_redirections(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            allowlist = ApprovalAllowlist(tmp)
-            command = "git log --oneline -5 2>$null; git status --short 2>&1"
-            request = ApprovalRequest("bash", {"command": command}, "shell_risky", "confirm")
-            prefixes = _persistent_prefix_for_request(request)
-            self.assertIsNotNone(prefixes)
-            allowlist.add_prefix_rule(prefixes, command=command)
-            self.assertTrue(allowlist.matches("git log --oneline -3 2>$null; git status --short 2>&1"))
-            self.assertFalse(allowlist.matches("git push origin main 2>$null"))
 
     def test_fallback_block_ids_are_unique_and_replay_stable(self):
         def build_ids() -> list[str]:

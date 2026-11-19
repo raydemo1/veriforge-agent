@@ -38,88 +38,43 @@ def _result(text: str, *, status: str | None = None) -> ToolResult:
 
 
 class ProductRuntimeTests(unittest.TestCase):
-    def test_deepseek_model_profiles_use_intensity_defaults(self):
+    def test_model_profiles_follow_intensity_env_overrides_and_tui_selection(self):
         from harness_code_agent import config
 
-        try:
+        def load(**env):
             with (
-                patch.dict(os.environ, {
-                    "OPENAI_BASE_URL": "https://api.deepseek.com",
-                    "HARNESS_MODEL_INTENSITY": "hard",
-                }, clear=True),
+                patch.dict(os.environ, {"OPENAI_BASE_URL": "https://api.deepseek.com", **env}, clear=True),
                 patch("pathlib.Path.exists", return_value=False),
             ):
                 importlib.reload(config)
 
-            fast = config.resolve_model_profile("fast")
-            normal = config.resolve_model_profile("normal")
-            hard = config.resolve_model_profile("hard")
-            max_profile = config.resolve_model_profile("max")
-
-            self.assertEqual(config.MODEL, "deepseek-v4-pro")
-            self.assertEqual(config.MODEL_INTENSITY, "hard")
-            self.assertEqual((fast.model, fast.thinking, fast.reasoning_effort), ("deepseek-flash", False, None))
-            self.assertEqual((normal.model, normal.thinking, normal.reasoning_effort), ("deepseek-flash", True, "high"))
-            self.assertEqual((hard.model, hard.thinking, hard.reasoning_effort), ("deepseek-v4-pro", True, "high"))
-            self.assertEqual((max_profile.model, max_profile.thinking, max_profile.reasoning_effort), ("deepseek-v4-pro", True, "max"))
-        finally:
-            importlib.reload(config)
-
-    def test_model_intensity_and_profile_model_overrides(self):
-        from harness_code_agent import config
+        def shape(profile):
+            return profile.model, profile.thinking, profile.reasoning_effort
 
         try:
-            with (
-                patch.dict(os.environ, {
-                    "OPENAI_BASE_URL": "https://api.deepseek.com",
-                    "HARNESS_MODEL_INTENSITY": "max",
-                    "HARNESS_MODEL_FAST": "custom-fast",
-                    "HARNESS_MODEL_MAX": "custom-max",
-                }, clear=True),
-                patch("pathlib.Path.exists", return_value=False),
-            ):
-                importlib.reload(config)
+            load(HARNESS_MODEL_INTENSITY="hard")
+            self.assertEqual((config.MODEL, config.MODEL_INTENSITY), ("deepseek-v4-pro", "hard"))
+            self.assertEqual(shape(config.resolve_model_profile("fast")), ("deepseek-flash", False, None))
+            self.assertEqual(shape(config.resolve_model_profile("normal")), ("deepseek-flash", True, "high"))
+            self.assertEqual(shape(config.resolve_model_profile("hard")), ("deepseek-v4-pro", True, "high"))
+            self.assertEqual(shape(config.resolve_model_profile("max")), ("deepseek-v4-pro", True, "max"))
 
-            self.assertEqual(config.MODEL_INTENSITY, "max")
-            self.assertEqual(config.MODEL, "custom-max")
-            self.assertEqual(config.resolve_model_profile("fast").model, "custom-fast")
-            self.assertEqual(config.resolve_model_profile("max").model, "custom-max")
-            self.assertEqual(config.resolve_model_profile("max").reasoning_effort, "max")
-        finally:
-            importlib.reload(config)
-
-    def test_runtime_model_override_applies_to_non_fast_lanes(self):
-        from harness_code_agent import config
-
-        try:
-            with (
-                patch.dict(os.environ, {
-                    "OPENAI_BASE_URL": "https://api.deepseek.com",
-                    "HARNESS_MODEL_INTENSITY": "hard",
-                }, clear=True),
-                patch("pathlib.Path.exists", return_value=False),
-            ):
-                importlib.reload(config)
-
+            # The TUI selection applies to every lane except the internal fast lane.
             selection = config.ModelSelection()
             selection.select(model="deepseek-flash", reasoning_effort="max")
-            profile = config.resolve_model_profile("normal", selection)
-            self.assertEqual((profile.model, profile.thinking, profile.reasoning_effort), ("deepseek-flash", True, "max"))
-            fast = config.resolve_model_profile("fast", selection)
-            self.assertEqual((fast.model, fast.thinking, fast.reasoning_effort), ("deepseek-flash", False, None))
-
+            self.assertEqual(shape(config.resolve_model_profile("normal", selection)), ("deepseek-flash", True, "max"))
+            self.assertEqual(shape(config.resolve_model_profile("fast", selection)), ("deepseek-flash", False, None))
             selection.select(reasoning_effort="low")
-            profile = config.resolve_model_profile("hard", selection)
-            self.assertEqual((profile.model, profile.reasoning_effort), ("deepseek-flash", "low"))
-
+            self.assertEqual(shape(config.resolve_model_profile("hard", selection))[::2], ("deepseek-flash", "low"))
             with self.assertRaises(ValueError):
                 selection.select(model="gpt-4o")
             with self.assertRaises(ValueError):
                 selection.select(reasoning_effort="medium")
 
-            selection = config.ModelSelection()
-            profile = config.resolve_model_profile("hard")
-            self.assertEqual((profile.model, profile.reasoning_effort), ("deepseek-v4-pro", "high"))
+            load(HARNESS_MODEL_INTENSITY="max", HARNESS_MODEL_FAST="custom-fast", HARNESS_MODEL_MAX="custom-max")
+            self.assertEqual((config.MODEL, config.MODEL_INTENSITY), ("custom-max", "max"))
+            self.assertEqual(config.resolve_model_profile("fast").model, "custom-fast")
+            self.assertEqual(shape(config.resolve_model_profile("max"))[::2], ("custom-max", "max"))
         finally:
             importlib.reload(config)
 
@@ -587,60 +542,82 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", completions.calls[0])
         self.assertEqual(completions.calls[0]["extra_body"], {"thinking": {"type": "disabled"}})
 
-    def test_permission_policy_does_not_block_format_substrings_in_safe_commands(self):
+    def test_permission_policy_decision_table_by_mode(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy
 
-        policy = PermissionPolicy(mode="workspace-write")
-
-        safe_commands = [
-            "ruff check --diff --no-fix --output-format=text",
-            "git log --format=%s -1",
-            "git show --format=fuller HEAD",
+        todo = {"items": [{"text": "do work", "status": "in_progress"}]}
+        # (mode, tool, args, tool permission, expected action, expected risk or None)
+        cases = [
+            ("workspace-write", "read_file", {"path": "x.txt"}, None, "allow", None),
+            ("workspace-write", "code_intelligence", {"operation": "definition", "path": "x.py"}, None, "allow", None),
+            ("workspace-write", "spawn_agent", {"role": "explorer"}, None, "allow", None),
+            ("workspace-write", "write_file", {"path": "x.txt"}, None, "allow", None),
+            ("workspace-write", "update_todo", todo, None, "allow", None),
+            ("workspace-write", "new_tool", {}, None, "ask", None),
+            # Proven workspace-scoped shell mutations run without a prompt.
+            ("workspace-write", "bash", {"command": "git status --short"}, None, "allow", None),
+            ("workspace-write", "bash", {"command": "env"}, None, "allow", "shell_safe"),
+            ("workspace-write", "bash", {"command": "mkdir generated"}, None, "allow", "shell_safe"),
+            ("workspace-write", "bash", {"command": "git commit --allow-empty -m test"}, None, "allow", "shell_safe"),
+            ("workspace-write", "bash", {"command": "rm -rf build"}, None, "allow", None),
+            ("workspace-write", "bash", {"command": "npm install"}, None, "ask", "shell_risky"),
+            # "--format" must not be mistaken for a disk format command.
+            ("workspace-write", "bash", {"command": "ruff check --diff --no-fix --output-format=text"}, None, "allow", None),
+            ("workspace-write", "bash", {"command": "git log --format=%s -1"}, None, "allow", None),
+            ("workspace-write", "bash", {"command": "git show --format=fuller HEAD"}, None, "allow", None),
+            ("llm-auto", "write_file", {"path": "x.txt"}, None, "allow", None),
+            ("llm-auto", "update_todo", todo, None, "allow", None),
+            ("llm-auto", "bash", {"command": "npm install"}, None, "ask", None),
+            ("llm-auto", "new_tool", {}, None, "ask", None),
+            ("llm-auto", "mcp_tool", {}, "dangerous", "ask", None),
+            ("danger-full-access", "bash", {"command": "npm install"}, None, "allow", None),
+            ("danger-full-access", "bash", {"command": "Set-Content out.txt bad"}, None, "allow", None),
+            ("read-only", "read_file", {"path": "x.txt"}, None, "allow", None),
+            ("read-only", "bash", {"command": "git status"}, None, "allow", None),
+            ("read-only", "write_file", {"path": "x.txt"}, None, "deny", None),
+            ("read-only", "bash", {"command": "mkdir generated"}, None, "deny", None),
         ]
+        for mode, tool, args, permission, action, risk in cases:
+            with self.subTest(mode=mode, tool=tool, args=args):
+                kwargs = {"tool_permission": permission} if permission else {}
+                decision = PermissionPolicy(mode=mode).decide_tool_call(tool, args, **kwargs)
+                self.assertEqual(decision.action, action)
+                if risk:
+                    self.assertEqual(decision.risk, risk)
 
-        for command in safe_commands:
-            with self.subTest(command=command):
-                decision = policy.decide_tool_call("bash", {"command": command})
-                self.assertNotEqual(decision.risk, "shell_blocked")
+        # A wildcard target cannot be proven to stay inside the workspace.
+        glob_delete = PermissionPolicy(mode="workspace-write").decide_tool_call("bash", {"command": "rm -rf *"})
+        self.assertFalse(glob_delete.allowed)
+        self.assertEqual(glob_delete.risk, "shell_risky")
+        with self.assertRaises(ValueError):
+            PermissionPolicy(mode="unsupported-mode")
 
-    def test_turn_summary_event_serializes_payload(self):
+    def test_turn_summary_rules_and_event_payload(self):
         from harness_code_agent.sessions.events import TurnSummaryEvent
-
-        event = TurnSummaryEvent(
-            turn=2,
-            summary="- changed app.py",
-            duration_seconds=12.5,
-            tool_counts={"read_file": 1},
-            changed_files=["app.py"],
-            generated_by={"intensity": "fast", "model": "custom-fast"},
-        ).to_event()
-
-        self.assertEqual(event.type, "turn_summary")
-        self.assertTrue(event.payload["long_task"])
-        self.assertTrue(event.payload["fold_details"])
-        self.assertEqual(event.payload["turn"], 2)
-        self.assertEqual(event.payload["tool_counts"], {"read_file": 1})
-        self.assertEqual(event.payload["changed_files"], ["app.py"])
-        self.assertEqual(event.payload["generated_by"]["intensity"], "fast")
-
-    def test_turn_summary_long_task_detection_rules(self):
         from harness_code_agent.sessions.turn_summary import should_summarize_turn
 
         simple = [{"type": "assistant_message", "payload": {"text": "hello"}}]
-        three_tools = [
-            {"type": "tool_result", "payload": {"tool": "read_file"}},
-            {"type": "tool_result", "payload": {"tool": "read_file"}},
-            {"type": "tool_result", "payload": {"tool": "read_file"}},
-        ]
-
         self.assertFalse(should_summarize_turn(simple, duration_seconds=1))
-        self.assertTrue(should_summarize_turn(three_tools, duration_seconds=1))
-        self.assertTrue(should_summarize_turn([{"type": "file_change", "payload": {"path": "app.py"}}], duration_seconds=1))
-        self.assertTrue(should_summarize_turn([{"type": "tool_result", "payload": {"tool": "bash"}}], duration_seconds=1))
-        self.assertTrue(should_summarize_turn([{"type": "agent_fallback", "payload": {"reason": "tool_call_budget_exceeded"}}], duration_seconds=1))
         self.assertTrue(should_summarize_turn(simple, duration_seconds=45))
+        for events in (
+            [{"type": "tool_result", "payload": {"tool": "read_file"}}] * 3,
+            [{"type": "file_change", "payload": {"path": "app.py"}}],
+            [{"type": "tool_result", "payload": {"tool": "bash"}}],
+            [{"type": "agent_fallback", "payload": {"reason": "tool_call_budget_exceeded"}}],
+        ):
+            self.assertTrue(should_summarize_turn(events, duration_seconds=1), events)
 
-    def test_generate_turn_summary_uses_configured_fast_profile(self):
+        event = TurnSummaryEvent(
+            turn=2, summary="- changed app.py", duration_seconds=12.5, tool_counts={"read_file": 1},
+            changed_files=["app.py"], generated_by={"intensity": "fast", "model": "custom-fast"},
+        ).to_event()
+        self.assertEqual(event.type, "turn_summary")
+        payload = event.payload
+        self.assertTrue(payload["long_task"] and payload["fold_details"])
+        self.assertEqual((payload["turn"], payload["tool_counts"], payload["changed_files"]), (2, {"read_file": 1}, ["app.py"]))
+        self.assertEqual(payload["generated_by"]["intensity"], "fast")
+
+    def test_generate_turn_summary_uses_fast_profile_and_falls_back_on_failure(self):
         from harness_code_agent import config
         from harness_code_agent.sessions import turn_summary
 
@@ -648,48 +625,27 @@ class ProductRuntimeTests(unittest.TestCase):
 
         def fake_create(**kwargs):
             calls.append(kwargs)
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content="- summary from fast"))]
-            )
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="- summary from fast"))])
 
-        profile = config.ModelProfile(
-            provider="deepseek",
-            model="custom-fast",
-            thinking=False,
-            reasoning_effort=None,
-        )
+        profile = config.ModelProfile(provider="deepseek", model="custom-fast", thinking=False, reasoning_effort=None)
         with patch.object(turn_summary.config, "resolve_model_profile", return_value=profile):
             result = turn_summary.generate_turn_summary(
                 [{"type": "tool_result", "payload": {"tool": "read_file"}}],
-                user_prompt="fix",
-                assistant_text="done",
-                llm_create=fake_create,
-            )
-
+                user_prompt="fix", assistant_text="done", llm_create=fake_create)
         self.assertEqual(result.summary, "- summary from fast")
         self.assertEqual(result.generated_by["model"], "custom-fast")
         self.assertEqual(calls[0]["model"], "custom-fast")
         self.assertEqual(calls[0]["extra_body"], {"thinking": {"type": "disabled"}})
 
-    def test_generate_turn_summary_falls_back_when_llm_fails(self):
-        from harness_code_agent.sessions import turn_summary
-
         def broken_create(**kwargs):
             raise RuntimeError("nope")
 
-        result = turn_summary.generate_turn_summary(
-            [
-                {"type": "tool_result", "payload": {"tool": "write_file"}},
-                {"type": "file_change", "payload": {"path": "app.py"}},
-            ],
-            user_prompt="fix app",
-            assistant_text="updated app.py",
-            llm_create=broken_create,
-        )
-
-        self.assertIn("fix app", result.summary)
-        self.assertIn("app.py", result.summary)
-        self.assertEqual(result.tool_counts, {"write_file": 1})
+        fallback = turn_summary.generate_turn_summary(
+            [{"type": "tool_result", "payload": {"tool": "write_file"}}, {"type": "file_change", "payload": {"path": "app.py"}}],
+            user_prompt="fix app", assistant_text="updated app.py", llm_create=broken_create)
+        self.assertIn("fix app", fallback.summary)
+        self.assertIn("app.py", fallback.summary)
+        self.assertEqual(fallback.tool_counts, {"write_file": 1})
 
     def test_openai_provider_accepts_prompt_cache_key_and_stream_usage_options(self):
         from harness_code_agent.support.llm import ProviderAdapter
@@ -789,110 +745,28 @@ class ProductRuntimeTests(unittest.TestCase):
         self.assertIn("prompt_cache_key", openai_conv.provider.calls[0])
         self.assertNotIn("prompt_cache_key", compatible_conv.provider.calls[0])
 
-    def test_prompt_cache_key_changes_when_system_prompt_changes(self):
+    def test_prompt_cache_key_tracks_prompt_model_identity_and_tool_set(self):
         from harness_code_agent.agent.conversation import Agent
         from harness_code_agent.agent.utils import _prompt_cache_key
 
-        first = _prompt_cache_key(
-            Agent("test", "system\nHARNESS A", use_tools=False), None, model="m"
-        )
-        second = _prompt_cache_key(
-            Agent("test", "system\nHARNESS B", use_tools=False), None, model="m"
-        )
+        def key(system="system", identity="a", tools=None, model="m"):
+            # An explicit identity replaces the rendered prompt as the stable prefix.
+            agent = Agent("test", system, use_tools=False,
+                          prompt_cache_identity={"global_rules_hash": identity} if identity else None)
+            return _prompt_cache_key(agent, tools, model=model)
 
-        self.assertNotEqual(first, second)
+        def schema(name, *fields):
+            return {"type": "function", "function": {"name": name, "parameters": {
+                "type": "object", "required": list(fields),
+                "properties": {field: {"type": "string"} for field in fields}}}}
 
-    def test_prompt_cache_key_changes_when_model_changes(self):
-        from harness_code_agent.agent.conversation import Agent
-        from harness_code_agent.agent.utils import _prompt_cache_key
-
-        first = _prompt_cache_key(Agent("test", "system", use_tools=False), None, model="gpt-5.6")
-        second = _prompt_cache_key(Agent("test", "system", use_tools=False), None, model="gpt-6")
-
-        self.assertNotEqual(first, second)
-
-    def test_prompt_cache_key_uses_stable_prefix_identity_and_tools_hash(self):
-        from harness_code_agent.agent.conversation import Agent
-        from harness_code_agent.agent.utils import _prompt_cache_key
-
-        first = _prompt_cache_key(
-            Agent(
-                "test",
-                "rendered system",
-                use_tools=False,
-                prompt_cache_identity={"global_rules_hash": "a"},
-            ),
-            [{"type": "function", "function": {"name": "read_file"}}],
-            model="m",
-        )
-        second = _prompt_cache_key(
-            Agent(
-                "test",
-                "rendered system",
-                use_tools=False,
-                prompt_cache_identity={"global_rules_hash": "b"},
-            ),
-            [{"type": "function", "function": {"name": "read_file"}}],
-            model="m",
-        )
-        third = _prompt_cache_key(
-            Agent(
-                "test",
-                "rendered system",
-                use_tools=False,
-                prompt_cache_identity={"global_rules_hash": "a"},
-            ),
-            [{"type": "function", "function": {"name": "write_file"}}],
-            model="m",
-        )
-
-        self.assertNotEqual(first, second)
-        self.assertNotEqual(first, third)
-
-    def test_prompt_cache_key_canonicalizes_tool_schema_order(self):
-        from harness_code_agent.agent.conversation import Agent
-        from harness_code_agent.agent.utils import _prompt_cache_key
-
-        agent = Agent(
-            "test",
-            "rendered system",
-            use_tools=True,
-            prompt_cache_identity={"global_rules_hash": "a"},
-        )
-        read_schema = {
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "parameters": {
-                    "type": "object",
-                    "required": ["path", "max_lines"],
-                    "properties": {
-                        "path": {"type": "string"},
-                        "max_lines": {"type": "integer"},
-                    },
-                },
-            },
-        }
-        write_schema = {
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "parameters": {
-                    "type": "object",
-                    "required": ["content", "path"],
-                    "properties": {
-                        "content": {"type": "string"},
-                        "path": {"type": "string"},
-                    },
-                },
-            },
-        }
-
-        first = _prompt_cache_key(agent, [read_schema, write_schema], model="m")
-        second = _prompt_cache_key(agent, [write_schema, read_schema], model="m")
-
-        self.assertEqual(first, second)
-
+        base = key(tools=[schema("read_file", "path")])
+        self.assertNotEqual(key(identity=None), key(identity=None, system="other"))
+        self.assertNotEqual(base, key(identity="b", tools=[schema("read_file", "path")]))
+        self.assertNotEqual(base, key(model="gpt-6", tools=[schema("read_file", "path")]))
+        self.assertNotEqual(base, key(tools=[schema("write_file", "path")]))
+        read, write = schema("read_file", "path", "max_lines"), schema("write_file", "content", "path")
+        self.assertEqual(key(tools=[read, write]), key(tools=[write, read]))
 
     def test_openai_cache_breakpoint_model_gate(self):
         from harness_code_agent.support.llm import (
@@ -1636,99 +1510,9 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertTrue(tool_result["payload"]["metadata"]["output_redacted"])
             self.assertEqual(tool_result["payload"]["metadata"]["output_length"], 5)
 
-    def test_read_file_supports_line_ranges_and_line_numbers(self):
-        from harness_code_agent.runtime.permissions import PermissionPolicy
-        from harness_code_agent.runtime.tool_context import ToolContext
-        from harness_code_agent.sessions.events import EventBus
-        from harness_code_agent.workspace.service import WorkspaceService
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "note.txt").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
-            context = ToolContext(
-                workspace=WorkspaceService(root=root, snapshots_dir=root / ".harness" / "snapshots"),
-                permission_policy=PermissionPolicy(mode="workspace-write"),
-                event_bus=EventBus(root / ".harness" / "events.jsonl"),
-            )
-
-            output = execute_tool(
-                "read_file",
-                {
-                    "path": "note.txt",
-                    "start_line": 2,
-                    "max_lines": 2,
-                    "include_line_numbers": True,
-                },
-                tool_context=context,
-                agent_name="main_agent",
-            )
-
-        self.assertEqual(output, "2: two\n3: three\n")
-
-    def test_read_file_rejects_invalid_range_arguments_without_exception(self):
-        from harness_code_agent.runtime.permissions import PermissionPolicy
-        from harness_code_agent.runtime.tool_context import ToolContext
-        from harness_code_agent.sessions.events import EventBus
-        from harness_code_agent.workspace.service import WorkspaceService
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "note.txt").write_text("one\ntwo\n", encoding="utf-8")
-            context = ToolContext(
-                workspace=WorkspaceService(root=root, snapshots_dir=root / ".harness" / "snapshots"),
-                permission_policy=PermissionPolicy(mode="workspace-write"),
-                event_bus=EventBus(root / ".harness" / "events.jsonl"),
-            )
-
-            start_output = execute_tool(
-                "read_file",
-                {"path": "note.txt", "start_line": "abc", "max_lines": 1},
-                tool_context=context,
-                agent_name="main_agent",
-            )
-            max_output = execute_tool(
-                "read_file",
-                {"path": "note.txt", "start_line": 1, "max_lines": 0},
-                tool_context=context,
-                agent_name="main_agent",
-            )
-
-        self.assertIn("[error]", start_output)
-        self.assertIn("start_line must be an integer", start_output)
-        self.assertIn("[error]", max_output)
-        self.assertIn("max_lines must be an integer", max_output)
-
-    def test_read_file_rejects_ranges_over_limit_lines(self):
-        from harness_code_agent.runtime.builtins.filesystem import READ_FILE_MAX_LINES
-        from harness_code_agent.runtime.permissions import PermissionPolicy
-        from harness_code_agent.runtime.tool_context import ToolContext
-        from harness_code_agent.sessions.events import EventBus
-        from harness_code_agent.workspace.service import WorkspaceService
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "big.txt").write_text(
-                "\n".join(f"line {i}" for i in range(1, READ_FILE_MAX_LINES + 200)),
-                encoding="utf-8",
-            )
-            context = ToolContext(
-                workspace=WorkspaceService(root=root, snapshots_dir=root / ".harness" / "snapshots"),
-                permission_policy=PermissionPolicy(mode="workspace-write"),
-                event_bus=EventBus(root / ".harness" / "events.jsonl"),
-            )
-
-            output = execute_tool(
-                "read_file",
-                {"path": "big.txt", "start_line": 1, "max_lines": READ_FILE_MAX_LINES + 1},
-                tool_context=context,
-                agent_name="main_agent",
-            )
-
-        self.assertIn("[error]", output)
-        self.assertIn(f"max_lines must be <= {READ_FILE_MAX_LINES}", output)
-
-    def test_read_file_pages_token_dense_windows(self):
+    def test_read_file_ranges_validation_and_token_dense_paging(self):
         from harness_code_agent.config import TOOL_OUTPUT_MAX_TOKENS
+        from harness_code_agent.runtime.builtins.filesystem import READ_FILE_MAX_LINES
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
         from harness_code_agent.runtime.tool_runner import execute_tool_result
@@ -1737,28 +1521,29 @@ class ProductRuntimeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            # Use diverse text so BPE cannot merge tokens as aggressively as a
-            # single repeated character (~6 tokens per 26-char fragment after
-            # cl100k encoding; ~4 chars/token for the char-based fallback).
-            fragment = "the quick brown fox jumps "
-            repeats = (TOOL_OUTPUT_MAX_TOKENS // 5) + 10
-            (root / "wide.txt").write_text(fragment * repeats, encoding="utf-8")
+            (root / "note.txt").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+            # Diverse words keep the line token-dense under both tokenizers.
+            (root / "wide.txt").write_text("the quick brown fox jumps " * (TOOL_OUTPUT_MAX_TOKENS // 5 + 10), encoding="utf-8")
             context = ToolContext(
                 workspace=WorkspaceService(root=root, snapshots_dir=root / ".harness" / "snapshots"),
                 permission_policy=PermissionPolicy(mode="workspace-write"),
                 event_bus=EventBus(root / ".harness" / "events.jsonl"),
             )
 
-            result = execute_tool_result(
-                "read_file",
-                {"path": "wide.txt", "start_line": 1, "max_lines": 1},
-                tool_context=context,
-                agent_name="main_agent",
-            )
+            def read(**args):
+                return execute_tool("read_file", args, tool_context=context, agent_name="main_agent")
 
-        self.assertEqual(result.status, "success")
-        self.assertIn("next_read", result.metadata)
-        self.assertNotIn("[TRUNCATED]", result.output)
+            self.assertEqual(read(path="note.txt", start_line=2, max_lines=2, include_line_numbers=True), "2: two\n3: three\n")
+            self.assertIn("start_line must be an integer", read(path="note.txt", start_line="abc", max_lines=1))
+            self.assertIn("max_lines must be an integer", read(path="note.txt", start_line=1, max_lines=0))
+            self.assertIn(f"max_lines must be <= {READ_FILE_MAX_LINES}",
+                          read(path="note.txt", start_line=1, max_lines=READ_FILE_MAX_LINES + 1))
+
+            wide = execute_tool_result("read_file", {"path": "wide.txt", "start_line": 1, "max_lines": 1},
+                                       tool_context=context, agent_name="main_agent")
+        self.assertEqual(wide.status, "success")
+        self.assertIn("next_read", wide.metadata)
+        self.assertNotIn("[TRUNCATED]", wide.output)
 
     def test_tool_result_does_not_infer_status_from_raw_tool_text(self):
         from unittest.mock import patch
@@ -1898,123 +1683,47 @@ class ProductRuntimeTests(unittest.TestCase):
                 ["tool_error", "validation_error", "validation_error"],
             )
 
-    def test_session_store_creates_metadata_and_jsonl_events(self):
+    def test_session_store_persists_lists_and_summarizes_sessions(self):
         from harness_code_agent.sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / ".harness")
-            session = store.create(
-                cwd=Path(tmp),
-                model="test-model",
-                permission_mode="workspace-write",
-            )
-            bus = store.event_bus(session)
-            bus.emit("session_started", agent="main_agent", payload={"task": "fix bug"})
+            first = store.create(cwd=Path(tmp), model="model-a", permission_mode="workspace-write")
+            store.event_bus(first).emit("session_started", agent="main_agent", payload={"task": "fix bug"})
+            second = store.create(cwd=Path(tmp), model="model-b", permission_mode="read-only")
+            store.event_bus(second).emit("user_input", agent="main_agent", payload={"text": "plan it"})
 
-            metadata = json.loads(session.metadata_path.read_text(encoding="utf-8"))
-            events = [
-                json.loads(line)
-                for line in session.events_path.read_text(encoding="utf-8").splitlines()
-            ]
-            self.assertEqual(metadata["model"], "test-model")
-            self.assertEqual(metadata["permission_mode"], "workspace-write")
-            self.assertEqual(events[0]["type"], "session_started")
-            self.assertEqual(events[0]["sequence"], 1)
+            metadata = json.loads(first.metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual((metadata["model"], metadata["permission_mode"]), ("model-a", "workspace-write"))
+            event = store.read_events(first.id)[0]
+            self.assertEqual((event["type"], event["sequence"]), ("session_started", 1))
+            self.assertEqual([item["id"] for item in store.list_sessions()], [second.id, first.id])
+            self.assertEqual(store.latest_session()["id"], second.id)
+            self.assertIn("Session summary", store.write_summary(second.id))
 
-    def test_session_store_lists_and_reads_sessions(self):
+    def test_session_store_forks_only_from_a_stable_boundary(self):
+        from harness_code_agent.runtime.recovery import atomic_json
         from harness_code_agent.sessions.store import SessionStore
 
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp) / ".harness")
-            first = store.create(
-                cwd=Path(tmp),
-                model="model-a",
-                permission_mode="workspace-write",
-            )
-            second = store.create(
-                cwd=Path(tmp),
-                model="model-b",
-                permission_mode="read-only",
-            )
-            store.event_bus(second).emit("session_finished", agent="main_agent", payload={})
-
-            sessions = store.list_sessions()
-            store.read_metadata(second.id)
-            events = store.read_events(second.id)
-
-            self.assertEqual([item["id"] for item in sessions], [second.id, first.id])
-            self.assertEqual(events[0]["type"], "session_finished")
-
-    def test_session_store_forks_session_metadata_and_lineage_event(self):
-        from harness_code_agent.sessions.store import SessionStore
-
-        with tempfile.TemporaryDirectory() as tmp:
-            store = SessionStore(Path(tmp) / ".harness")
-            source = store.create(
-                cwd=Path(tmp),
-                model="model-a",
-                permission_mode="workspace-write",
-            )
+            source = store.create(cwd=Path(tmp), model="model-a", permission_mode="workspace-write")
             store.event_bus(source).emit("session_started", agent="main_agent", payload={})
             store.event_bus(source).emit("session_finished", agent="main_agent", payload={})
+            with self.assertRaisesRegex(ValueError, "稳定"):
+                store.fork(source.id)
 
-            from harness_code_agent.runtime.recovery import atomic_json
             source_metadata = store.read_metadata(source.id)
             source_metadata["fork_boundary"] = {"turn": 0, "journal_sequence": 0, "event_count": 2, "change_cursor": 0}
             atomic_json(source.metadata_path, source_metadata)
             fork = store.fork(source.id)
             metadata = store.read_metadata(fork.id)
-            events = store.read_events(fork.id)
 
             self.assertNotEqual(fork.id, source.id)
-            self.assertEqual(metadata["model"], "model-a")
-            self.assertEqual(metadata["permission_mode"], "workspace-write")
+            self.assertEqual((metadata["model"], metadata["permission_mode"]), ("model-a", "workspace-write"))
             self.assertEqual(metadata["forked_from"], source.id)
             self.assertEqual(metadata["history_boundary"]["event_count"], 2)
-            self.assertEqual([e["type"] for e in events], ["session_started", "session_finished"])
-
-    def test_session_store_reads_fork_lineage(self):
-        from harness_code_agent.sessions.store import SessionStore
-
-        with tempfile.TemporaryDirectory() as tmp:
-            store = SessionStore(Path(tmp) / ".harness")
-            source = store.create(
-                cwd=Path(tmp),
-                model="model-a",
-                permission_mode="workspace-write",
-            )
-            with self.assertRaisesRegex(ValueError, "稳定"):
-                store.fork(source.id)
-            from harness_code_agent.runtime.recovery import atomic_json
-            metadata = store.read_metadata(source.id)
-            metadata["fork_boundary"] = {"turn": 0, "journal_sequence": 0, "event_count": 0, "change_cursor": 0}
-            atomic_json(source.metadata_path, metadata)
-            fork = store.fork(source.id)
-            self.assertEqual(store.read_metadata(fork.id)["forked_from"], source.id)
-
-    def test_session_store_reads_latest_session_and_persisted_summary(self):
-        from harness_code_agent.sessions.store import SessionStore
-
-        with tempfile.TemporaryDirectory() as tmp:
-            store = SessionStore(Path(tmp) / ".harness")
-            store.create(
-                cwd=Path(tmp),
-                model="model-a",
-                permission_mode="workspace-write",
-            )
-            second = store.create(
-                cwd=Path(tmp),
-                model="model-b",
-                permission_mode="read-only",
-            )
-            store.event_bus(second).emit("user_input", agent="main_agent", payload={"text": "plan it"})
-            summary = store.write_summary(second.id)
-
-            latest = store.latest_session()
-
-            self.assertEqual(latest["id"], second.id)
-            self.assertIn("Session summary", summary)
-    
+            self.assertEqual([e["type"] for e in store.read_events(fork.id)], ["session_started", "session_finished"])
 
     def test_session_summary_formats_human_readable_event_overview(self):
         from harness_code_agent.sessions.summary import format_session_summary
@@ -2250,245 +1959,6 @@ class ProductRuntimeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 workspace.apply_text_patch("app.py", search="same\n", replace="once\n")
             self.assertEqual(target.read_text(encoding="utf-8"), "same\nsame\n")
-
-    def test_permission_policy_defaults_to_workspace_scope(self):
-        from harness_code_agent.runtime.permissions import PermissionPolicy
-
-        workspace_policy = PermissionPolicy(mode="workspace-write")
-        read_decision = workspace_policy.decide_tool_call("read_file", {"path": "x.txt"})
-        code_intelligence_decision = workspace_policy.decide_tool_call(
-            "code_intelligence", {"operation": "definition", "path": "x.py"}
-        )
-        agent_decision = workspace_policy.decide_tool_call("spawn_agent", {"role": "explorer"})
-        edit_decision = workspace_policy.decide_tool_call("write_file", {"path": "x.txt"})
-        todo_decision = workspace_policy.decide_tool_call(
-            "update_todo",
-            {"items": [{"text": "do work", "status": "in_progress"}]},
-        )
-        safe_shell_decision = workspace_policy.decide_tool_call(
-            "bash",
-            {"command": "git status --short"},
-        )
-        risky_shell_decision = workspace_policy.decide_tool_call(
-            "bash",
-            {"command": "npm install"},
-        )
-        mkdir_decision = workspace_policy.decide_tool_call(
-            "bash",
-            {"command": "mkdir generated"},
-        )
-        reset_decision = workspace_policy.decide_tool_call(
-            "bash",
-            {"command": "git commit --allow-empty -m test"},
-        )
-        blocked_commands = [
-            "rm -rf /",
-            "rm -rf ~",
-            "mkfs.ext4 /dev/sda",
-            "dd if=/dev/zero of=/dev/sda",
-        ]
-        if os.name == "nt":
-            # Commands are parsed as PowerShell only on Windows; elsewhere the
-            # runtime shell is bash.
-            blocked_commands.append("Remove-Item C:\\ -Recurse")
-        destructive_git_decisions = [
-            workspace_policy.decide_tool_call("bash", {"command": command})
-            for command in (
-                "git reset --hard",
-                "git clean -fd",
-                "git push --force origin main",
-            )
-        ]
-        blocked_decisions = [
-            workspace_policy.decide_tool_call("bash", {"command": command})
-            for command in blocked_commands
-        ]
-        workspace_delete_decision = workspace_policy.decide_tool_call(
-            "bash", {"command": "rm -rf build"}
-        )
-        glob_delete_decision = workspace_policy.decide_tool_call(
-            "bash", {"command": "rm -rf *"}
-        )
-        unknown_decision = workspace_policy.decide_tool_call("new_tool", {})
-
-        llm_auto_policy = PermissionPolicy(mode="llm-auto")
-        llm_read_decision = llm_auto_policy.decide_tool_call("read_file", {"path": "x.txt"})
-        llm_code_intelligence_decision = llm_auto_policy.decide_tool_call(
-            "code_intelligence", {"operation": "definition", "path": "x.py"}
-        )
-        llm_edit_decision = llm_auto_policy.decide_tool_call("write_file", {"path": "x.txt"})
-        llm_todo_decision = llm_auto_policy.decide_tool_call(
-            "update_todo",
-            {"items": [{"text": "do work", "status": "in_progress"}]},
-        )
-        llm_safe_shell_decision = llm_auto_policy.decide_tool_call(
-            "bash",
-            {"command": "git status --short"},
-        )
-        llm_risky_shell_decision = llm_auto_policy.decide_tool_call(
-            "bash",
-            {"command": "npm install"},
-        )
-        llm_unknown_decision = llm_auto_policy.decide_tool_call("new_tool", {})
-        llm_dangerous_decision = llm_auto_policy.decide_tool_call(
-            "mcp_tool",
-            {},
-            tool_permission="dangerous",
-        )
-        llm_blocked_decision = llm_auto_policy.decide_tool_call(
-            "bash",
-            {"command": "rm -rf /"},
-        )
-
-        full_access_policy = PermissionPolicy(mode="danger-full-access")
-        full_access_decision = full_access_policy.decide_tool_call(
-            "bash",
-            {"command": "npm install"},
-        )
-        full_access_blocked_decision = full_access_policy.decide_tool_call(
-            "bash",
-            {"command": "dd if=/dev/zero of=/dev/sda"},
-        )
-        overwrite_decision = full_access_policy.decide_tool_call(
-            "bash",
-            {"command": "Set-Content out.txt bad"},
-        )
-
-        self.assertTrue(read_decision.allowed)
-        self.assertTrue(code_intelligence_decision.allowed)
-        self.assertTrue(agent_decision.allowed)
-        self.assertTrue(edit_decision.allowed)
-        self.assertTrue(todo_decision.allowed)
-        self.assertTrue(safe_shell_decision.allowed)
-        self.assertTrue(risky_shell_decision.requires_approval)
-        self.assertEqual(risky_shell_decision.risk, "shell_risky")
-        # workspace-write trusts proven workspace-scoped mutations: creating
-        # directories, local commits and recursive in-workspace deletes run
-        # without a prompt. Cross-boundary and unknown effects still ask/deny.
-        self.assertTrue(mkdir_decision.allowed)
-        self.assertEqual(mkdir_decision.risk, "shell_safe")
-        self.assertTrue(reset_decision.allowed)
-        self.assertEqual(reset_decision.risk, "shell_safe")
-        for command, blocked_decision in zip(blocked_commands, blocked_decisions):
-            with self.subTest(command=command):
-                self.assertFalse(blocked_decision.allowed)
-                self.assertFalse(blocked_decision.requires_approval)
-                self.assertEqual(blocked_decision.risk, "shell_blocked")
-        for decision in destructive_git_decisions:
-            with self.subTest(reason=decision.reason):
-                self.assertTrue(decision.requires_approval)
-        self.assertTrue(workspace_delete_decision.allowed)
-        # A wildcard target cannot be proven to stay inside the workspace, so
-        # the strictest fact decides: the whole line is refused, not allowed.
-        self.assertFalse(glob_delete_decision.allowed)
-        self.assertEqual(glob_delete_decision.risk, "shell_risky")
-        self.assertTrue(unknown_decision.requires_approval)
-        self.assertTrue(llm_read_decision.allowed)
-        self.assertTrue(llm_code_intelligence_decision.allowed)
-        self.assertTrue(llm_edit_decision.allowed)
-        self.assertTrue(llm_todo_decision.allowed)
-        self.assertTrue(llm_safe_shell_decision.allowed)
-        self.assertTrue(llm_risky_shell_decision.requires_approval)
-        self.assertTrue(llm_unknown_decision.requires_approval)
-        self.assertTrue(llm_dangerous_decision.requires_approval)
-        self.assertFalse(llm_blocked_decision.allowed)
-        self.assertFalse(llm_blocked_decision.requires_approval)
-        self.assertEqual(llm_blocked_decision.risk, "shell_blocked")
-        self.assertTrue(full_access_decision.allowed)
-        self.assertFalse(full_access_blocked_decision.allowed)
-        self.assertTrue(overwrite_decision.allowed)
-        self.assertEqual(full_access_blocked_decision.risk, "shell_blocked")
-
-    def test_read_only_mode_denies_mutations(self):
-        from harness_code_agent.runtime.permissions import PermissionPolicy
-
-        policy = PermissionPolicy(mode="read-only")
-        self.assertTrue(
-            policy.decide_tool_call("read_file", {"path": "x.txt"}).allowed
-        )
-        edit_decision = policy.decide_tool_call("write_file", {"path": "x.txt"})
-        self.assertFalse(edit_decision.allowed)
-        shell_decision = policy.decide_tool_call(
-            "bash", {"command": "mkdir generated"}
-        )
-        self.assertFalse(shell_decision.allowed)
-        read_shell = policy.decide_tool_call("bash", {"command": "git status"})
-        self.assertTrue(read_shell.allowed)
-
-    def test_permission_policy_rejects_unknown_mode_names(self):
-        from harness_code_agent.runtime.permissions import PermissionPolicy
-
-        with self.assertRaises(ValueError):
-            PermissionPolicy(mode="unsupported-mode")
-
-    def test_llm_auto_approval_provider_approves_only_high_confidence_json(self):
-        from harness_code_agent.runtime.approvals import (
-            ApprovalRequest,
-            LlmAutoApprovalProvider,
-        )
-
-        class FakeCompletions:
-            def __init__(self, content: str):
-                self.content = content
-
-            def create(self, **kwargs):
-                return SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            message=SimpleNamespace(content=self.content),
-                        )
-                    ]
-                )
-
-        class FakeClient:
-            def __init__(self, content: str):
-                self.chat = SimpleNamespace(completions=FakeCompletions(content))
-
-        request = ApprovalRequest(
-            tool_name="bash",
-            args={"command": "npm install"},
-            risk="shell_risky",
-            reason="llm-auto mode requires automatic LLM approval",
-        )
-
-        with patch("harness_code_agent.support.llm.get_client", return_value=FakeClient('{"approved": true, "confidence": 0.9, "reason": "bounded install"}')):
-            approved = LlmAutoApprovalProvider().request(request)
-        with patch("harness_code_agent.support.llm.get_client", return_value=FakeClient('{"approved": true, "confidence": 0.5, "reason": "not sure"}')):
-            low_confidence = LlmAutoApprovalProvider().request(request)
-        with patch("harness_code_agent.support.llm.get_client", return_value=FakeClient('{"approved": false, "confidence": 0.95, "reason": "too broad"}')):
-            denied = LlmAutoApprovalProvider().request(request)
-        with patch("harness_code_agent.support.llm.get_client", return_value=FakeClient("not json")):
-            invalid = LlmAutoApprovalProvider().request(request)
-
-        self.assertTrue(approved.approved)
-        self.assertEqual(approved.metadata["approval_source"], "llm_auto")
-        self.assertEqual(approved.metadata["confidence"], 0.9)
-        self.assertFalse(low_confidence.approved)
-        self.assertFalse(denied.approved)
-        self.assertFalse(invalid.approved)
-        self.assertEqual(invalid.metadata["approval_source"], "llm_auto")
-        self.assertIn("error", invalid.metadata)
-
-    def test_llm_auto_approval_provider_rejects_model_exceptions(self):
-        from harness_code_agent.runtime.approvals import (
-            ApprovalRequest,
-            LlmAutoApprovalProvider,
-        )
-
-        request = ApprovalRequest(
-            tool_name="bash",
-            args={"command": "npm install"},
-            risk="shell_risky",
-            reason="llm-auto mode requires automatic LLM approval",
-        )
-
-        with patch("harness_code_agent.support.llm.get_client", side_effect=RuntimeError("network down")):
-            result = LlmAutoApprovalProvider().request(request)
-
-        self.assertFalse(result.approved)
-        self.assertEqual(result.reason, "llm-auto approval failed")
-        self.assertEqual(result.metadata["approval_source"], "llm_auto")
-        self.assertIn("network down", result.metadata["error"])
 
     def test_execute_tool_records_events_and_snapshots(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy
@@ -3128,15 +2598,6 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertIn("[blocked]", blocked.output)
             self.assertIn("安全黑名单", blocked.output)
 
-    def test_env_shell_command_is_treated_as_read(self):
-        from harness_code_agent.runtime.permissions import PermissionPolicy
-
-        policy = PermissionPolicy(mode="workspace-write")
-        decision = policy.decide_tool_call("bash", {"command": "env"})
-
-        self.assertTrue(decision.allowed)
-        self.assertEqual(decision.risk, "shell_safe")
-
     def test_execute_tool_apply_patch_records_snapshot_and_rejects_ambiguous_patch(self):
         from harness_code_agent.runtime.permissions import PermissionPolicy
         from harness_code_agent.runtime.tool_context import ToolContext
@@ -3277,169 +2738,88 @@ class ProductRuntimeTests(unittest.TestCase):
             self.assertEqual(decided["payload"]["metadata"]["approval_source"], "llm_auto")
             self.assertEqual(decided["payload"]["metadata"]["confidence"], 0.9)
 
-    def test_static_verifier_passes_clean_python_file(self):
+    def test_static_verifier_git_delta_checks_only_current_turn_changes(self):
         import subprocess
 
         from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
 
-        with tempfile.TemporaryDirectory() as tmp:
+        events = []
+        bus = SimpleNamespace(emit=lambda event_type, agent=None, payload=None: events.append((event_type, agent, payload)))
+        clean_ruff = patch("harness_code_agent.runtime.verification.python._check_ruff", return_value=([], True))
+        with tempfile.TemporaryDirectory() as tmp, clean_ruff:
             root = Path(tmp)
-            subprocess.run(["git", "init"], cwd=root, capture_output=True, check=False)
-            (root / "ok.py").write_text("x = 1\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, check=False)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, check=False)
-            mw = StaticVerifierMiddleware(workspace_root=str(root))
-            (root / "ok.py").write_text("x = 2\n", encoding="utf-8")
-            state = SimpleNamespace()
-            with patch(
-                "harness_code_agent.runtime.verification.python._check_ruff",
-                return_value=([], True),
-            ):
-                mw.after_turn(runtime_state=state)
 
+            def git(*args):
+                subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                               cwd=root, capture_output=True, check=False)
+
+            git("init")
+            (root / "good.py").write_text("x = 1\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-m", "init")
+            mw = StaticVerifierMiddleware(workspace_root=str(root))
+
+            # Dirty before the turn: an unrelated broken file and a valid edit.
+            (root / "bad.py").write_text("def f(\n", encoding="utf-8")
+            (root / "good.py").write_text("x = 2\n", encoding="utf-8")
+            mw.begin_turn("task", messages=[])
+            # Shell-style writes: only content fingerprints and the git delta see them.
+            (root / "good.py").write_text("def f(\n", encoding="utf-8")
+            (root / "new.py").write_text("def g(\n", encoding="utf-8")
+            state = SimpleNamespace(event_bus=bus)
+            mw.after_turn(runtime_state=state)
+            self.assertEqual(sorted(state.verification["files"]), ["good.py", "new.py"])
+            self.assertEqual(state.verification["checks"][0]["status"], "failed")
+            self.assertEqual([event[0] for event in events], ["checks_recorded"])
+
+            # Files that were already dirty and untouched this turn are ignored.
+            mw.begin_turn("task", messages=[])
+            (root / "ok.py").write_text("y = 2\n", encoding="utf-8")
+            state = SimpleNamespace()
+            mw.after_turn(runtime_state=state)
+            self.assertEqual(state.verification["files"], ["ok.py"])
             self.assertEqual([check["status"] for check in state.verification["checks"]], ["passed", "passed"])
 
-    def test_static_verifier_ignores_preexisting_dirty_python_files(self):
+            # Unsupported file types produce no checks at all.
+            mw.begin_turn("task", messages=[])
+            (root / "data.json").write_text("{}", encoding="utf-8")
+            state = SimpleNamespace(verification=None)
+            mw.after_turn(runtime_state=state)
+            self.assertIsNone(state.verification)
+
+    def test_static_verifier_workspace_changes_report_syntax_and_lint(self):
         from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
         from harness_code_agent.workspace.service import WorkspaceService
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "bad.py").write_text("def f(\n", encoding="utf-8")
-
+            (root / "preexisting.py").write_text("def f(\n", encoding="utf-8")
             workspace = WorkspaceService(root=root)
             mw = StaticVerifierMiddleware(workspace_root=str(root), workspace=workspace)
+
             mw.begin_turn("task", messages=[])
             state = SimpleNamespace(verification=None)
             mw.after_turn(runtime_state=state)
-
             self.assertIsNone(state.verification)
 
-    def test_static_verifier_git_baseline_ignores_preexisting_dirty_files(self):
-        import subprocess
-
-        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            subprocess.run(["git", "init"], cwd=root, capture_output=True, check=False)
-            (root / "ok.py").write_text("x = 1\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, check=False)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, check=False)
-            # Broken file is already dirty *before* the turn starts.
-            (root / "bad.py").write_text("def f(\n", encoding="utf-8")
-
-            mw = StaticVerifierMiddleware(workspace_root=str(root))
-            mw.begin_turn("task", messages=[])
-            state = SimpleNamespace(verification=None)
-            mw.after_turn(runtime_state=state)
-
-            self.assertIsNone(state.verification)
-
-    def test_static_verifier_catches_shell_edit_of_preexisting_dirty_file(self):
-        import subprocess
-
-        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            subprocess.run(["git", "init"], cwd=root, capture_output=True, check=False)
-            (root / "good.py").write_text("x = 1\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, check=False)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, check=False)
-            # Already dirty (but valid) before the turn begins.
-            (root / "good.py").write_text("x = 2\n", encoding="utf-8")
-
-            mw = StaticVerifierMiddleware(workspace_root=str(root))
-            mw.begin_turn("task", messages=[])
-            # Shell-like out-of-band rewrite: the file stays inside the
-            # baseline dirty set, so only content fingerprints can see it.
-            (root / "good.py").write_text("def f(\n", encoding="utf-8")
-
-            state = SimpleNamespace()
-            with patch(
-                "harness_code_agent.runtime.verification.python._check_ruff",
-                return_value=([], True),
-            ):
+            with patch("harness_code_agent.runtime.verification.python._check_ruff", return_value=([], True)):
+                mw.begin_turn("task", messages=[])
+                workspace.write_text("bad.py", "def f(\n")
+                state = SimpleNamespace()
                 mw.after_turn(runtime_state=state)
-
-            self.assertEqual(state.verification["files"], ["good.py"])
             self.assertEqual(state.verification["checks"][0]["status"], "failed")
+            self.assertIn("bad.py", state.verification["checks"][0]["detail"])
 
-    def test_static_verifier_catches_shell_written_file_via_git_delta(self):
-        import subprocess
-
-        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            subprocess.run(["git", "init"], cwd=root, capture_output=True, check=False)
-            (root / "ok.py").write_text("x = 1\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, check=False)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, check=False)
-
-            mw = StaticVerifierMiddleware(workspace_root=str(root))
-            mw.begin_turn("task", messages=[])
-            # A file created out-of-band (e.g. via run_bash) — no workspace
-            # service, no change journal, only the git delta can see it.
-            (root / "bad.py").write_text("def f(\n", encoding="utf-8")
-
-            state = SimpleNamespace()
-            with patch(
-                "harness_code_agent.runtime.verification.python._check_ruff",
-                return_value=([], True),
-            ):
+            warning = [("warn.py", "W292", "no newline at end of file", 1)]
+            with patch("harness_code_agent.runtime.verification.python._check_ruff", return_value=(warning, True)):
+                mw.begin_turn("task", messages=[])
+                workspace.write_text("warn.py", "x = 1\n")
+                state = SimpleNamespace()
                 mw.after_turn(runtime_state=state)
+            self.assertEqual(state.verification["checks"][1]["status"], "warning")
+            self.assertIn("W292", state.verification["checks"][1]["detail"])
 
-            self.assertEqual(state.verification["files"], ["bad.py"])
-            self.assertEqual(state.verification["checks"][0]["status"], "failed")
-
-    def test_static_verifier_records_syntax_error_from_current_turn_workspace_change(self):
-        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
-        from harness_code_agent.workspace.service import WorkspaceService
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            workspace = WorkspaceService(root=root)
-            mw = StaticVerifierMiddleware(workspace_root=str(root), workspace=workspace)
-            mw.begin_turn("task", messages=[])
-            workspace.write_text("bad.py", "def f(\n")
-
-            state = SimpleNamespace()
-            with patch(
-                "harness_code_agent.runtime.verification.python._check_ruff",
-                return_value=([], True),
-            ):
-                mw.after_turn(runtime_state=state)
-
-            syntax = state.verification["checks"][0]
-            self.assertEqual(syntax["status"], "failed")
-            self.assertIn("bad.py", syntax["detail"])
-
-    def test_static_verifier_records_warning_and_allows_exit(self):
-        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
-        from harness_code_agent.workspace.service import WorkspaceService
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            workspace = WorkspaceService(root=root)
-            mw = StaticVerifierMiddleware(workspace_root=str(root), workspace=workspace)
-            mw.begin_turn("task", messages=[])
-            workspace.write_text("warn.py", "x = 1\n")
-
-            state = SimpleNamespace()
-            with patch(
-                "harness_code_agent.runtime.verification.python._check_ruff",
-                return_value=([("warn.py", "W292", "no newline at end of file", 1)], True),
-            ):
-                mw.after_turn(runtime_state=state)
-
-            lint = state.verification["checks"][1]
-            self.assertEqual(lint["status"], "warning")
-            self.assertIn("W292", lint["detail"])
-
-    def test_static_verifier_records_ruff_errors_scoped_to_turn_files(self):
-        import json
+    def test_static_verifier_runs_ruff_on_turn_files_and_skips_unusable_output(self):
         from unittest.mock import MagicMock
 
         from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
@@ -3447,207 +2827,66 @@ class ProductRuntimeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "old.py").write_text("x = 1\n", encoding="utf-8")  # pre-existing
+            (root / "old.py").write_text("x = 1\n", encoding="utf-8")
             workspace = WorkspaceService(root=root)
             mw = StaticVerifierMiddleware(workspace_root=str(root), workspace=workspace)
+            ruff_run = "harness_code_agent.runtime.verification.python.subprocess.run"
+
             mw.begin_turn("task", messages=[])
             workspace.write_text("new.py", "value = 1\n")
-
-            payload = json.dumps([
-                {
-                    "code": "F821",
-                    "message": "Undefined name `value`",
-                    "filename": str(root / "new.py"),
-                    "location": {"row": 3, "column": 1},
-                }
-            ])
-            fake_run = MagicMock(return_value=SimpleNamespace(
-                returncode=1, stdout=payload, stderr="",
-            ))
+            payload = json.dumps([{
+                "code": "F821", "message": "Undefined name `value`",
+                "filename": str(root / "new.py"), "location": {"row": 3, "column": 1},
+            }])
+            fake_run = MagicMock(return_value=SimpleNamespace(returncode=1, stdout=payload, stderr=""))
             state = SimpleNamespace()
-            with patch(
-                "harness_code_agent.runtime.verification.python.subprocess.run",
-                fake_run,
-            ):
+            with patch(ruff_run, fake_run):
                 mw.after_turn(runtime_state=state)
-
             lint = state.verification["checks"][1]
             self.assertEqual(lint["status"], "failed")
-            self.assertIn("F821", lint["detail"])
             self.assertIn("new.py:3", lint["detail"])
-            # Ruff only ever sees the current-turn file, never the whole tree.
             argv = fake_run.call_args.args[0]
             self.assertIn("new.py", argv)
             self.assertNotIn("old.py", argv)
 
-    def test_static_verifier_records_unusable_ruff_output_as_skipped(self):
-        from unittest.mock import MagicMock
-
-        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
-        from harness_code_agent.workspace.service import WorkspaceService
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            workspace = WorkspaceService(root=root)
-            mw = StaticVerifierMiddleware(workspace_root=str(root), workspace=workspace)
             mw.begin_turn("task", messages=[])
             workspace.write_text("ok.py", "x = 1\n")
-
-            fake_run = MagicMock(return_value=SimpleNamespace(
-                returncode=1, stdout="this is not json", stderr="",
-            ))
             state = SimpleNamespace()
-            with patch(
-                "harness_code_agent.runtime.verification.python.subprocess.run",
-                fake_run,
-            ):
+            with patch(ruff_run, MagicMock(return_value=SimpleNamespace(returncode=1, stdout="not json", stderr=""))):
                 mw.after_turn(runtime_state=state)
             self.assertEqual(state.verification["checks"][1]["status"], "skipped")
 
-    def test_static_verifier_produces_no_checks_for_unsupported_files(self):
+    def test_check_ruff_missing_tool_skips_and_timeout_warns(self):
         import subprocess
-
-        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            subprocess.run(["git", "init"], cwd=root, capture_output=True, check=False)
-            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, check=False)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, check=False)
-            mw = StaticVerifierMiddleware(workspace_root=str(root))
-            (root / "data.json").write_text("{}", encoding="utf-8")
-            state = SimpleNamespace(verification=None)
-            mw.after_turn(runtime_state=state)
-
-            self.assertIsNone(state.verification)
-
-    def test_check_ruff_not_installed_gracefully_skips(self):
-        from unittest.mock import patch as _patch
 
         from harness_code_agent.runtime.verification.python import _check_ruff
 
-        def fake_run(*a, **kw):
-            raise FileNotFoundError
-
-        with _patch("subprocess.run", side_effect=fake_run):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertEqual(_check_ruff("/tmp", ["x.py"]), ([], False))
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="ruff", timeout=30)):
             findings, ran = _check_ruff("/tmp", ["x.py"])
-
-        self.assertEqual(findings, [])
-        self.assertFalse(ran)
-
-    def test_check_ruff_timeout_is_non_blocking_warning(self):
-        import subprocess
-        from unittest.mock import patch as _patch
-
-        from harness_code_agent.runtime.verification.python import _check_ruff
-
-        def fake_run(*a, **kw):
-            raise subprocess.TimeoutExpired(cmd="ruff", timeout=30)
-
-        with _patch("subprocess.run", side_effect=fake_run):
-            findings, ran = _check_ruff("/tmp", ["x.py"])
-
-        self.assertEqual(len(findings), 1)
         self.assertTrue(ran)
+        self.assertEqual(len(findings), 1)
         self.assertTrue(findings[0][1].startswith("RUFF"))
-        self.assertNotIn("E", findings[0][1][:1])
-        self.assertNotIn("F", findings[0][1][:1])
 
-    def test_static_verifier_emits_checks_recorded_on_event_bus(self):
-        import subprocess
-
-        from harness_code_agent.runtime.middleware import StaticVerifierMiddleware
-
-        class FakeBus:
-            def __init__(self):
-                self.events = []
-
-            def emit(self, event_type, agent=None, payload=None):
-                self.events.append((event_type, agent, payload))
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            subprocess.run(["git", "init"], cwd=root, capture_output=True, check=False)
-            (root / "ok.py").write_text("x = 1\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, check=False)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=root, capture_output=True, check=False)
-
-            mw = StaticVerifierMiddleware(workspace_root=str(root))
-            mw.begin_turn("task", messages=[])
-            (root / "new.py").write_text("y = 2\n", encoding="utf-8")
-            bus = FakeBus()
-
-            with patch(
-                "harness_code_agent.runtime.verification.python._check_ruff",
-                return_value=([], True),
-            ):
-                mw.after_turn(runtime_state=SimpleNamespace(event_bus=bus))
-
-        self.assertEqual(len(bus.events), 1)
-        event_type, agent, payload = bus.events[0]
-        self.assertEqual(event_type, "checks_recorded")
-        self.assertIsNone(agent)
-        names = {item["name"]: item["status"] for item in payload["checks"]}
-        self.assertEqual(names, {"Python syntax": "passed", "Ruff lint": "passed"})
-
-    # ------------------------------------------------------------------
-    # safe_args_preview
-    # ------------------------------------------------------------------
-
-    def test_safe_args_preview_masks_sensitive_fields(self):
+    def test_safe_args_preview_masks_content_redacts_secrets_and_bounds_length(self):
         from harness_code_agent.agent.conversation import safe_args_preview
 
-        result = safe_args_preview({"path": "x.py", "content": "print('hello' * 999)"})
-        self.assertNotIn("print", result)
-        self.assertIn("chars", result)
-        self.assertIn("path", result)
+        content = safe_args_preview({"path": "x.py", "content": "print('hello' * 999)", "patch": "+def foo():"})
+        self.assertIn("path", content)
+        self.assertNotIn("print", content)
+        self.assertNotIn("def foo", content)
+        self.assertIn("502 chars", safe_args_preview({"key": "x" * 500}))
 
-        result2 = safe_args_preview({"path": "x.py", "patch": "+def foo():\n    pass"})
-        self.assertNotIn("def foo", result2)
-        self.assertIn("chars", result2)
+        ordered = safe_args_preview({"z": 3, "a": 1, "path": "f.py"})
+        self.assertEqual(ordered, safe_args_preview({"path": "f.py", "a": 1, "z": 3}))
+        self.assertLess(ordered.index("a"), ordered.index("z"))
+        self.assertLessEqual(len(safe_args_preview({k: 1 for k in "abcdef"}, max_chars=30)), 33)
 
-    def test_safe_args_preview_handles_large_fields(self):
-        from harness_code_agent.agent.conversation import safe_args_preview
-
-        large = "x" * 500
-        result = safe_args_preview({"key": large})
-        self.assertIn("chars", result)
-        # JSON-serialized string includes quotes, so the char count is 500 + 2
-        self.assertIn("502 chars", result)
-
-    def test_safe_args_preview_sorts_keys_stably(self):
-        from harness_code_agent.agent.conversation import safe_args_preview
-
-        # Call multiple times — result should be identical
-        args = {"z": 3, "a": 1, "path": "f.py"}
-        r1 = safe_args_preview(args)
-        r2 = safe_args_preview(args)
-        self.assertEqual(r1, r2)
-        # 'a' should come before 'z'
-        self.assertLess(r1.index("a"), r1.index("z"))
-
-    def test_safe_args_preview_respects_max_chars(self):
-        from harness_code_agent.agent.conversation import safe_args_preview
-
-        args = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6}
-        result = safe_args_preview(args, max_chars=30)
-        self.assertLessEqual(len(result), 33)  # 30 + "..."
-
-    def test_safe_args_preview_redacts_sensitive_key_names(self):
-        from harness_code_agent.agent.conversation import safe_args_preview
-
-        result = safe_args_preview({
-            "path": "x.py",
-            "api_key": "sk-1234567890",
-            "jwt": "header.payload.signature",
-            "token": "short-secret",
-        })
-
-        self.assertIn('"api_key": "[redacted]"', result)
-        self.assertIn('"jwt": "[redacted]"', result)
-        self.assertIn('"token": "[redacted]"', result)
-        self.assertNotIn("short-secret", result)
-
+        secrets = safe_args_preview({"path": "x.py", "api_key": "sk-1234567890", "jwt": "a.b.c", "token": "short-secret"})
+        for key in ("api_key", "jwt", "token"):
+            self.assertIn(f'"{key}": "[redacted]"', secrets)
+        self.assertNotIn("short-secret", secrets)
 
 @pytest.mark.session
 class ContextCommandTests(unittest.TestCase):

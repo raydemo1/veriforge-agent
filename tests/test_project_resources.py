@@ -162,14 +162,14 @@ app.run(transport="stdio")
         assert a != b
         assert ":1" in a and ":1" in b
         from contextlib import ExitStack
-        first.tool_timeout_seconds = .5
+        first.tool_timeout_seconds = .2
         with ThreadPoolExecutor(max_workers=1) as pool:
             with ExitStack() as leases:
                 for _ in range(2):
                     leases.enter_context(first.project_resources.acquire("mcp:isolated"))
                 result = pool.submit(first.call_tool, binding.exposed_name, {})
                 _wait(lambda: any(entry["resource"] == "mcp:isolated" for entry in first.project_resources.snapshot()["waiting"]))
-                time.sleep(.6)
+                time.sleep(.3)
                 assert not result.done()
             assert ":2" in result.result(5).to_text()
     finally:

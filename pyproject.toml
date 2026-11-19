@@ -24,7 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10", "pytest-timeout>=2.3,<3"]
+test = ["pytest>=8,<10", "pytest-timeout>=2.3,<3", "pytest-xdist>=3.6,<4"]
 eval = [
     "harbor>=0.25",
 ]
@@ -37,7 +37,9 @@ veriforge = "harness_code_agent.cli:main"
 # run artifacts (including stale symlink trees on Windows) that are not
 # tests and break collection when pytest recurses the whole repository.
 testpaths = ["tests"]
-addopts = "--strict-markers -m 'not integration and not external'"
+# Tests run in parallel by default (one worker per CPU); pass `-n0` to run a
+# single test serially without worker start-up cost.
+addopts = "--strict-markers -m 'not integration and not external' -n auto --dist worksteal"
 # pygls 2.1.1 uses the deprecated alias while dispatching JSON-RPC handlers.
 filterwarnings = [
     'ignore:.*asyncio\.iscoroutinefunction.* is deprecated:DeprecationWarning:pygls\.protocol\.json_rpc',

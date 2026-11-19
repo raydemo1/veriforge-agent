@@ -38,85 +38,41 @@ class CompactionGateTests(unittest.TestCase):
 class CompactionThresholdTests(unittest.TestCase):
     """Token usage thresholds drive compaction strategy."""
 
-    def test_thresholds_derived_from_context_window(self):
-        """Thresholds should be percentages of HARNESS_CONTEXT_WINDOW_TOKENS."""
-        with patch.dict(os.environ, {"HARNESS_CONTEXT_WINDOW_TOKENS": "100000"}):
-            from harness_code_agent.agent import compaction
-            thresholds = compaction.get_thresholds(100000)
-            self.assertEqual(thresholds.compact, 80000)
-
-    def test_threshold_is_capped_by_output_reserve(self):
-        from harness_code_agent.agent.compaction import get_thresholds
-
-        self.assertEqual(get_thresholds(64000, max_output_tokens=32768).compact, 31232)
-
-    def test_configured_threshold_cannot_exceed_input_capacity(self):
+    def test_threshold_follows_window_and_reserves_output_space(self):
         from harness_code_agent import config
-        from harness_code_agent.agent.compaction import get_thresholds
+        from harness_code_agent.agent.compaction import (
+            compaction_action,
+            get_thresholds,
+        )
 
-        with (
-            patch.object(config, "CONTEXT_WINDOW_TOKENS", 200000),
-            patch.object(config, "COMPRESS_THRESHOLD", 190000),
-        ):
+        self.assertEqual(get_thresholds(100000).compact, 80000)
+        self.assertEqual(get_thresholds(64000, max_output_tokens=32768).compact, 31232)
+        with patch.object(config, "CONTEXT_WINDOW_TOKENS", 200000), patch.object(config, "COMPRESS_THRESHOLD", 190000):
             self.assertEqual(get_thresholds(max_output_tokens=32768).compact, 167232)
-
-    def test_below_compact_threshold_no_action(self):
-        from harness_code_agent.agent.compaction import (
-            compaction_action,
-            get_thresholds,
-        )
         thresholds = get_thresholds(128000)
-        action = compaction_action(thresholds.compact - 1, thresholds)
-        self.assertEqual(action, "none")
-
-    def test_at_compact_threshold_triggers_auto_compact(self):
-        from harness_code_agent.agent.compaction import (
-            compaction_action,
-            get_thresholds,
-        )
-        thresholds = get_thresholds(128000)
-        action = compaction_action(thresholds.compact, thresholds)
-        self.assertEqual(action, "auto_compact")
-
+        self.assertEqual(compaction_action(thresholds.compact - 1, thresholds), "none")
+        self.assertEqual(compaction_action(thresholds.compact, thresholds), "auto_compact")
 
 class ContextAnxietyTests(unittest.TestCase):
-    def test_detect_anxiety_returns_structured_soft_signal(self):
+    def test_detect_anxiety_is_a_structured_soft_signal_in_english_and_chinese(self):
         from harness_code_agent.agent.context import detect_anxiety
 
-        signal = detect_anxiety([
+        english = detect_anxiety([
             {"role": "system", "content": "sys"},
             {"role": "assistant", "content": "Due to the context limit, let me wrap up here."},
         ])
+        self.assertTrue(english and english.detected)
+        self.assertGreaterEqual(english.score, 2)
+        self.assertEqual(english.source, "assistant_recent_messages")
+        self.assertTrue(any("context limit" in reason.lower() for reason in english.reasons))
 
-        self.assertTrue(signal.detected)
-        self.assertTrue(signal)
-        self.assertGreaterEqual(signal.score, 2)
-        self.assertEqual(signal.source, "assistant_recent_messages")
-        self.assertTrue(any("context limit" in reason.lower() for reason in signal.reasons))
+        chinese = detect_anxiety([{"role": "assistant", "content": "我快没上下文空间了，先收尾一下。上下文快满了，我只覆盖关键部分。"}])
+        self.assertGreaterEqual(chinese.score, 2)
+        self.assertTrue(any("上下文" in reason for reason in chinese.reasons))
 
-    def test_detect_anxiety_absent_signal_is_falsey(self):
-        from harness_code_agent.agent.context import detect_anxiety
-
-        signal = detect_anxiety([
-            {"role": "assistant", "content": "I will continue with the next verification step."},
-        ])
-
-        self.assertFalse(signal)
-        self.assertFalse(signal.detected)
-        self.assertEqual(signal.score, 0)
-        self.assertEqual(signal.reasons, [])
-
-    def test_detect_anxiety_recognizes_chinese_context_limit_language(self):
-        from harness_code_agent.agent.context import detect_anxiety
-
-        signal = detect_anxiety([
-            {"role": "assistant", "content": "我快没上下文空间了，先收尾一下。上下文快满了，我只覆盖关键部分。"},
-        ])
-
-        self.assertTrue(signal.detected)
-        self.assertGreaterEqual(signal.score, 2)
-        self.assertTrue(any("上下文" in reason for reason in signal.reasons))
-
+        calm = detect_anxiety([{"role": "assistant", "content": "I will continue with the next verification step."}])
+        self.assertFalse(calm)
+        self.assertEqual((calm.detected, calm.score, calm.reasons), (False, 0, []))
 
 # ---------------------------------------------------------------------------
 # /compact slash command
@@ -138,21 +94,14 @@ class CompactCommandTests(unittest.TestCase):
         ]
         return session
 
-    def test_compact_command_is_registered_for_manual_compaction(self):
+    def test_compact_command_is_a_plain_manual_trigger(self):
         from harness_code_agent.tui.commands import default_command_registry
+
         registry = default_command_registry()
-        spec = registry._by_name.get("/compact")
-        self.assertIsNotNone(spec, "/compact command should be registered")
-        self.assertEqual(spec.usage, "/compact")
+        self.assertEqual(registry._by_name["/compact"].usage, "/compact")
         self.assertEqual(registry.execute("/compact", self._make_session(".")).action, "compact")
-
-    def test_compact_requires_a_plain_command(self):
-        from harness_code_agent.tui.commands import default_command_registry
-        registry = default_command_registry()
-        session = MagicMock()
-
-        self.assertIn("用法：/compact", registry.execute("/compact status", session).text)
-        self.assertIn("用法：/compact", registry.execute("/compact history", session).text)
+        for args in ("status", "history"):
+            self.assertIn("用法：/compact", registry.execute(f"/compact {args}", MagicMock()).text)
 
     def test_manual_compact_runs_without_waiting_for_threshold(self):
         from harness_code_agent.agent.conversation import Agent
@@ -501,42 +450,23 @@ class AgentConversationCompactionLifecycleTests(unittest.TestCase):
 class CompactionEventTests(unittest.TestCase):
     """New session event types for compaction lifecycle."""
 
-    def test_compaction_started_event(self):
-        from harness_code_agent.sessions.events import ContextCompactionStartedEvent
-        event = ContextCompactionStartedEvent(
-            token_count=100000,
-            threshold=108800,
-            forced=False,
+    def test_compaction_and_anxiety_events_serialize_their_payloads(self):
+        from harness_code_agent.sessions.events import (
+            ContextAnxietyObservedEvent,
+            ContextCompactionCommittedEvent,
+            ContextCompactionStartedEvent,
         )
-        structured = event.to_event()
-        self.assertEqual(structured.type, "context_compaction_started")
-        self.assertEqual(structured.payload["token_count"], 100000)
 
-    def test_compaction_committed_event(self):
-        from harness_code_agent.sessions.events import ContextCompactionCommittedEvent
-        event = ContextCompactionCommittedEvent(
-            summary_chars=500,
-            messages_before=20,
-            messages_after=5,
-            tokens_saved=40000,
-        )
-        structured = event.to_event()
-        self.assertEqual(structured.type, "context_compaction_committed")
-        self.assertIn("tokens_saved", structured.payload)
-
-    def test_context_anxiety_observed_event(self):
-        from harness_code_agent.sessions.events import ContextAnxietyObservedEvent
-        event = ContextAnxietyObservedEvent(
-            token_count=120000,
-            threshold=170000,
-            score=2,
-            reasons=["due to context limit", "let me wrap up"],
-        )
-        structured = event.to_event()
-        self.assertEqual(structured.type, "context_anxiety_observed")
-        self.assertEqual(structured.payload["score"], 2)
-        self.assertEqual(structured.payload["threshold"], 170000)
-        self.assertEqual(structured.payload["reasons"], ["due to context limit", "let me wrap up"])
+        started = ContextCompactionStartedEvent(token_count=100000, threshold=108800, forced=False).to_event()
+        self.assertEqual((started.type, started.payload["token_count"]), ("context_compaction_started", 100000))
+        committed = ContextCompactionCommittedEvent(
+            summary_chars=500, messages_before=20, messages_after=5, tokens_saved=40000).to_event()
+        self.assertEqual((committed.type, committed.payload["tokens_saved"]), ("context_compaction_committed", 40000))
+        reasons = ["due to context limit", "let me wrap up"]
+        anxiety = ContextAnxietyObservedEvent(token_count=120000, threshold=170000, score=2, reasons=reasons).to_event()
+        self.assertEqual(anxiety.type, "context_anxiety_observed")
+        self.assertEqual((anxiety.payload["score"], anxiety.payload["threshold"], anxiety.payload["reasons"]),
+                         (2, 170000, reasons))
 
 # ---------------------------------------------------------------------------
 # TUI state — compaction events update status bar
@@ -556,51 +486,24 @@ class TuiStateCompactionTests(unittest.TestCase):
         )
         return TuiState(snapshot=snapshot)
 
-    def test_compaction_started_updates_status(self):
+    def test_compaction_progress_lives_in_the_status_bar_only(self):
+        def apply(state, event_type, payload, agent=None):
+            event = MagicMock()
+            event.to_dict.return_value = {"type": event_type, "payload": payload, **({"agent": agent} if agent else {})}
+            return state.apply_event(event)
+
         state = self._make_state()
-        event = MagicMock()
-        event.to_dict.return_value = {
-            "type": "context_compaction_started",
-            "payload": {"token_count": 100000, "forced": False},
-        }
-        block = state.apply_event(event)
-        # Compaction progress lives in the status bar only, not the transcript.
-        self.assertIsNone(block)
+        self.assertIsNone(apply(state, "context_compaction_started", {"token_count": 100000, "forced": False}))
         self.assertIn("compact", state.snapshot.status.lower())
+        self.assertIsNotNone(apply(state, "context_compaction_committed", {"tokens_saved": 40000}))
+        # Anxiety detection is internal and never reaches the transcript.
+        self.assertIsNone(apply(state, "context_anxiety_observed",
+                                {"token_count": 120000, "threshold": 170000, "score": 2, "reasons": ["limit"]}))
 
-    def test_child_compaction_does_not_change_main_status(self):
-        state = self._make_state()
-        state.snapshot.status = "idle"
-        event = MagicMock()
-        event.to_dict.return_value = {
-            "type": "context_compaction_started",
-            "agent": "worker-1",
-            "payload": {"token_count": 100000, "forced": False},
-        }
-        self.assertIsNone(state.apply_event(event))
-        self.assertEqual(state.snapshot.status, "idle")
-
-    def test_compaction_committed_restores_idle(self):
-        state = self._make_state()
-        event = MagicMock()
-        event.to_dict.return_value = {
-            "type": "context_compaction_committed",
-            "payload": {"tokens_saved": 40000},
-        }
-        block = state.apply_event(event)
-        self.assertIsNotNone(block)
-
-    def test_context_anxiety_observed_shows_soft_notice(self):
-        state = self._make_state()
-        event = MagicMock()
-        event.to_dict.return_value = {
-            "type": "context_anxiety_observed",
-            "payload": {"token_count": 120000, "threshold": 170000, "score": 2, "reasons": ["due to context limit"]},
-        }
-        block = state.apply_event(event)
-        # Internal anxiety detection stays out of the transcript.
-        self.assertIsNone(block)
-
+        child = self._make_state()
+        child.snapshot.status = "idle"
+        self.assertIsNone(apply(child, "context_compaction_started", {"token_count": 100000, "forced": False}, "worker-1"))
+        self.assertEqual(child.snapshot.status, "idle")
 
 # ---------------------------------------------------------------------------
 # Config — context window tokens
@@ -609,32 +512,22 @@ class TuiStateCompactionTests(unittest.TestCase):
 class ContextWindowConfigTests(unittest.TestCase):
     """HARNESS_CONTEXT_WINDOW_TOKENS config."""
 
-    def test_context_window_defaults_to_200k(self):
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("HARNESS_CONTEXT_WINDOW_TOKENS", None)
-            os.environ.pop("COMPRESS_THRESHOLD", None)
-            import importlib
+    def test_context_window_defaults_to_200k_and_threshold_follows_it(self):
+        import importlib
 
-            from harness_code_agent import config
-            importlib.reload(config)
-            self.assertEqual(config.CONTEXT_WINDOW_TOKENS, 200000)
-            self.assertEqual(config.COMPRESS_THRESHOLD, 160000)
-            # Restore default for later tests in this process.
-            importlib.reload(config)
+        from harness_code_agent import config
 
-    def test_context_window_configurable(self):
-        with patch.dict(os.environ, {"HARNESS_CONTEXT_WINDOW_TOKENS": "64000"}):
-            os.environ.pop("COMPRESS_THRESHOLD", None)
-            # Need to reload to pick up env change
-            import importlib
-
-            from harness_code_agent import config
+        try:
+            for window, expected in ((None, (200000, 160000)), ("64000", (64000, 51200))):
+                env = {"HARNESS_CONTEXT_WINDOW_TOKENS": window} if window else {}
+                with patch.dict(os.environ, env):
+                    if not window:
+                        os.environ.pop("HARNESS_CONTEXT_WINDOW_TOKENS", None)
+                    os.environ.pop("COMPRESS_THRESHOLD", None)
+                    importlib.reload(config)
+                    self.assertEqual((config.CONTEXT_WINDOW_TOKENS, config.COMPRESS_THRESHOLD), expected)
+        finally:
             importlib.reload(config)
-            self.assertEqual(config.CONTEXT_WINDOW_TOKENS, 64000)
-            self.assertEqual(config.COMPRESS_THRESHOLD, 51200)
-            # Restore default
-            importlib.reload(config)
-
 
 if __name__ == "__main__":
     unittest.main()

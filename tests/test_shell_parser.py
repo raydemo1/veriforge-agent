@@ -229,32 +229,6 @@ def test_proven_workspace_read_stays_allowed(tmp_path):
     assert decide("grep -r foo .", "workspace-write", str(tmp_path)) == "allow"
 
 
-def test_catastrophic_commands_are_denied_in_every_mode(tmp_path):
-    for command in ("rm -rf /", "rm -rf ~", "dd if=/dev/zero of=/dev/sda"):
-        for mode in ("read-only", "workspace-write", "llm-auto", "danger-full-access"):
-            decision = PermissionPolicy(mode).decide_tool_call(
-                "bash", {"command": command}, "shell", str(tmp_path)
-            )
-            assert decision.action == "deny", (command, mode)
-            assert decision.risk == "shell_blocked", (command, mode)
-
-
-def test_destructive_git_is_an_approval_question(tmp_path):
-    for command in ("git reset --hard", "git clean -fd"):
-        assert decide(command, "workspace-write", str(tmp_path)) == "ask", command
-        assert decide(command, "llm-auto", str(tmp_path)) == "ask", command
-        assert decide(command, "danger-full-access", str(tmp_path)) == "allow", command
-        assert decide(command, "read-only", str(tmp_path)) == "deny", command
-    # A repository outside the workspace is still a denied external write.
-    outside = PermissionPolicy("workspace-write").decide_tool_call(
-        "bash",
-        {"command": "git -C /tmp/repo reset --hard"},
-        "shell",
-        str(tmp_path),
-    )
-    assert outside.action == "deny"
-
-
 def test_workspace_internal_directories_are_ordinary_write_targets(tmp_path):
     # The sandbox guards the workspace boundary; .git and .harness are ordinary
     # project directories, not a second permission layer.
@@ -468,7 +442,9 @@ def _verdict(content: str, **overrides):
 def test_high_confidence_boolean_approval_is_accepted():
     result = _verdict('{"approved": true, "confidence": 0.9, "reason": "bounded install"}')
     assert result.approved
-
+    assert result.metadata["approval_source"] == "llm_auto"
+    assert result.metadata["confidence"] == 0.9
+    assert not _verdict('{"approved": false, "confidence": 0.95, "reason": "too broad"}').approved
 
 @pytest.mark.parametrize(
     "content",

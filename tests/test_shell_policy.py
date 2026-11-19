@@ -223,7 +223,8 @@ class ShellPermissionPolicyTests(unittest.TestCase):
                 "Remove-Item -Force -Recurse C:\\",
                 "Remove-Item -LiteralPath C:\\ -Recurse -Force",
             ]
-        for policy in (self.workspace, self.eval, self.full):
+        modes = (self.workspace, self.eval, self.full, PermissionPolicy("read-only"), PermissionPolicy("llm-auto"))
+        for policy in modes:
             for command in commands:
                 with self.subTest(mode=policy.mode, command=command):
                     decision = self._decide(policy, command)
@@ -251,6 +252,15 @@ class ShellPermissionPolicyTests(unittest.TestCase):
                     self.assertTrue(eval_decision.allowed)
             with self.subTest(command=command, mode="danger-full-access"):
                 self.assertTrue(self._decide(self.full, command).allowed)
+            with self.subTest(command=command, mode="llm-auto"):
+                self.assertTrue(self._decide(PermissionPolicy("llm-auto"), command).requires_approval)
+            with self.subTest(command=command, mode="read-only"):
+                decision = self._decide(PermissionPolicy("read-only"), command)
+                self.assertFalse(decision.allowed or decision.requires_approval)
+        # A repository outside the workspace is still a denied external write.
+        outside = PermissionPolicy("workspace-write").decide_tool_call(
+            "bash", {"command": "git -C /tmp/repo reset --hard"}, "shell", os.getcwd())
+        self.assertEqual(outside.action, "deny")
 
     # --- system, non-destructive writes -----------------------------------
 

@@ -31,78 +31,26 @@ class TerminalBenchLauncherTests(unittest.TestCase):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def test_build_command_uses_current_harbor_task_filter_flag(self):
-        command = build_harbor_run_command(
-            harbor_executable="harbor",
-            tasks=["fix-git", "headless-terminal"],
-            runner_env=None,
-            dataset_path=None,
-            force_build=False,
-        )
+    def test_build_command_targets_registry_or_local_dataset(self):
+        agent = ["--agent-import-path", "eval.benchmarks.harbor_agent:HarnessAgent"]
+        local = Path("E:/tmp/terminal-bench-2-1")
+
+        def build(tasks, **kwargs):
+            options = {"runner_env": None, "dataset_path": None, "force_build": False, **kwargs}
+            return build_harbor_run_command(harbor_executable="harbor", tasks=tasks, **options)
 
         self.assertEqual(
-            command,
-            [
-                "harbor",
-                "run",
-                "-d",
-                "terminal-bench@2.1",
-                "--agent-import-path",
-                "eval.benchmarks.harbor_agent:HarnessAgent",
-                "--include-task-name",
-                "fix-git",
-                "--include-task-name",
-                "headless-terminal",
-            ],
+            build(["fix-git", "headless-terminal"]),
+            ["harbor", "run", "-d", "terminal-bench@2.1", *agent,
+             "--include-task-name", "fix-git", "--include-task-name", "headless-terminal"],
         )
-
-    def test_build_command_can_target_local_dataset_path(self):
-        command = build_harbor_run_command(
-            harbor_executable="harbor",
-            tasks=["fix-git"],
-            runner_env="daytona",
-            dataset_path=Path("E:/tmp/terminal-bench-2-1"),
-            force_build=False,
-        )
-
         self.assertEqual(
-            command,
-            [
-                "harbor",
-                "run",
-                "--path",
-                str(Path("E:/tmp/terminal-bench-2-1")),
-                "--agent-import-path",
-                "eval.benchmarks.harbor_agent:HarnessAgent",
-                "--env",
-                "daytona",
-                "--include-task-name",
-                "fix-git",
-            ],
+            build(["fix-git"], runner_env="daytona", dataset_path=local),
+            ["harbor", "run", "--path", str(local), *agent, "--env", "daytona", "--include-task-name", "fix-git"],
         )
-
-    def test_build_command_can_force_environment_build(self):
-        command = build_harbor_run_command(
-            harbor_executable="harbor",
-            tasks=["fix-git"],
-            runner_env=None,
-            dataset_path=Path("E:/tmp/terminal-bench-2-1"),
-            force_build=True,
-        )
-
         self.assertEqual(
-            command,
-            [
-                "harbor",
-                "run",
-                "--path",
-                str(Path("E:/tmp/terminal-bench-2-1")),
-                "--agent-import-path",
-                "eval.benchmarks.harbor_agent:HarnessAgent",
-                "--force-build",
-                "--include-task-name",
-                "fix-git",
-            ],
+            build(["fix-git"], dataset_path=local, force_build=True),
+            ["harbor", "run", "--path", str(local), *agent, "--force-build", "--include-task-name", "fix-git"],
         )
 
     def test_build_environment_uses_repo_local_temp_and_loads_missing_dotenv_values(self):
@@ -418,156 +366,72 @@ class TerminalBenchLauncherTests(unittest.TestCase):
         finally:
             shutil.rmtree(repo_root, ignore_errors=True)
 
-    def test_repair_task_images_rewrites_unavailable_image_to_dockerhub_fallback(self):
+    def test_repair_task_images_rewrites_only_unavailable_selected_images(self):
         repo_root = self._workspace_path("test-terminal-bench-image-repair")
         dataset_path = repo_root / ".harbor" / "datasets" / "terminal-bench-2-1"
         try:
-            task_dir = dataset_path / "tasks" / "overfull-hbox"
-            task_dir.mkdir(parents=True, exist_ok=True)
-            task_file = task_dir / "task.toml"
-            task_file.write_text(
-                'version = "1.0"\n\n[environment]\ndocker_image = "ghcr.io/laude-institute/terminal-bench/overfull-hbox:2.0"',
-                encoding="utf-8",
-            )
-
-            def fake_exists(image: str) -> bool:
-                return image == "alexgshaw/overfull-hbox:20251031"
-
-            with patch("eval.benchmarks.run_terminal_bench._docker_image_exists", side_effect=fake_exists):
-                rewritten = repair_task_images(dataset_path)
-
-            self.assertEqual(rewritten, 1)
-            self.assertIn(
-                'docker_image = "alexgshaw/overfull-hbox:20251031"',
-                task_file.read_text(encoding="utf-8"),
-            )
-        finally:
-            shutil.rmtree(repo_root, ignore_errors=True)
-
-    def test_repair_task_images_preserves_available_image(self):
-        repo_root = self._workspace_path("test-terminal-bench-image-preserve")
-        dataset_path = repo_root / ".harbor" / "datasets" / "terminal-bench-2-1"
-        try:
-            task_dir = dataset_path / "tasks" / "fix-git"
-            task_dir.mkdir(parents=True, exist_ok=True)
-            task_file = task_dir / "task.toml"
-            task_file.write_text(
-                '[environment]\ndocker_image = "ghcr.io/laude-institute/terminal-bench/fix-git:2.0"',
-                encoding="utf-8",
-            )
-
-            with patch("eval.benchmarks.run_terminal_bench._docker_image_exists", return_value=True):
-                rewritten = repair_task_images(dataset_path)
-
-            self.assertEqual(rewritten, 0)
-            self.assertIn(
-                'docker_image = "ghcr.io/laude-institute/terminal-bench/fix-git:2.0"',
-                task_file.read_text(encoding="utf-8"),
-            )
-        finally:
-            shutil.rmtree(repo_root, ignore_errors=True)
-
-    def test_repair_task_images_can_limit_to_selected_tasks(self):
-        repo_root = self._workspace_path("test-terminal-bench-image-filter")
-        dataset_path = repo_root / ".harbor" / "datasets" / "terminal-bench-2-1"
-        try:
-            for task in ("overfull-hbox", "custom-memory-heap-crash"):
+            for task in ("overfull-hbox", "fix-git", "custom-memory-heap-crash"):
                 task_dir = dataset_path / "tasks" / task
                 task_dir.mkdir(parents=True, exist_ok=True)
                 (task_dir / "task.toml").write_text(
-                    "\n".join(
-                        [
-                            "[environment]",
-                            f'docker_image = "ghcr.io/laude-institute/terminal-bench/{task}:2.0"',
-                        ]
-                    ),
-                    encoding="utf-8",
-                )
-
+                    f'[environment]\ndocker_image = "ghcr.io/laude-institute/terminal-bench/{task}:2.0"', encoding="utf-8")
             seen: list[str] = []
 
             def fake_exists(image: str) -> bool:
                 seen.append(image)
-                return image == "alexgshaw/overfull-hbox:20251031"
+                return image in {"alexgshaw/overfull-hbox:20251031", "ghcr.io/laude-institute/terminal-bench/fix-git:2.0"}
 
             with patch("eval.benchmarks.run_terminal_bench._docker_image_exists", side_effect=fake_exists):
-                repaired = repair_task_images(dataset_path, ["overfull-hbox"])
+                repaired = repair_task_images(dataset_path, ["overfull-hbox", "fix-git"])
+
+            def image(task):
+                return (dataset_path / "tasks" / task / "task.toml").read_text(encoding="utf-8")
 
             self.assertEqual(repaired, 1)
-            self.assertIn("overfull-hbox", "\n".join(seen))
+            self.assertIn('docker_image = "alexgshaw/overfull-hbox:20251031"', image("overfull-hbox"))
+            self.assertIn("terminal-bench/fix-git:2.0", image("fix-git"))
             self.assertNotIn("custom-memory-heap-crash", "\n".join(seen))
         finally:
             shutil.rmtree(repo_root, ignore_errors=True)
 
-    def test_repair_task_images_uses_2_1_tasks_layout(self):
-        repo_root = self._workspace_path("test-terminal-bench-image-tasks-dir")
+    def test_patch_verifier_proxy_env_fills_merges_and_appends_sections(self):
+        repo_root = self._workspace_path("test-terminal-bench-verifier-proxy")
         dataset_path = repo_root / ".harbor" / "datasets" / "terminal-bench-2-1"
+        image = '[environment]\ndocker_image = "alexgshaw/circuit-fibsqrt:20251031"\n'
+        tasks = {
+            "empty": "[verifier]\ntimeout_sec = 3600.0\n\n[verifier.env]\n\n" + image,
+            "existing": '[verifier.env]\nNO_PROXY = "localhost,astral.sh"\n\n' + image,
+            "missing": "[environment]\n",
+            "defaults": '[verifier.env]\nNO_PROXY = "localhost,astral.sh"\nno_proxy = "localhost,astral.sh"\n',
+        }
         try:
-            task_dir = dataset_path / "tasks" / "overfull-hbox"
-            task_dir.mkdir(parents=True, exist_ok=True)
-            task_file = task_dir / "task.toml"
-            task_file.write_text(
-                '[environment]\ndocker_image = "ghcr.io/laude-institute/terminal-bench/overfull-hbox:2.1"',
-                encoding="utf-8",
-            )
+            for name, content in tasks.items():
+                (dataset_path / "tasks" / name).mkdir(parents=True, exist_ok=True)
+                (dataset_path / "tasks" / name / "task.toml").write_text(content, encoding="utf-8")
 
-            def fake_exists(image: str) -> bool:
-                return image == "alexgshaw/overfull-hbox:20251031"
+            def read(name):
+                return (dataset_path / "tasks" / name / "task.toml").read_text(encoding="utf-8")
 
-            with patch("eval.benchmarks.run_terminal_bench._docker_image_exists", side_effect=fake_exists):
-                repaired = repair_task_images(dataset_path, ["overfull-hbox"])
+            hosts = ("astral.sh", "github.com")
+            selected = ["empty", "existing", "missing"]
+            self.assertEqual(patch_verifier_proxy_env(dataset_path, selected, no_proxy_hosts=hosts), 3)
+            self.assertEqual(patch_verifier_proxy_env(dataset_path, selected, no_proxy_hosts=hosts), 0)
 
-            self.assertEqual(repaired, 1)
-            self.assertIn(
-                'docker_image = "alexgshaw/overfull-hbox:20251031"',
-                task_file.read_text(encoding="utf-8"),
-            )
-        finally:
-            shutil.rmtree(repo_root, ignore_errors=True)
+            empty = read("empty")
+            self.assertIn('[verifier.env]\nNO_PROXY = "astral.sh,github.com"\nno_proxy = "astral.sh,github.com"', empty)
+            self.assertLess(empty.index("NO_PROXY"), empty.index("[environment]"))
+            self.assertIn('NO_PROXY = "localhost,astral.sh,github.com"', read("existing"))
+            self.assertIn('no_proxy = "astral.sh,github.com"', read("existing"))
+            self.assertTrue(read("missing").endswith(
+                '[verifier.env]\nNO_PROXY = "astral.sh,github.com"\nno_proxy = "astral.sh,github.com"\n'))
 
-    def test_patch_verifier_proxy_env_populates_empty_verifier_env(self):
-        repo_root = self._workspace_path("test-terminal-bench-verifier-proxy-empty")
-        dataset_path = repo_root / ".harbor" / "datasets" / "terminal-bench-2-1"
-        try:
-            task_dir = dataset_path / "tasks" / "circuit-fibsqrt"
-            task_dir.mkdir(parents=True, exist_ok=True)
-            task_file = task_dir / "task.toml"
-            task_file.write_text(
-                '[verifier]\ntimeout_sec = 3600.0\n\n[verifier.env]\n\n[environment]\ndocker_image = "alexgshaw/circuit-fibsqrt:20251031"'
-                + "\n",
-                encoding="utf-8",
-            )
-
-            patched = patch_verifier_proxy_env(dataset_path, ["circuit-fibsqrt"], no_proxy_hosts=("astral.sh", "pypi.org"))
-
-            self.assertEqual(patched, 1)
-            content = task_file.read_text(encoding="utf-8")
-            self.assertIn('[verifier.env]\nNO_PROXY = "astral.sh,pypi.org"\nno_proxy = "astral.sh,pypi.org"', content)
-            self.assertLess(content.index("NO_PROXY"), content.index("[environment]"))
-        finally:
-            shutil.rmtree(repo_root, ignore_errors=True)
-
-    def test_patch_verifier_proxy_env_merges_existing_values(self):
-        repo_root = self._workspace_path("test-terminal-bench-verifier-proxy-merge")
-        dataset_path = repo_root / ".harbor" / "datasets" / "terminal-bench-2-1"
-        try:
-            task_dir = dataset_path / "tasks" / "circuit-fibsqrt"
-            task_dir.mkdir(parents=True, exist_ok=True)
-            task_file = task_dir / "task.toml"
-            task_file.write_text(
-                '[verifier.env]\nNO_PROXY = "localhost,astral.sh"\n\n[environment]\ndocker_image = "alexgshaw/circuit-fibsqrt:20251031"'
-                + "\n",
-                encoding="utf-8",
-            )
-
-            patched = patch_verifier_proxy_env(dataset_path, ["circuit-fibsqrt"], no_proxy_hosts=("astral.sh", "github.com"))
-            second = patch_verifier_proxy_env(dataset_path, ["circuit-fibsqrt"], no_proxy_hosts=("astral.sh", "github.com"))
-
-            content = task_file.read_text(encoding="utf-8")
-            self.assertEqual(patched, 1)
-            self.assertEqual(second, 0)
-            self.assertIn('NO_PROXY = "localhost,astral.sh,github.com"', content)
-            self.assertIn('no_proxy = "astral.sh,github.com"', content)
+            # The default host list covers the model and dataset download hosts.
+            self.assertEqual(patch_verifier_proxy_env(dataset_path, ["defaults"]), 1)
+            defaults = read("defaults")
+            for host in ("download.pytorch.org", "download-r2.pytorch.org", "huggingface.co",
+                         "us.aws.cdn.hf.co", "cas-bridge.xethub.hf.co"):
+                self.assertIn(host, defaults)
+            self.assertIn('NO_PROXY = "localhost,astral.sh,127.0.0.1', defaults)
         finally:
             shutil.rmtree(repo_root, ignore_errors=True)
 
@@ -577,49 +441,6 @@ class TerminalBenchLauncherTests(unittest.TestCase):
         self.assertIn("huggingface.co", DEFAULT_VERIFIER_NO_PROXY_HOSTS)
         self.assertIn("us.aws.cdn.hf.co", DEFAULT_VERIFIER_NO_PROXY_HOSTS)
         self.assertIn("cas-bridge.xethub.hf.co", DEFAULT_VERIFIER_NO_PROXY_HOSTS)
-
-    def test_patch_verifier_proxy_env_adds_huggingface_hosts_to_existing_task(self):
-        repo_root = self._workspace_path("test-terminal-bench-verifier-proxy-hf")
-        dataset_path = repo_root / ".harbor" / "datasets" / "terminal-bench-2-1"
-        try:
-            task_dir = dataset_path / "tasks" / "reshard-c4-data"
-            task_dir.mkdir(parents=True, exist_ok=True)
-            task_file = task_dir / "task.toml"
-            task_file.write_text(
-                '[verifier.env]\nNO_PROXY = "localhost,astral.sh"\nno_proxy = "localhost,astral.sh"'
-                + "\n",
-                encoding="utf-8",
-            )
-
-            patched = patch_verifier_proxy_env(dataset_path, ["reshard-c4-data"])
-
-            content = task_file.read_text(encoding="utf-8")
-            self.assertEqual(patched, 1)
-            self.assertIn("download.pytorch.org", content)
-            self.assertIn("download-r2.pytorch.org", content)
-            self.assertIn("huggingface.co", content)
-            self.assertIn("us.aws.cdn.hf.co", content)
-            self.assertIn("cas-bridge.xethub.hf.co", content)
-            self.assertIn('NO_PROXY = "localhost,astral.sh,127.0.0.1', content)
-            self.assertIn('no_proxy = "localhost,astral.sh,127.0.0.1', content)
-        finally:
-            shutil.rmtree(repo_root, ignore_errors=True)
-
-    def test_patch_verifier_proxy_env_appends_missing_section(self):
-        repo_root = self._workspace_path("test-terminal-bench-verifier-proxy-missing")
-        dataset_path = repo_root / ".harbor" / "datasets" / "terminal-bench-2-1"
-        try:
-            task_dir = dataset_path / "tasks" / "fix-git"
-            task_dir.mkdir(parents=True, exist_ok=True)
-            task_file = task_dir / "task.toml"
-            task_file.write_text("[environment]\n", encoding="utf-8")
-
-            patched = patch_verifier_proxy_env(dataset_path, ["fix-git"], no_proxy_hosts=("astral.sh",))
-
-            self.assertEqual(patched, 1)
-            self.assertTrue(task_file.read_text(encoding="utf-8").endswith('[verifier.env]\nNO_PROXY = "astral.sh"\nno_proxy = "astral.sh"\n'))
-        finally:
-            shutil.rmtree(repo_root, ignore_errors=True)
 
     def test_pre_pull_task_images_pulls_only_missing_selected_images(self):
         repo_root = self._workspace_path("test-terminal-bench-image-prepull")

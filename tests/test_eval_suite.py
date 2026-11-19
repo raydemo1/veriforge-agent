@@ -141,7 +141,10 @@ class EvalSuiteTests(unittest.TestCase):
         self.assertIsNone(tb2_plan["agent_budget_sec"])
 
     def test_tb41_launcher_uses_registry_dataset_and_caps_agent_timeout(self):
-        from eval.benchmarks.run_terminal_bench import build_tb41_run_command, parse_args
+        from eval.benchmarks.run_terminal_bench import (
+            build_tb41_run_command,
+            parse_args,
+        )
 
         args = parse_args(["--benchmark", "tb4.1", "--task", "music-harmony", "--task-budget", "1800"])
         command = build_tb41_run_command(args, "harbor")
@@ -531,87 +534,33 @@ class EvalSuiteTests(unittest.TestCase):
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(summary["task_count"], 1)
 
-    def test_terminal_bench_task_diagnostics_classifies_timeout(self):
+    def test_terminal_bench_task_diagnostics_classifies_failure_kinds(self):
         from eval.scripts.run_terminal_bench_eval import _task_diagnostics
 
-        diagnostic = _task_diagnostics(
-            task="example",
-            status="failed",
-            returncode=0,
-            stdout="harbor.trial.errors.AgentTimeoutError: Agent execution timed out after 900.0 seconds",
-            stderr="",
-            launcher_result={"trial_name": "example__abc", "metrics": {}},
-        )
-
-        self.assertEqual(diagnostic["failure_kind"], "agent_timeout")
-        self.assertTrue(diagnostic["missing_metrics"])
-
-    def test_terminal_bench_task_diagnostics_classifies_agent_setup_failure(self):
-        from eval.scripts.run_terminal_bench_eval import _task_diagnostics
-
-        diagnostic = _task_diagnostics(
-            task="example",
-            status="failed",
-            returncode=1,
-            stdout="",
-            stderr="",
-            launcher_result={
-                "trial_name": "example__abc",
-                "exception_type": "NonZeroAgentExitCodeError",
-                "exception_message": "FATAL: failed to install harness dependencies",
-                "metrics": {},
-            },
-        )
-
-        self.assertEqual(diagnostic["failure_kind"], "infra_failure")
-        self.assertTrue(diagnostic["missing_metrics"])
-
-    def test_terminal_bench_task_diagnostics_classifies_agent_start_failure(self):
-        from eval.scripts.run_terminal_bench_eval import _task_diagnostics
-
-        diagnostic = _task_diagnostics(
-            task="example",
-            status="failed",
-            returncode=1,
-            stdout="AttachmentError: 附件超过单文件限制（20 MB）",
-            stderr="",
-            launcher_result={"trial_name": "example__abc", "metrics": {}},
-        )
-
-        self.assertEqual(diagnostic["failure_kind"], "agent_start_failure")
-
-    def test_terminal_bench_task_diagnostics_classifies_bubblewrap_failure(self):
-        from eval.scripts.run_terminal_bench_eval import _task_diagnostics
-
-        diagnostic = _task_diagnostics(
-            task="example",
-            status="failed",
-            returncode=0,
-            stdout="restricted shell execution requires bubblewrap (bwrap) on Linux",
-            stderr="",
-            launcher_result={"trial_name": "example__abc", "metrics": {"tokens": {"llm_calls": 3}}},
-        )
-
-        self.assertEqual(diagnostic["failure_kind"], "infra_failure")
-
-    def test_terminal_bench_task_diagnostics_classifies_verifier_failure(self):
-        from eval.scripts.run_terminal_bench_eval import _task_diagnostics
-
-        diagnostic = _task_diagnostics(
-            task="example",
-            status="failed",
-            returncode=0,
-            stdout="FAILED ../tests/test_outputs.py::test_x - AssertionError: bad output",
-            stderr="",
-            launcher_result={
-                "trial_name": "example__abc",
-                "metrics": {"tokens": {"llm_calls": 3}, "tools": {"tool_calls": 5}},
-            },
-        )
-
-        self.assertEqual(diagnostic["failure_kind"], "task_failure")
-        self.assertFalse(diagnostic["missing_metrics"])
-        self.assertIn("FAILED", diagnostic["verifier_failure_headline"])
+        with_metrics = {"tokens": {"llm_calls": 3}, "tools": {"tool_calls": 5}}
+        cases = [
+            # (returncode, stdout, extra launcher fields, metrics, kind, missing metrics)
+            (0, "harbor.trial.errors.AgentTimeoutError: Agent execution timed out after 900.0 seconds",
+             {}, {}, "agent_timeout", True),
+            (1, "", {"exception_type": "NonZeroAgentExitCodeError",
+                     "exception_message": "FATAL: failed to install harness dependencies"},
+             {}, "infra_failure", True),
+            (1, "AttachmentError: 附件超过单文件限制（20 MB）", {}, {}, "agent_start_failure", True),
+            (0, "restricted shell execution requires bubblewrap (bwrap) on Linux",
+             {}, with_metrics, "infra_failure", False),
+            (0, "FAILED ../tests/test_outputs.py::test_x - AssertionError: bad output",
+             {}, with_metrics, "task_failure", False),
+        ]
+        for returncode, stdout, extra, metrics, kind, missing in cases:
+            with self.subTest(kind=kind, stdout=stdout[:40]):
+                diagnostic = _task_diagnostics(
+                    task="example", status="failed", returncode=returncode, stdout=stdout, stderr="",
+                    launcher_result={"trial_name": "example__abc", "metrics": metrics, **extra},
+                )
+                self.assertEqual(diagnostic["failure_kind"], kind)
+                self.assertEqual(diagnostic["missing_metrics"], missing)
+                if kind == "task_failure":
+                    self.assertIn("FAILED", diagnostic["verifier_failure_headline"])
 
     def test_terminal_bench_task_diagnostics_extracts_final_report_summary(self):
         from eval.scripts.run_terminal_bench_eval import _task_diagnostics
