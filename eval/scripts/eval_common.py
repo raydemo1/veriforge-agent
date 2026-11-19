@@ -23,9 +23,6 @@ TBENCH_TASK_FILES = {
     "24task": "terminal_bench_24task.json",
     "full": "terminal_bench_full.json",
 }
-CLAW_TASK_FILES = {
-    "lite80": "claw_swe_bench_lite80.json",
-}
 
 
 @dataclass
@@ -84,10 +81,6 @@ def load_task_list(filename: str) -> dict[str, Any]:
 
 def load_tbench_task_config(task_set: str) -> dict[str, Any]:
     return load_task_list(TBENCH_TASK_FILES[task_set])
-
-
-def load_claw_task_config(task_set: str) -> dict[str, Any]:
-    return load_task_list(CLAW_TASK_FILES[task_set])
 
 
 def load_tbench_metadata() -> dict[str, Any]:

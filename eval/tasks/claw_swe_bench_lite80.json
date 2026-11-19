@@ -1,9 +1,0 @@
-{
-  "suite": "claw_swe_bench_lite80",
-  "task_set": "lite80",
-  "benchmark_name": "Claw-SWE-Bench Lite80",
-  "description": "80-instance Claw-SWE-Bench Lite subset for low-cost SWE-style harness evaluation.",
-  "dataset_name": "TokenRhythm/Claw-SWE-Bench",
-  "dataset_config": "lite",
-  "split": "test"
-}

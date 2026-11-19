@@ -105,15 +105,6 @@ class EvalSuiteTests(unittest.TestCase):
         self.assertEqual(larger_plan["terminal_bench_task_set"], "24task")
         self.assertEqual(len(larger_plan["terminal_bench_tasks"]), 24)
 
-    def test_claw_swe_bench_lite80_config_is_fixed(self):
-        payload = json.loads(Path("eval/tasks/claw_swe_bench_lite80.json").read_text(encoding="utf-8"))
-        self.assertEqual(payload["suite"], "claw_swe_bench_lite80")
-        self.assertEqual(payload["task_set"], "lite80")
-        self.assertEqual(payload["benchmark_name"], "Claw-SWE-Bench Lite80")
-        self.assertEqual(payload["dataset_name"], "TokenRhythm/Claw-SWE-Bench")
-        self.assertEqual(payload["dataset_config"], "lite")
-        self.assertEqual(payload["split"], "test")
-
     def test_memory_ab_seed_records_cover_success_markers(self):
         payload = json.loads(Path("eval/tasks/memory_ab.json").read_text(encoding="utf-8"))
 
@@ -155,17 +146,6 @@ class EvalSuiteTests(unittest.TestCase):
         self.assertEqual(cost["pricing_per_1m_tokens"]["input_cache_miss"], 0.14)
         self.assertEqual(cost["pricing_per_1m_tokens"]["output"], 0.28)
         self.assertAlmostEqual(cost["estimated_cost_usd"], (800 * 0.0028 + 200 * 0.14 + 500 * 0.28) / 1_000_000)
-
-    def test_claw_swe_bench_eval_dry_run_includes_lite80(self):
-        from eval.scripts.run_claw_swe_bench_eval import _dry_run_plan, parse_args
-
-        args = parse_args(["--dry-run", "--claw-limit", "3"])
-        plan = _dry_run_plan(args)
-
-        self.assertEqual(plan["claw_swe_bench_task_set"], "lite80")
-        self.assertEqual(plan["claw_swe_bench_benchmark_name"], "Claw-SWE-Bench Lite80")
-        self.assertEqual(plan["claw_swe_bench_dataset"]["dataset_name"], "TokenRhythm/Claw-SWE-Bench")
-        self.assertEqual(plan["claw_swe_bench_dataset"]["limit"], 3)
 
     def test_run_tbench_suite_records_per_task_category_results(self):
         from eval.scripts.run_terminal_bench_eval import parse_args, run_tbench_suite
@@ -481,54 +461,6 @@ class EvalSuiteTests(unittest.TestCase):
 
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(summary["task_count"], 1)
-
-    def test_run_claw_suite_invokes_launcher(self):
-        from eval.scripts.run_claw_swe_bench_eval import parse_args, run_claw_suite
-
-        args = parse_args([
-            "--claw-limit",
-            "2",
-            "--output-root",
-            str(self.root / "results"),
-            "--run-name",
-            "unit",
-            "--claw-no-install-deps",
-        ])
-
-        with patch("eval.scripts.run_claw_swe_bench_eval.subprocess.run") as run_mock:
-            run_claw_suite(args)
-
-        command = run_mock.call_args.args[0]
-        self.assertIn("run_claw_swe_bench.py", command[1])
-        self.assertIn("--limit", command)
-        self.assertIn("2", command)
-        self.assertIn("--no-install-deps", command)
-
-    def test_harness_claw_adapter_builds_container_args_and_command(self):
-        from eval.benchmarks.harness_claw_adapter import (
-            HarnessCodeAgentAdapter,
-            _agent_command,
-        )
-
-        adapter = HarnessCodeAgentAdapter(
-            model="deepseek-v4-flash",
-            timeout=120,
-            max_turns=12,
-            repo_root=Path.cwd(),
-            install_deps=False,
-        )
-        args = adapter.container_run_args("example__repo-1")
-        joined = " ".join(args)
-        self.assertIn("/opt/harness-code-agent:ro", joined)
-        self.assertIn("HARNESS_WORKSPACE=/testbed", joined)
-        self.assertIn("HARNESS_MODEL=deepseek-v4-flash", joined)
-        self.assertIn("HARNESS_MODEL_HARD=deepseek-v4-flash", joined)
-        self.assertIn("HARNESS_MODEL_INTENSITY=normal", joined)
-        self.assertNotIn("MAX_AGENT_ITERATIONS", joined)
-
-        command = _agent_command(timeout=120)
-        self.assertIn("HARNESS_TASK_BUDGET=120", command)
-        self.assertIn("hca_claw_runner.py", command)
 
     def test_terminal_bench_task_diagnostics_classifies_timeout(self):
         from eval.scripts.run_terminal_bench_eval import _task_diagnostics

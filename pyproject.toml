@@ -96,5 +96,4 @@ extend-select = ["BLE001"]
 # Benchmark entrypoints must record arbitrary agent/runtime failures as failed
 # trials. The terminal runner also catches BaseException to preserve partial
 # artifacts when the benchmark process is interrupted.
-"eval/benchmarks/hca_claw_runner.py" = ["BLE001"]
 "eval/benchmarks/hca_terminal_runner.py" = ["BLE001"]

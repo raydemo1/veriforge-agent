@@ -16,7 +16,7 @@ pip install -e ".[eval]"
 eval/
 ├── scripts/      评测入口和结果账本工具
 ├── tasks/        固定的轻量任务集
-├── benchmarks/   外部基准的适配器：Terminal-Bench 2.1（通过 Harbor）、Claw-SWE-Bench
+├── benchmarks/   外部基准的适配器：Terminal-Bench 2.1（通过 Harbor）
 ├── reports/      历史评测报告（按日期命名）
 └── results/      运行产物和汇总（不进入 Git）
 ```
@@ -96,16 +96,6 @@ python eval/benchmarks/run_terminal_bench.py --task fix-git --force-build     # 
 任务元数据在 `benchmarks/data/tb2_tasks.json`，由 `benchmarks/tb2_metadata.py` 读取。
 
 当前账本记录：VeriForge + `DeepSeek-V4-Flash-Preview` 在 Terminal-Bench 2.1 上通过 `56/89`（62.9%）。作为参照，官方 DeepSeek Harness 在 Max 推理强度下的同模型成绩为 61.8%。
-
-## Claw-SWE-Bench
-
-```bash
-python eval/scripts/run_claw_swe_bench_eval.py --dry-run --claw-limit 5
-python eval/scripts/run_claw_swe_bench_eval.py --claw-limit 5
-python eval/benchmarks/run_claw_swe_bench.py --limit 5
-```
-
-默认使用 Hugging Face 数据集 `TokenRhythm/Claw-SWE-Bench` 的 `lite` 配置，需要 SWE-bench 的 Docker 镜像。首次运行时会把上游编排器 `opensquilla/claw-swe-bench` 克隆到 `.harbor/datasets/`。`benchmarks/harness_claw_adapter.py` 在每个容器内运行 VeriForge，由上游 runner 收集补丁。使用 `--no-install-deps` 时，任务镜像需要自带 `python3.14` 和 VeriForge 的运行依赖。
 
 ## 结果账本
 

@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from eval.benchmarks import hca_claw_runner, hca_terminal_runner
+from eval.benchmarks import hca_terminal_runner
 from harness_code_agent import cli, config
 from harness_code_agent.core.interactive import InteractiveSession
 from harness_code_agent.headless import run_task
@@ -102,14 +102,14 @@ def test_empty_task_fails_without_starting_session(tmp_path, model):
     model.chat.completions.create.assert_not_called()
 
 
-@pytest.mark.parametrize("entry,failure", [("cli", False), ("terminal", False), ("terminal", True), ("claw", False)])
+@pytest.mark.parametrize("entry,failure", [("cli", False), ("terminal", False), ("terminal", True)])
 def test_entrypoints_execute_real_session_and_report_failures(tmp_path, model, monkeypatch, capsys, entry, failure):
     monkeypatch.chdir(tmp_path)
     artifacts = tmp_path / "artifacts"
     monkeypatch.setenv("HCA_ARTIFACTS_ROOT", str(artifacts))
     if entry == "cli":
         exit_code = cli.main(["-p", "Inspect the code"])
-    elif entry == "terminal":
+    else:
         def create(**kwargs):
             assert len(list(artifacts.glob("hca/*/early_manifest.json"))) == 1
             if failure:
@@ -118,10 +118,6 @@ def test_entrypoints_execute_real_session_and_report_failures(tmp_path, model, m
 
         model.chat.completions.create.side_effect = create
         exit_code = hca_terminal_runner.main(["--workspace", str(tmp_path), "Inspect the code"])
-    else:
-        prompt_file = tmp_path / "prompt.txt"
-        prompt_file.write_text("Inspect the code", encoding="utf-8")
-        exit_code = hca_claw_runner.main([str(prompt_file), "--workspace", str(tmp_path)])
 
     output = capsys.readouterr()
     assert exit_code == (1 if failure else 0)
