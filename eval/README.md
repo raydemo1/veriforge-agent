@@ -16,7 +16,7 @@ pip install -e ".[eval]"
 eval/
 ├── scripts/      评测入口和结果账本工具
 ├── tasks/        固定的轻量任务集
-├── benchmarks/   外部基准的适配器：Terminal-Bench 2.1（通过 Harbor）
+├── benchmarks/   外部基准的适配器：Terminal-Bench 2.1 / 4.1（通过 Harbor）
 ├── reports/      历史评测报告（按日期命名）
 └── results/      运行产物和汇总（不进入 Git）
 ```
@@ -96,6 +96,24 @@ python eval/benchmarks/run_terminal_bench.py --task fix-git --force-build     # 
 任务元数据在 `benchmarks/data/tb2_tasks.json`，由 `benchmarks/tb2_metadata.py` 读取。
 
 当前账本记录：VeriForge + `DeepSeek-V4-Flash-Preview` 在 Terminal-Bench 2.1 上通过 `56/89`（62.9%）。作为参照，官方 DeepSeek Harness 在 Max 推理强度下的同模型成绩为 61.8%。
+
+## Terminal-Bench 4.1（VeriLoop 20 题子集）
+
+VeriLoop 的自进化实验使用 TB4.1 的一个固定 20 题子集，不跑全量。清单、切分（evolve 10 题、held-out 10 题）和挑选规则在 `tasks/veriloop_tb41_20task.json`，全部 66 题的元数据（类别、专家估时、任务和判题环境所需的 CPU/内存/GPU）在 `benchmarks/data/tb41_tasks.json`。
+
+```bash
+python eval/scripts/run_terminal_bench_eval.py --tbench-task-set tb41-20task --dry-run
+python eval/scripts/run_terminal_bench_eval.py --tbench-task-set tb41-20task                  # 20 题，每题 1 次
+python eval/scripts/run_terminal_bench_eval.py --tbench-task-set tb41-20task --split evolve   # 只跑一个切分
+python eval/benchmarks/run_terminal_bench.py --benchmark tb4.1 --task music-harmony          # 单个任务
+```
+
+和 TB2.1 的区别：
+
+- 直接从 Harbor 注册表运行 `terminal-bench/terminal-bench@4.1.0`，任务名带组织前缀（`terminal-bench/<task>`），不下载本地数据集，也不修复镜像（TB4.1 的任务从自己的 Dockerfile 构建）。
+- 判题器在独立环境中运行（`environment_mode = "separate"`）。代理绕行设置通过 Harbor 的 `--ve NO_PROXY=...` 传给判题环境，不再改写 `task.toml`。
+- TB4.1 的官方 Agent 超时是 8 小时。评测里 Agent 的预算默认是每题 3600 秒（`--task-budget` 或任务集的 `run_policy.agent_budget_sec`），通过 `HARNESS_TASK_BUDGET` 传进容器；Harbor 自身的 Agent 超时设为预算再加 900 秒，保证 Agent 先自己停下并导出会话。因此结果不能和排行榜上 8 小时的成绩直接比较。
+- 子集只包含任务环境和判题环境都不超过 4 核、8 GB、无 GPU 的题目。在 6 核 / 6 GB 的机器上建议并发保持 1（默认值）。
 
 ## 结果账本
 

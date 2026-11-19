@@ -51,7 +51,16 @@ def resolve_task_metadata(user_prompt: str = "", *, workspace: str = "") -> dict
 
 
 def resolve_task_budget(user_prompt: str = "", *, workspace: str = "") -> float:
-    """Return the wall-clock budget for this task, falling back to the default."""
+    """Return the wall-clock budget for this task.
+
+    An explicit ``HARNESS_TASK_BUDGET`` wins: the Terminal-Bench 4.1 launcher
+    sets it, since TB4.1 tasks are not in the TB2 table and their 8-hour
+    benchmark timeout is far above the budget the evaluation pays for.
+    Otherwise the TB2 per-task timeout applies, then the default.
+    """
+    explicit = _env_budget()
+    if explicit is not None:
+        return explicit
     metadata = resolve_task_metadata(user_prompt, workspace=workspace)
     if metadata and metadata.get("agent_timeout_sec"):
         try:
@@ -61,12 +70,17 @@ def resolve_task_budget(user_prompt: str = "", *, workspace: str = "") -> float:
     return _default_budget()
 
 
-def _default_budget() -> float:
+def _env_budget() -> float | None:
     raw = os.environ.get("HARNESS_TASK_BUDGET")
     try:
-        return float(raw) if raw else DEFAULT_TASK_BUDGET_SECONDS
+        value = float(raw) if raw else None
     except ValueError:
-        return DEFAULT_TASK_BUDGET_SECONDS
+        return None
+    return value if value and value > 0 else None
+
+
+def _default_budget() -> float:
+    return _env_budget() or DEFAULT_TASK_BUDGET_SECONDS
 
 
 def _task_meta_by_name(tasks: dict, raw_task_name: str) -> dict | None:

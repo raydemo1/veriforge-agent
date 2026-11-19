@@ -1,0 +1,78 @@
+{
+  "suite": "veriloop_tb41_20task",
+  "task_set": "tb41-20task",
+  "benchmark": "tb4.1",
+  "benchmark_name": "Terminal-Bench 4.1 20-task subset (VeriLoop)",
+  "description": "Fixed 20-task Terminal-Bench 4.1 subset for VeriLoop self-evolution experiments, split 10/10 into evolve and held-out halves. Not a full Terminal-Bench 4.1 run and must not be reported as one.",
+  "selection_policy": {
+    "source": "eval/benchmarks/data/tb41_tasks.json (task.toml metadata) plus each task's environment/Dockerfile and tests/",
+    "frozen_before_results": "Chosen from metadata and environment files only, never from any agent's pass/fail results, so rerunning the subset cannot show a regression-to-the-mean improvement. Public per-task solve rates were not used.",
+    "runnable": "No GPU; task environment and verifier environment both within 4 CPUs and 8 GB (excludes 16 GB and 8-CPU tasks such as medical-claims-processing, formal-crypto, shadow-relay, and payments-pipeline-fix whose verifier needs 8 CPUs / 16 GB); no CPU-served LLM inference (sglang-qwen-burst, vllm-deepseek-streaming); no nested VM (uefi-bootkit).",
+    "not_too_hard": "Shortest runnable tasks by expert_time_estimate_hours (0.75-4 h; the benchmark median is about 4 h).",
+    "diversity": "All 7 categories covered; near-duplicate variant layout-config-recreation2 excluded to avoid leakage across the split.",
+    "split": "10/10 stratified by category, with total expert hours close (evolve 22.75 h, held-out 20.25 h)."
+  },
+  "run_policy": {
+    "attempts_per_task": 1,
+    "agent_budget_sec": 3600,
+    "model": "deepseek-flash (DeepSeek-V4.1-Flash-1017 at selection time), intensity normal (thinking on, reasoning_effort=high)",
+    "pin": "Record the model identifier returned by the API on every run; rerun the baseline if it changes.",
+    "concurrency": "1 on a 6-CPU / 6 GB machine; several tasks request 8 GB and some run extra service containers."
+  },
+  "needs_check": {
+    "html-js-filter": "Its verifier image was tuned for Modal's sandbox; confirm the separate verifier builds and runs under local Docker, otherwise replace it from backups before any agent result is seen.",
+    "multi_service": "intrastat-meldung and legacy-utility-triage start extra service containers; watch memory on a 6 GB host."
+  },
+  "tasks": [
+    "photonic-waveguide-routing",
+    "mvcc-lsm-compaction",
+    "roy-polymorph-cn",
+    "freecad-platform-drawing",
+    "cad-model",
+    "music-harmony",
+    "interleaved-vigenere",
+    "intrastat-meldung",
+    "legacy-utility-triage",
+    "pretrain-shard-corruption",
+    "bun-sourcemap-leak",
+    "protein-autointerp-disulfide",
+    "foodstuff-beta-activity",
+    "freecad-impeller",
+    "freecad-spring-clip",
+    "layout-config-recreation",
+    "html-js-filter",
+    "cargo-flight-dispatch",
+    "production-planning",
+    "vpp-loss-divergence"
+  ],
+  "splits": {
+    "evolve": [
+      "photonic-waveguide-routing",
+      "mvcc-lsm-compaction",
+      "roy-polymorph-cn",
+      "freecad-platform-drawing",
+      "cad-model",
+      "music-harmony",
+      "interleaved-vigenere",
+      "intrastat-meldung",
+      "legacy-utility-triage",
+      "pretrain-shard-corruption"
+    ],
+    "held_out": [
+      "bun-sourcemap-leak",
+      "protein-autointerp-disulfide",
+      "foodstuff-beta-activity",
+      "freecad-impeller",
+      "freecad-spring-clip",
+      "layout-config-recreation",
+      "html-js-filter",
+      "cargo-flight-dispatch",
+      "production-planning",
+      "vpp-loss-divergence"
+    ]
+  },
+  "backups": {
+    "tasks": ["nextjs-performance", "sound-change-cascade", "risk-scorer-replay", "gsea-proteomics"],
+    "rule": "Replace a task only if it cannot run in the environment (image build failure, verifier infrastructure unavailable), decided before seeing any agent result, with a backup in the same split; record the replacement."
+  }
+}

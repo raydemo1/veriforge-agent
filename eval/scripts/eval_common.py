@@ -18,10 +18,12 @@ if str(PROJECT_ROOT) not in sys.path:
 RESULTS_ROOT = PROJECT_ROOT / "eval" / "results"
 TASKS_ROOT = PROJECT_ROOT / "eval" / "tasks"
 TBENCH_METADATA_PATH = PROJECT_ROOT / "eval" / "benchmarks" / "data" / "tb2_tasks.json"
+TB41_METADATA_PATH = PROJECT_ROOT / "eval" / "benchmarks" / "data" / "tb41_tasks.json"
 TBENCH_TASK_FILES = {
     "8task": "terminal_bench_8task.json",
     "24task": "terminal_bench_24task.json",
     "full": "terminal_bench_full.json",
+    "tb41-20task": "veriloop_tb41_20task.json",
 }
 
 
@@ -83,8 +85,24 @@ def load_tbench_task_config(task_set: str) -> dict[str, Any]:
     return load_task_list(TBENCH_TASK_FILES[task_set])
 
 
-def load_tbench_metadata() -> dict[str, Any]:
+def tbench_benchmark(payload: dict[str, Any]) -> str:
+    """Terminal-Bench version a task-set file targets (task sets predating tb4.1 are tb2.1)."""
+    return str(payload.get("benchmark") or "tb2.1")
+
+
+def load_tbench_metadata(benchmark: str = "tb2.1") -> dict[str, Any]:
+    if benchmark == "tb4.1":
+        return json.loads(TB41_METADATA_PATH.read_text(encoding="utf-8"))["tasks"]
     return json.loads(TBENCH_METADATA_PATH.read_text(encoding="utf-8"))
+
+
+def task_splits(payload: dict[str, Any]) -> dict[str, str]:
+    """Map each task to its split name when the task set declares splits."""
+    return {
+        task: split
+        for split, tasks in (payload.get("splits") or {}).items()
+        for task in tasks
+    }
 
 
 def make_run_dir(args: argparse.Namespace, suite: str) -> Path:
@@ -170,6 +188,26 @@ def category_results(task_results: list[dict[str, Any]]) -> dict[str, Any]:
             "pass_rate": values["passed"] / values["task_count"] if values["task_count"] else 0.0,
         }
         for category, values in sorted(grouped.items())
+    }
+
+
+def split_results(task_results: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[str, dict[str, int]] = {}
+    for item in task_results:
+        split = item.get("split")
+        if not split:
+            continue
+        bucket = grouped.setdefault(str(split), {"task_count": 0, "passed": 0})
+        bucket["task_count"] += 1
+        if item.get("status") == "passed":
+            bucket["passed"] += 1
+    return {
+        split: {
+            "task_count": values["task_count"],
+            "passed": values["passed"],
+            "pass_rate": values["passed"] / values["task_count"] if values["task_count"] else 0.0,
+        }
+        for split, values in sorted(grouped.items())
     }
 
 

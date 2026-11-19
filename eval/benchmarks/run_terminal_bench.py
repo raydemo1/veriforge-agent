@@ -24,6 +24,17 @@ DATASET_ARCHIVE_URL = (
 HARBOR_DATASET_ID = "terminal-bench@2.1"
 LOCAL_DATASET_DIR_NAME = "terminal-bench-2-1"
 TERMINAL_BENCH_LABEL = "Terminal-Bench 2.1"
+# Terminal-Bench 4.1 runs straight from the Harbor registry: its tasks build
+# from their own Dockerfiles, so there are no prebuilt images to repair, and
+# registry task names carry the organization prefix.
+TB41_HARBOR_DATASET_ID = "terminal-bench/terminal-bench@4.1.0"
+TB41_TASK_PREFIX = "terminal-bench/"
+TB41_AGENT_TIMEOUT_SEC = 28800.0
+DEFAULT_TB41_TASK_BUDGET_SEC = 3600.0
+# Harbor's own agent timeout stays a little above the agent's budget so the
+# agent stops itself first and the session artifacts are exported.
+TB41_AGENT_TIMEOUT_MARGIN_SEC = 900.0
+BENCHMARKS = ("tb2.1", "tb4.1")
 DOCKERHUB_IMAGE_NAMESPACE = "alexgshaw"
 DOCKERHUB_IMAGE_TAG = "20251031"
 DEFAULT_AGENT_SETUP_TIMEOUT_SEC = 1200.0
@@ -390,12 +401,15 @@ def build_harbor_run_command(
     jobs_dir: Path | None = None,
     agent_setup_timeout_sec: float | None = None,
     environment_build_timeout_multiplier: float | None = None,
+    dataset_id: str = HARBOR_DATASET_ID,
+    agent_timeout_multiplier: float | None = None,
+    verifier_env: dict[str, str] | None = None,
 ) -> list[str]:
     command = [harbor_executable, "run"]
     if jobs_dir is not None:
         command.extend(["--jobs-dir", str(jobs_dir)])
     if dataset_path is None:
-        command.extend(["-d", HARBOR_DATASET_ID])
+        command.extend(["-d", dataset_id])
     else:
         command.extend(["--path", str(dataset_path)])
 
@@ -415,15 +429,38 @@ def build_harbor_run_command(
                 str(environment_build_timeout_multiplier),
             ]
         )
+    if agent_timeout_multiplier is not None:
+        command.extend(["--agent-timeout-multiplier", f"{agent_timeout_multiplier:.6g}"])
+    for key, value in (verifier_env or {}).items():
+        command.extend(["--ve", f"{key}={value}"])
     for task in tasks:
         command.extend(["--include-task-name", task])
 
     return command
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=f"Run {TERMINAL_BENCH_LABEL} from a local dataset with repaired prebuilt image references."
+        description=(
+            f"Run {TERMINAL_BENCH_LABEL} from a local dataset with repaired prebuilt image "
+            "references, or Terminal-Bench 4.1 from the Harbor registry."
+        )
+    )
+    parser.add_argument(
+        "--benchmark",
+        choices=BENCHMARKS,
+        default="tb2.1",
+        help="Terminal-Bench version to run (default: tb2.1).",
+    )
+    parser.add_argument(
+        "--task-budget",
+        type=float,
+        default=DEFAULT_TB41_TASK_BUDGET_SEC,
+        help=(
+            "tb4.1 only: the agent's wall-clock budget per task in seconds "
+            f"(default {DEFAULT_TB41_TASK_BUDGET_SEC:.0f}). Harbor's agent timeout is set "
+            f"{TB41_AGENT_TIMEOUT_MARGIN_SEC:.0f}s above it."
+        ),
     )
     parser.add_argument(
         "--task",
@@ -481,14 +518,53 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not inject NO_PROXY/no_proxy into task verifier.env sections in the local dataset copy.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def tb41_registry_task_names(tasks: list[str]) -> list[str]:
+    """Registry task names for --include-task-name (Harbor matches org/name)."""
+    return [task if task.startswith(TB41_TASK_PREFIX) else TB41_TASK_PREFIX + task for task in tasks]
+
+
+def tb41_agent_timeout_multiplier(task_budget_sec: float) -> float:
+    return (task_budget_sec + TB41_AGENT_TIMEOUT_MARGIN_SEC) / TB41_AGENT_TIMEOUT_SEC
+
+
+def build_tb41_run_command(
+    args: argparse.Namespace,
+    harbor_executable: str,
+) -> list[str]:
+    if args.full or not args.task:
+        raise ValueError("tb4.1 runs need explicit --task names; the full dataset is not supported here.")
+    if args.task_budget <= 0:
+        raise ValueError("--task-budget must be positive.")
+    verifier_env: dict[str, str] = {}
+    if not args.no_patch_verifier_proxy:
+        no_proxy_value = ",".join(DEFAULT_VERIFIER_NO_PROXY_HOSTS)
+        verifier_env = {"NO_PROXY": no_proxy_value, "no_proxy": no_proxy_value}
+    return build_harbor_run_command(
+        harbor_executable=harbor_executable,
+        tasks=tb41_registry_task_names(args.task),
+        runner_env=args.runner_env,
+        dataset_path=None,
+        force_build=args.force_build,
+        jobs_dir=args.jobs_dir,
+        agent_setup_timeout_sec=args.agent_setup_timeout,
+        environment_build_timeout_multiplier=args.environment_build_timeout_multiplier,
+        dataset_id=TB41_HARBOR_DATASET_ID,
+        agent_timeout_multiplier=tb41_agent_timeout_multiplier(args.task_budget),
+        verifier_env=verifier_env,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     repo_root = Path(__file__).resolve().parents[2]
     env = build_launch_environment(repo_root)
     harbor_executable = resolve_harbor_executable(env)
+
+    if args.benchmark == "tb4.1":
+        return _run_tb41(args, repo_root, env, harbor_executable)
 
     tasks = [] if args.full else args.task
     selected_tasks = None if args.full or not args.task else tasks
@@ -520,8 +596,40 @@ def main() -> int:
     print(f"Repaired {repaired_count} broken task docker_image entries")
     print(f"Pre-pulled {len(pulled_images)} missing task image(s)")
     print(f"Running: {' '.join(command)}")
+    return _run_harbor(command, repo_root, env, args.jobs_dir)
 
-    jobs_root = (args.jobs_dir or (repo_root / "jobs")).resolve()
+
+def _run_tb41(
+    args: argparse.Namespace,
+    repo_root: Path,
+    env: dict[str, str],
+    harbor_executable: str,
+) -> int:
+    try:
+        command = build_tb41_run_command(args, harbor_executable)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.runner_env != "daytona" and not docker_daemon_running():
+        print("Docker daemon is not running. Please start Docker and try again.", file=sys.stderr)
+        return 125
+    # The in-container runner reads the budget from this variable; Harbor
+    # forwards it through the agent's environment (see harbor_env.py).
+    env["HARNESS_TASK_BUDGET"] = f"{args.task_budget:g}"
+    print(f"Using TEMP/TMP: {env['TEMP']}")
+    print(f"Dataset: {TB41_HARBOR_DATASET_ID} (Harbor registry)")
+    print(f"Agent budget per task: {args.task_budget:g}s")
+    print(f"Running: {' '.join(command)}")
+    return _run_harbor(command, repo_root, env, args.jobs_dir)
+
+
+def _run_harbor(
+    command: list[str],
+    repo_root: Path,
+    env: dict[str, str],
+    jobs_dir: Path | None,
+) -> int:
+    jobs_root = (jobs_dir or (repo_root / "jobs")).resolve()
     jobs_root.mkdir(parents=True, exist_ok=True)
     before_jobs = _job_names(jobs_root)
     completed = subprocess.run(command, cwd=repo_root, env=env, check=False)

@@ -769,7 +769,11 @@ def _suite_name(payload: dict[str, Any], dirname: str) -> str:
 
 
 def _benchmark_version(name: str, dirname: str, payload: dict[str, Any] | None) -> str:
+    if (payload or {}).get("benchmark") == "tb4.1":
+        return "4.1"
     text = f"{name} {dirname} {json.dumps(payload or {}, ensure_ascii=False)[:2000]}".lower()
+    if "terminal-bench 4.1" in text or "terminal-bench@4.1" in text:
+        return "4.1"
     if "2.1" in text or "2-1" in text or "tbench21" in text or "terminal-bench-2-1" in text:
         return "2.1"
     if "tbench" in text or "terminal-bench" in text or "terminal_bench" in text:
@@ -780,6 +784,8 @@ def _benchmark_version(name: str, dirname: str, payload: dict[str, Any] | None) 
 def _benchmark_name_from_version(version: str) -> str:
     if version == "2.1":
         return "Terminal-Bench 2.1"
+    if version == "4.1":
+        return "Terminal-Bench 4.1"
     return "Terminal-Bench"
 
 

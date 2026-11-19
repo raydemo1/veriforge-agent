@@ -196,7 +196,7 @@ cd frontend/opentui && bun run check && bun test   # 前端类型检查与测试
 - [上下文与会话](docs/context-and-sessions.md)：上下文版本、压缩、会话日志、多会话、回撤与 Worktree
 - [长期记忆](docs/memory.md)：数据模型、检索、自动提取与管理命令
 - [开发指南](docs/development.md)：环境、测试、CI 与约定
-- [评测](eval/README.md)：本地指标、Terminal-Bench 与历史评测报告
+- [评测](eval/README.md)：本地指标、Terminal-Bench 2.1 / 4.1 与历史评测报告
 
 ## 许可证
 

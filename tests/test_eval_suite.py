@@ -105,6 +105,75 @@ class EvalSuiteTests(unittest.TestCase):
         self.assertEqual(larger_plan["terminal_bench_task_set"], "24task")
         self.assertEqual(len(larger_plan["terminal_bench_tasks"]), 24)
 
+    def test_tb41_20task_subset_is_fixed_split_and_fits_small_machines(self):
+        payload = json.loads(Path("eval/tasks/veriloop_tb41_20task.json").read_text(encoding="utf-8"))
+        metadata = json.loads(Path("eval/benchmarks/data/tb41_tasks.json").read_text(encoding="utf-8"))["tasks"]
+
+        self.assertEqual(payload["benchmark"], "tb4.1")
+        self.assertEqual(payload["run_policy"]["attempts_per_task"], 1)
+        tasks = payload["tasks"]
+        evolve, held_out = payload["splits"]["evolve"], payload["splits"]["held_out"]
+        self.assertEqual(len(tasks), 20)
+        self.assertEqual(len(set(tasks)), 20)
+        self.assertEqual((len(evolve), len(held_out)), (10, 10))
+        self.assertEqual(sorted(tasks), sorted(evolve + held_out))
+        for task in tasks:
+            self.assertIn(task, metadata)
+            environment = metadata[task]["environment"]
+            verifier = metadata[task]["verifier_environment"] or {}
+            self.assertEqual(environment["gpus"], 0, task)
+            self.assertLessEqual(environment["cpus"], 4, task)
+            self.assertLessEqual(environment["memory_mb"], 8192, task)
+            self.assertLessEqual(verifier.get("cpus") or 0, 4, task)
+            self.assertLessEqual(verifier.get("memory_mb") or 0, 8192, task)
+
+    def test_terminal_bench_eval_dry_run_selects_tb41_split_and_budget(self):
+        from eval.scripts.run_terminal_bench_eval import _dry_run_plan, parse_args
+
+        plan = _dry_run_plan(parse_args(["--dry-run", "--tbench-task-set", "tb41-20task", "--split", "held_out"]))
+        self.assertEqual(plan["terminal_bench_benchmark"], "tb4.1")
+        self.assertEqual(plan["agent_budget_sec"], 3600.0)
+        self.assertEqual(len(plan["terminal_bench_tasks"]), 10)
+        self.assertIn("html-js-filter", plan["terminal_bench_tasks"])
+
+        tb2_plan = _dry_run_plan(parse_args(["--dry-run"]))
+        self.assertEqual(tb2_plan["terminal_bench_benchmark"], "tb2.1")
+        self.assertIsNone(tb2_plan["agent_budget_sec"])
+
+    def test_tb41_launcher_uses_registry_dataset_and_caps_agent_timeout(self):
+        from eval.benchmarks.run_terminal_bench import build_tb41_run_command, parse_args
+
+        args = parse_args(["--benchmark", "tb4.1", "--task", "music-harmony", "--task-budget", "1800"])
+        command = build_tb41_run_command(args, "harbor")
+
+        self.assertEqual(command[command.index("-d") + 1], "terminal-bench/terminal-bench@4.1.0")
+        self.assertNotIn("--path", command)
+        self.assertEqual(command[command.index("--include-task-name") + 1], "terminal-bench/music-harmony")
+        multiplier = float(command[command.index("--agent-timeout-multiplier") + 1])
+        self.assertAlmostEqual(multiplier * 28800.0, 1800.0 + 900.0, places=3)
+        verifier_env = [command[i + 1] for i, item in enumerate(command) if item == "--ve"]
+        self.assertTrue(any(item.startswith("NO_PROXY=") for item in verifier_env))
+
+        with self.assertRaises(ValueError):
+            build_tb41_run_command(parse_args(["--benchmark", "tb4.1"]), "harbor")
+
+    def test_explicit_task_budget_overrides_tb2_metadata(self):
+        from eval.benchmarks.tb2_metadata import resolve_task_budget
+
+        with patch.dict("os.environ", {"HARNESS_TERMINAL_TASK_NAME": "fix-git"}, clear=False):
+            with patch.dict("os.environ", {"HARNESS_TASK_BUDGET": ""}):
+                tb2_budget = resolve_task_budget("")
+            with patch.dict("os.environ", {"HARNESS_TASK_BUDGET": "3600"}):
+                self.assertEqual(resolve_task_budget(""), 3600.0)
+        self.assertNotEqual(tb2_budget, 3600.0)
+
+    def test_ledger_labels_tb41_runs_separately_from_tb21(self):
+        from eval.scripts.eval_ledger import _benchmark_version
+
+        self.assertEqual(_benchmark_version("Terminal-Bench 4.1 20-task subset (VeriLoop)", "run", {"benchmark": "tb4.1"}), "4.1")
+        self.assertEqual(_benchmark_version("", "job", {"dataset": "terminal-bench/terminal-bench@4.1.0"}), "4.1")
+        self.assertEqual(_benchmark_version("Terminal-Bench 2.1 subset", "run", {}), "2.1")
+
     def test_memory_ab_seed_records_cover_success_markers(self):
         payload = json.loads(Path("eval/tasks/memory_ab.json").read_text(encoding="utf-8"))
 

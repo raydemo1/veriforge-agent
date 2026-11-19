@@ -29,6 +29,9 @@ from eval.scripts.eval_common import (
     make_run_dir,
     number,
     safe_name,
+    split_results,
+    task_splits,
+    tbench_benchmark,
     write_eval_reports,
     write_suite_summary,
 )
@@ -66,7 +69,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--tbench-task-set",
         choices=sorted(TBENCH_TASK_FILES),
         default="8task",
-        help="Terminal-Bench task set size: 8task by default, or 24task for the larger subset.",
+        help=(
+            "Terminal-Bench task set: 8task (default), 24task or full for Terminal-Bench 2.1; "
+            "tb41-20task for the VeriLoop Terminal-Bench 4.1 subset."
+        ),
+    )
+    parser.add_argument(
+        "--split",
+        choices=("all", "evolve", "held_out"),
+        default="all",
+        help="Run only one split of a task set that declares splits (default: all).",
+    )
+    parser.add_argument(
+        "--task-budget",
+        type=float,
+        default=None,
+        help=(
+            "Terminal-Bench 4.1 only: agent wall-clock budget per task in seconds. "
+            "Defaults to the task set's run_policy.agent_budget_sec."
+        ),
     )
     parser.add_argument(
         "--runner-env",
@@ -93,11 +114,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _selected_tasks(args: argparse.Namespace, payload: dict[str, Any]) -> list[str]:
+    configured_tasks = list(payload["tasks"])
+    if args.split != "all":
+        splits = payload.get("splits") or {}
+        if args.split not in splits:
+            raise SystemExit(f"Task set {args.tbench_task_set} has no split {args.split!r}")
+        configured_tasks = list(splits[args.split])
+    return list(args.task or configured_tasks)
+
+
+def _task_budget(args: argparse.Namespace, payload: dict[str, Any]) -> float | None:
+    if tbench_benchmark(payload) != "tb4.1":
+        return None
+    if args.task_budget is not None:
+        return float(args.task_budget)
+    budget = (payload.get("run_policy") or {}).get("agent_budget_sec")
+    return float(budget) if budget else None
+
+
 def run_tbench_suite(args: argparse.Namespace) -> Path:
     payload = load_tbench_task_config(args.tbench_task_set)
-    metadata = load_tbench_metadata()
+    benchmark = tbench_benchmark(payload)
+    metadata = load_tbench_metadata(benchmark)
+    splits = task_splits(payload)
     configured_tasks = list(payload["tasks"])
-    tasks = list(args.task or configured_tasks)
+    tasks = _selected_tasks(args, payload)
     unknown_tasks = [task for task in tasks if task not in configured_tasks]
     if unknown_tasks:
         raise SystemExit(
@@ -111,7 +153,16 @@ def run_tbench_suite(args: argparse.Namespace) -> Path:
     parallelism = max(1, int(args.tbench_parallelism or 1))
     if parallelism == 1 or len(tasks) <= 1:
         task_results = [
-            _run_tbench_task(args, run_dir=run_dir, outputs_dir=outputs_dir, metadata=metadata, task=task)
+            _run_tbench_task(
+                args,
+                run_dir=run_dir,
+                outputs_dir=outputs_dir,
+                metadata=metadata,
+                task=task,
+                benchmark=benchmark,
+                task_budget=_task_budget(args, payload),
+                split=splits.get(task, ""),
+            )
             for task in tasks
         ]
     else:
@@ -125,6 +176,9 @@ def run_tbench_suite(args: argparse.Namespace) -> Path:
                     outputs_dir=outputs_dir,
                     metadata=metadata,
                     task=task,
+                    benchmark=benchmark,
+                    task_budget=_task_budget(args, payload),
+                    split=splits.get(task, ""),
                 ): task
                 for task in tasks
             }
@@ -138,6 +192,8 @@ def run_tbench_suite(args: argparse.Namespace) -> Path:
         "suite": "tbench",
         "benchmark_name": str(payload.get("benchmark_name") or "Terminal-Bench 2.1 subset"),
         "task_set": str(payload.get("task_set") or args.tbench_task_set),
+        "benchmark": benchmark,
+        "split": args.split,
         "status": "passed" if passed == len(tasks) else "failed",
         "task_count": len(tasks),
         "passed": passed,
@@ -146,6 +202,7 @@ def run_tbench_suite(args: argparse.Namespace) -> Path:
         "tasks": tasks,
         "task_results": task_results,
         "category_results": category_results(task_results),
+        "split_results": split_results(task_results),
         **aggregate_usage(task_results),
     }
     write_suite_summary(run_dir, summary, [])
@@ -159,16 +216,23 @@ def _run_tbench_task(
     outputs_dir: Path,
     metadata: dict[str, Any],
     task: str,
+    benchmark: str = "tb2.1",
+    task_budget: float | None = None,
+    split: str = "",
 ) -> dict[str, Any]:
     task_jobs_dir = run_dir / "harbor_jobs" / safe_name(task)
     command = [
         sys.executable,
         str(PROJECT_ROOT / "eval" / "benchmarks" / "run_terminal_bench.py"),
+        "--benchmark",
+        benchmark,
         "--jobs-dir",
         str(task_jobs_dir),
         "--task",
         task,
     ]
+    if task_budget is not None:
+        command.extend(["--task-budget", f"{task_budget:g}"])
     if args.runner_env:
         command.extend(["--env", args.runner_env])
     if args.force_build:
@@ -215,9 +279,13 @@ def _run_tbench_task(
     )
     return {
         "task": task,
+        "benchmark": benchmark,
+        "split": split,
         "category": str(task_meta.get("category") or "unknown"),
         "difficulty": str(task_meta.get("difficulty") or "unknown"),
+        "expert_time_estimate_hours": task_meta.get("expert_time_estimate_hours"),
         "agent_timeout_sec": number(task_meta.get("agent_timeout_sec")),
+        "agent_budget_sec": task_budget,
         "returncode": returncode,
         "status": status,
         "timed_out": timed_out,
@@ -239,8 +307,11 @@ def _dry_run_plan(args: argparse.Namespace) -> dict[str, Any]:
         "runner": "terminal_bench",
         "output_root": str(Path(args.output_root)),
         "terminal_bench_task_set": args.tbench_task_set,
+        "terminal_bench_benchmark": tbench_benchmark(payload),
         "terminal_bench_benchmark_name": payload.get("benchmark_name"),
-        "terminal_bench_tasks": list(args.task or payload["tasks"]),
+        "terminal_bench_split": args.split,
+        "terminal_bench_tasks": _selected_tasks(args, payload),
+        "agent_budget_sec": _task_budget(args, payload),
         "runner_env": args.runner_env,
         "force_build": args.force_build,
         "tbench_parallelism": max(1, int(args.tbench_parallelism or 1)),
@@ -507,6 +578,7 @@ def run_self_test() -> None:
     try:
         assert len(load_tbench_task_config("8task")["tasks"]) == 8
         assert len(load_tbench_task_config("24task")["tasks"]) == 24
+        assert len(load_tbench_task_config("tb41-20task")["tasks"]) == 20
         root = Path(temp_dir) / "results"
         run_dir = root / "tbench"
         run_dir.mkdir(parents=True)
