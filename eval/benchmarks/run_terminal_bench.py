@@ -125,6 +125,11 @@ def build_launch_environment(
             if key and key not in env:
                 env[key] = value
 
+    pythonpath = env.get("PYTHONPATH")
+    paths = [str(repo_root.resolve())]
+    if pythonpath:
+        paths.append(pythonpath)
+    env["PYTHONPATH"] = os.pathsep.join(paths)
     return env
 
 

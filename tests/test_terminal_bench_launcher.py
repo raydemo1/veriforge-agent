@@ -116,6 +116,7 @@ class TerminalBenchLauncherTests(unittest.TestCase):
             base_env = {
                 "PATH": "base-path",
                 "HARNESS_MODEL": "existing-model",
+                "PYTHONPATH": "existing-pythonpath",
             }
 
             env = build_launch_environment(repo_root, base_env=base_env, dotenv_path=dotenv_path)
@@ -125,6 +126,10 @@ class TerminalBenchLauncherTests(unittest.TestCase):
             self.assertEqual(env["TMP"], expected_temp)
             self.assertEqual(env["OPENAI_API_KEY"], "test-key")
             self.assertEqual(env["HARNESS_MODEL"], "existing-model")
+            self.assertEqual(
+                env["PYTHONPATH"],
+                os.pathsep.join([str(repo_root.resolve()), "existing-pythonpath"]),
+            )
             self.assertNotIn("MAX_AGENT_ITERATIONS", env)
             self.assertEqual(env["MAX_AGENT_TOOL_CALLS"], "400")
             self.assertEqual(env["PYTHONIOENCODING"], "utf-8")
@@ -147,6 +152,7 @@ class TerminalBenchLauncherTests(unittest.TestCase):
             )
 
             self.assertEqual(env["MAX_AGENT_TOOL_CALLS"], "500")
+            self.assertEqual(env["PYTHONPATH"], str(repo_root.resolve()))
         finally:
             shutil.rmtree(repo_root, ignore_errors=True)
 
