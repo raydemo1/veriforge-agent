@@ -26,9 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=8,<10", "pytest-timeout>=2.3,<3"]
 eval = [
-    "datasets>=5.0.0",
-    "pyarrow>=21.0.0",
-    "harbor>=0.13",
+    "harbor>=0.25",
 ]
 
 [project.scripts]
