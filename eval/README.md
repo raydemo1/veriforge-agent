@@ -8,35 +8,74 @@
 pip install -e ".[eval]"
 ```
 
-大部分 runner 默认只打印计划（`--dry-run` 或缺省 `--run`），需要显式参数才会发出计费的真实请求。
-
 ## 目录
 
 ```text
 eval/
-├── scripts/      评测入口和结果账本工具
-├── tasks/        固定的轻量任务集
+├── cli.py        统一入口（python -m eval）
+├── scripts/      各套件的 runner 和结果账本工具
+├── tasks/        固定任务集（VeriLoop-Bench、本地开发任务、Terminal-Bench 子集）
 ├── benchmarks/   外部基准的适配器：Terminal-Bench 2.1 / 4.1（通过 Harbor）
 ├── reports/      历史评测报告（按日期命名）
 └── results/      运行产物和汇总（不进入 Git）
 ```
 
-## 本地评测
+## 统一入口：`python -m eval`
 
-| 脚本 | 作用 |
-| --- | --- |
-| `scripts/run_basic_metrics_eval.py` | 本地指标套件：`memory`、`latency`（默认），`cache` 需要显式选择 |
-| `scripts/run_dev_task_eval.py` | 本地开发任务回归。`--validate` 离线检查夹具，`--run` 调用模型 |
-| `scripts/run_verifier_ablation.py` | 改动验证器的消融实验（见下文） |
-| `scripts/run_memory_candidate_eval.py` | 记忆候选提取评测 |
-| `scripts/check_memory_consolidation.py`、`scripts/check_memory_runtime.py` | 记忆整理与运行时的离线检查 |
-| `scripts/deepseek_context_eval.py` | DeepSeek 上下文 / 缓存场景测量 |
+所有评测套件都通过同一个入口运行。各套件的 runner 仍在 `scripts/` 下，入口负责把参数和语义统一：`run` 一定发起计费的真实运行，`--dry-run` 一定只打印计划（与底层脚本自己的默认值无关）。
 
 ```bash
-python eval/scripts/run_basic_metrics_eval.py --dry-run
-python eval/scripts/run_basic_metrics_eval.py --suites memory,latency
-python eval/scripts/run_basic_metrics_eval.py --suites cache
+python -m eval list                                   # 列出套件、测什么、花多少钱
+python -m eval validate veriloop                      # 离线检查，不调用模型
+python -m eval run veriloop --dry-run                 # 只看计划
+python -m eval run veriloop --split held_out --repetitions 3 --intensity fast
+python -m eval run tbench --task-set tb41-20task      # Terminal-Bench 4.1 子集
+python -m eval report                                 # 汇总 results/ 下所有运行，写 results/INDEX.md
+python -m eval compare eval/results/<基线> eval/results/<候选>   # 按任务配对比较，带 95% 置信区间
 ```
+
+通用参数会按套件翻译，套件不支持的参数直接报错：
+
+| 参数 | 含义 | 支持的套件 |
+| --- | --- | --- |
+| `--repetitions N` | 每题重复次数 | veriloop、dev、windows-native、ablation |
+| `--split evolve\|held_out` | 只跑一个切分 | veriloop、tbench |
+| `--intensity fast\|normal\|hard\|max` | 模型档位（`fast` 为关思考） | veriloop、dev、windows-native、tbench、metrics |
+| `--tasks a,b` | 只跑指定题目 | veriloop、dev、windows-native、tbench |
+| `--task-set` | 题集 | tbench（`8task`、`24task`、`full`、`tb41-20task`） |
+| `--output-root`、`--run-name` | 产物位置和名称 | 视套件而定 |
+
+`--` 之后的参数原样交给底层 runner，例如 `python -m eval run metrics -- --suites cache`。
+
+`compare` 以「题」为单位配对：先算每道题在两次运行中的通过率，再对每题差值的均值做 bootstrap，得到 95% 置信区间。同一道题的多次重复不会被当成独立样本。输出按切分分组，并列出两边的低级错误失败数和每道发生变化的题。
+
+## VeriLoop-Bench（主评测）
+
+`tasks/veriloop_bench_v1.py` 定义 24 道本地任务，不需要 Docker：每道题在临时目录里运行，Agent 结束后放入隐藏测试判定。题目分布在 3 个共享的基础项目里，每个项目约 15 个文件，带现有测试、文档和 CHANGELOG：
+
+| 项目 | 内容 | 典型约定 |
+| --- | --- | --- |
+| `stockroom` | 库存命令行工具 | 命令要注册并写文档；stdout / stderr 与退出码；拒绝的请求不改数据；默认值放在 `config/defaults.toml` |
+| `ledgerlite` | SQLite 复式记账库 | 金额用 Decimal；公开 API 从顶层导出；领域错误用 `LedgerError` 子类；改表用新迁移 |
+| `notifykit` | 通知命令行工具 | 渠道要注册并写文档；stdout 只输出一个 JSON 文档；先校验全部再投递；设置与环境变量覆盖 |
+
+- 约定只写在各项目的 CONTRIBUTING.md 和现有代码里，README 提示「改动前先读 CONTRIBUTING.md」；**任务提示词只描述功能**。
+- 隐藏测试里 `test_trap_<类别>_<内容>` 是陷阱检查，其余是核心检查。类别是 `deliverable`、`verify_claim`、`cross_file`、`edge_case`、`interface`、`persistence`，每题 2–4 个。一次失败如果只挂在陷阱检查上，就记为**低级错误失败**（`trap_failure`）；报告按类别统计「掉进陷阱」的比例。
+- 每道题带一个 **near-miss** 改动：只实现功能本身。`validate` 逐题证明：原始夹具失败；near-miss 通过全部核心检查、**挂掉全部**陷阱检查；golden 通过隐藏测试，并保持项目自带的 `tests/` 通过。
+- 切分：evolve 12 题、held-out 12 题，每个项目各 4 题。
+- 成本：估计每次运行约 ¥0.1–0.5，以实测为准。
+
+更早的一版草稿是 30 道单陷阱小题，要求都写在提示词里；DeepSeek-V4.1-Flash-1017 关思考档跑出 58/60，区分度不够，已删除。
+
+## 其他本地评测
+
+| 套件 | 底层脚本 | 作用 |
+| --- | --- | --- |
+| `dev`、`windows-native` | `scripts/run_dev_task_eval.py` | 原有的本地开发任务和 Windows 原生回归任务 |
+| `metrics` | `scripts/run_basic_metrics_eval.py` | 本地指标：`memory`、`latency`（默认），`cache` 需显式选择 |
+| `ablation` | `scripts/run_verifier_ablation.py` | 改动验证器的消融实验（见下文） |
+| `memory`、`memory-runtime`、`memory-candidate` | `scripts/run_memory_*.py` | 记忆的真实模型评测；`validate memory` 运行离线检查 |
+| `context` | `scripts/deepseek_context_eval.py` | DeepSeek 上下文 / 缓存场景测量 |
 
 ### 验证器消融实验
 
@@ -99,12 +138,12 @@ python eval/benchmarks/run_terminal_bench.py --task fix-git --force-build     # 
 
 ## Terminal-Bench 4.1（VeriLoop 20 题子集）
 
-VeriLoop 的自进化实验使用 TB4.1 的一个固定 20 题子集，不跑全量。清单、切分（evolve 10 题、held-out 10 题）和挑选规则在 `tasks/veriloop_tb41_20task.json`，全部 66 题的元数据（类别、专家估时、任务和判题环境所需的 CPU/内存/GPU）在 `benchmarks/data/tb41_tasks.json`。
+TB4.1 的一个固定 20 题子集，作为 VeriLoop 的可选外部旁证（主评测是本地的 VeriLoop-Bench）。清单、切分（evolve 10 题、held-out 10 题）和挑选规则在 `tasks/veriloop_tb41_20task.json`，全部 66 题的元数据（类别、专家估时、任务和判题环境所需的 CPU/内存/GPU）在 `benchmarks/data/tb41_tasks.json`。
 
 ```bash
-python eval/scripts/run_terminal_bench_eval.py --tbench-task-set tb41-20task --dry-run
-python eval/scripts/run_terminal_bench_eval.py --tbench-task-set tb41-20task                  # 20 题，每题 1 次
-python eval/scripts/run_terminal_bench_eval.py --tbench-task-set tb41-20task --split evolve   # 只跑一个切分
+python -m eval run tbench --task-set tb41-20task --dry-run
+python -m eval run tbench --task-set tb41-20task                  # 20 题，每题 1 次
+python -m eval run tbench --task-set tb41-20task --split evolve   # 只跑一个切分
 python eval/benchmarks/run_terminal_bench.py --benchmark tb4.1 --task music-harmony          # 单个任务
 ```
 

@@ -6,16 +6,21 @@ default model profile is ``.env`` (https://api.deepseek.com); ``--model-profile
 ab`` selects the ``.env.ab`` overlay instead.
 
 ``--validate`` needs no model: it proves every hidden test fails on the broken
-fixture and passes on the golden change.
+fixture and passes on the golden change. For tasks with a ``near_miss`` change
+(the VeriLoop-Bench pack), it also proves the near-miss passes every core
+check and fails only ``test_trap_*`` checks, so each trap is real and
+objectively detected.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import difflib
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +37,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from eval.scripts.eval_common import base_env, session_id_from_stdout
 from eval.tasks.dev_tasks_v1 import TASKS as DEV_TASKS
+from eval.tasks.veriloop_bench_v1 import TASKS as VERILOOP_TASKS
+from eval.tasks.veriloop_bench_v1 import trap_category
 from eval.tasks.windows_native_tasks_v1 import TASKS as WINDOWS_NATIVE_TASKS
 from harness_code_agent.sessions.observability import build_session_observability
 from harness_code_agent.sessions.store import SessionStore
@@ -40,21 +47,24 @@ from harness_code_agent.workspace.state_paths import ensure_workspace_state
 TASK_PACKS = {
     "dev": ("dev_tasks_v1", DEV_TASKS),
     "windows-native": ("windows_native_tasks_v1", WINDOWS_NATIVE_TASKS),
+    "veriloop": ("veriloop_bench_v1", VERILOOP_TASKS),
 }
+TRAP_TEST_PREFIX = "test_trap_"
+MODEL_INTENSITIES = ("fast", "normal", "hard", "max")
 
 IGNORED_DIRS = {"__pycache__", ".pytest_cache", ".git", ".harness", ".veriforge"}
 IGNORED_SUFFIXES = {".pyc", ".pyo"}
 
 
-def _model_env(profile: str) -> dict[str, str]:
+def _model_env(profile: str, intensity: str = "normal") -> dict[str, str]:
     env = base_env()
-    env["HARNESS_MODEL_INTENSITY"] = "normal"
+    env["HARNESS_MODEL_INTENSITY"] = intensity
     env["HARNESS_EVAL_PROFILE"] = "ab" if profile == "ab" else ""
     env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 
-def _configured_model(profile: str) -> dict:
+def _configured_model(profile: str, intensity: str = "normal") -> dict:
     # Resolve dotenv in a clean child, just as the actual agent does. Importing
     # config here would populate the runner's environment from the default .env.
     completed = subprocess.run(
@@ -65,16 +75,19 @@ def _configured_model(profile: str) -> dict:
             "input_mode=config.MODEL_INPUT_MODE)))"
         )],
         cwd=PROJECT_ROOT,
-        env=_model_env(profile),
+        env=_model_env(profile, intensity),
         capture_output=True,
         encoding="utf-8",
         check=True,
     )
-    return json.loads(completed.stdout)
+    return {**json.loads(completed.stdout), "intensity": intensity}
 
 
 def _selected_tasks(args) -> list[dict]:
     tasks = list(TASK_PACKS[args.task_pack][1])
+    split = getattr(args, "split", "all")
+    if split != "all":
+        tasks = [task for task in tasks if task.get("split") == split]
     if args.tasks:
         requested = {item.strip() for item in args.tasks.split(",") if item.strip()}
         tasks = [task for task in tasks if task["id"] in requested]
@@ -91,10 +104,72 @@ def _materialize(task: dict, root: Path) -> None:
 
 
 def _apply_golden(task: dict, root: Path) -> None:
-    for relative, content in task["golden"].items():
+    _apply_files(task["golden"], root)
+
+
+def _apply_files(files: dict[str, str], root: Path) -> None:
+    for relative, content in files.items():
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8", newline="\n")
+
+
+def _hidden_test_names(task: dict) -> list[str]:
+    tree = ast.parse(task["hidden_test"])
+    return [
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+    ]
+
+
+_FAILED_LINE = re.compile(r"^(FAILED|ERROR) \S+?(?:::(\w+))?(?:\[[^\]]*\])?(?: - .*)?$", re.MULTILINE)
+
+
+def _failed_tests(log: str) -> tuple[list[str], bool]:
+    """Failing test names from pytest's short summary, and whether collection broke."""
+    names: list[str] = []
+    collection_error = False
+    for match in _FAILED_LINE.finditer(log or ""):
+        name = match.group(2)
+        if name:
+            names.append(name)
+        else:
+            collection_error = True
+    return sorted(set(names)), collection_error
+
+
+def _task_traps(task: dict) -> list[str]:
+    """Trap categories a task checks (empty for packs without traps)."""
+    return list(task.get("traps") or [])
+
+
+def _failed_trap_categories(task: dict, failed: list[str]) -> list[str]:
+    return sorted({trap_category(name) for name in failed if name.startswith(TRAP_TEST_PREFIX)} - {""})
+
+
+def _trap_stats(results: list[dict]) -> dict:
+    """Per trap category: runs that checked it and runs that missed it."""
+    stats: dict[str, dict[str, int]] = {}
+    for item in results:
+        for category in item.get("traps") or []:
+            bucket = stats.setdefault(category, {"runs": 0, "missed": 0})
+            bucket["runs"] += 1
+            bucket["missed"] += 1 if category in (item.get("failed_trap_categories") or []) else 0
+    return {
+        category: {**values, "miss_rate": round(values["missed"] / values["runs"], 3)}
+        for category, values in sorted(stats.items())
+    }
+
+
+def _is_trap_failure(task: dict, hidden_ok: bool, hidden_log: str) -> bool:
+    """A failed hidden test whose only failing checks are trap checks."""
+    if hidden_ok or not _task_traps(task):
+        return False
+    failed, collection_error = _failed_tests(hidden_log)
+    return bool(failed) and not collection_error and all(
+        name.startswith(TRAP_TEST_PREFIX) for name in failed
+    )
 
 
 def _file_hashes(root: Path, paths: list[str]) -> dict[str, str]:
@@ -119,7 +194,10 @@ def _run_hidden(root: Path, task: dict, *, timeout: int = 180) -> tuple[bool, st
         handle.write(task["hidden_test"])
     try:
         completed = subprocess.run(
-            [sys.executable, "-X", "utf8", "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", path.name],
+            [
+                sys.executable, "-X", "utf8", "-B", "-m", "pytest", "-q", "-rfE",
+                "-p", "no:cacheprovider", path.name,
+            ],
             cwd=root,
             capture_output=True,
             encoding="utf-8",
@@ -338,22 +416,74 @@ def validate(tasks: list[dict], output_root: Path, *, prefix: str = "dev-task-va
             before_ok, before_log = _run_hidden(root, task)
             _apply_golden(task, root)
             after_ok, after_log = _run_hidden(root, task)
-        ok = (not before_ok) and after_ok
-        results.append({
+            project_ok, project_log = _run_project_tests(root) if task.get("project") else (True, "")
+        ok = (not before_ok) and after_ok and project_ok
+        result = {
             "id": task["id"],
             "category": task["category"],
             "broken_fails": not before_ok,
             "golden_passes": after_ok,
-            "ok": ok,
+            "golden_keeps_project_tests_green": project_ok,
+            "project_tests_log": project_log[-800:],
             "before_log": before_log[-800:],
             "after_log": after_log[-800:],
-        })
+        }
+        if task.get("near_miss") is not None:
+            near_ok, near_detail = _validate_near_miss(task)
+            result["near_miss_isolates_trap"] = near_ok
+            result["near_miss_detail"] = near_detail
+            ok = ok and near_ok
+        result["ok"] = ok
+        results.append(result)
         print(f"{'PASS' if ok else 'FAIL'}  {task['id']}")
     (run_dir / "validation.json").write_text(
         json.dumps({"tasks": results}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     print(f"\nWrote {run_dir / 'validation.json'}")
     return 0 if all(item["ok"] for item in results) else 1
+
+
+def _run_project_tests(root: Path, *, timeout: int = 180) -> tuple[bool, str]:
+    """Run a base project's own tests/ directory (golden changes must keep it green)."""
+    if not (root / "tests").is_dir():
+        return True, ""
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-X", "utf8", "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider", "tests"],
+            cwd=root,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"[project tests timed out after {timeout}s]"
+    return completed.returncode == 0, (completed.stdout or "") + (completed.stderr or "")
+
+
+def _validate_near_miss(task: dict) -> tuple[bool, dict]:
+    """The near-miss must pass every core check and fail only trap checks."""
+    names = _hidden_test_names(task)
+    traps = [name for name in names if name.startswith(TRAP_TEST_PREFIX)]
+    core = [name for name in names if not name.startswith(TRAP_TEST_PREFIX)]
+    with tempfile.TemporaryDirectory(prefix=f"vf-validate-near-{task['id']}-") as tmp:
+        root = Path(tmp)
+        _materialize(task, root)
+        _apply_files(task["near_miss"], root)
+        near_ok, near_log = _run_hidden(root, task)
+    failed, collection_error = _failed_tests(near_log)
+    ok = (
+        bool(traps)
+        and bool(core)
+        and not near_ok
+        and not collection_error
+        and bool(failed)
+        and all(name in traps for name in failed)
+    )
+    if task.get("near_miss_fails_all_traps"):
+        ok = ok and set(failed) == set(traps)
+    return ok, {"core_tests": core, "trap_tests": traps, "failed": failed, "log": near_log[-800:]}
 
 
 def _start_concurrent_edit(task: dict, workspace: Path, case_home: Path):
@@ -446,7 +576,7 @@ def _run_case(task: dict, rep: int, run_dir: Path, args, workspace_root: Path) -
     protected_before = _file_hashes(workspace, protected)
     snapshot = _snapshot(workspace)
 
-    env = _model_env(args.model_profile)
+    env = _model_env(args.model_profile, getattr(args, "intensity", "normal"))
     env["HARNESS_PERMISSION_MODE"] = "workspace-write"
     env["VERIFORGE_HOME"] = str(case_home)
     env["VERIFORGE_MEMORY_ROOT"] = str(case_memory)
@@ -494,6 +624,7 @@ def _run_case(task: dict, rep: int, run_dir: Path, args, workspace_root: Path) -
 
     hidden_ok, hidden_log = _run_hidden(workspace, task)
     (case_dir / "hidden.txt").write_text(hidden_log, encoding="utf-8", newline="\n")
+    hidden_failed, _ = _failed_tests(hidden_log)
     protected_after = _file_hashes(workspace, protected)
     protected_ok = len(protected_before) == len(protected) and protected_after == protected_before
     changed = _snapshot(workspace)
@@ -575,6 +706,8 @@ def _run_case(task: dict, rep: int, run_dir: Path, args, workspace_root: Path) -
     return {
         "task_id": task["id"],
         "category": task["category"],
+        "split": task.get("split", ""),
+        "trap": task.get("trap", ""),
         "rep": rep,
         "status": "stopped" if stop_reason else ("failed" if returncode != 0 else "completed"),
         "success": success,
@@ -586,6 +719,10 @@ def _run_case(task: dict, rep: int, run_dir: Path, args, workspace_root: Path) -
         "timings": cli_timings,
         "session_id": session_id,
         "hidden_test": hidden_ok,
+        "hidden_failed_tests": hidden_failed,
+        "trap_failure": _is_trap_failure(task, hidden_ok, hidden_log),
+        "traps": _task_traps(task),
+        "failed_trap_categories": _failed_trap_categories(task, hidden_failed),
         "hidden_tail": hidden_log[-400:],
         "protected_files_intact": protected_ok,
         "concurrent_edit": concurrent_edit,
@@ -649,6 +786,9 @@ def run(tasks: list[dict], args, output_root: Path, model: dict) -> int:
         per_task.append({
             "task_id": task["id"],
             "category": task["category"],
+            "split": task.get("split", ""),
+            "trap": task.get("trap", ""),
+            "trap_failures": sum(1 for item in runs if item["trap_failure"]),
             "runs": len(runs),
             "passed": sum(1 for item in runs if item["success"]),
             "success_rate": round(sum(1 for item in runs if item["success"]) / len(runs), 3),
@@ -669,7 +809,10 @@ def run(tasks: list[dict], args, output_root: Path, model: dict) -> int:
             "permission_mode": "workspace-write",
         },
         "repetitions": args.repetitions,
+        "split": getattr(args, "split", "all"),
         "task_count": len(tasks),
+        "by_split": _group_rates(results, "split"),
+        "by_trap": _trap_stats(results),
         "overall": {
             "runs": len(results),
             "passed": sum(1 for item in results if item["success"]),
@@ -686,6 +829,7 @@ def run(tasks: list[dict], args, output_root: Path, model: dict) -> int:
             "protected_test_modifications": sum(
                 1 for item in results if not item["protected_files_intact"]
             ),
+            "trap_failures": sum(1 for item in results if item["trap_failure"]),
             "stopped_runs": sum(1 for item in results if item["status"] == "stopped"),
             "init_seconds_p50": _percentile(
                 [item["timings"]["init_seconds"] for item in results
@@ -739,6 +883,22 @@ def run(tasks: list[dict], args, output_root: Path, model: dict) -> int:
     return 0 if all(item["success"] for item in results) else 1
 
 
+def _group_rates(results: list[dict], key: str) -> dict:
+    grouped: dict[str, list[dict]] = {}
+    for item in results:
+        if item.get(key):
+            grouped.setdefault(str(item[key]), []).append(item)
+    return {
+        name: {
+            "runs": len(items),
+            "passed": sum(1 for item in items if item["success"]),
+            "success_rate": round(sum(1 for item in items if item["success"]) / len(items), 3),
+            "trap_failures": sum(1 for item in items if item["trap_failure"]),
+        }
+        for name, items in sorted(grouped.items())
+    }
+
+
 def _report(summary: dict, per_task: list[dict], failures: list[dict]) -> str:
     lines = [
         "# P2.2 真实开发任务评测",
@@ -780,7 +940,10 @@ def _report(summary: dict, per_task: list[dict], failures: list[dict]) -> str:
         ),
         f"| 未要求的子 Agent | {summary['overall']['unexpected_agent_spawns']} |",
         f"| 篡改受保护测试 | {summary['overall']['protected_test_modifications']} |",
+        f"| 低级错误失败（只挂陷阱检查） | {summary['overall']['trap_failures']} |",
         "",
+        *_group_table("按切分", summary.get("by_split") or {}),
+        *_trap_table(summary.get("by_trap") or {}),
         "## 逐任务",
         "",
         "| 任务 | 类别 | 通过 | P50 秒 | LLM | 工具 | Token | 失败类型 |",
@@ -837,6 +1000,27 @@ def _report(summary: dict, per_task: list[dict], failures: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _group_table(title: str, groups: dict) -> list[str]:
+    if not groups:
+        return []
+    lines = [f"## {title}", "", "| 分组 | 通过 | 成功率 | 低级错误失败 |", "| --- | --- | --- | --- |"]
+    for name, values in groups.items():
+        lines.append(
+            f"| {name} | {values['passed']}/{values['runs']} | {values['success_rate']:.1%} | "
+            f"{values['trap_failures']} |"
+        )
+    return [*lines, ""]
+
+
+def _trap_table(stats: dict) -> list[str]:
+    if not stats:
+        return []
+    lines = ["## 按陷阱类别", "", "| 类别 | 检查过的运行 | 掉进陷阱 | 比例 |", "| --- | --- | --- | --- |"]
+    for name, values in stats.items():
+        lines.append(f"| {name} | {values['runs']} | {values['missed']} | {values['miss_rate']:.1%} |")
+    return [*lines, ""]
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group()
@@ -849,7 +1033,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--task-pack",
         choices=sorted(TASK_PACKS),
         default="dev",
-        help="Task pack: the original development tasks or the Windows-native regression set.",
+        help=(
+            "Task pack: the original development tasks, the Windows-native regression set, or "
+            "veriloop (VeriLoop-Bench: 24 multi-trap tasks inside three base projects, with "
+            "evolve / held_out splits)."
+        ),
+    )
+    parser.add_argument(
+        "--split",
+        choices=("all", "evolve", "held_out"),
+        default="all",
+        help="Only run tasks of one split (packs that declare splits, such as veriloop).",
+    )
+    parser.add_argument(
+        "--intensity",
+        choices=MODEL_INTENSITIES,
+        default="normal",
+        help="HARNESS_MODEL_INTENSITY for the agent (default normal; fast = thinking off).",
     )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--model-profile", choices=["default", "ab"], default="default")
@@ -890,7 +1090,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return validate(tasks, output_root, prefix=prefix)
     try:
-        model = _configured_model(args.model_profile)
+        model = _configured_model(args.model_profile, args.intensity)
     except subprocess.CalledProcessError as exc:
         print(exc.stderr.strip() or "Could not load the evaluation model configuration.", file=sys.stderr)
         return 2
